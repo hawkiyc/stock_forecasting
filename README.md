@@ -4,16 +4,14 @@
 
 ### 專案定位
 
-本專案以美國與台灣股票、ETF 的日線 OHLCV 資料，微調金融領域預訓練的時序基礎模型。現行版本是純數值預測系統：
+本專案以美國與台灣股票、ETF 的日線 OHLCV 資料，微調金融領域預訓練的時序基礎模型。系統只處理數值時序：
 
-- 不載入 LLM。
-- 不生成文字。
-- 不建立或預測 fact head。
+- 輸入與輸出都是數值張量，不提供自然語言生成或事實重建功能。
 - 不把外部 API 放進訓練迴圈。
 - 只輸出 3–14 個持有交易日的連續 alpha 條件分布。
-- 保留可供未來多模態模型重用的數值 encoder 介面。
+- 提供可供下游系統重用的數值 encoder 介面。
 
-這是能力驗證用的 side-project PoC，不是投資建議、交易系統或可保證獲利的模型。
+這是研究與能力驗證用的 PoC，不是投資建議、交易系統或可保證獲利的模型。
 
 ### 數值輸出契約
 
@@ -27,22 +25,23 @@
 模型沒有 `forecast_logits`、分類 head、分類 loss 或方向機率。推論時可由每個
 horizon 的 q10/q50/q90，使用固定閾值後處理成 `strong_bearish`、`bearish`、
 `neutral`、`bullish`、`strong_bullish`；這些訊號不是額外訓練目標，也不會增加
-loss 權重。舊版 LLM/fact/三分類 checkpoint 會因 output schema 不符而拒絕載入。
+loss 權重。Checkpoint 必須符合 `model_output_schema_version=4.0`；不相容的
+output schema 會被拒絕載入。
 
 ### 模型架構
 
 ```text
-資產截至收盤 t 的 adjusted OHLCV ──┐
-                                    ├── shared Kronos-base + LoRA
-benchmark 截至收盤 t 的 adjusted OHLCV ┘           │
-                                                    ▼
-                                      Causal Perceiver Resampler
-                                                    │
-                                                    ▼
-                                      gated benchmark cross-attention
-                                                    │
-                                                    ▼
-                                  3–14 日 alpha q10/q50/q90 [B,12,3]
+Adjusted asset OHLCV through close t ─────┐
+                                          ├── shared Kronos-base + LoRA
+Adjusted benchmark OHLCV through close t ─┘              │
+                                                         ▼
+                                           Causal Perceiver Resampler
+                                                         │
+                                                         ▼
+                                           gated benchmark cross-attention
+                                                         │
+                                                         ▼
+                                     3–14d alpha q10/q50/q90 [B,12,3]
 ```
 
 生產設定使用 `NeoQuasar/Kronos-base` 與
@@ -61,7 +60,7 @@ checkpoint 都會綁定 revisions。
 - `attention_mask`
 - `latent_tokens`
 
-因此，未來若恢復多模態研究，可以在數值表示之後接入新的跨模態對齊模組，不必把文字能力耦合回本次續練。
+下游系統可以在這些數值表示之後接入額外的數值模組或跨模態對齊模組，而不改變目前的 alpha 輸出契約。
 
 模型直接學習條件 alpha 分布；不是先預測 raw-return q50 再減 benchmark q50。
 benchmark 的歷史只透過動態 gated cross-attention 影響輸出。benchmark 在收盤 t
@@ -69,13 +68,13 @@ benchmark 的歷史只透過動態 gated cross-attention 影響輸出。benchmar
 
 ### 為什麼選 Kronos-base
 
-| 候選模型 | 與金融 OHLCV 的證據 | 本專案優勢 | 本專案主要限制 | 決策 |
-|---|---|---|---|---|
-| Kronos-base | 論文報告以超過 120 億筆、來自 45 個交易所的金融 K-line 記錄預訓練 | 領域與 OHLCV 高度吻合；公開權重；官方程式含微調流程；約 102M 參數適合單卡 PoC | 論文中的資料組成與比較主要由作者報告；context 上限 512 | 採用 |
-| TimesFM 2.5 | 原始 TimesFM 語料以 Google Trends、Wikipedia pageviews 等通用序列為主 | 200M 參數、最長 16k context、成熟的 point/quantile forecasting 與 LoRA 範例 | 沒有足夠證據顯示預訓練以金融 K-line 為核心；OHLCV 多變量適配需額外設計 | 不作第一版 backbone |
-| Chronos-Bolt / Chronos-2 | 通用公開與合成時序語料；不是金融專用語料的明確證據 | Bolt 推論快、記憶體需求低；Chronos-2 支援多變量與 covariates；工具鏈成熟 | 領域吻合度低於 Kronos；換 backbone 不能只比較吞吐量 | 保留為受控 baseline |
-| MOIRAI-1.1-R / Moirai 2 | LOTSA 涵蓋九類領域、約 270 億 observations，但不是以金融 OHLCV 為主 | 原生多變量、不同頻率與任意 horizon；有完整微調工具 | 領域專用性較弱；部分 checkpoint 授權限制需逐一確認 | 不作第一版 backbone |
-| PLUTUS / DELPHYNE 等金融時序模型 | 研究方向與金融相符 | 可作後續研究參考 | 公開權重、可重現微調鏈或與現有 head 的整合成熟度不足 | 暫不採用 |
+| 候選模型                         | 與金融 OHLCV 的證據                                                   | 本專案優勢                                                                    | 本專案主要限制                                                         | 決策                |
+| -------------------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------------- | ------------------- |
+| Kronos-base                      | 論文報告以超過 120 億筆、來自 45 個交易所的金融 K-line 記錄預訓練     | 領域與 OHLCV 高度吻合；公開權重；官方程式含微調流程；約 102M 參數適合單卡 PoC | 論文中的資料組成與比較主要由作者報告；context 上限 512                 | 採用                |
+| TimesFM 2.5                      | 原始 TimesFM 語料以 Google Trends、Wikipedia pageviews 等通用序列為主 | 200M 參數、最長 16k context、成熟的 point/quantile forecasting 與 LoRA 範例   | 沒有足夠證據顯示預訓練以金融 K-line 為核心；OHLCV 多變量適配需額外設計 | 不作第一版 backbone |
+| Chronos-Bolt / Chronos-2         | 通用公開與合成時序語料；不是金融專用語料的明確證據                    | Bolt 推論快、記憶體需求低；Chronos-2 支援多變量與 covariates；工具鏈成熟      | 領域吻合度低於 Kronos；換 backbone 不能只比較吞吐量                    | 保留為受控 baseline |
+| MOIRAI-1.1-R / Moirai 2          | LOTSA 涵蓋九類領域、約 270 億 observations，但不是以金融 OHLCV 為主   | 原生多變量、不同頻率與任意 horizon；有完整微調工具                            | 領域專用性較弱；部分 checkpoint 授權限制需逐一確認                     | 不作第一版 backbone |
+| PLUTUS / DELPHYNE 等金融時序模型 | 研究方向與金融相符                                                    | 可作後續研究參考                                                              | 公開權重、可重現微調鏈或與現有 head 的整合成熟度不足                   | 暫不採用            |
 
 選擇 Kronos 不是因為它在所有時序任務都必然最好，而是因為本 PoC 的首要條件是「預訓練確實接觸大量金融 K-line」，同時還要能公開重現、在 RunPod 單卡微調，並保留數值 encoder。後續比較必須在相同資料切分、輸入長度、quant head 與評估指標下進行，避免同時改變多個變因。
 
@@ -83,12 +82,12 @@ benchmark 的歷史只透過動態 gated cross-attention 影響輸出。benchmar
 
 透過 `FIN_TS_DATASET_PROFILE` 或 `fin-ts-download --profile` 選擇資料：
 
-| profile | 實際來源 | 狀態 | 適用情境 |
-|---|---|---|---|
-| `tw_only` | TWSE 官方 + TPEx 官方 | 可用 | 零美股 API 費用的研究路徑 |
-| `us_only_eodhd` | EODHD 美國股票/ETF | 可用 | 先驗證美股能力 |
-| `us_tw_eodhd` | EODHD + TWSE + TPEx | 預設 PoC | 美台跨市場完整 PoC |
-| `us_tw_massive` | Massive + TWSE + TPEx | 僅保留型別化介面 | 取得適合授權後再實作 |
+| profile           | 實際來源              | 狀態             | 適用情境                  |
+| ----------------- | --------------------- | ---------------- | ------------------------- |
+| `tw_only`       | TWSE 官方 + TPEx 官方 | 可用             | 零美股 API 費用的研究路徑 |
+| `us_only_eodhd` | EODHD 美國股票/ETF    | 可用             | 先驗證美股能力            |
+| `us_tw_eodhd`   | EODHD + TWSE + TPEx   | 預設 PoC         | 美台跨市場完整 PoC        |
+| `us_tw_massive` | Massive + TWSE + TPEx | 僅保留型別化介面 | 取得適合授權後再實作      |
 
 EODHD 路徑預設可發現 active 與 delisted 美國股票/ETF，減少只保留存活標的造成的 survivorship bias。若費用或呼叫額度有限，可用 `--symbols`、`--etf-symbols` 或 `--symbol-limit` 縮小 universe。輸出 manifest 會列出 profile、實際 provider、market、symbol、asset type、日期範圍與每個 split 的樣本數。
 
@@ -220,14 +219,14 @@ Parquet 或 manifest。RunPod CPU preparation wrapper 會把 staging artifacts �
 
 ### 兩階段訓練
 
-| 項目 | Stage 1 | Stage 2 |
-|---|---|---|
-| 目的 | 驗證資料、模型、loss、checkpoint、評估與 RunPod 腳本 | 完整資料微調與正式評估 |
-| train 樣本 | 依 market/asset strata 確定性配置的 15% target count | 100% train split |
-| validation / test | 完整保留 | 完整保留 |
-| 架構 | Kronos-base + 同一組 LoRA + resampler + conditioner + alpha head | 完全相同 |
-| 初始化 | 原始 pretrained base | 原始 pretrained base |
-| 是否接續 Stage 1 checkpoint | 否 | 否 |
+| 項目                        | Stage 1                                                          | Stage 2                |
+| --------------------------- | ---------------------------------------------------------------- | ---------------------- |
+| 目的                        | 驗證資料、模型、loss、checkpoint、評估與 RunPod 腳本             | 完整資料微調與正式評估 |
+| train 樣本                  | 依 market/asset strata 確定性配置的 15% target count             | 100% train split       |
+| validation / test           | 完整保留                                                         | 完整保留               |
+| 架構                        | Kronos-base + 同一組 LoRA + resampler + conditioner + alpha head | 完全相同               |
+| 初始化                      | 原始 pretrained base                                             | 原始 pretrained base   |
+| 是否接續 Stage 1 checkpoint | 否                                                               | 否                     |
 
 設定檔：
 
@@ -238,9 +237,9 @@ Parquet 或 manifest。RunPod CPU preparation wrapper 會把 staging artifacts �
 
 ### RunPod 完整操作手冊
 
-既有 RunPod 建立、S3 同步、network volume、readiness marker、supervisor、
-checkpoint、驗證與自動終止生命週期維持不變。這次只移除
-fact/text/LLM 相關步驟，並把資料與模型入口切換到 quant-only 設定。
+RunPod 操作流程涵蓋 Pod 建立、S3 同步、network volume、readiness marker、
+supervisor、checkpoint、驗證與自動終止。資料準備、訓練與驗證都使用
+quant-only 設定。
 
 本專案目前**沒有部署 PostgreSQL、SQLite、向量資料庫或其他資料庫服務**。
 下文的「遠端資料層」是 RunPod persistent network volume 上的 Parquet、
@@ -385,18 +384,16 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
 3. 依 `FIN_TS_DATASET_PROFILE`、symbol、日期、QPS 與 API call 上限下載資料；
    cache hit 不會再次呼叫 provider。
 4. 建立並驗證下列 persistent artifacts：
-
-   | 遠端路徑 | 內容 |
-   |---|---|
-   | `/runpod-volume/data/api-cache/` | provider raw response cache |
-   | `/runpod-volume/data/raw/market.parquet` | canonical daily OHLCV |
-   | `/runpod-volume/data/processed/windows.parquet` | 因果訓練視窗 |
-   | `/runpod-volume/data/download-manifest.json` | 實際 provider、profile、symbols 與下載 provenance |
-   | `/runpod-volume/data/dataset-manifest.json` | split counts、hash 與資料契約 |
-   | `/runpod-volume/data/manifests/api-request-log.jsonl` | 不含 token 的 request audit |
-   | `/runpod-volume/cache/huggingface/` | 離線 Kronos model/tokenizer cache |
-   | `/runpod-volume/cache/hf-models.json` | 固定 model revisions 與 cache manifest |
-
+   | 遠端路徑                                                | 內容                                              |
+   | ------------------------------------------------------- | ------------------------------------------------- |
+   | `/runpod-volume/data/api-cache/`                      | provider raw response cache                       |
+   | `/runpod-volume/data/raw/market.parquet`              | canonical daily OHLCV                             |
+   | `/runpod-volume/data/processed/windows.parquet`       | 因果訓練視窗                                      |
+   | `/runpod-volume/data/download-manifest.json`          | 實際 provider、profile、symbols 與下載 provenance |
+   | `/runpod-volume/data/dataset-manifest.json`           | split counts、hash 與資料契約                     |
+   | `/runpod-volume/data/manifests/api-request-log.jsonl` | 不含 token 的 request audit                       |
+   | `/runpod-volume/cache/huggingface/`                   | 離線 Kronos model/tokenizer cache                 |
+   | `/runpod-volume/cache/hf-models.json`                 | 固定 model revisions 與 cache manifest            |
 5. 只在全部檢查成功後發布
    `/runpod-volume/lifecycle/stage1/dataset.json`，再自動終止 Pod。
 
@@ -615,8 +612,8 @@ state。`validation-benchmark.json` 是完整數值 validation 與 baseline 比�
 不要只根據 W&B 畫面或 README 宣稱 run 成功，應同時檢查 lifecycle 的
 `state`、run ID、result path 與本機下載的原始 JSON。
 
-RunPod script 中保留的 `stage1-*`、`mixed-finalization` 等舊環境變數或
-lifecycle 名稱只用於部署相容性，不代表 LLM/fact/text 功能仍存在。
+實際訓練 stage 由 `RUNPOD_CONFIG` 決定。操作命令、tmux session 或 lifecycle
+路徑中的 `stage1-*` 名稱不會覆寫 config 所選擇的 stage。
 
 ### 訓練與推論產物
 
@@ -631,9 +628,9 @@ lifecycle 名稱只用於部署相容性，不代表 LLM/fact/text 功能仍存�
   revisions 與 bounded training implementation digest
 - validation metrics 與 baseline 比較
 
-舊的 LLM/fact/text checkpoint 與新 quant-only checkpoint 不相容，不能直接 resume。
-Stage 1/2 內部 resume 仍必須通過既有 RunPod run identity、artifact integrity、
-validation-selection、資料、模型與訓練程式碼契約檢查。
+Checkpoint resume 只接受目前的 quant output schema，並且必須通過 RunPod run
+identity、artifact integrity、validation-selection、資料、模型與訓練程式碼契約檢查；
+任何不相容的 schema 都會 fail closed。
 
 推論也必須在已建立專案 Poetry environment 且掛載相同 network volume 的 RunPod Pod
 內執行，不在本機載入 checkpoint：
@@ -691,17 +688,16 @@ Stage 1 只證明腳本與契約可運作，不用來宣稱模型具備 alpha。
 ### Project scope
 
 This project fine-tunes a finance-pretrained time-series foundation model on
-daily OHLCV data for US and Taiwan stocks and ETFs. The current system is
-strictly numerical:
+daily OHLCV data for US and Taiwan stocks and ETFs. The system processes only
+numerical time series:
 
-- It does not load an LLM.
-- It does not generate text.
-- It has no fact head.
-- It never calls an external API from the training loop.
-- It predicts only continuous conditional alpha distributions for holding days 3–14.
-- It exposes reusable numerical encoder representations for future multimodal work.
+- Inputs and outputs are numerical tensors; no natural-language generation or
+  fact-reconstruction interface is provided.
+- The training loop never calls an external market-data API.
+- It predicts continuous conditional alpha distributions for holding days 3–14.
+- It exposes reusable numerical encoder representations for downstream systems.
 
-This is a capability-validation side-project PoC. It is not investment advice,
+This is a research and capability-validation PoC. It is not investment advice,
 a production trading system, or a claim of guaranteed profitability.
 
 ### Numerical output contract
@@ -717,8 +713,8 @@ There is no `forecast_logits`, classification head, classification loss, or
 direction probability. Inference may post-process each horizon's q10/q50/q90
 with a fixed threshold into `strong_bearish`, `bearish`, `neutral`, `bullish`,
 or `strong_bullish`. These signals are not extra training targets and introduce
-no loss weights. Old LLM/fact/three-class checkpoints fail closed because their
-output schema is incompatible.
+no loss weights. Checkpoints must use `model_output_schema_version=4.0`;
+incompatible output schemas fail closed.
 
 ### Architecture
 
@@ -753,9 +749,9 @@ configs, and checkpoints bind those revisions.
 - `attention_mask`
 - `latent_tokens`
 
-A future multimodal system can therefore attach a new alignment module after
-the numerical representation without coupling language generation back into
-this continuation training.
+Downstream systems can attach additional numerical modules or multimodal
+alignment modules after these representations without changing the current
+alpha-output contract.
 
 The model predicts the conditional alpha distribution directly; it does not
 predict a raw-return q50 and subtract a benchmark q50. Historical benchmark
@@ -765,13 +761,13 @@ model input.
 
 ### Why Kronos-base
 
-| Candidate | Financial-OHLCV evidence | Advantages here | Main limitations here | Decision |
-|---|---|---|---|---|
-| Kronos-base | The paper reports pretraining on more than 12 billion financial K-line records from 45 exchanges | Strong domain match, public checkpoints, an official fine-tuning path, and about 102M parameters for a single-GPU PoC | Corpus composition and comparisons are primarily author-reported; context is limited to 512 | Selected |
-| TimesFM 2.5 | The original TimesFM corpus is dominated by general series such as Google Trends and Wikipedia pageviews | 200M parameters, up to 16k context, mature point/quantile forecasting, and a LoRA example | Insufficient evidence that financial K-lines dominate pretraining; multivariate OHLCV needs additional adaptation | Not the first backbone |
-| Chronos-Bolt / Chronos-2 | General public and synthetic time-series corpora rather than clearly finance-focused pretraining | Bolt is fast and memory-efficient; Chronos-2 supports multivariate data and covariates; mature tooling | Lower domain match than Kronos; throughput alone is not a fair backbone criterion | Controlled baseline later |
-| MOIRAI-1.1-R / Moirai 2 | LOTSA spans about 27B observations and nine domains, but is not finance-OHLCV-centric | Native multivariate, frequency, and arbitrary-horizon support with a complete fine-tuning toolkit | Weaker domain specificity; checkpoint licensing must be checked individually | Not the first backbone |
-| PLUTUS / DELPHYNE and related financial models | Research direction matches finance | Useful future research references | Public weights, reproducible tuning paths, or integration maturity with the locked head are insufficient | Deferred |
+| Candidate                                      | Financial-OHLCV evidence                                                                                 | Advantages here                                                                                                       | Main limitations here                                                                                             | Decision                  |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| Kronos-base                                    | The paper reports pretraining on more than 12 billion financial K-line records from 45 exchanges         | Strong domain match, public checkpoints, an official fine-tuning path, and about 102M parameters for a single-GPU PoC | Corpus composition and comparisons are primarily author-reported; context is limited to 512                       | Selected                  |
+| TimesFM 2.5                                    | The original TimesFM corpus is dominated by general series such as Google Trends and Wikipedia pageviews | 200M parameters, up to 16k context, mature point/quantile forecasting, and a LoRA example                             | Insufficient evidence that financial K-lines dominate pretraining; multivariate OHLCV needs additional adaptation | Not the first backbone    |
+| Chronos-Bolt / Chronos-2                       | General public and synthetic time-series corpora rather than clearly finance-focused pretraining         | Bolt is fast and memory-efficient; Chronos-2 supports multivariate data and covariates; mature tooling                | Lower domain match than Kronos; throughput alone is not a fair backbone criterion                                 | Controlled baseline later |
+| MOIRAI-1.1-R / Moirai 2                        | LOTSA spans about 27B observations and nine domains, but is not finance-OHLCV-centric                    | Native multivariate, frequency, and arbitrary-horizon support with a complete fine-tuning toolkit                     | Weaker domain specificity; checkpoint licensing must be checked individually                                      | Not the first backbone    |
+| PLUTUS / DELPHYNE and related financial models | Research direction matches finance                                                                       | Useful future research references                                                                                     | Public weights, reproducible tuning paths, or integration maturity with the locked head are insufficient          | Deferred                  |
 
 Kronos is selected because this PoC prioritizes demonstrable exposure to a
 large financial K-line corpus while remaining reproducible, single-GPU
@@ -784,12 +780,12 @@ splits, input length, quant head, and evaluation protocol constant.
 Select a dataset with `FIN_TS_DATASET_PROFILE` or
 `fin-ts-download --profile`:
 
-| profile | Actual sources | Status | Use case |
-|---|---|---|---|
-| `tw_only` | Official TWSE + official TPEx | Available | Research without US API cost |
-| `us_only_eodhd` | EODHD US stocks/ETFs | Available | Validate US-market capability first |
-| `us_tw_eodhd` | EODHD + TWSE + TPEx | Default PoC | Full US/Taiwan PoC |
-| `us_tw_massive` | Massive + TWSE + TPEx | Typed interface only | Implement after obtaining suitable rights |
+| profile           | Actual sources                | Status               | Use case                                  |
+| ----------------- | ----------------------------- | -------------------- | ----------------------------------------- |
+| `tw_only`       | Official TWSE + official TPEx | Available            | Research without US API cost              |
+| `us_only_eodhd` | EODHD US stocks/ETFs          | Available            | Validate US-market capability first       |
+| `us_tw_eodhd`   | EODHD + TWSE + TPEx           | Default PoC          | Full US/Taiwan PoC                        |
+| `us_tw_massive` | Massive + TWSE + TPEx         | Typed interface only | Implement after obtaining suitable rights |
 
 The EODHD path can discover both active and delisted US stocks/ETFs by default,
 reducing survivorship bias. Use `--symbols`, `--etf-symbols`, or
@@ -945,14 +941,14 @@ datasets are not automatically protected by that wrapper.
 
 ### Two training stages
 
-| Item | Stage 1 | Stage 2 |
-|---|---|---|
-| Purpose | Validate data, model, loss, checkpoints, evaluation, and RunPod scripts | Full-data fine-tuning and formal evaluation |
-| Train samples | Deterministic 15% target count allocated by market/asset strata | 100% of the train split |
-| Validation / test | Fully retained | Fully retained |
-| Architecture | Kronos-base + the same LoRA + resampler + conditioner + alpha head | Identical |
-| Initialization | Original pretrained base | Original pretrained base |
-| Continue from Stage 1 | No | No |
+| Item                  | Stage 1                                                                 | Stage 2                                     |
+| --------------------- | ----------------------------------------------------------------------- | ------------------------------------------- |
+| Purpose               | Validate data, model, loss, checkpoints, evaluation, and RunPod scripts | Full-data fine-tuning and formal evaluation |
+| Train samples         | Deterministic 15% target count allocated by market/asset strata         | 100% of the train split                     |
+| Validation / test     | Fully retained                                                          | Fully retained                              |
+| Architecture          | Kronos-base + the same LoRA + resampler + conditioner + alpha head      | Identical                                   |
+| Initialization        | Original pretrained base                                                | Original pretrained base                    |
+| Continue from Stage 1 | No                                                                      | No                                          |
 
 Configs:
 
@@ -965,10 +961,9 @@ validation/test and must not be approximated by taking the first 15% of data.
 
 ### Complete RunPod operations guide
 
-The established RunPod creation, S3 synchronization, network-volume,
-readiness-marker, supervisor, checkpoint, validation, and automatic-termination
-lifecycle remains intact. This refactor removes fact/text/LLM steps and changes
-the data/model entrypoints to quant-only configs.
+The RunPod workflow covers Pod creation, S3 synchronization, network volumes,
+readiness markers, supervision, checkpoints, validation, and automatic
+termination. Data preparation, training, and validation use quant-only configs.
 
 This project currently deploys **no PostgreSQL, SQLite, vector database, or
 other database service**. The "remote data layer" below means Parquet, raw API
@@ -1124,18 +1119,16 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
 3. Downloads according to `FIN_TS_DATASET_PROFILE`, symbols, dates, QPS, and
    the API-call cap. Cache hits do not call the provider again.
 4. Creates and verifies these persistent artifacts:
-
-   | Remote path | Contents |
-   |---|---|
-   | `/runpod-volume/data/api-cache/` | Provider raw-response cache |
-   | `/runpod-volume/data/raw/market.parquet` | Canonical daily OHLCV |
-   | `/runpod-volume/data/processed/windows.parquet` | Causal training windows |
-   | `/runpod-volume/data/download-manifest.json` | Actual providers, profile, symbols, and download provenance |
-   | `/runpod-volume/data/dataset-manifest.json` | Split counts, hashes, and data contract |
-   | `/runpod-volume/data/manifests/api-request-log.jsonl` | Request audit without tokens |
-   | `/runpod-volume/cache/huggingface/` | Offline Kronos model/tokenizer cache |
-   | `/runpod-volume/cache/hf-models.json` | Pinned model revisions and cache manifest |
-
+   | Remote path                                             | Contents                                                    |
+   | ------------------------------------------------------- | ----------------------------------------------------------- |
+   | `/runpod-volume/data/api-cache/`                      | Provider raw-response cache                                 |
+   | `/runpod-volume/data/raw/market.parquet`              | Canonical daily OHLCV                                       |
+   | `/runpod-volume/data/processed/windows.parquet`       | Causal training windows                                     |
+   | `/runpod-volume/data/download-manifest.json`          | Actual providers, profile, symbols, and download provenance |
+   | `/runpod-volume/data/dataset-manifest.json`           | Split counts, hashes, and data contract                     |
+   | `/runpod-volume/data/manifests/api-request-log.jsonl` | Request audit without tokens                                |
+   | `/runpod-volume/cache/huggingface/`                   | Offline Kronos model/tokenizer cache                        |
+   | `/runpod-volume/cache/hf-models.json`                 | Pinned model revisions and cache manifest                   |
 5. Publishes `/runpod-volume/lifecycle/stage1/dataset.json` only after all
    checks pass, then terminates the Pod automatically.
 
@@ -1230,9 +1223,9 @@ cd /runpod-volume/ts_multimodal_LLM
 bash scripts/runpod_tmux_launch.sh stage1-train
 ```
 
-`stage1-train` is a legacy workflow name retained for deployment
-compatibility. `RUNPOD_CONFIG` determines whether Stage 1 or Stage 2 actually
-runs. Attach for live observation:
+`RUNPOD_CONFIG` determines whether Stage 1 or Stage 2 runs; the
+`stage1-train` command name does not override that selection. Attach for live
+observation:
 
 ```bash
 tmux -L fin-ts-stage1-train attach -t fin-ts-stage1-train
@@ -1364,9 +1357,9 @@ numerical validation and baseline comparison. Do not claim run success from a
 W&B chart or README alone; inspect the lifecycle `state`, run ID, result path,
 and downloaded raw JSON together.
 
-Legacy `stage1-*`, `mixed-finalization`, and related environment/lifecycle names
-retained by RunPod scripts exist only for deployment compatibility. They do not
-indicate that any LLM/fact/text behavior remains.
+The selected stage is controlled by `RUNPOD_CONFIG`. Names containing
+`stage1-*` in operation commands, tmux sessions, or lifecycle paths do not
+override the selected config.
 
 ### Training and inference artifacts
 
@@ -1381,10 +1374,10 @@ Each run stores at least:
   revisions, and bounded training-implementation digest
 - Validation metrics and baseline comparisons
 
-Old LLM/fact/text checkpoints are incompatible with the new quant-only
-checkpoint schema and cannot be resumed directly. Resume within the new Stage
-1/2 system still passes the established RunPod run-identity, artifact-integrity,
-validation-selection, dataset, model, and training-source contract checks.
+Checkpoint resume accepts only the current quant output schema and must pass
+the RunPod run-identity, artifact-integrity, validation-selection, dataset,
+model, and training-source contract checks. Any incompatible schema fails
+closed.
 
 Inference also runs inside a RunPod Pod with the project Poetry environment and
 the same network volume mounted; do not load the checkpoint locally:
