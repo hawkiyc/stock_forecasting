@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Literal
 
-from fin_ts_multimodal.run_paths import (
+from stock_forecasting.run_paths import (
     CHECKPOINT_NAME_PATTERN,
     canonical_network_volume_root,
     validate_evaluation_path,

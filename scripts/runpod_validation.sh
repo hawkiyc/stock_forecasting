@@ -190,5 +190,5 @@ fi
 cd "${PROJECT_ROOT}"
 # The validation CLI keeps the lifecycle non-terminal until the numerical
 # benchmark has completed and persisted its validation-benchmark.json artifact.
-exec "${PROJECT_VENV}/bin/python" -m fin_ts_multimodal.cli.validate_benchmarks \
+exec "${PROJECT_VENV}/bin/python" -m stock_forecasting.cli.validate_benchmarks \
     "${arguments[@]}"

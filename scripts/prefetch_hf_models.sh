@@ -150,7 +150,7 @@ printf 'Hugging Face prefetch policy: max_workers=%s, max_attempts=%s, retry_bac
     "${HF_HUB_ETAG_TIMEOUT}" "${HF_HUB_DOWNLOAD_TIMEOUT}" \
     "${HF_HUB_DISABLE_XET}" "${HF_XET_NUM_CONCURRENT_RANGE_GETS}"
 set +e
-"${POETRY_BIN}" run python -m fin_ts_multimodal.cli.prefetch_models \
+"${POETRY_BIN}" run python -m stock_forecasting.cli.prefetch_models \
     --config "${RUNPOD_CONFIG}" \
     --max-workers "${HF_PREFETCH_MAX_WORKERS}" "$@"
 PREFETCH_EXIT_CODE=$?

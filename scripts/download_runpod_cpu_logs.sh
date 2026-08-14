@@ -40,7 +40,7 @@ with open(path, encoding="utf-8") as handle:
     payload = json.load(handle)
 
 state = str(payload.get("state", ""))
-if state not in {"ready", "failed", "timed_out"}:
+if state not in {"ready", "failed", "timed_out", "waiting_for_provider"}:
     raise SystemExit(f"CPU dataset lifecycle is not terminal: {state or '<missing>'}")
 
 launch_id = str(payload.get("launch_id", ""))
@@ -49,17 +49,17 @@ if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", launch_id) is None:
 
 log_path = str(payload.get("log_path", ""))
 expected_prefix = "/runpod-volume/logs/tmux/fin-ts-cpu-prepare/"
-if not log_path.startswith(expected_prefix):
+expected_log_path = expected_prefix + launch_id + "/combined.log"
+if log_path != expected_log_path:
     raise SystemExit(f"Unexpected CPU log_path: {log_path or '<missing>'}")
-if log_path.rstrip("/").rsplit("/", 1)[-1] != launch_id:
-    raise SystemExit("CPU log_path does not belong to the lifecycle launch_id")
 
 print("\t".join((state, launch_id, log_path)))
 PY
 )"
 IFS=$'\t' read -r CPU_STATE CPU_LAUNCH_ID CPU_LOG_PATH <<< "${LIFECYCLE_FIELDS}"
 
-CPU_LOG_KEY="${CPU_LOG_PATH#/runpod-volume/}"
+CPU_LOG_DIR="${CPU_LOG_PATH%/combined.log}"
+CPU_LOG_KEY="${CPU_LOG_DIR#/runpod-volume/}"
 LOCAL_CPU_LAUNCH_DIR="${LOCAL_CPU_ROOT}/${CPU_LAUNCH_ID}"
 mkdir -p "${LOCAL_CPU_LAUNCH_DIR}"
 

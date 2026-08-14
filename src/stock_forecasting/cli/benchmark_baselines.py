@@ -7,18 +7,18 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fin_ts_multimodal.baselines import (
+from stock_forecasting.baselines import (
     GradientBoostingBaseline,
     baseline_arrays,
     evaluate_causal_gru,
     fit_causal_gru,
     rule_baseline_suite,
 )
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.data.io import read_processed_records
-from fin_ts_multimodal.evaluation_paths import validate_standalone_baseline_output
-from fin_ts_multimodal.run_paths import validate_wandb_directory
-from fin_ts_multimodal.training import resolve_processed_dataset
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.data.io import read_processed_records
+from stock_forecasting.evaluation_paths import validate_standalone_baseline_output
+from stock_forecasting.run_paths import validate_wandb_directory
+from stock_forecasting.training import resolve_processed_dataset
 
 
 def build_parser() -> argparse.ArgumentParser:

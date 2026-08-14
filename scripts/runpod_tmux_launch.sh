@@ -31,6 +31,7 @@ LOG_ROOT="${LOG_ROOT:-${NETWORK_VOLUME_ROOT}/logs}"
 READINESS_HELPER="${SCRIPT_DIR}/runpod_readiness.py"
 RUNPOD_IMAGE_PYTHON="${RUNPOD_PYTHON_BIN:-/usr/local/bin/python}"
 FINALIZE_LIFECYCLE_ON_EXIT=0
+PROVIDER_WAIT_EXIT_ALLOWED=0
 RUN_DIRECTORY_ID=""
 
 runpod_validate_absolute_path "${NETWORK_VOLUME_ROOT}" NETWORK_VOLUME_ROOT
@@ -63,6 +64,7 @@ case "$1" in
         JOB_TIMEOUT_GRACE_SECONDS=0
         FAILURE_LIFECYCLE_MARKER="${NETWORK_VOLUME_ROOT}/lifecycle/stage1/dataset.json"
         FAILURE_LIFECYCLE_KIND=stage1-dataset
+        PROVIDER_WAIT_EXIT_ALLOWED=1
         ;;
     cpu-finalize)
         SESSION_NAME=fin-ts-cpu-finalize
@@ -236,6 +238,9 @@ mkdir -p "${JOB_DIR}"
     printf 'status_state=failed\n'
     printf 'if [[ ${job_exit_code} -eq 0 ]]; then status_state=succeeded; fi\n'
     printf 'if [[ ${job_exit_code} -eq 124 ]]; then status_state=timed_out; fi\n'
+    if [[ ${PROVIDER_WAIT_EXIT_ALLOWED} -eq 1 ]]; then
+        printf 'if [[ ${job_exit_code} -eq 75 ]]; then status_state=waiting_for_provider; fi\n'
+    fi
     printf 'status_tmp=%q\n' "${JOB_STATUS}.tmp.$$.$RANDOM"
     printf 'publish_status() {\n'
     printf '  local state="$1" exit_code="$2" finalization_code="$3"\n'

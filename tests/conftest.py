@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from fin_ts_multimodal.data.splits import chronological_split
-from fin_ts_multimodal.data.windows import build_causal_windows
+from stock_forecasting.data.splits import chronological_split
+from stock_forecasting.data.windows import build_causal_windows
 
 _PERSISTENT_ENVIRONMENT_KEYS = frozenset(
     {

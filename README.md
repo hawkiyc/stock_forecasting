@@ -80,7 +80,8 @@ benchmark 的歷史只透過動態 gated cross-attention 影響輸出。benchmar
 
 ### 資料來源與可選資料集
 
-透過 `FIN_TS_DATASET_PROFILE` 或 `fin-ts-download --profile` 選擇資料：
+正常 RunPod workflow 透過 `bash scripts/runpod_workflow.sh configure` 選擇
+profile；`FIN_TS_DATASET_PROFILE` 是腳本驗證 selection 後傳入 Pod 的內部值：
 
 | profile           | 實際來源              | 狀態             | 適用情境                  |
 | ----------------- | --------------------- | ---------------- | ------------------------- |
@@ -89,7 +90,21 @@ benchmark 的歷史只透過動態 gated cross-attention 影響輸出。benchmar
 | `us_tw_eodhd`   | EODHD + TWSE + TPEx   | 預設 PoC         | 美台跨市場完整 PoC        |
 | `us_tw_massive` | Massive + TWSE + TPEx | 僅保留型別化介面 | 取得適合授權後再實作      |
 
-EODHD 路徑預設可發現 active 與 delisted 美國股票/ETF，減少只保留存活標的造成的 survivorship bias。若費用或呼叫額度有限，可用 `--symbols`、`--etf-symbols` 或 `--symbol-limit` 縮小 universe。輸出 manifest 會列出 profile、實際 provider、market、symbol、asset type、日期範圍與每個 split 的樣本數。
+EODHD 路徑預設可發現 active 與 delisted 美國股票/ETF，減少只保留存活標的造成的 survivorship bias。若費用或呼叫額度有限，可在 `configure` 使用 `--universe explicit` 搭配 `--stocks`、`--etfs`，或在 all 模式使用 `--symbol-limit` 縮小 universe。輸出 manifest 會列出 profile、實際 provider、market、symbol、asset type、日期範圍與每個 split 的樣本數。
+
+`--universe all` 的 discovery 是準備當下 EODHD 回傳的 active/delisted 清單，並非
+每個歷史交易日各自重建的 point-in-time constituents。以 `--start 2005-01-01
+--end 2026-04-30` 為例，日期契約是 `[2005-01-01, 2026-04-30)`：區間中途上市的
+商品只會從 provider 可取得的第一個交易日開始，區間中途下市的商品只會保留到最後
+可取得日；同時在區間內上市又下市的商品，只要 EODHD delisted discovery 有回傳且
+帳戶有權限，就會納入。`explicit` 只處理明列的 ticker；使用 `--symbol-limit` 時則只
+處理限制後的子集。raw row 的 `is_active` 是 discovery 當下狀態，不是逐日上市狀態。
+
+EODHD 官方另註明：2018 年後下市的商品可取得 EOD、fundamentals、dividends 與
+splits；2018 年前下市的商品只保證 EOD。因此這些舊下市商品的 EOD rows 仍可能進入
+raw／training windows，但 split-adjusted volume 的輔助資料覆蓋不能視為完整。下載
+manifest 會列出 `delisted_pre_2018_auxiliary_coverage_warning` 的數量與 symbols，避免
+把「有價格歷史」誤寫成「所有公司行動資料都完整」。
 
 EODHD 是 PoC 資料，不應被描述成交易所級真實行情。跨 provider 的 adjusted price、公司行動、delisted history、時區與資料修訂可能不同；正式比較前必須先做重疊標的抽樣對帳。
 
@@ -108,13 +123,22 @@ total-return log return 差，`h ∈ {3,…,14}`。
 - 無法合理映射的窄基、槓桿、反向、商品型或跨國 ETF 會 fail closed；只有窄幅
   allowlist 或明確的 `benchmark_mapping_path` 映射才進入訓練。
 
+`VTI.US` 是美國商品建立 benchmark-relative label 與 benchmark context 的必要資料
+依賴，不是 `--symbol-limit` 的一般候選商品，也不會成為自己的訓練 target
+（`self_benchmark` 會排除它）。因此限制是在 ETF 與 stock 各自選完 N 檔後才確認
+VTI：若已選到便不重複，否則額外補入。這讓 N 個 ETF target candidates 不會被
+benchmark 占掉一席；raw universe 最多是 `N ETF + N stock + 1 VTI`，但實際可訓練
+target 數仍可能因資料長度、benchmark mapping 或品質 gate 而更少。
+
 raw O/H/L/C/V 永久保留。模型視窗把 vendor/官方 total-return factor 正規化到
 `cutoff_at`，再套用到歷史 O/H/L/C，因此收盤後推論不會因未來公司行動而回寫輸入；
 volume 只依 split/share change 調整，不用現金股利調整。EODHD 保留
-`adjusted_close`；2015-01-01 起的範圍只抓一次 exchange-wide split calendar，較早的
-範圍則改用每個 symbol 的 Historical Splits API，因為 calendar 官方覆蓋只從 2015
-年開始。兩種策略與預估/實際呼叫數都寫入 manifest，且在下載前受
-`STAGE1_MAX_API_CALLS` 限制。台股使用 TWSE/TPEx 官方除權息資料與官方報酬指數。
+`adjusted_close`；所有日期範圍都對每個 symbol 使用 Historical Splits API。官方將
+這個 endpoint 列入 EOD Historical Data — All World 且每個 request 為 1 API call；
+管線不使用另屬 Calendar 產品的 `calendar/splits`。每個 symbol 因此需要一個 EOD
+history request 加一個 split-history request，兩者都可 cache／續傳，也會在下載前
+納入 `STAGE1_MAX_API_CALLS` 預估；provider 對 2018 年前下市商品的上述輔助覆蓋例外
+則依前述 warning 顯式保留。台股使用 TWSE/TPEx 官方除權息資料與官方報酬指數。
 這可避免股票分割或除權息造成的人為跳空，同時維持下一日 raw open 的可交易 entry
 語意。
 
@@ -152,8 +176,12 @@ Stage 1 / Stage 2 訓練（完全離線）
 
 - provider-specific QPS throttle。
 - 指數退避與有限次重試。
-- 跨 provider、含 retry 的實際 network attempts 共用 `max_api_calls`
-  fail-closed 上限；cache hit 不扣額度。
+- `max_api_calls` 同時限制完整計畫的預估 HTTP requests，以及單次 CPU attempt
+  跨 provider、含 retry 的實際 network attempts；cache hit 不扣額度。
+- QPS 與 `max_api_calls` 都不是 provider 的每日／每週 quota，也不代表 EODHD
+  不同 endpoint 的計費 call units。
+- 暫時性 provider 錯誤或 429 重試耗盡時，保留成功的 raw responses、寫入
+  `download-progress.json`，並允許下一個 CPU Pod 只補未快取的 requests。
 - API token 不進 cache key、request log 或 manifest。
 - raw cache 與直接執行的下載／準備 CLI 拒絕靜默覆寫。
 - Parquet 與 manifest 的 SHA-256、row count 與 provenance 綁定。
@@ -164,7 +192,8 @@ Stage 1 / Stage 2 訓練（完全離線）
 
 本專案的 Python dependency resolution、Poetry environment、lint、pytest、資料準備、
 模型 cache smoke test、訓練與驗證都在 RunPod 執行。本機只作為 control plane：編輯
-source/config/`.env`、透過 shell script 上傳程式碼、建立或停止 Pod，以及下載 artifacts。
+source，並透過 workflow script 管理 credentials、selection、上傳、Pod lifecycle 與
+artifacts；不手動編輯 `.env`、YAML 或 JSON 設定。
 
 不得在本機為本專案執行 `poetry install`、`poetry lock`、pytest、Python preflight 或模型
 載入，也不得建立或檢查本機 `.venv`。本機若殘留其他環境產生的 `poetry.lock`，它已被
@@ -212,10 +241,10 @@ poetry run fin-ts-prepare \
   --output data/processed/windows.parquet
 ```
 
-若要建立新的資料版本，請使用新的資料根目錄或版本化檔名，不要覆寫既有 cache、
-Parquet 或 manifest。RunPod CPU preparation wrapper 會把 staging artifacts 發布到
-固定的 `DATA_ROOT` 路徑，因此重跑時必須明確指定新的、版本化 `DATA_ROOT`；不能把
-舊 dataset 視為自動受保護。
+每個 dataset request 會自動映射到
+`/runpod-volume/datasets/<dataset-request-sha256>/`。profile、日期、universe、
+symbol limit 或處理契約變動時會使用新的根目錄，不需要手動指定 `DATA_ROOT`，也不會
+把不同範圍的資料誤當成同一份 dataset。
 
 ### 兩階段訓練
 
@@ -257,16 +286,8 @@ Python 3 只供無第三方相依的 manifest/JSON control helper 使用，不�
 - [RunPod Secrets](https://docs.runpod.io/pods/templates/secrets)
 - [runpodctl](https://docs.runpod.io/runpodctl/overview)
 
-在 RunPod Console 完成以下設定：
-
-1. 在支援 S3-compatible API 的 datacenter 建立 persistent network volume。
-   記下 volume ID 與 datacenter ID。CPU Pod、GPU Pod、S3 region 與 endpoint
-   必須使用同一個 datacenter。
-2. 建立 project-scoped RunPod API key，供本機建立與終止 Pod。
-3. 另外建立 S3 API key。它與 RunPod API key 是不同的 credential，僅供本機
-   上傳、查詢與下載 network volume 物件。
-4. 建立下列 RunPod Secrets；名稱需與 `.env` 中的
-   `RUNPOD_*_SECRET_NAME` 一致：
+在 RunPod Console 建立 project-scoped RunPod API key 與另一組 S3 API key，
+再建立下列固定名稱的 RunPod Secrets：
 
    - `huggingface_token`：必要，用來預抓固定 revision 的 Kronos model 與
      tokenizer。
@@ -274,53 +295,193 @@ Python 3 只供無第三方相依的 manifest/JSON control helper 使用，不�
    - `eodhd_api_token`：只有 `us_only_eodhd` 或 `us_tw_eodhd` profile
      需要；`tw_only` 不需要。
 
-建立本機設定檔並限制權限：
+不要複製、開啟或手動修改 `.env`。以隱藏輸入方式建立 credential-only
+`.env`；腳本會原子寫入並固定權限為 `600`：
 
 ```bash
-cp .env.example .env
-chmod 600 .env
+bash scripts/runpod_workflow.sh credentials
 ```
 
-至少填入：
+接著由腳本建立 network volume。成功回傳的 volume ID、datacenter、S3 region
+與 endpoint 會自動寫回同一個 `.env`，不需要複製 ID：
 
-```text
-RUNPOD_API_KEY=<project-scoped RunPod API key>
-RUNPOD_NETWORK_VOLUME_ID=<network volume ID>
-RUNPOD_DATACENTER_ID=<network volume datacenter>
-RUNPOD_S3_ACCESS_KEY_ID=<S3 access key>
-RUNPOD_S3_SECRET_ACCESS_KEY=<S3 secret key>
-RUNPOD_S3_REGION=<same datacenter>
-RUNPOD_S3_ENDPOINT=https://s3api-<lowercase-datacenter>.runpod.io/
-WANDB_ENTITY=
-RUNPOD_CONFIG=configs/stage1_kronos_base_lora.yaml
+```bash
+bash scripts/runpod_workflow.sh volume deploy \
+  --name stock-forecasting \
+  --size-gb 100 \
+  --datacenter EU-RO-1
 ```
 
-再選擇資料 profile 與 API 預算。成本受限的最小美股驗證範例：
+若 `.env` 已登記 volume，volume script 預設不會再建立另一個可能計費的
+volume；只有刻意使用 `--force-new` 才會建立並改登記新 volume。
 
-```text
-FIN_TS_DATASET_PROFILE=us_tw_eodhd
-STAGE1_US_SYMBOLS=AAPL MSFT
-STAGE1_US_ETF_SYMBOLS=SPY QQQ
-STAGE1_SYMBOL_LIMIT=
-STAGE1_DATA_START=2010-01-01
-STAGE1_DATA_END=2026-07-27
-STAGE1_MAX_API_CALLS=5000
-STAGE1_EODHD_QPS=5
-STAGE1_TAIWAN_QPS=0.5
+在 CPU Pod 建立前，必須先由腳本選定 stage、資料來源、日期與 universe。
+不帶參數會進入互動式選單：
+
+```bash
+bash scripts/runpod_workflow.sh configure
 ```
 
-若要完全避免美股 API 費用，改用
-`FIN_TS_DATASET_PROFILE=tw_only`。若 EODHD profile 的美股 symbol 與 ETF
-清單都留空，CPU preparation 會嘗試發現帳號可取得的完整 active/delisted
-universe；第一次 PoC 不建議在沒有確認 RAM、API 額度與費用前這樣執行。
-若 `STAGE1_DATA_START` 早於 2015-01-01，完整 split history 會讓每個美股 symbol
-多一個 API request；若從 2015-01-01 起始，則整個美股 universe 共用一個 calendar
-request。先用小型明確清單驗證預估呼叫數，再放大 universe。
+##### `configure` 參數與資料範圍
 
-`.env` 已被 `.gitignore` 排除。不要 `source .env`，專案 wrapper 會以 allowlist
-讀取它；不要把 API key、token 或 secret value 寫進 README、config、shell
-script 或提交紀錄。Pod 只會收到 RunPod Secret reference，不會收到本機的
-account-level RunPod/S3 credential。
+`--universe`、`--stocks`、`--etfs` 與 `--symbol-limit` **只控制美國資料
+範圍**，不會篩選台股。`us_tw_eodhd` 永遠由「依 universe 選出的 EODHD
+美國資料」加上「指定日期範圍內 TWSE／TPEx 官方端點回傳的完整台灣市場
+資料」組成。
+
+`--data-profile` 可選值如下：
+
+| 值 | 美國資料 | 台灣資料 | 是否需要 `eodhd_api_token` |
+| --- | --- | --- | --- |
+| `tw_only` | 無 | TWSE／TPEx 官方日資料與官方 benchmark；`--universe` 必須為 `all` | 否 |
+| `us_only_eodhd` | 依 `--universe` 選出的 EODHD 美國股票／ETF，並自動補入 `VTI.US` benchmark | 無 | 是 |
+| `us_tw_eodhd` | 依 `--universe` 選出的 EODHD 美國股票／ETF，並自動補入 `VTI.US` benchmark | 與 `tw_only` 相同的完整台灣官方資料 | 是 |
+
+`--universe` 可選值如下：
+
+| 值 | 意義 | 可搭配的選項 |
+| --- | --- | --- |
+| `all` | 對含美國資料的 profile，透過 EODHD discovery 取得 active 與 delisted 美國商品；對 `tw_only`，表示完整台灣官方資料 | 美國 profile 可選擇搭配 `--symbol-limit`；不得同時提供 `--stocks` 或 `--etfs` |
+| `explicit` | **只限制美國資料**；至少要提供一個 `--stocks` 或 `--etfs`。系統仍會自動補入 `VTI.US` | 只能用於 `us_only_eodhd` 或 `us_tw_eodhd`；不得搭配 `--symbol-limit` |
+
+「完整美股與美國 ETF」在此指 EODHD 帳戶可取得且 discovery 回傳的 active／delisted
+common stocks 與 ETFs；使用含美國資料的 profile、`--universe all`，並完全省略
+`--symbol-limit`。它不是保證涵蓋 provider 未回傳或帳戶未授權的商品。
+
+所有使用者可設定的 `configure` 選項如下：
+
+| 選項 | 可選值／格式 | 意義與限制 |
+| --- | --- | --- |
+| `--stage` | `stage1`、`stage2` | 選擇固定的訓練 config。非互動模式必填 |
+| `--data-profile` | `tw_only`、`us_only_eodhd`、`us_tw_eodhd` | 決定實際使用的 provider 與市場組合。非互動模式必填 |
+| `--dataset-revision` | 1～64 字元；英數開頭，之後可用英數、`.`、`_`、`-`；預設 `v1` | provider 修訂歷史資料時，用新 label 強制建立新的 immutable dataset namespace |
+| `--start` | `YYYY-MM-DD` | 所有選定市場共用的起始日，包含該日。非互動模式必填 |
+| `--end` | `YYYY-MM-DD` | 所有選定市場共用的結束邊界，不包含該日。非互動模式必填 |
+| `--universe` | `all`、`explicit` | 控制美國商品選取方式；對 `tw_only` 只能使用 `all`。非互動模式必填 |
+| `--stocks` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的美國股票，例如 `"AAPL,MSFT"`；不影響台股 |
+| `--etfs` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的美國 ETF，例如 `"SPY,QQQ"`；不影響台股 |
+| `--symbol-limit` | 正整數 N | **小規模容量／流程驗證用，不是完整美國市場模式。**只適用於含美國資料的 `all` 模式。discovery 後把 ETF 與 stock 分開，各自依 active → delisted、ticker 字母順序取最多 N 檔；若某一類少於 N 就全取。這不是隨機或代表性抽樣。接著確認必要的 `VTI.US` benchmark：已在 N 檔 ETF 內就不重複，否則額外補入，所以 raw universe 最多 `2N+1` 檔。要完整美股與美國 ETF 就不要提供此選項 |
+| `--max-api-calls` | 正整數；預設 `100000` | 專案端 request safety budget，不是抽樣數。預設數字對齊 EODHD 付費方案官方的 100,000 daily API calls，但程式仍以它限制完整計畫的預估 HTTP requests 與單次 CPU attempt（含 retry）的 network attempts；超過時 fail closed，不會縮小資料範圍。它不會讀取帳戶已用額度，也不把任意 endpoint 的 HTTP request 誤當成固定一個計費 call unit |
+| `--eodhd-qps` | 大於零的數字；預設 `16` | EODHD requests/second pacing；官方上限為每分鐘 1,000 requests，但預設值會向下取整為每秒 16 requests（每分鐘最多 960 requests），保留每分鐘 40 requests（4%）的餘裕。client 會平均分散 requests；此設定不取代 daily call quota，`tw_only` 也不會呼叫 EODHD |
+| `--taiwan-qps` | 大於零的數字；預設 `0.5` | TWSE／TPEx 最大 requests/second，只控制短時間 pacing；`us_only_eodhd` 不會呼叫台灣 provider |
+| `--interactive` | 無值 flag | 明確開啟互動式選單；直接執行 `configure` 而不帶選項時會自動使用此模式 |
+
+互動模式的預設值是 `stage1`、`us_tw_eodhd`、dataset revision `v1`、起始日
+`2010-01-01`、本機當日作為 exclusive end、US universe `all`、API budget
+`100000`、EODHD QPS `16`（即每分鐘最多 960 requests）與 Taiwan
+QPS `0.5`；每一項都會先顯示並允許修改。
+底層 helper 的 `--project-root` 由 `runpod_workflow.sh` 自動注入，不是使用者
+設定資料範圍的選項，不要自行提供。
+
+下列範例的實際資料範圍是：
+
+- 美國：`AAPL.US`、`MSFT.US`、`SPY.US`、`QQQ.US`，以及系統自動補入的
+  `VTI.US` benchmark。
+- 台灣：不是只有四個美國 ticker，也不是沒有台股；會包含相同日期範圍內
+  TWSE／TPEx 官方端點回傳的完整市場資料與官方 benchmark。
+- 日期：兩個市場都從 `2015-01-01` 開始，並在 `2026-07-27` 之前結束；
+  `2026-07-27` 本身不包含在資料內。
+
+非互動式「美國 explicit universe + 完整台灣市場」範例：
+
+```bash
+bash scripts/runpod_workflow.sh configure \
+  --stage stage1 \
+  --data-profile us_tw_eodhd \
+  --start 2015-01-01 \
+  --end 2026-07-27 \
+  --universe explicit \
+  --stocks "AAPL,MSFT" \
+  --etfs "SPY,QQQ" \
+  --max-api-calls 10000 \
+  --eodhd-qps 16 \
+  --taiwan-qps 0.5
+```
+
+`--max-api-calls 10000` 只是此日期範圍的安全上限，不會把台股或美股截成
+10,000 筆資料。若改成不足以涵蓋完整台灣逐日請求的 `5000`，CPU preparation
+會拒絕執行，而不是默默縮小資料範圍。
+
+供應商額度是另一層限制。EODHD 官方價格頁目前列出 `EOD Historical Data — All
+World` 個人方案月繳 USD 19.99；官方限制文件指出付費方案預設每日 100,000 API
+calls、每分鐘 1,000 HTTP requests，且訂閱方案的每日額度在午夜 GMT 重置。兩種
+單位彼此獨立，不同 endpoint 也可能消耗不同數量的計費 calls；實際訂閱、帳戶已用
+額度與 provider 回傳 headers 才是執行時依據。本專案把預設 pacing 向下取整為每秒
+16 requests（每分鐘 960 requests），但若同一帳戶還有其他 client 同時使用，仍須再
+降低 `--eodhd-qps`。可參考
+[EODHD Pricing](https://eodhd.com/pricing)、
+[EODHD API Limits](https://eodhd.com/financial-apis/api-limits) 與
+[EODHD User API](https://eodhd.com/financial-apis/user-api)。因此若要完整下載美股與
+美國 ETF，`--max-api-calls` 必須足以容納完整 request 計畫，供應商每日／每週額度
+則由後述的 CPU Pod 續傳流程跨多次執行處理。
+
+完整 EODHD discovery 範圍加完整台灣市場的設定不提供 `--stocks`、`--etfs` 或
+`--symbol-limit`：
+
+```bash
+bash scripts/runpod_workflow.sh configure \
+  --stage stage1 \
+  --data-profile us_tw_eodhd \
+  --start 2015-01-01 \
+  --end 2026-07-27 \
+  --universe all
+```
+
+若 discovery 後估算的完整 HTTP request 計畫超過預設 `100000`，準備流程會明確回報
+估算值並停止；使用該值評估費用後，以更高的 `--max-api-calls` 重新 `configure`。
+這只提高安全上限，不會改成抽樣，也不會繞過 provider quota。
+
+如果要使用相同的美國 explicit universe、但**完全不下載台股**，必須把 profile
+改成 `us_only_eodhd`：
+
+```bash
+bash scripts/runpod_workflow.sh configure \
+  --stage stage1 \
+  --data-profile us_only_eodhd \
+  --start 2015-01-01 \
+  --end 2026-07-27 \
+  --universe explicit \
+  --stocks "AAPL,MSFT" \
+  --etfs "SPY,QQQ" \
+  --max-api-calls 5000 \
+  --eodhd-qps 16
+```
+
+這個 `us_only_eodhd` 範例只包含上述四個美國 ticker 加上自動補入的
+`VTI.US`，不包含 TWSE／TPEx 資料。
+
+台股全市場、不使用 EODHD 的範例：
+
+```bash
+bash scripts/runpod_workflow.sh configure \
+  --stage stage1 \
+  --data-profile tw_only \
+  --start 2015-01-01 \
+  --end 2026-07-27 \
+  --universe all
+```
+
+腳本會建立 `.runpod/selections/<selection-id>.json` 與
+`.runpod/active-selection.json`。兩者都不含 secret 且被 `.gitignore` 排除。
+profile、日期、universe、symbol limit、資料處理契約或 stage config SHA-256
+任一不同，都會得到不同 identity。QPS/API budget 會記錄在 selection，但不會
+把完全相同的資料語意誤判成不同 dataset request。
+
+若 provider 可能修訂歷史資料，且確實要為相同 profile/date/universe 建立新快照，
+請在 `configure` 明確加入新的 `--dataset-revision <label>`；CPU workflow 不會
+覆寫完整的既有 namespace，部分殘留也會 fail closed。
+
+可用下列指令檢視目前選擇，不需開啟 JSON：
+
+```bash
+bash scripts/runpod_workflow.sh selection show
+```
+
+`.env` 現在只保存本機 RunPod/S3 credentials 與腳本回填的 volume metadata；
+stage、資料範圍、runtime 與 config 不從 `.env` 讀取。不要 `source .env`，也不要
+把 API key、token 或 secret value 寫進 README、config、shell script 或提交
+紀錄。Pod 只會收到 RunPod Secret reference，不會收到本機 account-level
+RunPod/S3 credential。
 
 #### 2. 驗證 S3 並上傳程式碼
 
@@ -328,14 +489,14 @@ account-level RunPod/S3 credential。
 
 ```bash
 bash scripts/verify_runpod_s3_access.sh
-bash scripts/sync_project_to_runpod_volume.sh --dry-run
+bash scripts/runpod_workflow.sh sync --dry-run
 ```
 
 確認清單後才實際上傳，並驗證 remote code readiness：
 
 ```bash
-bash scripts/sync_project_to_runpod_volume.sh --apply
-bash scripts/verify_runpod_stage_readiness.sh --code-only
+bash scripts/runpod_workflow.sh sync --apply
+bash scripts/runpod_workflow.sh readiness --code-only
 ```
 
 上傳器會掃描 allowlisted source、config、script、test、`README.md` 與
@@ -345,21 +506,17 @@ artifact 不會上傳。`poetry.lock` 也不會上傳；它會依 approved RunPo
 的 Python/PyTorch/CUDA 環境在 network volume 上重新產生。
 
 任何 allowlisted 程式碼或 config 修改後，都要重新執行 `--dry-run`、
-`--apply` 與 readiness check。若資料 marker 綁定的是舊 code release，
+`--apply` 與 readiness check。config 修改也會使 active selection 失效，必須
+重新執行 `configure`。若資料 marker 綁定的是舊 code release 或舊 selection，
 還必須重跑 CPU preparation，不能略過 GPU gate。
 
 #### 3. 遠端部署模型與離線資料層
 
-Stage 1 第一次準備資料時，確認 `.env` 使用：
-
-```text
-RUNPOD_CONFIG=configs/stage1_kronos_base_lora.yaml
-```
-
-在本機建立短生命週期 CPU Pod：
+CPU Pod 只能使用 active selection；如果尚未執行 `configure`、config SHA 已改變，
+或 selection JSON 不完整，建立前就會失敗。在本機建立短生命週期 CPU Pod：
 
 ```bash
-bash scripts/create_runpod_cpu_pod.sh
+bash scripts/runpod_workflow.sh cpu prepare
 ```
 
 指令會輸出 Pod ID、外部 hard-limit guard 與 SSH 後應執行的 workflow。
@@ -381,71 +538,106 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
 1. 建立 persistent directory layout、Poetry 2.4.0 與 remote Python 3.12
    `.venv`，並在 RunPod image 內產生 canonical `poetry.lock`。
 2. 固定 Kronos source/model/tokenizer revisions，執行完整 pytest。
-3. 依 `FIN_TS_DATASET_PROFILE`、symbol、日期、QPS 與 API call 上限下載資料；
-   cache hit 不會再次呼叫 provider。
+3. 從 mounted immutable selection 重新驗證 stage、profile、日期、universe、
+   config SHA-256 與 Pod environment，再依該 selection 下載資料；cache hit 不會
+   再次呼叫 provider。
 4. 建立並驗證下列 persistent artifacts：
-   | 遠端路徑                                                | 內容                                              |
-   | ------------------------------------------------------- | ------------------------------------------------- |
-   | `/runpod-volume/data/api-cache/`                      | provider raw response cache                       |
-   | `/runpod-volume/data/raw/market.parquet`              | canonical daily OHLCV                             |
-   | `/runpod-volume/data/processed/windows.parquet`       | 因果訓練視窗                                      |
-   | `/runpod-volume/data/download-manifest.json`          | 實際 provider、profile、symbols 與下載 provenance |
-   | `/runpod-volume/data/dataset-manifest.json`           | split counts、hash 與資料契約                     |
-   | `/runpod-volume/data/manifests/api-request-log.jsonl` | 不含 token 的 request audit                       |
-   | `/runpod-volume/cache/huggingface/`                   | 離線 Kronos model/tokenizer cache                 |
-   | `/runpod-volume/cache/hf-models.json`                 | 固定 model revisions 與 cache manifest            |
-5. 只在全部檢查成功後發布
-   `/runpod-volume/lifecycle/stage1/dataset.json`，再自動終止 Pod。
+   | 遠端路徑                                                                  | 內容                                              |
+   | ------------------------------------------------------------------------- | ------------------------------------------------- |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/api-cache/`            | provider raw response cache                       |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/download-progress.json` | 續傳 attempt、cache 數量與安全的 provider 等待資訊 |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/raw/market.parquet`    | canonical daily OHLCV                             |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/processed/windows.parquet` | 因果訓練視窗                                  |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/download-manifest.json` | 實際 provider、profile、symbols 與下載 provenance |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/dataset-manifest.json` | split counts、hash 與資料契約                     |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/manifests/api-request-log.jsonl` | 不含 token 的 request audit             |
+   | `/runpod-volume/cache/huggingface/`                                      | 離線 Kronos model/tokenizer cache                 |
+   | `/runpod-volume/cache/hf-models.json`                                    | 固定 model revisions 與 cache manifest            |
+5. 將 selection ID/SHA、dataset request SHA、stage/config SHA、requested
+   profile/date/universe 與 resolved artifact hashes 綁入
+   `/runpod-volume/lifecycle/stage1/dataset.json`；只有全部檢查成功才發布並
+   自動終止 Pod。
 
 Pod 終止後，以 S3 lifecycle 為準，不要依賴已消失的 SSH session：
 
 ```bash
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://<network-volume-id>/lifecycle/stage1/dataset.json" - \
-  --only-show-errors
+bash scripts/runpod_workflow.sh status
 ```
 
-若狀態是 `failed` 或 `timed_out`，先從 lifecycle 讀取 `launch_id` 與
-`log_path`。tmux log 目錄固定為
-`logs/tmux/fin-ts-cpu-prepare/<launch-id>/`，可下載到本機診斷目錄：
+##### Provider quota 與跨 CPU Pod 續傳
+
+若下載遇到 429、暫時性網路錯誤或 provider 5xx，下載器會先做有限次重試；仍無法
+完成時會採取下列動作：
+
+1. 已成功取得的每個 raw JSON response 仍保留在該 dataset request 專屬的
+   `api-cache/`，不發布不完整 Parquet 或 `state=ready` marker。
+2. `download-progress.json` 記錄 attempt number、各 provider 的 cache 數量、此次
+   network attempts，以及供應商有回傳時的 HTTP status、`Retry-After` 與
+   rate-limit headers；不記錄 token 或 response body。
+3. dataset lifecycle 進入 `waiting_for_provider`，GPU readiness 維持不通過，CPU
+   Pod 自動終止，不會為每日／每週重置時間持續空轉計費。
+4. 額度恢復後，**不要重新 `configure`、不要改 `--dataset-revision`、不要刪除
+   cache**。在本機再次建立 CPU Pod，登入後重新啟動同一個 workflow：
+
+   ```bash
+   bash scripts/runpod_workflow.sh cpu prepare
+   # Run after connecting to the newly created CPU Pod:
+   cd /runpod-volume/stock_forecasting
+   bash scripts/runpod_tmux_launch.sh cpu-prepare
+   ```
+
+5. 新 attempt 會用相同 dataset request identity 重新播放已快取 responses，只對缺少
+   的 request 呼叫 provider；Parquet 會由完整 response 集合重新建立。只有全部資料、
+   manifest 與 selection gate 都通過後，lifecycle 才會變成 `ready`。`all` 模式的
+   discovery response 也屬於同一份 immutable cache，因此跨日續傳不會重新取得一份
+   已漂移的商品清單。
+
+`bash scripts/runpod_workflow.sh status` 會在 dataset lifecycle 下方顯示 download
+attempt、已快取 response 數、此次 network request 數、可用的完整 request 估算與
+安全的 provider error 摘要，不需要手動開啟 JSON。
+
+這是 request-level 續傳，不是 HTTP response 的 byte-range 續傳。每個成功完成的 API
+request 都是續傳單位。若 `download-progress.json` 的 identity 與目前 dataset request
+不同，流程會 fail closed，避免混用不同 profile、日期或 universe。401／403、過小的
+`--max-api-calls` 或其他設定錯誤會標記為 `failed`；先修正 Secret 或重新執行
+`configure` 調高 safety budget，再以相同 dataset request 重跑。只有確實要建立新的
+provider 資料快照時才改 `--dataset-revision`，新 revision 不會沿用舊 snapshot cache。
+
+若狀態是 `waiting_for_provider`、`failed` 或 `timed_out`，先從 lifecycle 讀取
+`launch_id`、`log_path` 與可用的 `progress_path`。tmux log 目錄固定為
+`logs/tmux/fin-ts-cpu-prepare/<launch-id>/`；由腳本解析並下載到本機診斷目錄：
 
 ```bash
-mkdir -p "runpod_error_log_temp/cpu-prepare/<launch-id>"
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://<network-volume-id>/logs/tmux/fin-ts-cpu-prepare/<launch-id>/" \
-  "runpod_error_log_temp/cpu-prepare/<launch-id>/" \
-  --recursive --only-show-errors
+bash scripts/runpod_workflow.sh cpu-logs
 ```
 
 只有下列 gate 通過後才租用 GPU：
 
 ```bash
-bash scripts/verify_runpod_stage_readiness.sh --gpu
+bash scripts/runpod_workflow.sh readiness --gpu
 ```
 
-Stage 2 使用同一份完整 Parquet，但以 100% train split 重新從相同 pretrained
-base 開始，不接續 Stage 1 checkpoint。將 `.env` 改為：
-
-```text
-RUNPOD_CONFIG=configs/stage2_kronos_base_lora.yaml
-```
-
-若 source/config 有修改，先重新上傳。接著建立 CPU Pod，SSH 登入後執行
-Stage 2 contract finalization：
+Stage 2 使用相同 dataset request 時會得到相同 data namespace，但以 100%
+train split 重新從相同 pretrained base 開始，不接續 Stage 1 checkpoint。
+必須重新執行 `configure --stage stage2` 並明確提供與原 CPU dataset 相同的
+profile/date/universe；stage/config identity 不同時，舊 Stage 1 marker 會被 GPU
+gate 拒絕。範例：
 
 ```bash
-bash scripts/create_runpod_cpu_pod.sh
+bash scripts/runpod_workflow.sh configure \
+  --stage stage2 \
+  --data-profile tw_only \
+  --start 2015-01-01 \
+  --end 2026-07-27 \
+  --universe all
+bash scripts/runpod_workflow.sh sync --apply
+bash scripts/runpod_workflow.sh cpu prepare
 ```
 
-```bash
-cd /runpod-volume/stock_forecasting
-bash scripts/runpod_tmux_launch.sh cpu-finalize
-```
-
-finalization 完成後，在本機再次執行
-`bash scripts/verify_runpod_stage_readiness.sh --gpu`。這一步不重新動態下載訓練
-資料；它重新驗證 Stage 2 config、完整資料、model cache 與 code release 的
-一致性。
+CPU workflow 完成後，在本機再次執行
+`bash scripts/runpod_workflow.sh readiness --gpu`。若只把 stage 改成 Stage 2，
+但 profile/date/universe 與先前不同，dataset request SHA 也會不同，不會錯用舊
+Parquet。
 
 #### 4. 建立 GPU Pod 並訓練
 
@@ -456,23 +648,25 @@ finalization 完成後，在本機再次執行
 bash scripts/runpodctl_project.sh gpu list
 ```
 
-再次確認 `.env` 的 `RUNPOD_CONFIG` 是要執行的 stage，並通過 GPU gate：
+檢視 active selection 並通過 GPU gate；gate 會在租用 GPU 前比對本機 selection、
+S3 selection、CPU marker、code release、config SHA 與 namespaced artifacts：
 
 ```bash
-bash scripts/verify_runpod_stage_readiness.sh --gpu
+bash scripts/runpod_workflow.sh selection show
+bash scripts/runpod_workflow.sh readiness --gpu
 ```
 
 以預設 GPU 建立 Pod：
 
 ```bash
-bash scripts/create_runpod_pod.sh
+bash scripts/runpod_workflow.sh train
 ```
 
 或指定清單中完整的 `gpuId`：
 
 ```bash
 RUNPOD_GPU_ID="NVIDIA GeForce RTX 5090" \
-  bash scripts/create_runpod_pod.sh
+  bash scripts/runpod_workflow.sh train
 ```
 
 建立指令會在本機先配置唯一 run ID、掛載同一個 network volume、注入 W&B
@@ -484,7 +678,7 @@ bash scripts/runpod_tmux_launch.sh stage1-train
 ```
 
 `stage1-train` 是為了維持既有部署相容性的 workflow 名稱；實際 Stage 1 或
-Stage 2 由 `RUNPOD_CONFIG` 決定。即時查看：
+Stage 2 由 immutable selection 所映射的 `RUNPOD_CONFIG` 決定。即時查看：
 
 ```bash
 tmux -L fin-ts-stage1-train attach -t fin-ts-stage1-train
@@ -497,15 +691,10 @@ manifest 與 run identity，再寫入
 完成後自動執行完整 validation benchmark；成功、失敗或超時後都會留下
 lifecycle/artifact，再依既有 supervisor 與外部 guard 終止 Pod。
 
-Pod 終止後，以 S3 查詢最新 terminal state：
+Pod 終止後，以 workflow status 查詢 S3 上的最新 terminal state：
 
 ```bash
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://<network-volume-id>/lifecycle/stage1/training.json" - \
-  --only-show-errors
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://<network-volume-id>/lifecycle/stage1/validation.json" - \
-  --only-show-errors
+bash scripts/runpod_workflow.sh status
 ```
 
 `state=ready` 才表示該 lifecycle 完成；`failed` 與 `timed_out` 必須視為未完成。
@@ -513,11 +702,11 @@ bash scripts/runpod_s3_project.sh s3 cp \
 `<run-id>`。SSH/tmux 只用於仍存活 Pod 的即時除錯，不是 terminal state 的
 權威來源。
 
-若訓練已完成但需要獨立重跑 validation，可在本機建立 validation Pod：
-先確認 `.env` 的 `RUNPOD_CONFIG` 與該 run 保存的 config 相同。
+若訓練已完成但需要獨立重跑 validation，可在本機建立 validation Pod。active
+selection 必須與該 run 保存的 stage 與 dataset identity 相同：
 
 ```bash
-bash scripts/create_runpod_validation_pod.sh <run-id>
+bash scripts/runpod_workflow.sh validate <run-id>
 ```
 
 SSH 登入後執行：
@@ -529,82 +718,32 @@ bash scripts/runpod_tmux_launch.sh stage1-validate
 
 #### 5. 下載 best checkpoint 與 validation 結果
 
-以下命令會下載到已被 `.gitignore` 排除的 `artifacts/runpod/`。先把
-`VOLUME_ID` 設成 `.env` 中相同的 network volume ID，下載 training lifecycle，
-再從其中取得 run ID：
+不需要手動讀取 `.env` 的 volume ID、解析 lifecycle 或拼接 S3 path。先查看
+已知 lifecycle：
 
 ```bash
-VOLUME_ID="<network-volume-id>"
-DOWNLOAD_ROOT="artifacts/runpod"
-mkdir -p "${DOWNLOAD_ROOT}"
-
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/lifecycle/stage1/training.json" \
-  "${DOWNLOAD_ROOT}/training-lifecycle.json" \
-  --only-show-errors
-
-RUN_ID="$(python3 -c \
-  'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["wandb_run_id"])' \
-  "${DOWNLOAD_ROOT}/training-lifecycle.json")"
-printf 'Run ID: %s\n' "${RUN_ID}"
-mkdir -p "${DOWNLOAD_ROOT}/${RUN_ID}"
+bash scripts/runpod_workflow.sh status
 ```
 
-先下載 run manifest、leaderboard 與 best-checkpoint pointer：
+不帶 run ID 時，下載腳本只接受最新 `state=ready` 的 training lifecycle，並
+自動解析 run ID 與 validation-selected best checkpoint：
 
 ```bash
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/savedModel/${RUN_ID}/run-manifest.json" \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/run-manifest.json" \
-  --only-show-errors
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/savedModel/${RUN_ID}/checkpoint-leaderboard.json" \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/checkpoint-leaderboard.json" \
-  --only-show-errors
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/savedModel/${RUN_ID}/best-checkpoint.json" \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/best-checkpoint.json" \
-  --only-show-errors
-
-BEST_CHECKPOINT="$(python3 -c \
-  'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["path"])' \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/best-checkpoint.json")"
-printf 'Best checkpoint: %s\n' "${BEST_CHECKPOINT}"
+bash scripts/runpod_workflow.sh download
 ```
 
-只下載 validation-selected best checkpoint，不必下載全部 top-k：
+也可以明確指定 run ID；若本機目錄已存在，必須顯式使用 `--resume` 才會填補或
+重新取得已知檔案：
 
 ```bash
-mkdir -p "${DOWNLOAD_ROOT}/${RUN_ID}/${BEST_CHECKPOINT}"
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/savedModel/${RUN_ID}/${BEST_CHECKPOINT}/" \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/${BEST_CHECKPOINT}/" \
-  --recursive --only-show-errors
+bash scripts/runpod_workflow.sh download <run-id>
+bash scripts/runpod_workflow.sh download --resume <run-id>
 ```
 
-下載 validation benchmark、validation lifecycle 與 immutable training
-completion record：
-
-```bash
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/evaluations/${RUN_ID}/validation-benchmark.json" \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/validation-benchmark.json" \
-  --only-show-errors
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/lifecycle/stage1/validation.json" \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/validation-lifecycle.json" \
-  --only-show-errors
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/lifecycle/runs/${RUN_ID}/training-completed.json" \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/training-completed.json" \
-  --only-show-errors
-```
-
-確認本機檔案：
-
-```bash
-find "${DOWNLOAD_ROOT}/${RUN_ID}" -maxdepth 3 -type f -print | sort
-```
+成果固定下載到被 `.gitignore` 排除的
+`artifacts/runpod/<run-id>/`，包含 run manifest、resolved config、leaderboard、
+best-checkpoint pointer、該 best checkpoint、validation benchmark、training/
+validation lifecycle 與 immutable training completion record。
 
 best checkpoint 目錄至少應包含 `adapter.safetensors`、
 `resolved-config.yaml`、`trainer-state.json` 與它所列出的 optimizer/scheduler
@@ -612,8 +751,8 @@ state。`validation-benchmark.json` 是完整數值 validation 與 baseline 比�
 不要只根據 W&B 畫面或 README 宣稱 run 成功，應同時檢查 lifecycle 的
 `state`、run ID、result path 與本機下載的原始 JSON。
 
-實際訓練 stage 由 `RUNPOD_CONFIG` 決定。操作命令、tmux session 或 lifecycle
-路徑中的 `stage1-*` 名稱不會覆寫 config 所選擇的 stage。
+實際訓練 stage 由 active immutable selection 與它綁定的 config SHA 決定。
+操作命令、tmux session 或 lifecycle 路徑中的 `stage1-*` 名稱不會覆寫該選擇。
 
 ### 訓練與推論產物
 
@@ -624,6 +763,7 @@ state。`validation-benchmark.json` 是完整數值 validation 與 baseline 比�
 - `trainer-state.json`
 - optimizer / scheduler state
 - run manifest、checkpoint leaderboard 與 best-checkpoint pointer
+- selection ID/SHA、dataset request SHA、stage config SHA 與 requested dataset contract
 - dataset manifest 摘要、architecture digest、Kronos source/model/tokenizer
   revisions 與 bounded training implementation digest
 - validation metrics 與 baseline 比較
@@ -639,7 +779,7 @@ identity、artifact integrity、validation-selection、資料、模型與訓練�
 poetry run fin-ts-infer \
   --config configs/stage2_kronos_base_lora.yaml \
   --checkpoint /runpod-volume/savedModel/<run-id>/<checkpoint> \
-  --input /runpod-volume/data/raw/market.parquet \
+  --input "${DATA_ROOT}/raw/market.parquet" \
   --symbol AAPL.US
 ```
 
@@ -652,10 +792,11 @@ PoC 最低驗收條件：
 1. Stage 1 精確使用 15% train samples，完整 validation/test，能完成 forward/backward、checkpoint reload 與 inference smoke test。
 2. Stage 2 與 Stage 1 architecture digest 相同，且由相同 pretrained base 重新開始。
 3. 所有 run 都可追溯到 immutable Parquet、dataset profile、provider、symbols、日期範圍與 split counts。
-4. `alpha_quantiles` 固定為 `[B,12,3]`，且沒有 classifier、文字或 fact 輸出。
-5. 模型 input、時序切分與正規化不使用未來資訊；未來 benchmark 只存在於離線 label construction。
-6. 模型至少與 zero-return、momentum、technical、GBDT 與 neural baselines 在同一 validation/test protocol 下比較。
-7. 不只報告單一 aggregate loss；同時報告各 horizon 的 normalized pinball、median correlation、方向一致率、區間 coverage/width 與依市場、asset type、年份的切片。
+4. CPU marker 與 active training selection 必須在 stage、config SHA、profile、日期、requested universe 與 dataset request SHA 完全一致；例如 CPU `tw_only` 對 GPU `us_tw_eodhd` 必須在 Pod 建立前 fail closed。
+5. `alpha_quantiles` 固定為 `[B,12,3]`，且沒有 classifier、文字或 fact 輸出。
+6. 模型 input、時序切分與正規化不使用未來資訊；未來 benchmark 只存在於離線 label construction。
+7. 模型至少與 zero-return、momentum、technical、GBDT 與 neural baselines 在同一 validation/test protocol 下比較。
+8. 不只報告單一 aggregate loss；同時報告各 horizon 的 normalized pinball、median correlation、方向一致率、區間 coverage/width 與依市場、asset type、年份的切片。
 
 Stage 1 只證明腳本與契約可運作，不用來宣稱模型具備 alpha。Stage 2 若只跑單一 seed，也只能視為 PoC 結果；要做較強的模型優劣主張，需增加多 seed 與受控 ablation。
 
@@ -674,6 +815,7 @@ Stage 1 只證明腳本與契約可運作，不用來宣稱模型具備 alpha。
 - [EODHD Historical Splits API](https://eodhd.com/financial-apis/api-splits-dividends)
 - [EODHD API limits](https://eodhd.com/financial-apis/api-limits)
 - [EODHD pricing](https://eodhd.com/pricing)
+- [EODHD delisted data coverage](https://eodhd.com/financial-apis/delisted-stock-companies-data-2)
 - [TWSE OpenAPI](https://openapi.twse.com.tw/)
 - [TWSE 除權除息計算說明](https://www.twse.com.tw/en/announcement/ex-right/twt49u.html)
 - [TPEx OpenAPI](https://www.tpex.org.tw/openapi/)
@@ -777,8 +919,9 @@ splits, input length, quant head, and evaluation protocol constant.
 
 ### Data sources and selectable datasets
 
-Select a dataset with `FIN_TS_DATASET_PROFILE` or
-`fin-ts-download --profile`:
+The normal RunPod workflow selects a profile through
+`bash scripts/runpod_workflow.sh configure`. `FIN_TS_DATASET_PROFILE` is an
+internal value passed to the Pod only after the script validates the selection:
 
 | profile           | Actual sources                | Status               | Use case                                  |
 | ----------------- | ----------------------------- | -------------------- | ----------------------------------------- |
@@ -788,10 +931,29 @@ Select a dataset with `FIN_TS_DATASET_PROFILE` or
 | `us_tw_massive` | Massive + TWSE + TPEx         | Typed interface only | Implement after obtaining suitable rights |
 
 The EODHD path can discover both active and delisted US stocks/ETFs by default,
-reducing survivorship bias. Use `--symbols`, `--etf-symbols`, or
-`--symbol-limit` when budget or quota is constrained. Manifests record the
-profile, actual providers, markets, symbols, asset types, date range, and
-per-split sample counts.
+reducing survivorship bias. When budget or quota is constrained, use
+`--universe explicit` with `--stocks` and `--etfs`, or use `--symbol-limit` in
+all-universe mode. Manifests record the profile, actual providers, markets,
+symbols, asset types, date range, and per-split sample counts.
+
+Discovery under `--universe all` is the active/delisted snapshot returned by
+EODHD at preparation time, not point-in-time constituents reconstructed for
+every historical session. For `--start 2005-01-01 --end 2026-04-30`, the date
+contract is `[2005-01-01, 2026-04-30)`: an instrument listed during the range
+starts at its first provider-available session, and one delisted during the
+range ends at its last available session. An instrument both listed and
+delisted inside the range is included when EODHD delisted discovery returns it
+and the account is entitled to it. `explicit` processes only named tickers;
+`--symbol-limit` processes only its selected subset. A raw row's `is_active`
+value is the discovery-time state, not a daily listing-state history.
+
+EODHD separately documents EOD, fundamentals, dividends, and splits for
+instruments delisted after 2018, but guarantees only EOD for pre-2018
+delistings. Those older EOD rows can therefore still enter raw data and training
+windows, while their split-adjusted-volume auxiliary coverage cannot be treated
+as complete. The download manifest records their count and symbols under
+`delisted_pre_2018_auxiliary_coverage_warning`, so price history is not
+misrepresented as complete corporate-action history.
 
 EODHD is PoC data and must not be represented as an exchange-grade market feed.
 Adjusted prices, corporate actions, delisted history, time zones, and revisions
@@ -816,16 +978,27 @@ Default benchmark policy:
 - Narrow, leveraged, inverse, commodity, or cross-country ETFs fail closed
   unless covered by the narrow allowlist or an explicit `benchmark_mapping_path`.
 
+`VTI.US` is a required data dependency for US benchmark-relative labels and
+benchmark context. It is not an ordinary `--symbol-limit` candidate and cannot
+be its own training target (`self_benchmark` excludes it). The workflow first
+selects N ETF candidates and N stock candidates, then ensures VTI is present:
+an already-selected VTI is not duplicated; otherwise it is added. This prevents
+the benchmark from consuming one of the N ETF candidate slots. The raw universe
+is therefore at most `N ETFs + N stocks + 1 VTI`, while data-length, benchmark
+mapping, and quality gates can reduce the actual trainable-target count.
+
 Raw O/H/L/C/V is retained permanently. Model windows normalize each vendor or
 official total-return factor to `cutoff_at` before applying it to historical
 O/H/L/C, so future corporate actions cannot rewrite an after-close inference
 input. Volume is adjusted only for splits/share changes, never for cash
-dividends. EODHD retains `adjusted_close` and fetches the exchange-wide split
-calendar once for ranges beginning on or after 2015-01-01. Earlier ranges use
-the per-symbol Historical Splits API because the documented calendar coverage
-starts in 2015. Both the strategy and estimated/actual request counts are
-recorded in the manifest and bounded before download by
-`STAGE1_MAX_API_CALLS`. Taiwan uses official TWSE/TPEx ex-right/ex-dividend
+dividends. EODHD retains `adjusted_close` and uses the per-symbol Historical
+Splits API for every date range. EODHD lists that endpoint under EOD
+Historical Data — All World at one API call per request; the pipeline does not
+use `calendar/splits`, which belongs to Calendar-enabled products. Each symbol
+therefore requires one EOD-history request plus one split-history request. Both
+are cacheable/resumable and included in the pre-download
+`STAGE1_MAX_API_CALLS` estimate; the provider's pre-2018 delisting exception is
+retained explicitly in the warning described above. Taiwan uses official TWSE/TPEx ex-right/ex-dividend
 data and official return indices. This removes artificial corporate-action
 gaps while retaining the tradable next-day raw-open entry semantics.
 
@@ -864,8 +1037,14 @@ The downloader provides:
 
 - Provider-specific QPS throttling.
 - Bounded retries with exponential backoff.
-- One fail-closed `max_api_calls` cap shared by actual network attempts across
-  providers, including retries; cache hits do not consume it.
+- `max_api_calls` limits both estimated HTTP requests for the complete plan and
+  actual network attempts, including retries, across providers in one CPU
+  attempt; cache hits do not consume it.
+- Neither QPS nor `max_api_calls` represents a provider's daily/weekly quota or
+  EODHD's endpoint-specific billed call units.
+- After retry exhaustion on a temporary provider failure or HTTP 429,
+  successful raw responses remain cached, `download-progress.json` is updated,
+  and a later CPU Pod requests only missing cache entries.
 - Cache identities, request logs, and manifests that exclude API tokens.
 - A raw cache and direct download/preparation CLIs that refuse silent overwrite.
 - SHA-256, row-count, and provenance bindings for artifacts.
@@ -878,9 +1057,9 @@ TPEx, or Massive.
 
 Python dependency resolution, the Poetry environment, lint, pytest, data
 preparation, model-cache smoke tests, training, and validation all run on
-RunPod. The local machine is only a control plane: edit source, configs, and
-`.env`; use shell scripts to upload code and create or stop Pods; and download
-artifacts.
+RunPod. The local machine is only a control plane: edit source and use the
+workflow script to manage credentials, selections, uploads, Pod lifecycle, and
+artifacts. Do not manually edit `.env`, YAML, or JSON configuration.
 
 Do not run `poetry install`, `poetry lock`, pytest, Python preflight, or model
 loading for this project on the local machine, and do not create or inspect a
@@ -933,11 +1112,11 @@ poetry run fin-ts-prepare \
   --output data/processed/windows.parquet
 ```
 
-Create a new versioned data root or filenames for each dataset revision. Do not
-overwrite an existing cache, Parquet file, or manifest. The RunPod CPU
-preparation wrapper publishes staged artifacts to fixed paths under `DATA_ROOT`;
-therefore, a rerun must explicitly use a new, versioned `DATA_ROOT`. Existing
-datasets are not automatically protected by that wrapper.
+Each dataset request maps automatically to
+`/runpod-volume/datasets/<dataset-request-sha256>/`. A profile, date range,
+universe, symbol limit, or preparation-contract change selects a new root. No
+manual `DATA_ROOT` is required, and different data ranges cannot be mistaken
+for the same dataset.
 
 ### Two training stages
 
@@ -983,18 +1162,8 @@ environment. Official RunPod references:
 - [RunPod Secrets](https://docs.runpod.io/pods/templates/secrets)
 - [runpodctl](https://docs.runpod.io/runpodctl/overview)
 
-Complete these steps in the RunPod Console:
-
-1. Create a persistent network volume in a datacenter that supports the
-   S3-compatible API. Record the volume ID and datacenter ID. The CPU Pod, GPU
-   Pod, S3 region, and endpoint must all use that datacenter.
-2. Create a project-scoped RunPod API key for local Pod creation and
-   termination.
-3. Create a separate S3 API key. It is distinct from the RunPod API key and is
-   used only by the local machine to upload, inspect, and download
-   network-volume objects.
-4. Create these RunPod Secrets. Their names must match the
-   `RUNPOD_*_SECRET_NAME` entries in `.env`:
+In the RunPod Console, create a project-scoped RunPod API key and a separate S3
+API key. Then create these fixed-name RunPod Secrets:
 
    - `huggingface_token`: required to prefetch the pinned Kronos model and
      tokenizer revisions.
@@ -1002,55 +1171,207 @@ Complete these steps in the RunPod Console:
    - `eodhd_api_token`: required only by the `us_only_eodhd` and
      `us_tw_eodhd` profiles; it is not required by `tw_only`.
 
-Create the local settings file and restrict its permissions:
+Do not copy, open, or manually edit `.env`. Create the credential-only file
+through hidden input; the script writes it atomically with mode `600`:
 
 ```bash
-cp .env.example .env
-chmod 600 .env
+bash scripts/runpod_workflow.sh credentials
 ```
 
-At minimum, fill in:
+Create the network volume through the script. The returned volume ID,
+datacenter, S3 region, and endpoint are written back to the same `.env`
+automatically:
 
-```text
-RUNPOD_API_KEY=<project-scoped RunPod API key>
-RUNPOD_NETWORK_VOLUME_ID=<network volume ID>
-RUNPOD_DATACENTER_ID=<network volume datacenter>
-RUNPOD_S3_ACCESS_KEY_ID=<S3 access key>
-RUNPOD_S3_SECRET_ACCESS_KEY=<S3 secret key>
-RUNPOD_S3_REGION=<same datacenter>
-RUNPOD_S3_ENDPOINT=https://s3api-<lowercase-datacenter>.runpod.io/
-WANDB_ENTITY=
-RUNPOD_CONFIG=configs/stage1_kronos_base_lora.yaml
+```bash
+bash scripts/runpod_workflow.sh volume deploy \
+  --name stock-forecasting \
+  --size-gb 100 \
+  --datacenter EU-RO-1
 ```
 
-Then select the dataset profile and API budget. A cost-bounded small US-market
-validation example is:
+If `.env` already registers a volume, the script will not create another
+potentially billable volume by default. Only an intentional `--force-new`
+creates and registers a replacement.
 
-```text
-FIN_TS_DATASET_PROFILE=us_tw_eodhd
-STAGE1_US_SYMBOLS=AAPL MSFT
-STAGE1_US_ETF_SYMBOLS=SPY QQQ
-STAGE1_SYMBOL_LIMIT=
-STAGE1_DATA_START=2010-01-01
-STAGE1_DATA_END=2026-07-27
-STAGE1_MAX_API_CALLS=5000
-STAGE1_EODHD_QPS=5
-STAGE1_TAIWAN_QPS=0.5
+Before creating a CPU Pod, select the stage, data source, date range, and
+universe through the script. With no options, it opens an interactive menu:
+
+```bash
+bash scripts/runpod_workflow.sh configure
 ```
 
-Use `FIN_TS_DATASET_PROFILE=tw_only` to eliminate US API cost. If both US stock
-and ETF lists are empty for an EODHD profile, CPU preparation attempts to
-discover the complete active/delisted universe available to the account. Do not
-do this for the first PoC without first confirming RAM, API quota, and cost.
-When `STAGE1_DATA_START` is earlier than 2015-01-01, complete split history adds
-one request per US symbol. A range beginning on or after 2015-01-01 shares one
-calendar request across the US universe. Validate the estimated call count with
-a small explicit universe before scaling out.
+##### `configure` options and dataset scope
 
-`.env` is excluded by `.gitignore`. Do not `source .env`; the project wrappers
-read it through an allowlist. Never put API keys, tokens, or secret values in
-the README, configs, shell scripts, or commit history. Pods receive RunPod
-Secret references, not the local account-level RunPod or S3 credentials.
+`--universe`, `--stocks`, `--etfs`, and `--symbol-limit` control **only the US
+dataset scope**; they never filter Taiwan instruments. `us_tw_eodhd` always
+combines the EODHD US scope selected by `--universe` with the complete Taiwan
+market data returned by the official TWSE and TPEx endpoints over the selected
+date range.
+
+Available `--data-profile` values are:
+
+| Value | US data | Taiwan data | Requires `eodhd_api_token` |
+| --- | --- | --- | --- |
+| `tw_only` | None | Official TWSE/TPEx daily data and official benchmarks; `--universe` must be `all` | No |
+| `us_only_eodhd` | EODHD US stocks/ETFs selected by `--universe`, plus the automatically added `VTI.US` benchmark | None | Yes |
+| `us_tw_eodhd` | EODHD US stocks/ETFs selected by `--universe`, plus the automatically added `VTI.US` benchmark | The same complete official Taiwan scope as `tw_only` | Yes |
+
+Available `--universe` values are:
+
+| Value | Meaning | Compatible options |
+| --- | --- | --- |
+| `all` | For profiles containing US data, use EODHD discovery for active and delisted US instruments. For `tw_only`, use the complete official Taiwan scope | US profiles may optionally use `--symbol-limit`; do not provide `--stocks` or `--etfs` |
+| `explicit` | Restrict **only the US scope** and require at least one `--stocks` or `--etfs` value. The workflow still adds `VTI.US` automatically | Only `us_only_eodhd` and `us_tw_eodhd`; cannot be combined with `--symbol-limit` |
+
+Here, “all US stocks and ETFs” means the active/delisted common stocks and ETFs
+that the EODHD account is entitled to access and that discovery returns. Use a
+US-containing profile with `--universe all` and omit `--symbol-limit` entirely.
+It cannot guarantee instruments that the provider omits or the account cannot
+access.
+
+All user-facing `configure` options are:
+
+| Option | Values or format | Meaning and restrictions |
+| --- | --- | --- |
+| `--stage` | `stage1`, `stage2` | Select the fixed training config. Required in non-interactive mode |
+| `--data-profile` | `tw_only`, `us_only_eodhd`, `us_tw_eodhd` | Select the actual provider and market combination. Required in non-interactive mode |
+| `--dataset-revision` | 1-64 characters; start with an alphanumeric character, followed by alphanumerics, `.`, `_`, or `-`; default `v1` | Use a new label to force a new immutable dataset namespace after a provider revises historical data |
+| `--start` | `YYYY-MM-DD` | Inclusive start date shared by every selected market. Required in non-interactive mode |
+| `--end` | `YYYY-MM-DD` | Exclusive end boundary shared by every selected market. Required in non-interactive mode |
+| `--universe` | `all`, `explicit` | Select the US-instrument strategy; `tw_only` accepts only `all`. Required in non-interactive mode |
+| `--stocks` | Comma- or space-separated US tickers; repeatable | US stocks in `explicit` mode, such as `"AAPL,MSFT"`; does not affect Taiwan data |
+| `--etfs` | Comma- or space-separated US tickers; repeatable | US ETFs in `explicit` mode, such as `"SPY,QQQ"`; does not affect Taiwan data |
+| `--symbol-limit` | Positive integer N | **A bounded capacity/workflow check, not a complete-US-market mode.** Only valid for a US-containing `all` profile. After discovery, split ETFs and stocks, then keep up to N of each by active → delisted and ticker order; take all when a type has fewer than N. This is neither random nor representative sampling. Then ensure the required `VTI.US` benchmark is present: do not duplicate it if it is among the N ETFs, otherwise add it, so the raw universe is at most `2N+1`. Omit this option for all discovered US stocks and ETFs |
+| `--max-api-calls` | Positive integer; default `100000` | Project-side request safety budget, not a sample count. Its default number matches EODHD's official 100,000 daily API calls for paid plans, but the code still uses it to limit estimated complete-plan HTTP requests and network attempts, including retries, in one CPU attempt. Exceeding it fails closed without shrinking the dataset. It neither reads already-consumed account quota nor assumes every endpoint's HTTP request always costs exactly one billed call unit |
+| `--eodhd-qps` | Positive number; default `16` | EODHD requests-per-second pacing. The official limit is 1,000 requests per minute, while the default is floored to 16 requests per second (at most 960 per minute), leaving 40 requests per minute (4%) of headroom. The client spaces requests evenly. This does not replace the daily call quota, and `tw_only` never calls EODHD |
+| `--taiwan-qps` | Positive number; default `0.5` | Maximum TWSE/TPEx requests per second. It controls short-term pacing; `us_only_eodhd` never calls a Taiwan provider |
+| `--interactive` | Flag with no value | Explicitly open the interactive prompts; invoking `configure` with no options enables this mode automatically |
+
+Interactive defaults are `stage1`, `us_tw_eodhd`, dataset revision `v1`, start
+date `2010-01-01`, the local current date as the exclusive end, US universe
+`all`, API budget `100000`, EODHD QPS `16` (at most 960 requests per minute),
+and Taiwan QPS `0.5`. Every value is displayed before confirmation
+and can be changed. The lower-level helper's
+`--project-root` is injected by `runpod_workflow.sh`; it is not a user-facing
+dataset-scope option and should not be supplied manually.
+
+The following example has this exact scope:
+
+- US: `AAPL.US`, `MSFT.US`, `SPY.US`, `QQQ.US`, plus the automatically added
+  `VTI.US` benchmark.
+- Taiwan: it is neither absent nor restricted to the four US tickers; it
+  contains the complete market data and official benchmarks returned by the
+  TWSE/TPEx endpoints over the same date range.
+- Dates: both markets start on `2015-01-01` and end before `2026-07-27`;
+  `2026-07-27` itself is excluded.
+
+Non-interactive "explicit US universe plus complete Taiwan market" example:
+
+```bash
+bash scripts/runpod_workflow.sh configure \
+  --stage stage1 \
+  --data-profile us_tw_eodhd \
+  --start 2015-01-01 \
+  --end 2026-07-27 \
+  --universe explicit \
+  --stocks "AAPL,MSFT" \
+  --etfs "SPY,QQQ" \
+  --max-api-calls 10000 \
+  --eodhd-qps 16 \
+  --taiwan-qps 0.5
+```
+
+`--max-api-calls 10000` is only a safety ceiling for this date range; it does
+not truncate either market to 10,000 rows. Using `5000`, which is too small for
+the complete Taiwan day-by-day requests over this period, makes CPU preparation
+fail instead of silently reducing the dataset scope.
+
+Provider quotas are a separate boundary. EODHD's current pricing page lists the
+personal `EOD Historical Data — All World` plan at USD 19.99 per month. Its
+limits documentation gives paid plans a default 100,000 API calls per day and
+1,000 HTTP requests per minute, with subscription daily limits resetting at
+midnight GMT. The units are independent, and endpoints may consume different
+numbers of billed calls. The actual subscription, used account quota, and
+provider response headers remain authoritative. This project floors the default
+pacing to 16 requests per second (960 per minute); lower `--eodhd-qps` further
+if another client uses the same account concurrently. See
+[EODHD Pricing](https://eodhd.com/pricing),
+[EODHD API Limits](https://eodhd.com/financial-apis/api-limits) and the
+[EODHD User API](https://eodhd.com/financial-apis/user-api). For a complete US
+stock and ETF download, `--max-api-calls` must cover the complete request plan;
+the resumable CPU workflow below handles provider daily/weekly quotas across
+multiple attempts.
+
+For the complete EODHD discovery scope plus the complete Taiwan market, provide
+none of `--stocks`, `--etfs`, or `--symbol-limit`:
+
+```bash
+bash scripts/runpod_workflow.sh configure \
+  --stage stage1 \
+  --data-profile us_tw_eodhd \
+  --start 2015-01-01 \
+  --end 2026-07-27 \
+  --universe all
+```
+
+If the post-discovery complete HTTP request estimate exceeds the default
+`100000`, preparation reports the estimate and stops. Assess cost, then rerun
+`configure` with a larger `--max-api-calls`. Raising this safety ceiling does
+not enable sampling or bypass provider quotas.
+
+To use the same explicit US universe while downloading **no Taiwan data**, set
+the profile to `us_only_eodhd`:
+
+```bash
+bash scripts/runpod_workflow.sh configure \
+  --stage stage1 \
+  --data-profile us_only_eodhd \
+  --start 2015-01-01 \
+  --end 2026-07-27 \
+  --universe explicit \
+  --stocks "AAPL,MSFT" \
+  --etfs "SPY,QQQ" \
+  --max-api-calls 5000 \
+  --eodhd-qps 16
+```
+
+This `us_only_eodhd` example contains only those four US tickers plus the
+automatically added `VTI.US`; it contains no TWSE or TPEx data.
+
+For the complete Taiwan universe without EODHD:
+
+```bash
+bash scripts/runpod_workflow.sh configure \
+  --stage stage1 \
+  --data-profile tw_only \
+  --start 2015-01-01 \
+  --end 2026-07-27 \
+  --universe all
+```
+
+The script creates `.runpod/selections/<selection-id>.json` and
+`.runpod/active-selection.json`. They contain no secrets and are excluded by
+`.gitignore`. A different profile, date range, universe, symbol limit, data
+preparation contract, or stage-config SHA-256 produces a different identity.
+QPS and API budget remain recorded in the selection without misidentifying the
+same dataset semantics as a different dataset request.
+
+When provider history may have been revised and a new snapshot is intentional
+for the same profile/date/universe, pass a new explicit
+`--dataset-revision <label>` to `configure`. The CPU workflow never overwrites a
+complete existing namespace and fails closed on a partial namespace.
+
+Inspect the active selection without opening JSON:
+
+```bash
+bash scripts/runpod_workflow.sh selection show
+```
+
+`.env` now stores only local RunPod/S3 credentials and volume metadata written
+by the scripts. Stage, data range, runtime, and config are never read from
+`.env`. Do not `source .env`, and never put API keys, tokens, or secret values
+in the README, configs, shell scripts, or commit history. Pods receive RunPod
+Secret references, not local account-level RunPod or S3 credentials.
 
 #### 2. Verify S3 and upload source code
 
@@ -1058,14 +1379,14 @@ Run the read-only S3 access check, then preview the explicit upload allowlist:
 
 ```bash
 bash scripts/verify_runpod_s3_access.sh
-bash scripts/sync_project_to_runpod_volume.sh --dry-run
+bash scripts/runpod_workflow.sh sync --dry-run
 ```
 
 After reviewing the list, upload it and verify remote code readiness:
 
 ```bash
-bash scripts/sync_project_to_runpod_volume.sh --apply
-bash scripts/verify_runpod_stage_readiness.sh --code-only
+bash scripts/runpod_workflow.sh sync --apply
+bash scripts/runpod_workflow.sh readiness --code-only
 ```
 
 The uploader scans allowlisted source, configs, scripts, tests, `README.md`, and
@@ -1076,21 +1397,18 @@ the approved RunPod image regenerates that file for its Python/PyTorch/CUDA
 environment on the network volume.
 
 After any allowlisted source or config change, rerun `--dry-run`, `--apply`, and
-the readiness check. If the dataset marker is bound to an older code release,
-rerun CPU preparation as well. Never bypass the GPU gate.
+the readiness check. A config change also invalidates the active selection, so
+rerun `configure`. If the dataset marker is bound to an older code release or
+selection, rerun CPU preparation as well. Never bypass the GPU gate.
 
 #### 3. Deploy the model and offline data layer remotely
 
-For the first Stage 1 data preparation, set:
-
-```text
-RUNPOD_CONFIG=configs/stage1_kronos_base_lora.yaml
-```
-
-Create a short-lived CPU Pod from the local machine:
+The CPU Pod accepts only the active selection. Pod creation fails before any
+compute is rented when `configure` has not run, the config SHA changed, or the
+selection JSON is incomplete. Create a short-lived CPU Pod locally:
 
 ```bash
-bash scripts/create_runpod_cpu_pod.sh
+bash scripts/runpod_workflow.sh cpu prepare
 ```
 
 The command prints the Pod ID, external hard-limit guard, and the workflow to
@@ -1116,74 +1434,117 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    image.
 2. Pins the Kronos source/model/tokenizer revisions and runs the complete pytest
    suite.
-3. Downloads according to `FIN_TS_DATASET_PROFILE`, symbols, dates, QPS, and
-   the API-call cap. Cache hits do not call the provider again.
+3. Revalidates the stage, profile, dates, universe, config SHA-256, and Pod
+   environment from the mounted immutable selection before downloading. Cache
+   hits do not call the provider again.
 4. Creates and verifies these persistent artifacts:
-   | Remote path                                             | Contents                                                    |
-   | ------------------------------------------------------- | ----------------------------------------------------------- |
-   | `/runpod-volume/data/api-cache/`                      | Provider raw-response cache                                 |
-   | `/runpod-volume/data/raw/market.parquet`              | Canonical daily OHLCV                                       |
-   | `/runpod-volume/data/processed/windows.parquet`       | Causal training windows                                     |
-   | `/runpod-volume/data/download-manifest.json`          | Actual providers, profile, symbols, and download provenance |
-   | `/runpod-volume/data/dataset-manifest.json`           | Split counts, hashes, and data contract                     |
-   | `/runpod-volume/data/manifests/api-request-log.jsonl` | Request audit without tokens                                |
-   | `/runpod-volume/cache/huggingface/`                   | Offline Kronos model/tokenizer cache                        |
-   | `/runpod-volume/cache/hf-models.json`                 | Pinned model revisions and cache manifest                   |
-5. Publishes `/runpod-volume/lifecycle/stage1/dataset.json` only after all
-   checks pass, then terminates the Pod automatically.
+   | Remote path                                                                        | Contents                                                    |
+   | ---------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/api-cache/`                     | Provider raw-response cache                                 |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/download-progress.json`          | Resume attempt, cache counts, and safe provider-wait details |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/raw/market.parquet`             | Canonical daily OHLCV                                       |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/processed/windows.parquet`      | Causal training windows                                     |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/download-manifest.json`         | Actual providers, profile, symbols, and download provenance |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/dataset-manifest.json`          | Split counts, hashes, and data contract                     |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/manifests/api-request-log.jsonl` | Request audit without tokens                               |
+   | `/runpod-volume/cache/huggingface/`                                             | Offline Kronos model/tokenizer cache                        |
+   | `/runpod-volume/cache/hf-models.json`                                           | Pinned model revisions and cache manifest                   |
+5. Binds the selection ID/SHA, dataset request SHA, stage/config SHA, requested
+   profile/date/universe, and resolved artifact hashes into
+   `/runpod-volume/lifecycle/stage1/dataset.json`. It publishes the marker only
+   after every check passes, then terminates automatically.
 
 After the Pod terminates, use the S3 lifecycle as the authority instead of the
 now-unavailable SSH session:
 
 ```bash
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://<network-volume-id>/lifecycle/stage1/dataset.json" - \
-  --only-show-errors
+bash scripts/runpod_workflow.sh status
 ```
 
-If the state is `failed` or `timed_out`, first read `launch_id` and `log_path`
-from the lifecycle. The tmux log directory is
-`logs/tmux/fin-ts-cpu-prepare/<launch-id>/`; download it into the local
-diagnostic directory:
+##### Provider quotas and cross-Pod resume
+
+When a download receives HTTP 429, a temporary network error, or provider 5xx,
+the downloader first performs bounded retries. If completion is still
+impossible, it follows this contract:
+
+1. Every successful raw JSON response remains in the dataset request's
+   `api-cache/`. No incomplete Parquet or `state=ready` marker is published.
+2. `download-progress.json` records the attempt number, per-provider cache
+   counts, network attempts in this execution, and—when supplied—HTTP status,
+   `Retry-After`, and rate-limit headers. It stores neither tokens nor response
+   bodies.
+3. The dataset lifecycle becomes `waiting_for_provider`, GPU readiness remains
+   blocked, and the CPU Pod terminates instead of accruing cost while waiting
+   for a daily or weekly reset.
+4. After quota becomes available, **do not reconfigure, change
+   `--dataset-revision`, or delete the cache**. Create another CPU Pod locally,
+   connect to it, and start the same workflow:
+
+   ```bash
+   bash scripts/runpod_workflow.sh cpu prepare
+   # Run after connecting to the newly created CPU Pod:
+   cd /runpod-volume/stock_forecasting
+   bash scripts/runpod_tmux_launch.sh cpu-prepare
+   ```
+
+5. The new attempt replays cached responses under the same dataset request
+   identity and calls the provider only for missing requests. It rebuilds
+   Parquet from the complete response set. The lifecycle becomes `ready` only
+   after all data, manifests, and selection gates pass. The `all`-mode discovery
+   response is part of the same immutable cache, so a cross-day resume does not
+   replace it with a drifted instrument list.
+
+`bash scripts/runpod_workflow.sh status` prints the download attempt, cached
+response count, network requests in that attempt, the full request estimate when
+available, and a safe provider-error summary below the dataset lifecycle, so no
+JSON file needs to be opened manually.
+
+This is request-level resume, not byte-range resume within one HTTP response.
+Each successfully completed API request is the resume unit. A progress identity
+that differs from the current profile, dates, universe, or dataset request
+fails closed. A 401/403, an undersized `--max-api-calls`, or another
+configuration error produces `failed`: correct the Secret or rerun `configure`
+with a larger safety budget, then retry the same dataset request. Change
+`--dataset-revision` only for an intentional new provider snapshot; a new
+revision does not reuse the old snapshot cache.
+
+If the state is `waiting_for_provider`, `failed`, or `timed_out`, first read
+`launch_id`, `log_path`, and any `progress_path` from the lifecycle. The tmux log directory is
+`logs/tmux/fin-ts-cpu-prepare/<launch-id>/`; let the script resolve and download
+it into the local diagnostic directory:
 
 ```bash
-mkdir -p "runpod_error_log_temp/cpu-prepare/<launch-id>"
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://<network-volume-id>/logs/tmux/fin-ts-cpu-prepare/<launch-id>/" \
-  "runpod_error_log_temp/cpu-prepare/<launch-id>/" \
-  --recursive --only-show-errors
+bash scripts/runpod_workflow.sh cpu-logs
 ```
 
 Do not rent a GPU until this gate passes:
 
 ```bash
-bash scripts/verify_runpod_stage_readiness.sh --gpu
+bash scripts/runpod_workflow.sh readiness --gpu
 ```
 
-Stage 2 uses the same complete Parquet dataset, but trains on 100% of the train
-split from the same pretrained base. It does not continue from a Stage 1
-checkpoint. Change `.env` to:
-
-```text
-RUNPOD_CONFIG=configs/stage2_kronos_base_lora.yaml
-```
-
-If source or config changed, upload it first. Then create a CPU Pod and run the
-Stage 2 contract finalization after SSH login:
+Stage 2 uses the same data namespace when its dataset request is identical, but
+trains on 100% of the train split from the same pretrained base. It does not
+continue from a Stage 1 checkpoint. Run `configure --stage stage2` again and
+explicitly supply the same profile/date/universe as the intended CPU dataset.
+The GPU gate rejects an old Stage 1 marker when the stage/config identity has
+changed. For example:
 
 ```bash
-bash scripts/create_runpod_cpu_pod.sh
+bash scripts/runpod_workflow.sh configure \
+  --stage stage2 \
+  --data-profile tw_only \
+  --start 2015-01-01 \
+  --end 2026-07-27 \
+  --universe all
+bash scripts/runpod_workflow.sh sync --apply
+bash scripts/runpod_workflow.sh cpu prepare
 ```
 
-```bash
-cd /runpod-volume/stock_forecasting
-bash scripts/runpod_tmux_launch.sh cpu-finalize
-```
-
-After finalization, rerun
-`bash scripts/verify_runpod_stage_readiness.sh --gpu` locally. This step does
-not dynamically redownload training data; it revalidates the Stage 2 config,
-complete dataset, model cache, and code release as one contract.
+After the CPU workflow completes, rerun
+`bash scripts/runpod_workflow.sh readiness --gpu` locally. If only the stage is
+changed but profile/date/universe differs from the prior CPU deployment, the
+dataset request SHA also differs and the old Parquet cannot be selected.
 
 #### 4. Create a GPU Pod and train
 
@@ -1194,24 +1555,26 @@ List the currently available complete `gpuId` values. The default is
 bash scripts/runpodctl_project.sh gpu list
 ```
 
-Confirm that `RUNPOD_CONFIG` in `.env` selects the intended stage and pass the
-GPU gate:
+Inspect the active selection and pass the GPU gate. Before renting the GPU, the
+gate compares the local selection, S3 selection, CPU marker, code release,
+config SHA, and namespaced artifacts:
 
 ```bash
-bash scripts/verify_runpod_stage_readiness.sh --gpu
+bash scripts/runpod_workflow.sh selection show
+bash scripts/runpod_workflow.sh readiness --gpu
 ```
 
 Create a Pod with the default GPU:
 
 ```bash
-bash scripts/create_runpod_pod.sh
+bash scripts/runpod_workflow.sh train
 ```
 
 Or specify one complete `gpuId` from the list:
 
 ```bash
 RUNPOD_GPU_ID="NVIDIA GeForce RTX 5090" \
-  bash scripts/create_runpod_pod.sh
+  bash scripts/runpod_workflow.sh train
 ```
 
 The creator first allocates one run ID locally, mounts the same network volume,
@@ -1223,9 +1586,9 @@ cd /runpod-volume/stock_forecasting
 bash scripts/runpod_tmux_launch.sh stage1-train
 ```
 
-`RUNPOD_CONFIG` determines whether Stage 1 or Stage 2 runs; the
-`stage1-train` command name does not override that selection. Attach for live
-observation:
+The immutable selection maps to the `RUNPOD_CONFIG` that determines whether
+Stage 1 or Stage 2 runs; the `stage1-train` command name does not override that
+selection. Attach for live observation:
 
 ```bash
 tmux -L fin-ts-stage1-train attach -t fin-ts-stage1-train
@@ -1239,15 +1602,11 @@ automatically executes the complete validation benchmark after training.
 Whether it succeeds, fails, or times out, the lifecycle and artifacts are
 persisted before the existing supervisor and external guard terminate the Pod.
 
-After termination, query the latest terminal states through S3:
+After termination, use the workflow status command to query the latest terminal
+states stored on S3:
 
 ```bash
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://<network-volume-id>/lifecycle/stage1/training.json" - \
-  --only-show-errors
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://<network-volume-id>/lifecycle/stage1/validation.json" - \
-  --only-show-errors
+bash scripts/runpod_workflow.sh status
 ```
 
 Only `state=ready` means that lifecycle completed. Treat `failed` and
@@ -1256,11 +1615,11 @@ checkpoints, evaluations, W&B, and run-scoped logs. SSH/tmux is only for live
 debugging while a Pod still exists; it is not the authority for terminal state.
 
 If training completed but validation must be rerun independently, create a
-validation Pod locally. First confirm that `RUNPOD_CONFIG` in `.env` matches the
-config stored by that run.
+validation Pod locally. The active selection must match the stage and dataset
+identity stored by that run.
 
 ```bash
-bash scripts/create_runpod_validation_pod.sh <run-id>
+bash scripts/runpod_workflow.sh validate <run-id>
 ```
 
 After SSH login, run:
@@ -1272,83 +1631,34 @@ bash scripts/runpod_tmux_launch.sh stage1-validate
 
 #### 5. Download the best checkpoint and validation results
 
-The following commands download into `artifacts/runpod/`, which `.gitignore`
-excludes. Set `VOLUME_ID` to the same network-volume ID used in `.env`, download
-the training lifecycle, and read the run ID from it:
+There is no need to read the volume ID from `.env`, parse lifecycle JSON, or
+assemble S3 paths manually. First inspect known lifecycle markers:
 
 ```bash
-VOLUME_ID="<network-volume-id>"
-DOWNLOAD_ROOT="artifacts/runpod"
-mkdir -p "${DOWNLOAD_ROOT}"
-
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/lifecycle/stage1/training.json" \
-  "${DOWNLOAD_ROOT}/training-lifecycle.json" \
-  --only-show-errors
-
-RUN_ID="$(python3 -c \
-  'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["wandb_run_id"])' \
-  "${DOWNLOAD_ROOT}/training-lifecycle.json")"
-printf 'Run ID: %s\n' "${RUN_ID}"
-mkdir -p "${DOWNLOAD_ROOT}/${RUN_ID}"
+bash scripts/runpod_workflow.sh status
 ```
 
-Download the run manifest, leaderboard, and best-checkpoint pointer first:
+Without a run ID, the download script accepts only the latest training
+lifecycle with `state=ready`, then resolves its run ID and validation-selected
+best checkpoint automatically:
 
 ```bash
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/savedModel/${RUN_ID}/run-manifest.json" \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/run-manifest.json" \
-  --only-show-errors
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/savedModel/${RUN_ID}/checkpoint-leaderboard.json" \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/checkpoint-leaderboard.json" \
-  --only-show-errors
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/savedModel/${RUN_ID}/best-checkpoint.json" \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/best-checkpoint.json" \
-  --only-show-errors
-
-BEST_CHECKPOINT="$(python3 -c \
-  'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["path"])' \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/best-checkpoint.json")"
-printf 'Best checkpoint: %s\n' "${BEST_CHECKPOINT}"
+bash scripts/runpod_workflow.sh download
 ```
 
-Download only the validation-selected best checkpoint instead of every retained
-top-k checkpoint:
+You may select a run explicitly. If its local target already exists, use
+`--resume` explicitly before the script fills or refreshes known files:
 
 ```bash
-mkdir -p "${DOWNLOAD_ROOT}/${RUN_ID}/${BEST_CHECKPOINT}"
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/savedModel/${RUN_ID}/${BEST_CHECKPOINT}/" \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/${BEST_CHECKPOINT}/" \
-  --recursive --only-show-errors
+bash scripts/runpod_workflow.sh download <run-id>
+bash scripts/runpod_workflow.sh download --resume <run-id>
 ```
 
-Download the validation benchmark, validation lifecycle, and immutable training
-completion record:
-
-```bash
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/evaluations/${RUN_ID}/validation-benchmark.json" \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/validation-benchmark.json" \
-  --only-show-errors
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/lifecycle/stage1/validation.json" \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/validation-lifecycle.json" \
-  --only-show-errors
-bash scripts/runpod_s3_project.sh s3 cp \
-  "s3://${VOLUME_ID}/lifecycle/runs/${RUN_ID}/training-completed.json" \
-  "${DOWNLOAD_ROOT}/${RUN_ID}/training-completed.json" \
-  --only-show-errors
-```
-
-Inspect the local files:
-
-```bash
-find "${DOWNLOAD_ROOT}/${RUN_ID}" -maxdepth 3 -type f -print | sort
-```
+Results are written under the ignored
+`artifacts/runpod/<run-id>/` directory. They include the run manifest, resolved
+config, leaderboard, best-checkpoint pointer, selected best checkpoint,
+validation benchmark, training/validation lifecycle files, and immutable
+training completion record.
 
 The best-checkpoint directory should contain at least `adapter.safetensors`,
 `resolved-config.yaml`, `trainer-state.json`, and the optimizer/scheduler state
@@ -1357,9 +1667,9 @@ numerical validation and baseline comparison. Do not claim run success from a
 W&B chart or README alone; inspect the lifecycle `state`, run ID, result path,
 and downloaded raw JSON together.
 
-The selected stage is controlled by `RUNPOD_CONFIG`. Names containing
-`stage1-*` in operation commands, tmux sessions, or lifecycle paths do not
-override the selected config.
+The active immutable selection and its bound config SHA control the selected
+stage. Names containing `stage1-*` in operation commands, tmux sessions, or
+lifecycle paths do not override that selection.
 
 ### Training and inference artifacts
 
@@ -1370,6 +1680,7 @@ Each run stores at least:
 - `trainer-state.json`
 - Optimizer and scheduler state
 - Run manifest, checkpoint leaderboard, and best-checkpoint pointer
+- Selection ID/SHA, dataset request SHA, stage-config SHA, and requested dataset contract
 - Dataset-manifest summary, architecture digest, Kronos source/model/tokenizer
   revisions, and bounded training-implementation digest
 - Validation metrics and baseline comparisons
@@ -1386,7 +1697,7 @@ the same network volume mounted; do not load the checkpoint locally:
 poetry run fin-ts-infer \
   --config configs/stage2_kronos_base_lora.yaml \
   --checkpoint /runpod-volume/savedModel/<run-id>/<checkpoint> \
-  --input /runpod-volume/data/raw/market.parquet \
+  --input "${DATA_ROOT}/raw/market.parquet" \
   --symbol AAPL.US
 ```
 
@@ -1403,13 +1714,16 @@ Minimum PoC acceptance:
    pretrained base.
 3. Every run is traceable to immutable Parquet, dataset profile, providers,
    symbols, date range, and split counts.
-4. `alpha_quantiles` remains fixed at `[B,12,3]`, with no classifier, text, or
+4. The CPU marker and active training selection match exactly on stage, config
+   SHA, profile, dates, requested universe, and dataset request SHA. For example,
+   CPU `tw_only` versus GPU `us_tw_eodhd` fails closed before Pod creation.
+5. `alpha_quantiles` remains fixed at `[B,12,3]`, with no classifier, text, or
    fact output.
-5. Model inputs, time splits, and normalization use no future information;
+6. Model inputs, time splits, and normalization use no future information;
    future benchmark values exist only in offline label construction.
-6. The model is compared with zero-return, momentum, technical, GBDT, and neural
+7. The model is compared with zero-return, momentum, technical, GBDT, and neural
    baselines under one validation/test protocol.
-7. Reports include per-horizon normalized pinball, median correlation,
+8. Reports include per-horizon normalized pinball, median correlation,
    directional agreement, interval coverage/width, and slices by market, asset
    type, and year—not only one aggregate loss.
 
@@ -1432,6 +1746,7 @@ seeds and controlled ablations.
 - [EODHD Historical Splits API](https://eodhd.com/financial-apis/api-splits-dividends)
 - [EODHD API limits](https://eodhd.com/financial-apis/api-limits)
 - [EODHD pricing](https://eodhd.com/pricing)
+- [EODHD delisted data coverage](https://eodhd.com/financial-apis/delisted-stock-companies-data-2)
 - [TWSE OpenAPI](https://openapi.twse.com.tw/)
 - [TWSE ex-right/ex-dividend calculation](https://www.twse.com.tw/en/announcement/ex-right/twt49u.html)
 - [TPEx OpenAPI](https://www.tpex.org.tw/openapi/)

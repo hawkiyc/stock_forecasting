@@ -10,9 +10,9 @@ from typing import Any
 
 import torch
 
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.data.manifest import load_dataset_manifest
-from fin_ts_multimodal.models import (
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.data.manifest import load_dataset_manifest
+from stock_forecasting.models import (
     CausalPerceiverResampler,
     DeterministicTimeSeriesBackbone,
     GatedBenchmarkConditioner,

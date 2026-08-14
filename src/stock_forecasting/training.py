@@ -20,33 +20,33 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from fin_ts_multimodal.checkpointing import (
+from stock_forecasting.checkpointing import (
     load_checkpoint,
     reconcile_checkpoint_storage,
     save_ranked_checkpoint,
     validate_checkpoint_selection,
 )
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.data import (
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.data import (
     FinancialBatchCollator,
     FinancialWindowDataset,
     read_processed_records,
 )
-from fin_ts_multimodal.factory import ModelBundle, build_model_bundle
-from fin_ts_multimodal.metrics import (
+from stock_forecasting.factory import ModelBundle, build_model_bundle
+from stock_forecasting.metrics import (
     POSTPROCESS_SIGNAL_NAMES,
     cross_sectional_metrics,
     multi_horizon_alpha_metrics,
     postprocess_alpha_signal,
 )
-from fin_ts_multimodal.preflight import run_preflight
-from fin_ts_multimodal.tracking import (
+from stock_forecasting.preflight import run_preflight
+from stock_forecasting.tracking import (
     TrackingRun,
     start_tracking,
     training_run_lease,
     validate_tracking_run_contract,
 )
-from fin_ts_multimodal.training_paths import resolve_processed_dataset_path
+from stock_forecasting.training_paths import resolve_processed_dataset_path
 
 
 def set_global_seed(seed: int) -> None:

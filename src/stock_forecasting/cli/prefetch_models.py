@@ -11,8 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.run_paths import canonical_network_volume_root
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.run_paths import canonical_network_volume_root
 
 SnapshotDownloader = Callable[..., str]
 DEFAULT_HF_HUB_ETAG_TIMEOUT = 60
@@ -164,8 +164,8 @@ def smoke_test_time_series_backbone(
 
     import torch
 
-    from fin_ts_multimodal.factory import _prepare_kronos_import
-    from fin_ts_multimodal.models import KronosBackbone
+    from stock_forecasting.factory import _prepare_kronos_import
+    from stock_forecasting.models import KronosBackbone
 
     revision = config.model.kronos_source_revision
     assert revision is not None

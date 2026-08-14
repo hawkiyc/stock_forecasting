@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from fin_ts_multimodal.data.schema import write_market_data
-from fin_ts_multimodal.data.synthetic import DEFAULT_SYMBOLS, generate_synthetic_ohlcv
+from stock_forecasting.data.schema import write_market_data
+from stock_forecasting.data.synthetic import DEFAULT_SYMBOLS, generate_synthetic_ohlcv
 
 
 def build_parser() -> argparse.ArgumentParser:

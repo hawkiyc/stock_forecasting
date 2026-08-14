@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from fin_ts_multimodal.data.schema import normalize_ohlcv_frame
+from stock_forecasting.data.schema import normalize_ohlcv_frame
 
 DEFAULT_SYMBOLS: Mapping[str, str] = {
     "AAPL.US": "stock",

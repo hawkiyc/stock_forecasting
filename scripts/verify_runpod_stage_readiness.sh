@@ -14,7 +14,9 @@ DATASET_MARKER_KEY="lifecycle/stage1/dataset.json"
 # shellcheck source=lib/runpod_project_env.sh
 source "${SCRIPT_DIR}/lib/runpod_project_env.sh"
 runpod_load_create_env "${LOCAL_PROJECT_ROOT}"
-RUNPOD_CONFIG="${RUNPOD_CONFIG:-configs/stage1_kronos_base_lora.yaml}"
+# shellcheck source=lib/runpod_selection.sh
+source "${SCRIPT_DIR}/lib/runpod_selection.sh"
+runpod_load_active_selection "${LOCAL_PROJECT_ROOT}"
 
 if [[ $# -ne 1 ]]; then
     echo "Usage: verify_runpod_stage_readiness.sh --code-only|--gpu" >&2
@@ -70,47 +72,36 @@ DATASET_JSON="$(bash "${S3_WRAPPER}" s3 cp \
     "s3://${RUNPOD_NETWORK_VOLUME_ID}/${DATASET_MARKER_KEY}" - \
     --only-show-errors)"
 printf '%s\n' "${DATASET_JSON}" \
+    | python3 "${SCRIPT_DIR}/runpod_selection.py" verify-marker \
+        --project-root "${LOCAL_PROJECT_ROOT}" \
+        --selection "${RUNPOD_SELECTION_FILE}" \
+        --marker -
+REMOTE_SELECTION_JSON="$(bash "${S3_WRAPPER}" s3 cp \
+    "s3://${RUNPOD_NETWORK_VOLUME_ID}/${RUNPOD_REMOTE_SELECTION_RELATIVE_PATH}" - \
+    --only-show-errors)"
+printf '%s\n' "${REMOTE_SELECTION_JSON}" \
+    | python3 "${SCRIPT_DIR}/runpod_selection.py" verify-selection-copy \
+        --project-root "${LOCAL_PROJECT_ROOT}" \
+        --selection "${RUNPOD_SELECTION_FILE}" \
+        --candidate -
+printf '%s\n' "${DATASET_JSON}" \
     | python3 "${READINESS_HELPER}" check-dataset \
         --marker - \
         --expected-code-release-digest "${CODE_RELEASE_DIGEST}" \
         --stage-config "${LOCAL_PROJECT_ROOT}/${RUNPOD_CONFIG}"
 
-RAW_EXPECTED_SIZE="$(printf '%s\n' "${DATASET_JSON}" | python3 -c \
-    'import json, sys; print(json.load(sys.stdin)["raw"]["size_bytes"])')"
-PROCESSED_EXPECTED_SIZE="$(printf '%s\n' "${DATASET_JSON}" | python3 -c \
-    'import json, sys; print(json.load(sys.stdin)["processed"]["size_bytes"])')"
-RAW_REMOTE_SIZE="$(bash "${S3_WRAPPER}" s3api head-object \
-    --bucket "${RUNPOD_NETWORK_VOLUME_ID}" \
-    --key data/raw/market.parquet \
-    --query ContentLength \
-    --output text)"
-PROCESSED_REMOTE_SIZE="$(bash "${S3_WRAPPER}" s3api head-object \
-    --bucket "${RUNPOD_NETWORK_VOLUME_ID}" \
-    --key data/processed/windows.parquet \
-    --query ContentLength \
-    --output text)"
-if [[ "${RAW_REMOTE_SIZE}" != "${RAW_EXPECTED_SIZE}" ]]; then
-    echo "Raw dataset size does not match its readiness manifest" >&2
-    exit 3
-fi
-if [[ "${PROCESSED_REMOTE_SIZE}" != "${PROCESSED_EXPECTED_SIZE}" ]]; then
-    echo "Processed dataset size does not match its readiness manifest" >&2
-    exit 3
-fi
-DATASET_MANIFEST_EXPECTED_SIZE="$(printf '%s\n' "${DATASET_JSON}" | python3 -c \
-    'import json, sys; print(json.load(sys.stdin)["dataset_manifest"]["size_bytes"])')"
-DOWNLOAD_MANIFEST_EXPECTED_SIZE="$(printf '%s\n' "${DATASET_JSON}" | python3 -c \
-    'import json, sys; print(json.load(sys.stdin)["download_manifest"]["size_bytes"])')"
-REQUEST_LOG_EXPECTED_SIZE="$(printf '%s\n' "${DATASET_JSON}" | python3 -c \
-    'import json, sys; print(json.load(sys.stdin)["request_log"]["size_bytes"])')"
-MODEL_MANIFEST_EXPECTED_SIZE="$(printf '%s\n' "${DATASET_JSON}" | python3 -c \
-    'import json, sys; print(json.load(sys.stdin)["model_manifest"]["size_bytes"])')"
-
 verify_remote_size() {
-    local object_key="$1"
-    local expected_size="$2"
-    local label="$3"
+    local artifact_name="$1"
+    local label="$2"
+    local object_key=""
+    local expected_size=""
     local remote_size
+    object_key="$(printf '%s\n' "${DATASET_JSON}" | python3 -c \
+        'import json, sys; print(json.load(sys.stdin)[sys.argv[1]]["relative_path"])' \
+        "${artifact_name}")"
+    expected_size="$(printf '%s\n' "${DATASET_JSON}" | python3 -c \
+        'import json, sys; print(json.load(sys.stdin)[sys.argv[1]]["size_bytes"])' \
+        "${artifact_name}")"
     remote_size="$(bash "${S3_WRAPPER}" s3api head-object \
         --bucket "${RUNPOD_NETWORK_VOLUME_ID}" \
         --key "${object_key}" \
@@ -122,13 +113,11 @@ verify_remote_size() {
     fi
 }
 
-verify_remote_size data/dataset-manifest.json \
-    "${DATASET_MANIFEST_EXPECTED_SIZE}" "Dataset manifest"
-verify_remote_size data/download-manifest.json \
-    "${DOWNLOAD_MANIFEST_EXPECTED_SIZE}" "Download manifest"
-verify_remote_size data/manifests/api-request-log.jsonl \
-    "${REQUEST_LOG_EXPECTED_SIZE}" "API request log"
-verify_remote_size cache/hf-models.json \
-    "${MODEL_MANIFEST_EXPECTED_SIZE}" "Hugging Face model manifest"
+verify_remote_size raw "Raw dataset"
+verify_remote_size processed "Processed dataset"
+verify_remote_size dataset_manifest "Dataset manifest"
+verify_remote_size download_manifest "Download manifest"
+verify_remote_size request_log "API request log"
+verify_remote_size model_manifest "Hugging Face model manifest"
 
 printf 'GPU creation gate passed: code, dataset, and offline model cache are ready.\n'

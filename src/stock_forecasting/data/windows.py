@@ -10,13 +10,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from fin_ts_multimodal.data.adjustments import (
+from stock_forecasting.data.adjustments import (
     asof_adjusted_window,
     ensure_adjustment_columns,
     execution_total_return,
 )
-from fin_ts_multimodal.data.benchmarks import resolve_benchmark
-from fin_ts_multimodal.data.schema import normalize_ohlcv_frame
+from stock_forecasting.data.benchmarks import resolve_benchmark
+from stock_forecasting.data.schema import normalize_ohlcv_frame
 
 CONTEXT_FIELDS = ("open", "high", "low", "close", "volume")
 DEFAULT_ALPHA_HORIZONS = tuple(range(3, 15))

@@ -619,12 +619,51 @@ def _validate_quant_dataset_payload(
         raise ValueError(
             "Stage 1 dataset manifest is not ready: {}".format(payload.get("state", "missing"))
         )
+    selection_id = payload.get("selection_id")
+    selection_sha256 = payload.get("selection_sha256")
+    dataset_request_sha256 = payload.get("dataset_request_sha256")
+    if not isinstance(selection_id, str) or not re.fullmatch(
+        r"selection-[0-9a-f]{16}", selection_id
+    ):
+        raise ValueError("Dataset readiness selection_id is invalid")
+    if not isinstance(selection_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", selection_sha256
+    ):
+        raise ValueError("Dataset readiness selection digest is invalid")
+    if not isinstance(dataset_request_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", dataset_request_sha256
+    ):
+        raise ValueError("Dataset readiness request digest is invalid")
+    if selection_id != f"selection-{selection_sha256[:16]}":
+        raise ValueError("Dataset readiness selection ID disagrees with its digest")
+    requested_dataset = payload.get("requested_dataset")
+    if (
+        not isinstance(requested_dataset, dict)
+        or _payload_sha256(requested_dataset) != dataset_request_sha256
+    ):
+        raise ValueError("Dataset readiness requested dataset contract is invalid")
+    expected_data_root = f"datasets/{dataset_request_sha256}"
+    if payload.get("data_root_relative") != expected_data_root:
+        raise ValueError("Dataset readiness namespace disagrees with its request digest")
+    selected_stage = payload.get("selected_stage")
+    if selected_stage not in {"stage1", "stage2"}:
+        raise ValueError("Dataset readiness selected stage is invalid")
+    stage_config_path = payload.get("stage_config_path")
+    stage_config_sha256 = payload.get("stage_config_sha256")
+    if (
+        not isinstance(stage_config_path, str)
+        or _safe_relative_path(stage_config_path).as_posix() != stage_config_path
+        or not isinstance(stage_config_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", stage_config_sha256)
+    ):
+        raise ValueError("Dataset readiness stage config identity is invalid")
+
     approved_paths = {
-        "raw": "data/raw/market.parquet",
-        "processed": "data/processed/windows.parquet",
-        "dataset_manifest": "data/dataset-manifest.json",
-        "download_manifest": "data/download-manifest.json",
-        "request_log": "data/manifests/api-request-log.jsonl",
+        "raw": f"{expected_data_root}/raw/market.parquet",
+        "processed": f"{expected_data_root}/processed/windows.parquet",
+        "dataset_manifest": f"{expected_data_root}/dataset-manifest.json",
+        "download_manifest": f"{expected_data_root}/download-manifest.json",
+        "request_log": f"{expected_data_root}/manifests/api-request-log.jsonl",
         "model_manifest": "cache/hf-models.json",
     }
     artifacts = {}
@@ -647,6 +686,12 @@ def _validate_quant_dataset_payload(
         raise ValueError("Dataset readiness profile is unsupported")
     if payload.get("selected_datasets") != selected_by_profile[profile]:
         raise ValueError("Dataset readiness providers disagree with its profile")
+    if requested_dataset.get("profile") != profile:
+        raise ValueError("Dataset readiness requested profile disagrees with prepared data")
+    if requested_dataset.get("selected_datasets") != payload.get("selected_datasets"):
+        raise ValueError("Dataset readiness requested providers disagree with prepared data")
+    if requested_dataset.get("date_range") != payload.get("date_range"):
+        raise ValueError("Dataset readiness requested date range disagrees with prepared data")
     if stage_contract is not None:
         if profile != stage_contract.dataset_profile:
             raise ValueError("Dataset profile differs from the selected training config")
@@ -654,6 +699,8 @@ def _validate_quant_dataset_payload(
             stage_contract.required_model_repositories
         ):
             raise ValueError("Offline model cache does not cover the selected model config")
+        if selected_stage != stage_contract.training_stage:
+            raise ValueError("Dataset selected stage differs from the selected training config")
 
     symbols = payload.get("symbols")
     if (
@@ -819,6 +866,9 @@ def command_check_dataset(arguments):
         arguments.expected_code_release_digest,
         stage_contract,
     )
+    if arguments.stage_config is not None:
+        if payload.get("stage_config_sha256") != _sha256(arguments.stage_config):
+            raise ValueError("Dataset was prepared for a different stage config revision")
     if arguments.network_volume_root is not None:
         _verify_dataset_artifacts(payload, arguments.network_volume_root)
     print(
@@ -1369,6 +1419,51 @@ def command_write_state(arguments):
         raise ValueError("Lifecycle kind is unsupported")
     if output != expected_output.resolve(strict=False):
         raise ValueError(f"{arguments.kind} lifecycle must equal {expected_output}")
+    if arguments.state == "waiting_for_provider" and arguments.kind != "stage1-dataset":
+        raise ValueError("waiting_for_provider is valid only for stage1-dataset")
+    resolved_progress_path = None
+    if arguments.progress_path:
+        if arguments.kind != "stage1-dataset":
+            raise ValueError("Only stage1-dataset lifecycle may reference download progress")
+        progress_path = Path(arguments.progress_path)
+        if not progress_path.is_file() or progress_path.is_symlink():
+            raise ValueError("Download progress must be a regular file")
+        resolved_progress_path = progress_path.resolve()
+        datasets_root = (volume_root / "datasets").resolve(strict=False)
+        try:
+            progress_relative = resolved_progress_path.relative_to(datasets_root)
+        except ValueError as error:
+            raise ValueError("Download progress must be stored below datasets/") from error
+        if (
+            len(progress_relative.parts) != 2
+            or re.fullmatch(r"[0-9a-f]{64}", progress_relative.parts[0]) is None
+            or progress_relative.parts[1] != "download-progress.json"
+        ):
+            raise ValueError(
+                "Download progress must equal datasets/<dataset-request-sha256>/"
+                "download-progress.json"
+            )
+        progress_payload = _load_json(resolved_progress_path)
+        if not isinstance(progress_payload, dict):
+            raise ValueError("Download progress must contain a JSON object")
+        progress_identity = progress_payload.get("identity")
+        if (
+            progress_payload.get("schema_version") != 1
+            or progress_payload.get("kind") != "ohlcv-download-progress"
+            or not isinstance(progress_identity, dict)
+            or progress_payload.get("identity_sha256")
+            != _payload_sha256(progress_identity)
+            or progress_identity.get("dataset_request_sha256")
+            != progress_relative.parts[0]
+        ):
+            raise ValueError("Download progress identity does not match its dataset namespace")
+        if (
+            arguments.state == "waiting_for_provider"
+            and progress_payload.get("state") != "waiting_for_provider"
+        ):
+            raise ValueError("Provider-wait lifecycle requires provider-wait download progress")
+    elif arguments.state == "waiting_for_provider":
+        raise ValueError("Provider-wait lifecycle requires --progress-path")
     inherited = {}
     if arguments.inherit_existing and output.is_file():
         with output.open("r", encoding="utf-8") as stream:
@@ -1393,6 +1488,7 @@ def command_write_state(arguments):
                 "wandb_run_id",
                 "training_completed",
                 "recovery_path",
+                "progress_path",
                 "log_path",
                 "max_runtime_seconds",
                 "checkpoint",
@@ -1400,7 +1496,12 @@ def command_write_state(arguments):
             ):
                 if existing.get(key) not in (None, ""):
                     inherited[key] = existing[key]
-        elif existing_state not in {"ready", "failed", "timed_out"}:
+        elif existing_state not in {
+            "ready",
+            "failed",
+            "timed_out",
+            "waiting_for_provider",
+        }:
             raise ValueError("Existing lifecycle state is unsupported for finalization")
     payload = {
         **inherited,
@@ -1419,6 +1520,8 @@ def command_write_state(arguments):
         payload["wandb_run_id"] = arguments.wandb_run_id
     if arguments.recovery_path:
         payload["recovery_path"] = arguments.recovery_path
+    if resolved_progress_path is not None:
+        payload["progress_path"] = str(resolved_progress_path)
     if arguments.max_runtime_seconds is not None:
         payload["max_runtime_seconds"] = arguments.max_runtime_seconds
     if arguments.kind == "stage1-training" and arguments.state in {
@@ -1573,7 +1676,14 @@ def build_parser():
     state.add_argument("--kind", required=True)
     state.add_argument(
         "--state",
-        choices=("preparing", "finalizing", "ready", "failed", "timed_out"),
+        choices=(
+            "preparing",
+            "finalizing",
+            "ready",
+            "failed",
+            "timed_out",
+            "waiting_for_provider",
+        ),
         required=True,
     )
     state.add_argument("--launch-id", required=True)
@@ -1581,6 +1691,7 @@ def build_parser():
     state.add_argument("--log-path")
     state.add_argument("--wandb-run-id")
     state.add_argument("--recovery-path")
+    state.add_argument("--progress-path")
     state.add_argument("--max-runtime-seconds", type=int)
     state.add_argument("--training-completed", type=int, choices=(0, 1))
     state.add_argument("--inherit-existing", action="store_true")

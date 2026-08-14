@@ -6,8 +6,8 @@ import pandas as pd
 import pytest
 import torch
 
-from fin_ts_multimodal.cli.infer import _forecast_payload, prepare_causal_observation
-from fin_ts_multimodal.data.windows import DEFAULT_ALPHA_HORIZONS
+from stock_forecasting.cli.infer import _forecast_payload, prepare_causal_observation
+from stock_forecasting.data.windows import DEFAULT_ALPHA_HORIZONS
 
 
 def test_inference_observation_stops_at_explicit_cutoff_and_pairs_benchmark(

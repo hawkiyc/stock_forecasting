@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
-from fin_ts_multimodal.config import ExperimentConfig
+from stock_forecasting.config import ExperimentConfig
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -35,6 +38,67 @@ def test_runpod_entrypoint_scripts_remain_executable() -> None:
     )
     for path in entrypoints:
         assert path.stat().st_mode & stat.S_IXUSR, path
+
+
+def test_dataset_lifecycle_accepts_matching_provider_wait_progress(
+    tmp_path: Path,
+) -> None:
+    volume_root = tmp_path / "runpod-volume"
+    digest = "a" * 64
+    progress_path = volume_root / "datasets" / digest / "download-progress.json"
+    progress_path.parent.mkdir(parents=True)
+    identity = {"dataset_request_sha256": digest}
+    identity_sha256 = hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    progress_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "ohlcv-download-progress",
+                "state": "waiting_for_provider",
+                "identity": identity,
+                "identity_sha256": identity_sha256,
+            }
+        ),
+        encoding="utf-8",
+    )
+    marker = volume_root / "lifecycle" / "stage1" / "dataset.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/runpod_readiness.py"),
+            "write-state",
+            "--output",
+            str(marker),
+            "--network-volume-root",
+            str(volume_root),
+            "--kind",
+            "stage1-dataset",
+            "--state",
+            "waiting_for_provider",
+            "--launch-id",
+            "test-launch",
+            "--exit-code",
+            "75",
+            "--progress-path",
+            str(progress_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["state"] == "waiting_for_provider"
+    assert payload["progress_path"] == str(progress_path.resolve())
 
 
 def test_runpod_entrypoints_use_only_two_quant_stages() -> None:
@@ -133,9 +197,9 @@ def test_stage_configs_preserve_stable_runpod_path_overrides() -> None:
 
 def test_training_code_has_no_network_provider_imports() -> None:
     training_files = (
-        ROOT / "src/fin_ts_multimodal/training.py",
-        ROOT / "src/fin_ts_multimodal/cli/train.py",
-        ROOT / "src/fin_ts_multimodal/validation_benchmark.py",
+        ROOT / "src/stock_forecasting/training.py",
+        ROOT / "src/stock_forecasting/cli/train.py",
+        ROOT / "src/stock_forecasting/validation_benchmark.py",
     )
     combined = "\n".join(path.read_text(encoding="utf-8") for path in training_files)
 

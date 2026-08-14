@@ -1,19 +1,36 @@
 """Daily OHLCV provider interfaces and implementations."""
 
 from .base import DailyOHLCVProvider, Instrument, ProviderFetch, RequestRecord
-from .eodhd import EODHDProvider
-from .http import CachedJsonClient, NetworkRequestBudget
+from .eodhd import (
+    EODHD_DEFAULT_DAILY_API_CALL_LIMIT,
+    EODHD_DEFAULT_REQUESTS_PER_MINUTE,
+    EODHD_DEFAULT_REQUESTS_PER_SECOND,
+    EODHD_DELISTED_AUXILIARY_DATA_START,
+    EODHDProvider,
+)
+from .http import (
+    CachedJsonClient,
+    NetworkRequestBudget,
+    NetworkRequestBudgetExceeded,
+    ProviderRequestError,
+)
 from .massive import MassiveProvider
 from .taiwan import TPExProvider, TWSEProvider
 
 __all__ = [
     "CachedJsonClient",
     "DailyOHLCVProvider",
+    "EODHD_DEFAULT_DAILY_API_CALL_LIMIT",
+    "EODHD_DEFAULT_REQUESTS_PER_MINUTE",
+    "EODHD_DEFAULT_REQUESTS_PER_SECOND",
+    "EODHD_DELISTED_AUXILIARY_DATA_START",
     "EODHDProvider",
     "Instrument",
     "MassiveProvider",
     "NetworkRequestBudget",
+    "NetworkRequestBudgetExceeded",
     "ProviderFetch",
+    "ProviderRequestError",
     "RequestRecord",
     "TPExProvider",
     "TWSEProvider",

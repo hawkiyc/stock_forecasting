@@ -14,18 +14,18 @@ import torch
 from numpy.typing import NDArray
 from torch import Tensor
 
-from fin_ts_multimodal.checkpointing import load_checkpoint
-from fin_ts_multimodal.cli.evaluate import resolve_checkpoint
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.data.adjustments import asof_adjusted_window, ensure_adjustment_columns
-from fin_ts_multimodal.data.benchmarks import resolve_benchmark
-from fin_ts_multimodal.data.manifest import provenance_summary
-from fin_ts_multimodal.data.schema import normalize_ohlcv_frame, read_market_data
-from fin_ts_multimodal.factory import build_model_bundle
-from fin_ts_multimodal.metrics import POSTPROCESS_SIGNAL_NAMES, postprocess_alpha_signal
-from fin_ts_multimodal.models import MODEL_OUTPUT_SCHEMA_VERSION
-from fin_ts_multimodal.preflight import run_preflight
-from fin_ts_multimodal.training import _autocast_context, set_global_seed
+from stock_forecasting.checkpointing import load_checkpoint
+from stock_forecasting.cli.evaluate import resolve_checkpoint
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.data.adjustments import asof_adjusted_window, ensure_adjustment_columns
+from stock_forecasting.data.benchmarks import resolve_benchmark
+from stock_forecasting.data.manifest import provenance_summary
+from stock_forecasting.data.schema import normalize_ohlcv_frame, read_market_data
+from stock_forecasting.factory import build_model_bundle
+from stock_forecasting.metrics import POSTPROCESS_SIGNAL_NAMES, postprocess_alpha_signal
+from stock_forecasting.models import MODEL_OUTPUT_SCHEMA_VERSION
+from stock_forecasting.preflight import run_preflight
+from stock_forecasting.training import _autocast_context, set_global_seed
 
 Float32Array = NDArray[np.float32]
 Int64Array = NDArray[np.int64]

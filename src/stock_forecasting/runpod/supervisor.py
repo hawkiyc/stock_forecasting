@@ -23,8 +23,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-from fin_ts_multimodal.checkpointing import validate_checkpoint_selection
-from fin_ts_multimodal.run_paths import (
+from stock_forecasting.checkpointing import validate_checkpoint_selection
+from stock_forecasting.run_paths import (
     canonical_network_volume_root,
     checkpoint_run_directory,
     log_run_directory,

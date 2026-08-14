@@ -18,13 +18,13 @@ import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.models import MODEL_OUTPUT_SCHEMA_VERSION
-from fin_ts_multimodal.run_contract import (
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.models import MODEL_OUTPUT_SCHEMA_VERSION
+from stock_forecasting.run_contract import (
     CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
     training_resume_contract_digest,
 )
-from fin_ts_multimodal.run_paths import (
+from stock_forecasting.run_paths import (
     CHECKPOINT_NAME_PATTERN,
     validate_run_id,
 )

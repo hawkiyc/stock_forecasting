@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import uuid
@@ -17,15 +18,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fin_ts_multimodal.checkpointing import validate_checkpoint_selection
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.data.manifest import provenance_summary
-from fin_ts_multimodal.run_contract import (
+from stock_forecasting.checkpointing import validate_checkpoint_selection
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.data.manifest import provenance_summary
+from stock_forecasting.run_contract import (
     CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
     training_resume_contract_fingerprint,
     validate_training_resume_contract,
 )
-from fin_ts_multimodal.run_paths import (
+from stock_forecasting.run_paths import (
     canonical_network_volume_root,
     checkpoint_run_directory,
     validate_run_environment_ids,
@@ -34,6 +35,10 @@ from fin_ts_multimodal.run_paths import (
     validate_training_resume_path,
     validate_wandb_directory,
 )
+
+
+_SELECTION_ID_PATTERN = re.compile(r"selection-[0-9a-f]{16}")
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 def collect_system_metadata() -> dict[str, Any]:
@@ -110,6 +115,50 @@ def collect_dataset_provenance(
         "request_log",
     )
     return {"status": "ready", "path": str(marker), **{key: payload.get(key) for key in keys}}
+
+
+def collect_selection_provenance() -> dict[str, Any]:
+    """Collect the non-secret selection identity already checked by the mounted gate."""
+
+    selection_id = os.environ.get("RUNPOD_SELECTION_ID", "")
+    selection_sha256 = os.environ.get("RUNPOD_SELECTION_SHA256", "")
+    dataset_request_sha256 = os.environ.get("RUNPOD_DATASET_REQUEST_SHA256", "")
+    if not selection_id and not os.environ.get("RUNPOD_POD_ID"):
+        return {"status": "unavailable"}
+    if _SELECTION_ID_PATTERN.fullmatch(selection_id) is None:
+        raise ValueError("RunPod selection ID is unavailable or invalid")
+    if _SHA256_PATTERN.fullmatch(selection_sha256) is None:
+        raise ValueError("RunPod selection digest is unavailable or invalid")
+    if _SHA256_PATTERN.fullmatch(dataset_request_sha256) is None:
+        raise ValueError("RunPod dataset request digest is unavailable or invalid")
+
+    volume_root = canonical_network_volume_root()
+    marker = Path(
+        os.environ.get(
+            "DATASET_READINESS_MANIFEST",
+            str(volume_root / "lifecycle/stage1/dataset.json"),
+        )
+    )
+    if not marker.is_file():
+        raise FileNotFoundError(f"RunPod dataset readiness marker is missing: {marker}")
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    expected = {
+        "selection_id": selection_id,
+        "selection_sha256": selection_sha256,
+        "dataset_request_sha256": dataset_request_sha256,
+        "selected_stage": os.environ.get("RUNPOD_STAGE", ""),
+        "stage_config_sha256": os.environ.get("RUNPOD_STAGE_CONFIG_SHA256", ""),
+    }
+    for key, value in expected.items():
+        if payload.get(key) != value:
+            raise ValueError(f"RunPod selection provenance disagrees on {key}")
+    return {
+        "status": "ready",
+        "path": str(marker),
+        **expected,
+        "stage_config_path": payload.get("stage_config_path"),
+        "requested_dataset": payload.get("requested_dataset"),
+    }
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -348,6 +397,7 @@ def _start_wandb(config: ExperimentConfig) -> Any:
             **config.as_dict(),
             "system": collect_system_metadata(),
             "dataset_provenance": collect_dataset_provenance(config),
+            "selection_provenance": collect_selection_provenance(),
         },
         dir=str(config.wandb.directory),
         mode=config.wandb.mode,
@@ -393,6 +443,7 @@ def start_tracking(config: ExperimentConfig) -> TrackingRun:
                         **config.as_dict(),
                         "system": collect_system_metadata(),
                         "dataset_provenance": collect_dataset_provenance(config),
+                        "selection_provenance": collect_selection_provenance(),
                     },
                     dir=str(config.wandb.directory),
                     mode="offline",
@@ -461,6 +512,7 @@ def start_tracking(config: ExperimentConfig) -> TrackingRun:
                     "created_at": datetime.now(UTC).isoformat(),
                     "system": collect_system_metadata(),
                     "dataset_provenance": collect_dataset_provenance(config),
+                    "selection_provenance": collect_selection_provenance(),
                 },
             )
             if run_directory.exists():

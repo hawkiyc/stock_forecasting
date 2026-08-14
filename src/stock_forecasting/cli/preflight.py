@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import argparse
 
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.preflight import run_preflight
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.preflight import run_preflight
 
 
 def parse_args() -> argparse.Namespace:

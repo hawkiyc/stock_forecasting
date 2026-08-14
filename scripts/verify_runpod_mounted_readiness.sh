@@ -14,6 +14,8 @@ LIFECYCLE_ROOT="${LIFECYCLE_ROOT:-${NETWORK_VOLUME_ROOT}/lifecycle}"
 CODE_MARKER="${LIFECYCLE_ROOT}/stage1/code.json"
 DATASET_MARKER="${LIFECYCLE_ROOT}/stage1/dataset.json"
 RUNPOD_CONFIG="${RUNPOD_CONFIG:-configs/stage1_kronos_base_lora.yaml}"
+RUNPOD_SELECTION_HELPER="${PROJECT_ROOT}/scripts/runpod_selection.py"
+RUNPOD_REMOTE_SELECTION_PATH="${RUNPOD_REMOTE_SELECTION_PATH:-}"
 
 if [[ -z "${RUNPOD_POD_ID:-}" && "${RUNPOD_TEST_MODE:-0}" != "1" ]]; then
     echo "Mounted readiness verification must run inside a RunPod Pod" >&2
@@ -26,7 +28,8 @@ case "${NETWORK_VOLUME_ROOT}" in
         exit 2
         ;;
 esac
-for path_name in PROJECT_ROOT LIFECYCLE_ROOT CODE_MARKER DATASET_MARKER; do
+for path_name in PROJECT_ROOT LIFECYCLE_ROOT CODE_MARKER DATASET_MARKER \
+    RUNPOD_SELECTION_HELPER RUNPOD_REMOTE_SELECTION_PATH; do
     runpod_validate_path_in_root \
         "${!path_name}" "${NETWORK_VOLUME_ROOT}" "${path_name}" NETWORK_VOLUME_ROOT
 done
@@ -57,6 +60,12 @@ if [[ ! -f "${CONFIG_PATH}" || -L "${CONFIG_PATH}" ]]; then
     echo "RUNPOD_CONFIG is missing or is a symlink: ${CONFIG_PATH}" >&2
     exit 2
 fi
+if [[ ! -f "${RUNPOD_SELECTION_HELPER}" || -L "${RUNPOD_SELECTION_HELPER}" \
+    || ! -f "${RUNPOD_REMOTE_SELECTION_PATH}" \
+    || -L "${RUNPOD_REMOTE_SELECTION_PATH}" ]]; then
+    echo "Mounted immutable training selection is unavailable" >&2
+    exit 2
+fi
 
 "${RUNPOD_PYTHON_BIN}" "${SCRIPT_DIR}/runpod_readiness.py" quarantine-stale-code \
     --marker "${CODE_MARKER}" \
@@ -65,6 +74,13 @@ fi
 "${RUNPOD_PYTHON_BIN}" "${SCRIPT_DIR}/runpod_readiness.py" check-code \
     --marker "${CODE_MARKER}" \
     --project-root "${PROJECT_ROOT}"
+"${RUNPOD_PYTHON_BIN}" "${RUNPOD_SELECTION_HELPER}" verify-environment \
+    --project-root "${PROJECT_ROOT}" \
+    --selection "${RUNPOD_REMOTE_SELECTION_PATH}"
+"${RUNPOD_PYTHON_BIN}" "${RUNPOD_SELECTION_HELPER}" verify-marker \
+    --project-root "${PROJECT_ROOT}" \
+    --selection "${RUNPOD_REMOTE_SELECTION_PATH}" \
+    --marker "${DATASET_MARKER}"
 "${RUNPOD_PYTHON_BIN}" "${SCRIPT_DIR}/runpod_readiness.py" check-dataset \
     --marker "${DATASET_MARKER}" \
     --code-marker "${CODE_MARKER}" \

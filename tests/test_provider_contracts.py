@@ -10,12 +10,28 @@ from typing import Any
 import pytest
 import requests
 
-from fin_ts_multimodal.data.ingestion import _explicit_instruments
-from fin_ts_multimodal.data.providers.base import Instrument, RequestRecord
-from fin_ts_multimodal.data.providers.eodhd import EODHDProvider
-from fin_ts_multimodal.data.providers.http import CachedJsonClient, NetworkRequestBudget
-from fin_ts_multimodal.data.providers.massive import MassiveProvider
-from fin_ts_multimodal.data.providers.taiwan import TWSEProvider
+from stock_forecasting.data.download_progress import DownloadProgress
+from stock_forecasting.data.ingestion import (
+    _ensure_us_benchmark,
+    _explicit_instruments,
+    _inclusive_end,
+    _limit_instruments,
+)
+from stock_forecasting.data.providers.base import Instrument, RequestRecord
+from stock_forecasting.data.providers.eodhd import (
+    EODHD_DEFAULT_DAILY_API_CALL_LIMIT,
+    EODHD_DEFAULT_REQUESTS_PER_MINUTE,
+    EODHD_DEFAULT_REQUESTS_PER_SECOND,
+    EODHDProvider,
+)
+from stock_forecasting.data.providers.http import (
+    CachedJsonClient,
+    NetworkRequestBudget,
+    NetworkRequestBudgetExceeded,
+    ProviderRequestError,
+)
+from stock_forecasting.data.providers.massive import MassiveProvider
+from stock_forecasting.data.providers.taiwan import TWSEProvider
 
 
 class _FakeSession:
@@ -109,7 +125,7 @@ def test_shared_network_budget_counts_retries_and_fails_closed(tmp_path: Path) -
         sleeper=lambda _seconds: None,
     )
 
-    with pytest.raises(RuntimeError, match="budget exhausted"):
+    with pytest.raises(NetworkRequestBudgetExceeded, match="budget exhausted"):
         client.get_json("https://example.invalid/eod/AAPL.US", params={})
     assert budget.network_requests == 2
     assert budget.provider_counts == {"eodhd": 2}
@@ -141,10 +157,108 @@ def test_non_retryable_http_error_consumes_only_one_attempt(tmp_path: Path) -> N
         sleeper=lambda _seconds: None,
     )
 
-    with pytest.raises(RuntimeError, match="after 1 attempt"):
+    with pytest.raises(ProviderRequestError, match="after 1 attempt") as captured:
         client.get_json("https://example.invalid/eod/AAPL.US", params={})
+    assert captured.value.category == "provider_rejected"
+    assert captured.value.status_code == 401
+    assert not captured.value.retryable
     assert session.calls == 1
     assert budget.network_requests == 1
+
+
+def test_rate_limit_failure_exposes_safe_resume_metadata(tmp_path: Path) -> None:
+    class _RateLimitedSession:
+        def get(self, _endpoint: str, **_kwargs: Any) -> requests.Response:
+            response = requests.Response()
+            response.status_code = 429
+            response._content = b'{"error":"rate limited"}'
+            response.headers = {
+                "Retry-After": "86400",
+                "X-RateLimit-Limit": "1000",
+                "X-RateLimit-Remaining": "0",
+            }
+            return response
+
+    client = CachedJsonClient(
+        provider="eodhd",
+        raw_cache_root=tmp_path,
+        max_requests_per_second=10.0,
+        max_attempts=1,
+        session=_RateLimitedSession(),
+        clock=lambda: 1.0,
+        sleeper=lambda _seconds: None,
+    )
+
+    with pytest.raises(ProviderRequestError) as captured:
+        client.get_json("https://example.invalid/eod/AAPL.US", params={})
+
+    assert captured.value.metadata() == {
+        "category": "rate_limited",
+        "provider": "eodhd",
+        "attempts": 1,
+        "retryable": True,
+        "status_code": 429,
+        "retry_after_seconds": 86400.0,
+        "rate_limit_limit": 1000,
+        "rate_limit_remaining": 0,
+    }
+
+
+def test_new_client_reuses_successful_cache_after_rate_limit_interruption(
+    tmp_path: Path,
+) -> None:
+    first_session = _FakeSession([{"date": "2026-01-02", "close": 100.0}])
+    first_client = CachedJsonClient(
+        provider="eodhd",
+        raw_cache_root=tmp_path,
+        max_requests_per_second=10.0,
+        session=first_session,
+        clock=lambda: 1.0,
+        sleeper=lambda _seconds: None,
+    )
+    first_client.get_json("https://example.invalid/eod/AAPL.US", params={})
+
+    class _RateLimitedSession:
+        def get(self, _endpoint: str, **_kwargs: Any) -> requests.Response:
+            response = requests.Response()
+            response.status_code = 429
+            response._content = b"{}"
+            response.headers = {}
+            return response
+
+    interrupted_client = CachedJsonClient(
+        provider="eodhd",
+        raw_cache_root=tmp_path,
+        max_requests_per_second=10.0,
+        max_attempts=1,
+        session=_RateLimitedSession(),
+        clock=lambda: 1.0,
+        sleeper=lambda _seconds: None,
+    )
+    with pytest.raises(ProviderRequestError, match="rate_limited"):
+        interrupted_client.get_json("https://example.invalid/eod/MSFT.US", params={})
+
+    resumed_session = _FakeSession([{"date": "2026-01-02", "close": 200.0}])
+    resumed_client = CachedJsonClient(
+        provider="eodhd",
+        raw_cache_root=tmp_path,
+        max_requests_per_second=10.0,
+        session=resumed_session,
+        clock=lambda: 1.0,
+        sleeper=lambda _seconds: None,
+    )
+    _, cached = resumed_client.get_json(
+        "https://example.invalid/eod/AAPL.US",
+        params={},
+    )
+    _, downloaded = resumed_client.get_json(
+        "https://example.invalid/eod/MSFT.US",
+        params={},
+    )
+
+    assert cached.cache_hit
+    assert not downloaded.cache_hit
+    assert len(resumed_session.calls) == 1
 
 
 def test_http_failure_traceback_never_exposes_api_token(tmp_path: Path) -> None:
@@ -215,48 +329,60 @@ def test_eodhd_preserves_total_return_anchor_and_split_adjusted_volume() -> None
     assert fetched.frame.loc[0, "adjusted_close"] == pytest.approx(51.0)
     assert fetched.frame.loc[0, "split_adjusted_volume"] == pytest.approx(1000.0)
     assert fetched.frame.loc[0, "adjustment_source"] == (
-        "eodhd_adjusted_close+calendar_splits"
+        "eodhd_adjusted_close+historical_splits"
     )
 
 
-def test_eodhd_split_calendar_is_one_exchange_wide_typed_request() -> None:
+def test_eodhd_end_boundary_is_converted_from_exclusive_to_inclusive() -> None:
+    assert _inclusive_end("2026-04-30") == "2026-04-29"
+
+
+def test_delisted_instrument_rows_keep_discovery_time_status() -> None:
     client = _StubClient(
-        {
-            "splits": [
-                {
-                    "code": "AAPL.US",
-                    "split_date": "2026-01-15",
-                    "old_shares": 1,
-                    "new_shares": 4,
-                },
-                {
-                    "code": "NOT-US.LSE",
-                    "split_date": "2026-01-20",
-                    "old_shares": 1,
-                    "new_shares": 2,
-                },
-            ]
-        }
+        [
+            {
+                "date": "2010-01-04",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "adjusted_close": 10.5,
+                "volume": 1000,
+            },
+            {
+                "date": "2020-06-30",
+                "open": 20.0,
+                "high": 21.0,
+                "low": 19.0,
+                "close": 20.5,
+                "adjusted_close": 20.5,
+                "volume": 2000,
+            },
+        ]
     )
-    fetched = EODHDProvider(client, api_token="fixture-token").fetch_split_events(
-        start="2026-01-01",
-        end="2026-01-31",
+    instrument = Instrument(
+        "FORMER.US",
+        "FORMER.US",
+        "stock",
+        "US",
+        "USD",
+        False,
     )
 
-    assert len(client.calls) == 1
-    assert client.calls[0][0].endswith("/calendar/splits")
-    assert fetched.metadata["split_events"] == 1
-    row = fetched.frame.iloc[0]
-    assert row["symbol"] == "AAPL.US"
-    assert row["price_factor"] == pytest.approx(0.25)
-    assert row["share_multiplier"] == pytest.approx(4.0)
+    fetched = EODHDProvider(client, api_token="fixture-token").fetch_instrument(
+        instrument,
+        start="2005-01-01",
+        end="2026-04-29",
+        dataset_profile="us_only_eodhd",
+    )
 
-
-def test_eodhd_split_calendar_rejects_pre_2015_silent_coverage_gap() -> None:
-    provider = EODHDProvider(_StubClient({"splits": []}), api_token="fixture-token")
-
-    with pytest.raises(ValueError, match="begins at 2015-01-01"):
-        provider.fetch_split_events(start="2010-01-01", end="2014-12-31")
+    assert list(fetched.frame["timestamp"].dt.strftime("%Y-%m-%d")) == [
+        "2010-01-04",
+        "2020-06-30",
+    ]
+    assert list(fetched.frame["is_active"]) == [False, False]
+    assert client.calls[0][1]["from"] == "2005-01-01"
+    assert client.calls[0][1]["to"] == "2026-04-29"
 
 
 def test_eodhd_historical_splits_parse_new_over_old_ratio() -> None:
@@ -278,7 +404,7 @@ def test_eodhd_historical_splits_parse_new_over_old_ratio() -> None:
     )
 
     assert client.calls[0][0].endswith("/splits/AAPL.US")
-    assert fetched.metadata["coverage"] == "per_symbol_full_history"
+    assert fetched.metadata["coverage"] == "provider_historical_splits_response"
     assert list(fetched.frame["share_multiplier"]) == pytest.approx([7.0, 4.0])
     assert list(fetched.frame["price_factor"]) == pytest.approx([1.0 / 7.0, 0.25])
 
@@ -318,6 +444,116 @@ def test_explicit_etf_only_universe_does_not_require_stock_symbols() -> None:
     instruments = _explicit_instruments((), ("SPY", "QQQ.US"))
     assert [item.canonical_symbol for item in instruments] == ["QQQ.US", "SPY.US"]
     assert {item.asset_type for item in instruments} == {"etf"}
+
+
+def test_symbol_limit_keeps_n_per_asset_type_before_benchmark_insertion() -> None:
+    instruments = [
+        Instrument("ZZZ.US", "ZZZ.US", "etf", "US", "USD", True),
+        Instrument("AAA.US", "AAA.US", "etf", "US", "USD", False),
+        Instrument("BBB.US", "BBB.US", "etf", "US", "USD", True),
+        Instrument("MSFT.US", "MSFT.US", "stock", "US", "USD", True),
+        Instrument("AAPL.US", "AAPL.US", "stock", "US", "USD", True),
+        Instrument("AAA-S.US", "AAA-S.US", "stock", "US", "USD", False),
+    ]
+
+    limited = _limit_instruments(instruments, 2)
+    with_benchmark = _ensure_us_benchmark(limited)
+
+    assert [item.canonical_symbol for item in limited] == [
+        "BBB.US",
+        "ZZZ.US",
+        "AAPL.US",
+        "MSFT.US",
+    ]
+    assert [item.canonical_symbol for item in with_benchmark] == [
+        "BBB.US",
+        "ZZZ.US",
+        "AAPL.US",
+        "MSFT.US",
+        "VTI.US",
+    ]
+
+
+def test_existing_vti_benchmark_is_not_added_twice() -> None:
+    instruments = [
+        Instrument("VTI.US", "VTI.US", "etf", "US", "USD", True),
+        Instrument("AAPL.US", "AAPL.US", "stock", "US", "USD", True),
+    ]
+
+    assert _ensure_us_benchmark(instruments) == instruments
+
+
+def test_eodhd_paid_plan_limits_define_pipeline_defaults() -> None:
+    assert EODHD_DEFAULT_DAILY_API_CALL_LIMIT == 100000
+    assert EODHD_DEFAULT_REQUESTS_PER_MINUTE == 1000
+    assert EODHD_DEFAULT_REQUESTS_PER_SECOND == pytest.approx(16.0)
+    assert EODHD_DEFAULT_REQUESTS_PER_SECOND * 60.0 == pytest.approx(960.0)
+    assert (
+        EODHD_DEFAULT_REQUESTS_PER_SECOND * 60.0
+        < EODHD_DEFAULT_REQUESTS_PER_MINUTE
+    )
+
+
+def test_download_progress_persists_quota_state_and_attempt_number(tmp_path: Path) -> None:
+    cache_root = tmp_path / "api-cache"
+    cached_response = cache_root / "eodhd" / "aa" / f"{'a' * 64}.json"
+    cached_response.parent.mkdir(parents=True)
+    cached_response.write_text("[]", encoding="utf-8")
+    identity = {
+        "dataset_profile": "us_only_eodhd",
+        "dataset_request_sha256": "b" * 64,
+    }
+    progress_path = tmp_path / "download-progress.json"
+    budget = NetworkRequestBudget(100)
+    progress = DownloadProgress(
+        path=progress_path,
+        raw_cache_root=cache_root,
+        identity=identity,
+    )
+    progress.start(budget)
+    state = progress.fail(
+        ProviderRequestError(
+            provider="eodhd",
+            category="rate_limited",
+            attempts=3,
+            retryable=True,
+            status_code=429,
+        ),
+        budget,
+    )
+
+    waiting_payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert state == "waiting_for_provider"
+    assert waiting_payload["state"] == "waiting_for_provider"
+    assert waiting_payload["cache"]["responses"] == 1
+    assert waiting_payload["attempt"]["number"] == 1
+
+    resumed = DownloadProgress(
+        path=progress_path,
+        raw_cache_root=cache_root,
+        identity=identity,
+    )
+    resumed.start(NetworkRequestBudget(100))
+    resumed_payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert resumed_payload["state"] == "in_progress"
+    assert resumed_payload["attempt"]["number"] == 2
+
+
+def test_download_progress_rejects_a_different_dataset_identity(tmp_path: Path) -> None:
+    progress_path = tmp_path / "download-progress.json"
+    first = DownloadProgress(
+        path=progress_path,
+        raw_cache_root=tmp_path / "api-cache",
+        identity={"dataset_request_sha256": "a" * 64},
+    )
+    first.start(NetworkRequestBudget(10))
+
+    with pytest.raises(ValueError, match="different dataset request"):
+        DownloadProgress(
+            path=progress_path,
+            raw_cache_root=tmp_path / "api-cache",
+            identity={"dataset_request_sha256": "b" * 64},
+        )
 
 
 def test_massive_channel_is_reserved_but_typed() -> None:

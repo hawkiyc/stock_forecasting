@@ -8,13 +8,13 @@ from pathlib import Path
 
 import torch
 
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.data.manifest import (
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.data.manifest import (
     validate_dataset_preparation_contract,
     validate_training_dataset_manifest,
 )
-from fin_ts_multimodal.factory import verify_kronos_source_revision
-from fin_ts_multimodal.training_paths import resolve_processed_dataset_path
+from stock_forecasting.factory import verify_kronos_source_revision
+from stock_forecasting.training_paths import resolve_processed_dataset_path
 
 
 @dataclass

@@ -11,19 +11,19 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from fin_ts_multimodal.baselines import baseline_arrays
-from fin_ts_multimodal.data.adjustments import asof_adjusted_window
-from fin_ts_multimodal.data.dataset import FinancialBatchCollator, FinancialWindowDataset
-from fin_ts_multimodal.data.manifest import (
+from stock_forecasting.baselines import baseline_arrays
+from stock_forecasting.data.adjustments import asof_adjusted_window
+from stock_forecasting.data.dataset import FinancialBatchCollator, FinancialWindowDataset
+from stock_forecasting.data.manifest import (
     artifact_metadata,
     atomic_write_json,
     canonical_json_sha256,
     validate_dataset_preparation_contract,
     validate_training_dataset_manifest,
 )
-from fin_ts_multimodal.data.schema import MarketDataValidationError, normalize_ohlcv_frame
-from fin_ts_multimodal.data.windows import DEFAULT_ALPHA_HORIZONS, build_causal_windows
-from fin_ts_multimodal.training import deterministic_stratified_indices
+from stock_forecasting.data.schema import MarketDataValidationError, normalize_ohlcv_frame
+from stock_forecasting.data.windows import DEFAULT_ALPHA_HORIZONS, build_causal_windows
+from stock_forecasting.training import deterministic_stratified_indices
 
 
 def test_causal_records_have_paired_historical_inputs_and_future_labels_only(

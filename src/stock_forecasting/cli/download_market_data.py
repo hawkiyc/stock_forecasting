@@ -5,9 +5,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
-from fin_ts_multimodal.data.ingestion import IngestionOptions, ingest_daily_ohlcv
+from stock_forecasting.data.ingestion import IngestionOptions, ingest_daily_ohlcv
+from stock_forecasting.data.providers import (
+    EODHD_DEFAULT_DAILY_API_CALL_LIMIT,
+    EODHD_DEFAULT_REQUESTS_PER_SECOND,
+    ProviderRequestError,
+)
+
+TEMPORARY_PROVIDER_EXIT_CODE = 75
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,10 +47,53 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--manifest-root", type=Path)
     parser.add_argument("--raw-cache-root", type=Path)
-    parser.add_argument("--symbol-limit", type=int)
-    parser.add_argument("--max-api-calls", type=int, default=90_000)
-    parser.add_argument("--eodhd-qps", type=float, default=5.0)
-    parser.add_argument("--taiwan-qps", type=float, default=0.5)
+    parser.add_argument(
+        "--progress-path",
+        type=Path,
+        help="Persistent progress JSON used to resume the same dataset request.",
+    )
+    parser.add_argument(
+        "--dataset-request-sha256",
+        default=os.environ.get("RUNPOD_DATASET_REQUEST_SHA256"),
+    )
+    parser.add_argument("--selection-id", default=os.environ.get("RUNPOD_SELECTION_ID"))
+    parser.add_argument(
+        "--selection-sha256",
+        default=os.environ.get("RUNPOD_SELECTION_SHA256"),
+    )
+    parser.add_argument("--launch-id", default=os.environ.get("RUNPOD_LAUNCH_ID"))
+    parser.add_argument(
+        "--symbol-limit",
+        type=int,
+        help=(
+            "Deterministic bounded US-discovery check: keep up to N ETFs and N "
+            "stocks, then add the required VTI benchmark."
+        ),
+    )
+    parser.add_argument(
+        "--max-api-calls",
+        type=int,
+        default=EODHD_DEFAULT_DAILY_API_CALL_LIMIT,
+        help=(
+            "Project-side HTTP request safety ceiling; defaults to the official "
+            "paid-plan daily API-call limit but remains distinct from provider usage."
+        ),
+    )
+    parser.add_argument(
+        "--eodhd-qps",
+        type=float,
+        default=EODHD_DEFAULT_REQUESTS_PER_SECOND,
+        help=(
+            "Even EODHD pacing in requests/second; the default floors the official "
+            "1000 requests/minute limit to 16 requests/second (960/minute)."
+        ),
+    )
+    parser.add_argument(
+        "--taiwan-qps",
+        type=float,
+        default=0.5,
+        help="Short-term TWSE/TPEx request pacing.",
+    )
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument(
         "--exclude-delisted",
@@ -75,11 +126,31 @@ def main(argv: list[str] | None = None) -> int:
         eodhd_requests_per_second=args.eodhd_qps,
         taiwan_requests_per_second=args.taiwan_qps,
         max_attempts=args.max_attempts,
+        progress_path=args.progress_path,
+        dataset_request_sha256=args.dataset_request_sha256,
+        selection_id=args.selection_id,
+        selection_sha256=args.selection_sha256,
+        launch_id=args.launch_id,
     )
-    payload = ingest_daily_ohlcv(
-        options,
-        eodhd_api_token=os.environ.get("EODHD_API_TOKEN"),
-    )
+    try:
+        payload = ingest_daily_ohlcv(
+            options,
+            eodhd_api_token=os.environ.get("EODHD_API_TOKEN"),
+        )
+    except ProviderRequestError as error:
+        if not error.retryable:
+            raise
+        waiting = {
+            "state": "waiting_for_provider",
+            "exit_code": TEMPORARY_PROVIDER_EXIT_CODE,
+            "progress_path": str(
+                options.progress_path
+                or options.manifest_root / "download-progress.json"
+            ),
+            "provider_error": error.metadata(),
+        }
+        print(json.dumps(waiting, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+        return TEMPORARY_PROVIDER_EXIT_CODE
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 0
 

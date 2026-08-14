@@ -266,7 +266,7 @@ def _dataset_contract(readiness_payload, dataset_payload, dataset_manifest_sha25
             raise ValueError(f"Dataset readiness marker and dataset manifest disagree on {key}")
     return {
         "status": "ready",
-        "path": "/runpod-volume/data/dataset-manifest.json",
+        "path": f"/runpod-volume/{readiness_dataset_manifest['relative_path']}",
         "sha256": dataset_manifest_sha256,
         "dataset_profile": dataset_payload["dataset_profile"],
         "selected_datasets": dataset_payload["selected_datasets"],
@@ -378,8 +378,12 @@ def validate_remote_checkpoint_run(
         "lifecycle/stage1/dataset.json",
         "dataset readiness manifest",
     )
+    dataset_manifest_artifact = _dataset_artifact(
+        dataset_readiness,
+        "dataset_manifest",
+    )
     dataset_manifest_bytes = reader.bytes_object(
-        "data/dataset-manifest.json",
+        dataset_manifest_artifact["relative_path"],
         "numerical dataset manifest",
     )
     try:

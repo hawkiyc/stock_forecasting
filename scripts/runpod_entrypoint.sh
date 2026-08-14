@@ -405,7 +405,7 @@ fi
 
 # Invoke the installed modules with the persistent Poetry-managed interpreter.
 # This avoids an extra Poetry/Cleo option-parsing layer around supervisor flags.
-"${PROJECT_VENV}/bin/python" -m fin_ts_multimodal.runpod.supervisor \
+"${PROJECT_VENV}/bin/python" -m stock_forecasting.runpod.supervisor \
     --max-runtime-seconds "${MAX_RUNTIME_SECONDS}" \
     --no-auto-shutdown \
     -- "$@" &

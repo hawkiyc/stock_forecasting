@@ -8,9 +8,9 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from fin_ts_multimodal.config import DataConfig, ExperimentConfig
-from fin_ts_multimodal.models import MODEL_OUTPUT_SCHEMA_VERSION
-from fin_ts_multimodal.run_contract import (
+from stock_forecasting.config import DataConfig, ExperimentConfig
+from stock_forecasting.models import MODEL_OUTPUT_SCHEMA_VERSION
+from stock_forecasting.run_contract import (
     TRAINING_IMPLEMENTATION_PATHS,
     TRAINING_RESUME_CONTRACT_VERSION,
     training_implementation_contract,

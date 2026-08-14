@@ -10,23 +10,23 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from fin_ts_multimodal.checkpointing import (
+from stock_forecasting.checkpointing import (
     _load_trainable_model_state,
     _validate_loaded_model_contract,
     trainable_state_dict,
 )
-from fin_ts_multimodal.cli.prefetch_models import prefetch_repositories
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.data import FinancialBatchCollator, FinancialWindowDataset
-from fin_ts_multimodal.factory import _promote_trainable_parameters_to_fp32, build_model_bundle
-from fin_ts_multimodal.models.backbones import (
+from stock_forecasting.cli.prefetch_models import prefetch_repositories
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.data import FinancialBatchCollator, FinancialWindowDataset
+from stock_forecasting.factory import _promote_trainable_parameters_to_fp32, build_model_bundle
+from stock_forecasting.models.backbones import (
     DeterministicTimeSeriesBackbone,
     KronosBackbone,
 )
-from fin_ts_multimodal.models.lora import LoRALinear, inject_lora, lora_parameter_names
-from fin_ts_multimodal.models.outputs import MODEL_OUTPUT_SCHEMA_VERSION
-from fin_ts_multimodal.run_contract import training_resume_contract_digest
-from fin_ts_multimodal.training import evaluate_loader
+from stock_forecasting.models.lora import LoRALinear, inject_lora, lora_parameter_names
+from stock_forecasting.models.outputs import MODEL_OUTPUT_SCHEMA_VERSION
+from stock_forecasting.run_contract import training_resume_contract_digest
+from stock_forecasting.training import evaluate_loader
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -258,7 +258,7 @@ def test_kronos_loader_passes_independent_pinned_weight_revisions(
             return cls()
 
     monkeypatch.setattr(
-        "fin_ts_multimodal.models.backbones.importlib.import_module",
+        "stock_forecasting.models.backbones.importlib.import_module",
         lambda _name: SimpleNamespace(
             Kronos=LoaderModel,
             KronosTokenizer=LoaderTokenizer,

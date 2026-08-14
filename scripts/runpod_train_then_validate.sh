@@ -78,7 +78,7 @@ for required_path_name in RUNPOD_SHUTDOWN_DIR RUNPOD_TRAINING_LIFECYCLE_MARKER; 
         "${required_path_name}" NETWORK_VOLUME_ROOT
 done
 
-"${PROJECT_VENV}/bin/python" -m fin_ts_multimodal.cli.train --config "${RUNPOD_CONFIG}"
+"${PROJECT_VENV}/bin/python" -m stock_forecasting.cli.train --config "${RUNPOD_CONFIG}"
 
 "${RUNPOD_PYTHON_BIN}" "${READINESS_HELPER}" write-training-completion \
     --output "${IMMUTABLE_TRAINING_COMPLETION_MARKER}" \
@@ -106,7 +106,7 @@ mv "${marker_tmp}" "${TRAINING_COMPLETED_MARKER}"
 
 VALIDATION_AUTO_RUN="$("${PROJECT_VENV}/bin/python" -c \
     'import sys
-from fin_ts_multimodal.config import ExperimentConfig
+from stock_forecasting.config import ExperimentConfig
 config = ExperimentConfig.from_yaml(sys.argv[1])
 print("1" if config.validation.enabled and config.validation.auto_run_after_training else "0")' \
     "${RUNPOD_CONFIG}")"

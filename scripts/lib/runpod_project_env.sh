@@ -137,20 +137,7 @@ runpod_load_create_env() {
     set +x
     runpod_validate_project_env_file "${project_root}"
     for key in \
-        RUNPOD_NETWORK_VOLUME_ID RUNPOD_VOLUME_ROOT NETWORK_VOLUME_ROOT PROJECT_ROOT \
-        DATA_ROOT MODEL_ROOT CACHE_ROOT SAVED_MODEL_ROOT LOG_ROOT \
-        WANDB_DIR HF_HOME TORCH_HOME RUNPOD_IMAGE RUNPOD_PYTHON_BIN \
-        RUNPOD_API_BASE_URL RUNPOD_CPU_FLAVOR_ID RUNPOD_CPU_VCPU_COUNT \
-        RUNPOD_EXPECTED_TORCH_VERSION RUNPOD_EXPECTED_CUDA_PREFIX \
-        RUNPOD_EXPECTED_UBUNTU_VERSION RUNPOD_CONFIG MAX_RUNTIME_SECONDS \
-        RUNPOD_HARD_LIMIT_SECONDS RUNPOD_TERMINATE_AFTER RUNPOD_DATACENTER_ID \
-        RUNPOD_HF_SECRET_NAME RUNPOD_WANDB_SECRET_NAME WANDB_ENTITY WANDB_PROJECT \
-        RUNPOD_CPU_POD_NAME RUNPOD_CPU_CONTAINER_DISK_GB \
-        RUNPOD_CPU_MAX_RUNTIME_SECONDS RUNPOD_CPU_HARD_LIMIT_SECONDS \
-        RUNPOD_EODHD_SECRET_NAME FIN_TS_DATASET_PROFILE \
-        STAGE1_US_SYMBOLS STAGE1_US_ETF_SYMBOLS STAGE1_SYMBOL_LIMIT \
-        STAGE1_DATA_START STAGE1_DATA_END STAGE1_MAX_API_CALLS \
-        STAGE1_EODHD_QPS STAGE1_TAIWAN_QPS; do
+        RUNPOD_NETWORK_VOLUME_ID RUNPOD_DATACENTER_ID; do
         runpod_load_project_env_key "${project_root}" "${key}" optional
     done
     export RUNPOD_ENV_FILE="$(runpod_project_env_file "${project_root}")"
@@ -166,9 +153,6 @@ runpod_load_s3_env() {
     runpod_load_project_env_key "${project_root}" RUNPOD_S3_SECRET_ACCESS_KEY required
     runpod_load_project_env_key "${project_root}" RUNPOD_S3_REGION required
     runpod_load_project_env_key "${project_root}" RUNPOD_S3_ENDPOINT optional
-    runpod_load_project_env_key "${project_root}" RUNPOD_REMOTE_PROJECT_DIR optional
-    runpod_load_project_env_key "${project_root}" RUNPOD_S3_CONNECT_TIMEOUT optional
-    runpod_load_project_env_key "${project_root}" RUNPOD_S3_READ_TIMEOUT optional
     export RUNPOD_ENV_FILE="$(runpod_project_env_file "${project_root}")"
 }
 

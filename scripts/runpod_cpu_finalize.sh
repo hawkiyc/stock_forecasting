@@ -17,6 +17,8 @@ POETRY_VERSION="${POETRY_VERSION:-2.4.0}"
 POETRY_BIN="${RUNPOD_POETRY_BIN:-${NETWORK_VOLUME_ROOT}/tools/poetry/${POETRY_VERSION}/bin/poetry}"
 RUNPOD_PYTHON_BIN="${RUNPOD_PYTHON_BIN:-/usr/local/bin/python}"
 RUNPOD_ROLE="${RUNPOD_ROLE:-cpu-prep}"
+RUNPOD_SELECTION_HELPER="${SCRIPT_DIR}/runpod_selection.py"
+RUNPOD_REMOTE_SELECTION_PATH="${RUNPOD_REMOTE_SELECTION_PATH:-}"
 # Keep the established environment name so existing RunPod launch automation remains compatible.
 STAGE2_CONFIG="${RUNPOD_MIXED_CONFIG:-configs/stage2_kronos_base_lora.yaml}"
 FIN_TS_DATASET_PROFILE="${FIN_TS_DATASET_PROFILE:-us_tw_eodhd}"
@@ -45,6 +47,10 @@ if [[ "${RUNPOD_ROLE}" != "cpu-prep" ]]; then
     echo "Stage 2 contract finalization requires the CPU-only cpu-prep role" >&2
     exit 2
 fi
+if [[ "${RUNPOD_STAGE:-}" != "stage2" ]]; then
+    echo "Stage 2 finalization requires a stage2 selection created before the CPU Pod" >&2
+    exit 2
+fi
 runpod_validate_absolute_path "${NETWORK_VOLUME_ROOT}" NETWORK_VOLUME_ROOT
 if [[ ! "${LAUNCH_ID}" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "RUNPOD_LAUNCH_ID contains unsupported characters" >&2
@@ -61,7 +67,7 @@ for path_name in \
     PROJECT_ROOT DATA_ROOT LOG_ROOT LIFECYCLE_ROOT POETRY_BIN FINALIZE_DIR \
     FINALIZE_LOG METADATA_PATH CODE_MARKER DATASET_MARKER FINALIZATION_MARKER \
     MODEL_MANIFEST DATASET_MANIFEST STAGE2_CONFIG_PATH RUNPOD_SHUTDOWN_DIR \
-    RUNPOD_SHUTDOWN_MARKER; do
+    RUNPOD_SHUTDOWN_MARKER RUNPOD_SELECTION_HELPER RUNPOD_REMOTE_SELECTION_PATH; do
     path_value="${!path_name}"
     case "${path_value}" in
         /workspace|/workspace/*)
@@ -132,6 +138,9 @@ fi
 "${RUNPOD_PYTHON_BIN}" "${SCRIPT_DIR}/runpod_readiness.py" check-code \
     --marker "${CODE_MARKER}" \
     --project-root "${PROJECT_ROOT}"
+"${RUNPOD_PYTHON_BIN}" "${RUNPOD_SELECTION_HELPER}" verify-environment \
+    --project-root "${PROJECT_ROOT}" \
+    --selection "${RUNPOD_REMOTE_SELECTION_PATH}"
 "${RUNPOD_PYTHON_BIN}" "${SCRIPT_DIR}/runpod_readiness.py" check-dataset \
     --marker "${DATASET_MARKER}" \
     --code-marker "${CODE_MARKER}" \
@@ -158,6 +167,11 @@ cd "${PROJECT_ROOT}"
     --volume-root "${NETWORK_VOLUME_ROOT}" \
     --launch-id "${LAUNCH_ID}" \
     --output "${DATASET_MARKER}"
+"${RUNPOD_PYTHON_BIN}" "${RUNPOD_SELECTION_HELPER}" bind-marker \
+    --project-root "${PROJECT_ROOT}" \
+    --selection "${RUNPOD_REMOTE_SELECTION_PATH}" \
+    --marker "${DATASET_MARKER}" \
+    --volume-root "${NETWORK_VOLUME_ROOT}"
 
 write_finalization_state ready
 FINALIZE_SUCCEEDED=1

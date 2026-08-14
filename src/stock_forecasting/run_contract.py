@@ -7,10 +7,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.data.manifest import load_dataset_manifest, sha256_file
-from fin_ts_multimodal.models import MODEL_OUTPUT_SCHEMA_VERSION
-from fin_ts_multimodal.run_paths import validate_run_id, validate_training_resume_path
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.data.manifest import load_dataset_manifest, sha256_file
+from stock_forecasting.models import MODEL_OUTPUT_SCHEMA_VERSION
+from stock_forecasting.run_paths import validate_run_id, validate_training_resume_path
 
 CHECKPOINT_ARTIFACT_SCHEMA_VERSION = "3.0"
 TRAINING_RESUME_CONTRACT_VERSION = "4.0"

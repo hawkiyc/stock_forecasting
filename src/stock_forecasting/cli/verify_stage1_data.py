@@ -11,8 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.data.manifest import (
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.data.manifest import (
     canonical_json_sha256,
     load_dataset_manifest,
     sha256_file,
@@ -22,14 +22,14 @@ from fin_ts_multimodal.data.manifest import (
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PIPELINE_PATHS = (
-    "src/fin_ts_multimodal/cli/prepare_data.py",
-    "src/fin_ts_multimodal/data/adjustments.py",
-    "src/fin_ts_multimodal/data/benchmarks.py",
-    "src/fin_ts_multimodal/data/schema.py",
-    "src/fin_ts_multimodal/data/quality.py",
-    "src/fin_ts_multimodal/data/windows.py",
-    "src/fin_ts_multimodal/data/splits.py",
-    "src/fin_ts_multimodal/data/io.py",
+    "src/stock_forecasting/cli/prepare_data.py",
+    "src/stock_forecasting/data/adjustments.py",
+    "src/stock_forecasting/data/benchmarks.py",
+    "src/stock_forecasting/data/schema.py",
+    "src/stock_forecasting/data/quality.py",
+    "src/stock_forecasting/data/windows.py",
+    "src/stock_forecasting/data/splits.py",
+    "src/stock_forecasting/data/io.py",
 )
 
 
@@ -98,7 +98,7 @@ def _validate_code_manifest(path: Path) -> dict[str, Any]:
     if missing:
         raise ValueError("Code manifest omits numerical pipeline files: " + ", ".join(missing))
     pipeline_payload = {
-        relative.removeprefix("src/fin_ts_multimodal/"): by_path[relative]["sha256"]
+        relative.removeprefix("src/stock_forecasting/"): by_path[relative]["sha256"]
         for relative in _PIPELINE_PATHS
     }
     payload["quant_pipeline_digest"] = canonical_json_sha256(pipeline_payload)

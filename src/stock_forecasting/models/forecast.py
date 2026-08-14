@@ -10,7 +10,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from fin_ts_multimodal.data.windows import DEFAULT_ALPHA_HORIZONS
+from stock_forecasting.data.windows import DEFAULT_ALPHA_HORIZONS
 
 
 class GatedBenchmarkConditioner(nn.Module):

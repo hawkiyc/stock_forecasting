@@ -248,7 +248,16 @@ if type(schema_version) is not int or schema_version != 1:
 if payload.get("kind") != expected_kind or payload.get("pod_id") != expected_pod_id:
     raise SystemExit(2)
 state = payload.get("state")
-if state not in ("preparing", "finalizing", "ready", "failed", "timed_out"):
+if state not in (
+    "preparing",
+    "finalizing",
+    "ready",
+    "failed",
+    "timed_out",
+    "waiting_for_provider",
+):
+    raise SystemExit(2)
+if state == "waiting_for_provider" and expected_kind != "stage1-dataset":
     raise SystemExit(2)
 if state == "ready":
     if expected_kind == "stage1-training" and payload.get("training_completed") is not True:
@@ -284,7 +293,8 @@ print(state)' \
                 fi
                 if [[ "${marker_state}" == "ready" \
                     || "${marker_state}" == "failed" \
-                    || "${marker_state}" == "timed_out" ]]; then
+                    || "${marker_state}" == "timed_out" \
+                    || "${marker_state}" == "waiting_for_provider" ]]; then
                     terminal_state="${marker_state}"
                     terminal_key="${lifecycle_candidate}"
                     break

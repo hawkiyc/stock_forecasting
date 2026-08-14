@@ -21,20 +21,20 @@ dependencies = [
 ]
 
 [project.scripts]
-fin-ts-download = "fin_ts_multimodal.cli.download_market_data:main"
-fin-ts-synthetic = "fin_ts_multimodal.cli.generate_synthetic_data:main"
-fin-ts-prepare = "fin_ts_multimodal.cli.prepare_data:main"
-fin-ts-train = "fin_ts_multimodal.cli.train:main"
-fin-ts-evaluate = "fin_ts_multimodal.cli.evaluate:main"
-fin-ts-infer = "fin_ts_multimodal.cli.infer:main"
-fin-ts-preflight = "fin_ts_multimodal.cli.preflight:main"
-fin-ts-benchmark = "fin_ts_multimodal.cli.benchmark_baselines:main"
-fin-ts-validate-benchmarks = "fin_ts_multimodal.cli.validate_benchmarks:main"
-fin-ts-verify-stage1-data = "fin_ts_multimodal.cli.verify_stage1_data:main"
-fin-ts-supervise = "fin_ts_multimodal.runpod.supervisor:main"
+fin-ts-download = "stock_forecasting.cli.download_market_data:main"
+fin-ts-synthetic = "stock_forecasting.cli.generate_synthetic_data:main"
+fin-ts-prepare = "stock_forecasting.cli.prepare_data:main"
+fin-ts-train = "stock_forecasting.cli.train:main"
+fin-ts-evaluate = "stock_forecasting.cli.evaluate:main"
+fin-ts-infer = "stock_forecasting.cli.infer:main"
+fin-ts-preflight = "stock_forecasting.cli.preflight:main"
+fin-ts-benchmark = "stock_forecasting.cli.benchmark_baselines:main"
+fin-ts-validate-benchmarks = "stock_forecasting.cli.validate_benchmarks:main"
+fin-ts-verify-stage1-data = "stock_forecasting.cli.verify_stage1_data:main"
+fin-ts-supervise = "stock_forecasting.runpod.supervisor:main"
 
 [tool.poetry]
-packages = [{ include = "fin_ts_multimodal", from = "src" }]
+packages = [{ include = "stock_forecasting", from = "src" }]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.3,<10.0"
@@ -65,7 +65,9 @@ ignore = ["B008"]
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/runpod_readiness.py" = ["UP017"]
+"scripts/runpod_selection.py" = ["UP006", "UP007", "UP017", "UP035"]
 "scripts/utc_deadline.py" = ["UP017"]
+"scripts/update_runpod_env.py" = ["UP006", "UP017", "UP035"]
 
 [tool.mypy]
 python_version = "3.12"

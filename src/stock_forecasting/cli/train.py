@@ -7,15 +7,15 @@ import hashlib
 import os
 from pathlib import Path
 
-from fin_ts_multimodal.checkpointing import validate_checkpoint_selection
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.run_contract import validate_training_resume_contract
-from fin_ts_multimodal.run_paths import (
+from stock_forecasting.checkpointing import validate_checkpoint_selection
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.run_contract import validate_training_resume_contract
+from stock_forecasting.run_paths import (
     canonical_network_volume_root,
     validate_run_environment_ids,
     validate_training_resume_path,
 )
-from fin_ts_multimodal.training import train, write_training_result
+from stock_forecasting.training import train, write_training_result
 
 
 def parse_args() -> argparse.Namespace:

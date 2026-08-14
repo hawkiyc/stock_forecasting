@@ -10,17 +10,17 @@ from typing import Any, Literal, cast
 
 import torch
 
-from fin_ts_multimodal.checkpointing import load_checkpoint, validate_checkpoint_selection
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.data.manifest import provenance_summary
-from fin_ts_multimodal.evaluation_paths import (
+from stock_forecasting.checkpointing import load_checkpoint, validate_checkpoint_selection
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.data.manifest import provenance_summary
+from stock_forecasting.evaluation_paths import (
     checkpoint_run_id,
     validate_checkpoint_evaluation_output,
 )
-from fin_ts_multimodal.factory import build_model_bundle
-from fin_ts_multimodal.preflight import run_preflight
-from fin_ts_multimodal.run_paths import validate_checkpoint_path, validate_run_id
-from fin_ts_multimodal.training import build_dataloaders, evaluate_loader, set_global_seed
+from stock_forecasting.factory import build_model_bundle
+from stock_forecasting.preflight import run_preflight
+from stock_forecasting.run_paths import validate_checkpoint_path, validate_run_id
+from stock_forecasting.training import build_dataloaders, evaluate_loader, set_global_seed
 
 EvaluationSplit = Literal["validation", "test"]
 

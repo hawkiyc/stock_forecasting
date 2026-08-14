@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from fin_ts_multimodal.baselines import (
+from stock_forecasting.baselines import (
     RULE_BASELINE_NAMES,
     BaselineArrays,
     GradientBoostingBaseline,
@@ -25,15 +25,15 @@ from fin_ts_multimodal.baselines import (
     fit_patchtst,
     rule_baseline_suite,
 )
-from fin_ts_multimodal.cli.evaluate import evaluate_checkpoint, resolve_checkpoint
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.data import FinancialWindowDataset
-from fin_ts_multimodal.data.io import read_processed_records
-from fin_ts_multimodal.run_contract import (
+from stock_forecasting.cli.evaluate import evaluate_checkpoint, resolve_checkpoint
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.data import FinancialWindowDataset
+from stock_forecasting.data.io import read_processed_records
+from stock_forecasting.run_contract import (
     training_resume_contract_fingerprint,
     validate_training_resume_contract,
 )
-from fin_ts_multimodal.run_paths import (
+from stock_forecasting.run_paths import (
     LIFECYCLE_SCHEMA_VERSION,
     checkpoint_run_directory,
     validate_checkpoint_path,
@@ -45,7 +45,7 @@ from fin_ts_multimodal.run_paths import (
     validate_validation_lifecycle_path,
     validate_wandb_directory,
 )
-from fin_ts_multimodal.training import (
+from stock_forecasting.training import (
     deterministic_stratified_indices,
     resolve_processed_dataset,
 )

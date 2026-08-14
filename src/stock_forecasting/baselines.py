@@ -15,8 +15,8 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from fin_ts_multimodal.data.windows import DEFAULT_ALPHA_HORIZONS
-from fin_ts_multimodal.metrics import cross_sectional_metrics, multi_horizon_alpha_metrics
+from stock_forecasting.data.windows import DEFAULT_ALPHA_HORIZONS
+from stock_forecasting.metrics import cross_sectional_metrics, multi_horizon_alpha_metrics
 
 ALPHA_QUANTILES = (0.1, 0.5, 0.9)
 RULE_BASELINE_NAMES = (

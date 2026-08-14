@@ -9,9 +9,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fin_ts_multimodal.data.adjustments import robust_horizon_scales
-from fin_ts_multimodal.data.io import write_processed_records
-from fin_ts_multimodal.data.manifest import (
+from stock_forecasting.data.adjustments import robust_horizon_scales
+from stock_forecasting.data.io import write_processed_records
+from stock_forecasting.data.manifest import (
     DATASET_MANIFEST_SCHEMA_VERSION,
     artifact_metadata,
     atomic_write_json,
@@ -19,10 +19,10 @@ from fin_ts_multimodal.data.manifest import (
     load_dataset_manifest,
     sha256_file,
 )
-from fin_ts_multimodal.data.quality import assess_ohlcv_quality
-from fin_ts_multimodal.data.schema import read_market_data
-from fin_ts_multimodal.data.splits import chronological_split
-from fin_ts_multimodal.data.windows import (
+from stock_forecasting.data.quality import assess_ohlcv_quality
+from stock_forecasting.data.schema import read_market_data
+from stock_forecasting.data.splits import chronological_split
+from stock_forecasting.data.windows import (
     DEFAULT_ALPHA_HORIZONS,
     PROCESSED_SCHEMA_VERSION,
     build_causal_windows,

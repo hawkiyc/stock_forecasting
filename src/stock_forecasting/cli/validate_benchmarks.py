@@ -9,13 +9,13 @@ from pathlib import Path
 
 import torch
 
-from fin_ts_multimodal.config import ExperimentConfig
-from fin_ts_multimodal.run_paths import (
+from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.run_paths import (
     canonical_network_volume_root,
     validate_validation_lifecycle_path,
     validate_wandb_directory,
 )
-from fin_ts_multimodal.validation_benchmark import (
+from stock_forecasting.validation_benchmark import (
     ALL_VALIDATION_MODELS,
     ValidationBenchmark,
     discover_checkpoint,

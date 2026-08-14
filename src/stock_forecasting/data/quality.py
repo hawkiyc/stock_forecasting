@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from fin_ts_multimodal.data.schema import normalize_ohlcv_frame
+from stock_forecasting.data.schema import normalize_ohlcv_frame
 
 
 def assess_ohlcv_quality(

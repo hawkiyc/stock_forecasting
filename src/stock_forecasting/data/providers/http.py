@@ -4,20 +4,108 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
 import requests
 
-from fin_ts_multimodal.data.manifest import canonical_json_sha256
+from stock_forecasting.data.manifest import canonical_json_sha256
 
 from .base import RequestRecord
 
 _SECRET_PARAMETER_NAMES = frozenset({"api_token", "api_key", "token", "password", "secret"})
+
+
+class NetworkRequestBudgetExceeded(RuntimeError):
+    """Signal that the project-side network-attempt safety ceiling was reached."""
+
+    def __init__(self, *, consumed: int, maximum: int) -> None:
+        self.consumed = consumed
+        self.maximum = maximum
+        super().__init__(
+            "External API network-attempt budget exhausted: "
+            f"{self.consumed}/{self.maximum}"
+        )
+
+
+class ProviderRequestError(RuntimeError):
+    """Expose safe, structured provider failure metadata without request secrets."""
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        category: str,
+        attempts: int,
+        retryable: bool,
+        status_code: int | None = None,
+        retry_after_seconds: float | None = None,
+        rate_limit_limit: int | None = None,
+        rate_limit_remaining: int | None = None,
+    ) -> None:
+        self.provider = provider
+        self.category = category
+        self.attempts = attempts
+        self.retryable = retryable
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
+        self.rate_limit_limit = rate_limit_limit
+        self.rate_limit_remaining = rate_limit_remaining
+        suffix = "" if attempts == 1 else "s"
+        status = "" if status_code is None else f", HTTP {status_code}"
+        super().__init__(
+            f"{provider} request failed after {attempts} attempt{suffix} "
+            f"(category={category}{status})"
+        )
+
+    def metadata(self) -> dict[str, Any]:
+        """Return fields that are safe to persist in logs and progress manifests."""
+
+        payload: dict[str, Any] = {
+            "category": self.category,
+            "provider": self.provider,
+            "attempts": self.attempts,
+            "retryable": self.retryable,
+        }
+        optional = {
+            "status_code": self.status_code,
+            "retry_after_seconds": self.retry_after_seconds,
+            "rate_limit_limit": self.rate_limit_limit,
+            "rate_limit_remaining": self.rate_limit_remaining,
+        }
+        payload.update({key: value for key, value in optional.items() if value is not None})
+        return payload
+
+
+def _nonnegative_integer_header(response: requests.Response, name: str) -> int | None:
+    value = response.headers.get(name)
+    if value is None or not value.strip().isdigit():
+        return None
+    parsed = int(value)
+    return parsed if parsed >= 0 else None
+
+
+def _retry_after_seconds(response: requests.Response) -> float | None:
+    value = response.headers.get("Retry-After")
+    if value is None:
+        return None
+    normalized = value.strip()
+    if normalized.replace(".", "", 1).isdigit():
+        parsed_seconds = float(normalized)
+        return max(0.0, parsed_seconds) if math.isfinite(parsed_seconds) else None
+    try:
+        reset_at = parsedate_to_datetime(normalized)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if reset_at.tzinfo is None:
+        reset_at = reset_at.replace(tzinfo=UTC)
+    return max(0.0, (reset_at.astimezone(UTC) - datetime.now(UTC)).total_seconds())
 
 
 class NetworkRequestBudget:
@@ -36,9 +124,9 @@ class NetworkRequestBudget:
 
         with self._lock:
             if self._network_requests >= self.max_network_requests:
-                raise RuntimeError(
-                    "External API network-attempt budget exhausted: "
-                    f"{self._network_requests}/{self.max_network_requests}"
+                raise NetworkRequestBudgetExceeded(
+                    consumed=self._network_requests,
+                    maximum=self.max_network_requests,
                 )
             self._network_requests += 1
             self._provider_counts[provider] = self._provider_counts.get(provider, 0) + 1
@@ -150,7 +238,12 @@ class CachedJsonClient:
                 ),
             )
 
-        last_error_name = "unknown"
+        last_category = "unknown"
+        last_retryable = False
+        last_status_code: int | None = None
+        last_retry_after_seconds: float | None = None
+        last_rate_limit_limit: int | None = None
+        last_rate_limit_remaining: int | None = None
         for attempt in range(1, self.max_attempts + 1):
             now = self.clock()
             if self._last_request_at is not None:
@@ -194,21 +287,50 @@ class CachedJsonClient:
                     ),
                 )
             except (json.JSONDecodeError, requests.RequestException) as error:
-                last_error_name = type(error).__name__
                 response = error.response if isinstance(error, requests.HTTPError) else None
-                retryable_http = (
-                    response is None or response.status_code == 429 or response.status_code >= 500
+                last_status_code = response.status_code if response is not None else None
+                last_retry_after_seconds = (
+                    _retry_after_seconds(response) if response is not None else None
                 )
-                if not retryable_http:
+                last_rate_limit_limit = (
+                    _nonnegative_integer_header(response, "X-RateLimit-Limit")
+                    if response is not None
+                    else None
+                )
+                last_rate_limit_remaining = (
+                    _nonnegative_integer_header(response, "X-RateLimit-Remaining")
+                    if response is not None
+                    else None
+                )
+                if isinstance(error, json.JSONDecodeError):
+                    last_category = "invalid_json"
+                    last_retryable = True
+                elif response is None:
+                    last_category = "network_error"
+                    last_retryable = True
+                elif response.status_code == 429:
+                    last_category = "rate_limited"
+                    last_retryable = True
+                elif response.status_code >= 500:
+                    last_category = "provider_unavailable"
+                    last_retryable = True
+                else:
+                    last_category = "provider_rejected"
+                    last_retryable = False
+                if not last_retryable:
                     break
                 if attempt < self.max_attempts:
                     delay = min(float(2 ** (attempt - 1)), 30.0)
-                    if response is not None:
-                        retry_after = response.headers.get("Retry-After")
-                        if retry_after and retry_after.replace(".", "", 1).isdigit():
-                            delay = min(float(retry_after), 60.0)
+                    if last_retry_after_seconds is not None:
+                        delay = min(last_retry_after_seconds, 60.0)
                     self.sleeper(delay)
-        suffix = "" if attempt == 1 else "s"
-        raise RuntimeError(
-            f"{self.provider} request failed after {attempt} attempt{suffix} ({last_error_name})"
+        raise ProviderRequestError(
+            provider=self.provider,
+            category=last_category,
+            attempts=attempt,
+            retryable=last_retryable,
+            status_code=last_status_code,
+            retry_after_seconds=last_retry_after_seconds,
+            rate_limit_limit=last_rate_limit_limit,
+            rate_limit_remaining=last_rate_limit_remaining,
         ) from None

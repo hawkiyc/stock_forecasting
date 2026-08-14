@@ -8,7 +8,7 @@ from typing import Any, ClassVar
 import numpy as np
 import pandas as pd
 
-from fin_ts_multimodal.data.schema import normalize_ohlcv_frame
+from stock_forecasting.data.schema import normalize_ohlcv_frame
 
 from .base import Instrument, ProviderFetch, RequestRecord
 from .http import CachedJsonClient

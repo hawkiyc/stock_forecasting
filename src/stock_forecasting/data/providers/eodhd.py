@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
-from datetime import date
 from typing import Any
 
 import pandas as pd
 
-from fin_ts_multimodal.data.adjustments import apply_cumulative_adjustments
-from fin_ts_multimodal.data.schema import normalize_ohlcv_frame
+from stock_forecasting.data.adjustments import apply_cumulative_adjustments
+from stock_forecasting.data.schema import normalize_ohlcv_frame
 
 from .base import Instrument, ProviderFetch, RequestRecord
 from .http import CachedJsonClient
+
+
+EODHD_DEFAULT_DAILY_API_CALL_LIMIT = 100_000
+EODHD_DEFAULT_REQUESTS_PER_MINUTE = 1_000
+EODHD_DEFAULT_REQUESTS_PER_SECOND = float(
+    EODHD_DEFAULT_REQUESTS_PER_MINUTE // 60
+)
+EODHD_DELISTED_AUXILIARY_DATA_START = "2018-01-01"
 
 
 class EODHDProvider:
@@ -19,7 +26,6 @@ class EODHDProvider:
 
     name = "eodhd"
     base_url = "https://eodhd.com/api"
-    calendar_split_history_start = date(2015, 1, 1)
 
     def __init__(self, client: CachedJsonClient, *, api_token: str) -> None:
         if not api_token.strip():
@@ -105,7 +111,7 @@ class EODHDProvider:
         end: str,
         dataset_profile: str,
         split_events: pd.DataFrame | None = None,
-        split_adjustment_source: str = "calendar_splits",
+        split_adjustment_source: str = "historical_splits",
     ) -> ProviderFetch:
         payload, request = self.client.get_json(
             f"{self.base_url}/eod/{instrument.provider_symbol}",
@@ -150,60 +156,6 @@ class EODHDProvider:
             metadata={"empty": False},
         )
 
-    def fetch_split_events(self, *, start: str, end: str) -> ProviderFetch:
-        """Fetch exchange-wide split factors for the calendar API coverage period."""
-
-        if date.fromisoformat(start) < self.calendar_split_history_start:
-            raise ValueError(
-                "EODHD calendar/splits begins at 2015-01-01; use the per-symbol "
-                "Historical Splits API for an earlier range"
-            )
-
-        payload, request = self.client.get_json(
-            f"{self.base_url}/calendar/splits",
-            params={
-                "api_token": self._api_token,
-                "fmt": "json",
-                "from": start,
-                "to": end,
-            },
-        )
-        if not isinstance(payload, dict) or not isinstance(payload.get("splits"), list):
-            raise ValueError("EODHD calendar/splits did not return a splits array")
-        rows: list[dict[str, Any]] = []
-        dropped = 0
-        for raw in payload["splits"]:
-            if not isinstance(raw, dict):
-                dropped += 1
-                continue
-            symbol = str(raw.get("code", "")).strip().upper()
-            try:
-                old_shares = float(raw["old_shares"])
-                new_shares = float(raw["new_shares"])
-            except (KeyError, TypeError, ValueError):
-                dropped += 1
-                continue
-            if not symbol.endswith(".US") or old_shares <= 0.0 or new_shares <= 0.0:
-                continue
-            rows.append(
-                {
-                    "timestamp": raw.get("split_date"),
-                    "symbol": symbol,
-                    "price_factor": old_shares / new_shares,
-                    "share_multiplier": new_shares / old_shares,
-                    "source": "eodhd_calendar_splits",
-                }
-            )
-        return ProviderFetch(
-            frame=pd.DataFrame(rows),
-            requests=(request,),
-            metadata={
-                "split_events": len(rows),
-                "dropped_rows": dropped,
-                "coverage": "calendar_from_2015",
-            },
-        )
-
     def fetch_historical_split_events(
         self,
         instrument: Instrument,
@@ -211,11 +163,7 @@ class EODHDProvider:
         start: str,
         end: str,
     ) -> ProviderFetch:
-        """Fetch full-history split factors for one symbol.
-
-        EODHD documents the calendar endpoint as complete only from 2015. The
-        per-symbol endpoint is therefore required for earlier start dates.
-        """
+        """Fetch full-history split factors from the All World plan endpoint."""
 
         payload, request = self.client.get_json(
             f"{self.base_url}/splits/{instrument.provider_symbol}",
@@ -262,6 +210,6 @@ class EODHDProvider:
             metadata={
                 "split_events": len(rows),
                 "dropped_rows": dropped,
-                "coverage": "per_symbol_full_history",
+                "coverage": "provider_historical_splits_response",
             },
         )

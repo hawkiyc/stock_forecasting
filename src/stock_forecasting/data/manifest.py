@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from fin_ts_multimodal.config import DatasetProfile
+from stock_forecasting.config import DatasetProfile
 
 DATASET_MANIFEST_SCHEMA_VERSION = "2.0"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")

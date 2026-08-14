@@ -16,15 +16,19 @@ K-line 預訓練。
 
 | 市場／通道 | 選擇 | 理由 | 主要風險與限制 |
 |---|---|---|---|
-| 美國 PoC | EODHD | 一個 symbol 的日線歷史可用單次 EOD request；提供 adjusted close、symbol discovery、delisted 選項與 split calendar；價格與用量比商業級 feed 適合 side-project | 不是交易所級 truth；方案額度與授權需依實際訂閱確認；跨 provider 需抽樣對帳 |
+| 美國 PoC | EODHD | 一個 symbol 的日線歷史可用單次 EOD request；提供 adjusted close、symbol discovery、delisted 選項與 Historical Splits API；價格與用量比商業級 feed 適合 side-project | 不是交易所級 truth；方案額度與授權需依實際訂閱確認；跨 provider 需抽樣對帳 |
 | 台灣上市 | TWSE 官方 | 官方市場日報、除權息資料與 TAIEX/報酬指數 | endpoint schema 可能調整；逐交易日下載需低 QPS、cache 與重試 |
 | 台灣上櫃 | TPEx 官方 | 官方市場日報、除權息資料與櫃買報酬指數 | 同樣需低 QPS、cache、schema 驗證 |
 | 美國擴充 | Massive Developer | 保留型別化 provider 與 profile | side-project 目前沒有足夠商業授權，因此 fail closed，不執行下載 |
 
-程式不把 provider 公布上限直接當成安全 QPS。預設客戶端 cap 是 EODHD `5 QPS`、
-每個台灣官方 provider `0.5 QPS`，且由 `.env` 調低或依實際方案審慎調整。所有實際
-network attempts（包含 retry）共用 `STAGE1_MAX_API_CALLS`；cache hit 不扣新的
-network attempt。這些值是專案端的保守流量控制，不是對 provider SLA 的宣稱。
+EODHD 付費方案的官方預設值是每日 `100,000 API calls` 與每分鐘 `1,000 HTTP
+requests`。資料管線因此預設 `max_api_calls=100000`，但把每分鐘限制向下取整為
+`16 QPS`，也就是每分鐘最多 `960 requests`，保留 40 requests（4%）的餘裕；每個
+台灣官方 provider 維持 `0.5 QPS`。
+所有調整都透過 `runpod_workflow.sh configure`，不手動修改 `.env` 或 config。
+所有實際 network attempts（包含 retry）共用 project safety budget；cache hit 不扣
+新的 network attempt。API calls 與 HTTP requests 是不同單位，實際帳戶已用額度與
+provider headers 仍是執行時依據。
 
 ### 3. 可選 dataset profiles
 
@@ -43,8 +47,20 @@ market、symbol、asset type、日期與 split counts。日後若退回 `tw_only
 ### 4. Universe 管理
 
 EODHD profile 可指定 `STAGE1_US_SYMBOLS` 與 `STAGE1_US_ETF_SYMBOLS`，或把兩者留空
-以執行 active/delisted discovery。`STAGE1_SYMBOL_LIMIT` 在套用後仍會自動補入
-`VTI.US` benchmark，避免目標 symbol 存在但 benchmark 缺失。
+以執行 active/delisted discovery。`STAGE1_SYMBOL_LIMIT=N` 會在 ETF 與 stock 兩組
+各自依 active → delisted、ticker 排序並各取最多 N 檔；不是兩類合計 N 檔。
+`VTI.US` 是 label/context 必需、但不會成為 target 的 benchmark dependency，因此
+不占 N 個 ETF candidate 名額；若限制結果沒有 VTI 才額外補入，raw universe 最多
+`2N+1` 檔。
+
+discovery 是下載當下的 active/delisted 清單，不是逐日 point-in-time constituents。
+區間中途上市的商品只有上市後可取得的 rows，中途下市的商品只有下市前可取得的
+rows；兩者皆發生於區間內的商品，必須由 EODHD delisted discovery 回傳且帳戶有權限
+才會納入。`is_active` 是 discovery 當下狀態，不是每個 timestamp 的狀態。
+
+官方只保證 2018 年前下市商品的 EOD，不保證 splits/dividends 等輔助資料。這些 EOD
+rows 仍可進入 windows，但 split-adjusted volume 覆蓋可能不完整；download manifest
+會以 `delisted_pre_2018_auxiliary_coverage_warning` 列出受影響數量與 symbols。
 
 第一次 PoC 建議明確指定少量股票與 ETF；完整 discovery 可能同時受到 API 額度、
 訂閱權限、CPU preparation 時間、Parquet 大小與記憶體限制。raw Parquet 是串流分批
@@ -91,11 +107,12 @@ range、負 volume、非有限數值與未知 asset type。
 EODHD：
 
 - EOD endpoint 提供 raw OHLCV 與 adjusted close。
-- 2015-01-01 起的日期範圍使用 calendar/splits，在整個 US universe 只抓一次，再依
-  symbol 套用 share multiplier。
-- calendar 官方完整度只從 2015 年開始；更早的日期範圍改用每個 symbol 的
-  Historical Splits API。此額外成本會在任何歷史資料請求前納入 `max_api_calls`
-  預檢，不能用不完整 split history 靜默產生 volume anchor。
+- 所有日期範圍都使用每個 symbol 的 Historical Splits API；官方將它列入 EOD
+  Historical Data — All World 且每個 request 為 1 API call。管線不使用需要
+  Calendar-enabled 產品的 `calendar/splits`。
+- 每個商品是一個 EOD request 加一個 split-history request。額外成本會在任何歷史
+  資料請求前納入 `max_api_calls` 預檢，且兩種 response 都能跨 CPU Pod cache／續傳；
+  不能用不完整 split history 靜默產生 volume anchor。
 - `adjusted_close` 保持 vendor total-return series，`split_adjusted_volume` 由 split
   event 產生。
 
@@ -195,7 +212,7 @@ benchmark calendar gaps、symbol/date coverage、corporate-action 前後連續�
 - [EODHD historical EOD API](https://eodhd.com/financial-apis/api-for-historical-data-and-volumes)
 - [EODHD API limits](https://eodhd.com/financial-apis/api-limits)
 - [EODHD pricing](https://eodhd.com/pricing)
-- [EODHD split calendar](https://eodhd.com/financial-apis/calendar-upcoming-earnings-ipos-and-splits)
+- [EODHD delisted data coverage](https://eodhd.com/financial-apis/delisted-stock-companies-data-2)
 - [EODHD Historical Splits API](https://eodhd.com/financial-apis/api-splits-dividends)
 - [TWSE OpenAPI](https://openapi.twse.com.tw/)
 - [TWSE ex-right/ex-dividend reference](https://www.twse.com.tw/en/announcement/ex-right/twt49u.html)
@@ -225,16 +242,21 @@ pretraining evidence.
 
 | Market/channel | Choice | Rationale | Main risks and constraints |
 |---|---|---|---|
-| US PoC | EODHD | One full daily history per symbol per EOD request; adjusted close, discovery, delisted option, and split calendar; side-project economics are more suitable than a commercial-grade feed | Not exchange-grade truth; actual quota/license follows the subscription; overlap reconciliation is required |
+| US PoC | EODHD | One full daily history per symbol per EOD request; adjusted close, discovery, delisted option, and the Historical Splits API; side-project economics are more suitable than a commercial-grade feed | Not exchange-grade truth; actual quota/license follows the subscription; overlap reconciliation is required |
 | Taiwan listed | Official TWSE | Official market-wide daily report, actions, TAIEX and return index | Endpoint schemas can change; daily requests require low QPS, caching, and retries |
 | Taiwan OTC | Official TPEx | Official market-wide daily report, actions, and TPEx return index | Same low-QPS, cache, and parser-validation requirements |
 | US expansion | Massive Developer | Typed provider/profile remains reserved | No suitable side-project commercial license now, so it fails closed |
 
-Published provider limits are not treated as safe operating QPS automatically.
-Project defaults cap EODHD at `5 QPS` and each Taiwan provider at `0.5 QPS`;
-`.env` may lower or carefully adapt them to the actual plan. All network
-attempts, including retries, share `STAGE1_MAX_API_CALLS`; cache hits create no
-new attempt. These are conservative client controls, not provider-SLA claims.
+EODHD's official paid-plan defaults are `100,000 API calls` per day and `1,000
+HTTP requests` per minute. The data pipeline therefore defaults to
+`max_api_calls=100000`, but floors the minute limit to `16 QPS`, or at most
+`960 requests` per minute, leaving 40 requests (4%) of headroom. Each Taiwan
+provider remains at `0.5 QPS`. Adjustments go through
+`runpod_workflow.sh configure`, never manual
+`.env` or config edits. All network attempts, including retries, share the
+project safety budget; cache hits create no new attempt. API calls and HTTP
+requests are different units, so used account quota and provider headers remain
+authoritative at runtime.
 
 ### 3. Selectable dataset profiles
 
@@ -253,8 +275,26 @@ counts. A later `tw_only` run is therefore distinguishable in every output.
 ### 4. Universe management
 
 EODHD profiles may set `STAGE1_US_SYMBOLS` and `STAGE1_US_ETF_SYMBOLS`, or leave
-both empty for active/delisted discovery. After `STAGE1_SYMBOL_LIMIT`, the
-pipeline still adds `VTI.US`, ensuring the benchmark is present.
+both empty for active/delisted discovery. `STAGE1_SYMBOL_LIMIT=N` sorts ETFs and
+stocks separately by active → delisted and ticker, then keeps up to N of each;
+it is not N instruments across both groups. `VTI.US` is a label/context
+dependency but never a training target, so it does not consume one of the N ETF
+candidate slots. It is added only when absent, making the raw universe at most
+`2N+1` instruments.
+
+Discovery is the active/delisted snapshot at download time, not daily
+point-in-time constituents. An instrument listed during the requested range has
+rows only from its first available session; one delisted during the range has
+rows only through its last available session. An instrument experiencing both
+events inside the range is included only when EODHD delisted discovery returns
+it and the account is entitled to it. `is_active` is the discovery-time state,
+not a timestamp-by-timestamp state.
+
+EODHD guarantees only EOD—not splits/dividends and other auxiliary data—for
+instruments delisted before 2018. Those EOD rows can still enter windows, but
+split-adjusted-volume coverage may be incomplete. The download manifest records
+the affected count and symbols under
+`delisted_pre_2018_auxiliary_coverage_warning`.
 
 The first PoC should use a small explicit universe. Complete discovery can hit
 API quota, subscription, preparation-time, Parquet-size, and memory limits. Raw
@@ -287,13 +327,14 @@ types.
 
 ### 6. Adjustments and benchmark series
 
-EODHD retains EOD raw OHLCV and adjusted close. For ranges beginning on or
-after 2015-01-01, it fetches calendar/splits once for the US universe and
-applies per-symbol share multipliers. Because the documented calendar history
-starts in 2015, earlier ranges use the per-symbol Historical Splits API. Those
-extra calls are included in the fail-closed `max_api_calls` estimate before
-historical requests begin; incomplete split history is never silently labeled
-as a complete volume anchor.
+EODHD retains EOD raw OHLCV and adjusted close. Every date range uses the
+per-symbol Historical Splits API, which EODHD lists under EOD Historical Data —
+All World at one API call per request. The pipeline does not use
+`calendar/splits`, which requires a Calendar-enabled product. Each instrument
+therefore needs one EOD request and one split-history request. Both responses
+are cacheable/resumable, and the extra cost is included in the fail-closed
+`max_api_calls` estimate before historical requests begin; incomplete split
+history is never silently labeled as a complete volume anchor.
 
 TWSE/TPEx fetch market-wide raw OHLCV by trading date and official action data
 for the range. TWSE may query action detail for free-share ratios. Price and
@@ -385,7 +426,7 @@ transaction-cost research.
 - [EODHD historical EOD API](https://eodhd.com/financial-apis/api-for-historical-data-and-volumes)
 - [EODHD API limits](https://eodhd.com/financial-apis/api-limits)
 - [EODHD pricing](https://eodhd.com/pricing)
-- [EODHD split calendar](https://eodhd.com/financial-apis/calendar-upcoming-earnings-ipos-and-splits)
+- [EODHD delisted data coverage](https://eodhd.com/financial-apis/delisted-stock-companies-data-2)
 - [EODHD Historical Splits API](https://eodhd.com/financial-apis/api-splits-dividends)
 - [TWSE OpenAPI](https://openapi.twse.com.tw/)
 - [TWSE ex-right/ex-dividend reference](https://www.twse.com.tw/en/announcement/ex-right/twt49u.html)

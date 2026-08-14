@@ -12,8 +12,8 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
-from fin_ts_multimodal.data.io import read_processed_records
-from fin_ts_multimodal.data.windows import (
+from stock_forecasting.data.io import read_processed_records
+from stock_forecasting.data.windows import (
     CONTEXT_FIELDS,
     DEFAULT_ALPHA_HORIZONS,
     PROCESSED_SCHEMA_VERSION,
