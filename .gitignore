@@ -1,0 +1,66 @@
+.DS_Store
+.AppleDouble
+.LSOverride
+.env
+*.env
+.env.*
+!.env.example
+.envrc
+.direnv/
+.venv/
+/poetry.lock
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Local research references and presentation assets
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.pptx
+
+# Local artifacts and downloaded model/data caches
+/artifacts/
+/cache/
+/data/
+/lifecycle/
+/models/
+/savedModel/
+/logs/
+/wandb/
+/third_party/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# Secrets and credentials
+.runpod/
+.ssh/
+id_ed25519*
+id_rsa*
+*.pem
+*.key
+credentials.json
+secrets.json
+*api_key*
+*API_KEY*
+*ApiKey*
+*Api_Key*
+*apiKey*
+*APIKey*
+*APIkey*
+
+# chatlog temporary files
+*chat_temp*
+
+# Local RunPod diagnostic downloads
+/runpod_error_log_temp/

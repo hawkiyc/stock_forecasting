@@ -1,0 +1,74 @@
+[project]
+name = "fin-ts-multimodal"
+version = "0.1.0"
+description = "Quant-only OHLCV forecasting with a finance-pretrained time-series foundation model."
+authors = [{ name = "Project Contributors" }]
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "einops>=0.8.1,<1.0",
+    "huggingface-hub>=0.34,<2.0",
+    "safetensors>=0.5,<1.0",
+    "wandb>=0.21,<1.0",
+    "pydantic>=2.11,<3.0",
+    "PyYAML>=6.0,<7.0",
+    "numpy>=1.26,<2.0",
+    "pandas>=2.2,<3.0",
+    "pyarrow>=19,<24",
+    "scikit-learn>=1.6,<2.0",
+    "requests>=2.32,<3.0",
+    "tqdm>=4.67,<5.0",
+]
+
+[project.scripts]
+fin-ts-download = "fin_ts_multimodal.cli.download_market_data:main"
+fin-ts-synthetic = "fin_ts_multimodal.cli.generate_synthetic_data:main"
+fin-ts-prepare = "fin_ts_multimodal.cli.prepare_data:main"
+fin-ts-train = "fin_ts_multimodal.cli.train:main"
+fin-ts-evaluate = "fin_ts_multimodal.cli.evaluate:main"
+fin-ts-infer = "fin_ts_multimodal.cli.infer:main"
+fin-ts-preflight = "fin_ts_multimodal.cli.preflight:main"
+fin-ts-benchmark = "fin_ts_multimodal.cli.benchmark_baselines:main"
+fin-ts-validate-benchmarks = "fin_ts_multimodal.cli.validate_benchmarks:main"
+fin-ts-verify-stage1-data = "fin_ts_multimodal.cli.verify_stage1_data:main"
+fin-ts-supervise = "fin_ts_multimodal.runpod.supervisor:main"
+
+[tool.poetry]
+packages = [{ include = "fin_ts_multimodal", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.3,<10.0"
+pytest-cov = ">=6.0,<8.0"
+pytest-xdist = ">=3.6,<4.0"
+ruff = ">=0.12,<1.0"
+mypy = ">=1.17,<2.0"
+types-PyYAML = ">=6.0,<7.0"
+types-requests = ">=2.32,<3.0"
+pandas-stubs = ">=2.2,<3.0"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/runpod_readiness.py" = ["UP017"]
+"scripts/utc_deadline.py" = ["UP017"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+plugins = ["pydantic.mypy"]

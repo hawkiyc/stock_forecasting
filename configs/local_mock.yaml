@@ -1,0 +1,105 @@
+experiment_name: quant-local-mock
+description: Download-free numerical smoke test.
+
+data:
+  raw_path: data/raw/market.parquet
+  processed_path: data/processed/windows.parquet
+  manifest_path: data/dataset-manifest.json
+  dataset_profile: tw_only
+  input_length: 128
+  alpha_horizons: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+  benchmark_mapping_path: null
+  forecast_horizon: 5
+  diagnostic_horizons: [1, 20]
+  stride: 5
+  sample_stride: 1
+  train_fraction: 0.15
+  flat_volatility_multiplier: 0.25
+  max_abs_log_return: 0.5
+  embargo_trading_days: 5
+  effective_embargo_trading_days: 14
+  max_samples: 512
+  require_ready_manifest: false
+
+model:
+  time_series_backend: mock
+  time_series_model_id: mock-kronos
+  time_series_tokenizer_id: mock-tokenizer
+  kronos_source_root: third_party/Kronos
+  local_files_only: true
+  dtype: fp32
+  gradient_checkpointing: false
+  encoder_dim: 64
+  latent_tokens: 8
+  resampler_layers: 1
+  resampler_heads: 4
+  projector_hidden_multiplier: 2
+  resampler_dropout: 0.0
+  benchmark_conditioner_heads: 4
+  benchmark_conditioner_dropout: 0.0
+  alpha_head_hidden_dim: 64
+  alpha_head_dropout: 0.0
+  alpha_quantiles: [0.1, 0.5, 0.9]
+  postprocess_alpha_threshold: 0.0
+  lora:
+    enabled: false
+    rank: 8
+    alpha: 16.0
+    dropout: 0.0
+    target_modules: [q_proj, k_proj, v_proj, out_proj, w1, w2, w3]
+
+training:
+  stage: stage1
+  seed: 42
+  epochs: 1
+  max_steps: 2
+  batch_size: 4
+  evaluation_batch_size: 8
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0001
+  lora_learning_rate: 0.00001
+  weight_decay: 0.01
+  warmup_ratio: 0.0
+  max_grad_norm: 1.0
+  log_every_steps: 1
+  evaluate_every_steps: 1
+  checkpoint_every_steps: 1
+  checkpoint_save_top_k: 1
+  checkpoint_monitor: primary_5d/selection_score
+  checkpoint_mode: min
+  output_root: outputs/checkpoints
+  resume_checkpoint: null
+  mixed_precision: "no"
+  num_workers: 0
+
+wandb:
+  enabled: false
+  project: fin-ts-quant
+  entity: null
+  group: local
+  name: local-mock
+  tags: [quant-only, mock]
+  directory: outputs
+  mode: disabled
+  allow_offline_fallback: true
+  log_model_artifact: false
+
+validation:
+  enabled: false
+  auto_run_after_training: false
+  output_root: outputs/evaluations
+  models: [always_buy, zero_return]
+  seeds: [42]
+  neural_epochs: 1
+  neural_patience: 1
+  neural_batch_size: 8
+  neural_learning_rate: 0.001
+  recompute_full_model: false
+  resume_completed_models: true
+
+runtime:
+  max_runtime_seconds: 3600
+  auto_terminate_pod: false
+  termination_retry_seconds: 15
+  termination_max_attempts: 20
+  log_root: outputs/logs

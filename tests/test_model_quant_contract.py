@@ -1,0 +1,390 @@
+"""Tensor and trainability contracts for the numerical model."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+
+from fin_ts_multimodal.checkpointing import (
+    _load_trainable_model_state,
+    _validate_loaded_model_contract,
+    trainable_state_dict,
+)
+from fin_ts_multimodal.cli.prefetch_models import prefetch_repositories
+from fin_ts_multimodal.config import ExperimentConfig
+from fin_ts_multimodal.data import FinancialBatchCollator, FinancialWindowDataset
+from fin_ts_multimodal.factory import _promote_trainable_parameters_to_fp32, build_model_bundle
+from fin_ts_multimodal.models.backbones import (
+    DeterministicTimeSeriesBackbone,
+    KronosBackbone,
+)
+from fin_ts_multimodal.models.lora import LoRALinear, inject_lora, lora_parameter_names
+from fin_ts_multimodal.models.outputs import MODEL_OUTPUT_SCHEMA_VERSION
+from fin_ts_multimodal.run_contract import training_resume_contract_digest
+from fin_ts_multimodal.training import evaluate_loader
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_prefetch_binds_every_repository_to_its_exact_revision(tmp_path: Path) -> None:
+    revisions = {
+        "owner/model": "a" * 40,
+        "owner/tokenizer": "b" * 40,
+    }
+    calls: list[dict[str, object]] = []
+
+    def downloader(**kwargs: object) -> str:
+        calls.append(kwargs)
+        snapshot = tmp_path / str(kwargs["revision"])
+        snapshot.mkdir(exist_ok=True)
+        return str(snapshot)
+
+    resolved = prefetch_repositories(
+        revisions,
+        cache_directory=tmp_path / "cache",
+        verify_only=True,
+        downloader=downloader,
+    )
+
+    assert set(resolved) == set(revisions)
+    assert [(call["repo_id"], call["revision"]) for call in calls] == list(revisions.items())
+    assert all(call["local_files_only"] is True for call in calls)
+
+
+def test_quant_model_preserves_head_and_reusable_encoder_shapes() -> None:
+    config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    bundle = build_model_bundle(config, torch.device("cpu"))
+    asset_series = torch.rand(2, config.data.input_length, 5)
+    benchmark_series = torch.rand(2, config.data.input_length, 5)
+    mask = torch.ones(2, config.data.input_length, dtype=torch.bool)
+    timestamps = torch.zeros(2, config.data.input_length, 5, dtype=torch.long)
+
+    output = bundle.model(
+        asset_series,
+        benchmark_series,
+        asset_attention_mask=mask,
+        benchmark_attention_mask=mask,
+        asset_timestamps=timestamps,
+        benchmark_timestamps=timestamps,
+        target_alpha=torch.zeros(2, len(config.data.alpha_horizons)),
+    )
+
+    assert set(output) == {
+        "loss",
+        "pinball_loss",
+        "alpha_quantiles",
+        "asset_last_hidden_state",
+        "benchmark_last_hidden_state",
+        "asset_attention_mask",
+        "benchmark_attention_mask",
+        "asset_latent_tokens",
+        "benchmark_latent_tokens",
+        "conditioned_latent_tokens",
+        "conditioning_gate",
+    }
+    assert output.alpha_quantiles.shape == (2, 12, 3)
+    assert output.asset_last_hidden_state.shape == (2, config.data.input_length, 64)
+    assert output.benchmark_last_hidden_state.shape == (2, config.data.input_length, 64)
+    assert output.asset_attention_mask.shape == (2, config.data.input_length)
+    assert output.benchmark_attention_mask.shape == (2, config.data.input_length)
+    assert output.asset_latent_tokens.shape == (2, 8, 64)
+    assert output.benchmark_latent_tokens.shape == (2, 8, 64)
+    assert output.conditioned_latent_tokens.shape == (2, 8, 64)
+    assert output.conditioning_gate.shape == (2, 8, 64)
+    assert torch.all(output.alpha_quantiles[..., 0] <= output.alpha_quantiles[..., 1])
+    assert torch.all(output.alpha_quantiles[..., 1] <= output.alpha_quantiles[..., 2])
+    assert output.loss is not None
+    assert output.pinball_loss is output.loss
+
+    encoded = bundle.model.encode_ohlcv(
+        asset_series,
+        attention_mask=mask,
+        timestamps=timestamps,
+    )
+    assert encoded.last_hidden_state.shape == output.asset_last_hidden_state.shape
+    assert encoded.latent_tokens.shape == output.asset_latent_tokens.shape
+
+
+def test_mock_checkpoint_contains_only_reusable_numeric_and_alpha_modules() -> None:
+    config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    bundle = build_model_bundle(config, torch.device("cpu"))
+    state = trainable_state_dict(bundle.model)
+
+    assert state
+    assert all(
+        name.startswith(("resampler.", "benchmark_conditioner.", "alpha_head."))
+        for name in state
+    )
+    assert not any(name.startswith("backbone.") for name in state)
+
+
+def test_checkpoint_restore_requires_the_exact_trainable_parameter_union() -> None:
+    config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    model = build_model_bundle(config, torch.device("cpu")).model
+    state = trainable_state_dict(model)
+    missing_key = next(iter(state))
+    incomplete = {name: tensor for name, tensor in state.items() if name != missing_key}
+
+    with pytest.raises(ValueError, match="Missing trainable checkpoint keys"):
+        _load_trainable_model_state(model, incomplete)
+
+    with pytest.raises(ValueError, match="Unexpected checkpoint keys"):
+        _load_trainable_model_state(
+            model,
+            {**state, "legacy_text_head.weight": torch.ones(1)},
+        )
+
+
+def test_loaded_checkpoint_must_match_model_ids_architecture_and_stage(
+    tmp_path: Path,
+) -> None:
+    config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    config.save_resolved(tmp_path / "resolved-config.yaml")
+    state = {
+        "model_output_schema_version": MODEL_OUTPUT_SCHEMA_VERSION,
+        "training_resume_contract_sha256": training_resume_contract_digest(config),
+        "model_architecture_sha256": config.model.architecture_digest(),
+        "training_stage": config.training.stage,
+        "time_series_model_id": config.model.time_series_model_id,
+        "time_series_tokenizer_id": config.model.time_series_tokenizer_id,
+        "time_series_model_revision": config.model.time_series_model_revision,
+        "time_series_tokenizer_revision": config.model.time_series_tokenizer_revision,
+        "kronos_source_revision": config.model.kronos_source_revision,
+    }
+
+    _validate_loaded_model_contract(tmp_path, state, config)
+
+    with pytest.raises(ValueError, match="implementation or dataset contract"):
+        _validate_loaded_model_contract(
+            tmp_path,
+            {**state, "training_resume_contract_sha256": "0" * 64},
+            config,
+        )
+
+    with pytest.raises(ValueError, match="training stage"):
+        _validate_loaded_model_contract(
+            tmp_path,
+            {**state, "training_stage": "stage2"},
+            config,
+        )
+
+    with pytest.raises(ValueError, match="predates the conditional alpha"):
+        _validate_loaded_model_contract(
+            tmp_path,
+            {**state, "model_output_schema_version": "3.1"},
+            config,
+        )
+
+
+def test_trainable_master_parameters_remain_fp32() -> None:
+    model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 2))
+    model[0].requires_grad_(False)
+    model.to(dtype=torch.bfloat16)
+
+    _promote_trainable_parameters_to_fp32(model)
+
+    assert model[0].weight.dtype == torch.bfloat16
+    assert model[1].weight.dtype == torch.float32
+    assert model[1].bias.dtype == torch.float32
+
+
+def test_deterministic_backbone_is_causal() -> None:
+    backbone = DeterministicTimeSeriesBackbone(hidden_size=16, max_context=12)
+    original = torch.rand(1, 12, 5)
+    changed = original.clone()
+    changed[:, 8:] = 1000.0
+
+    first = backbone(original).last_hidden_state
+    second = backbone(changed).last_hidden_state
+
+    torch.testing.assert_close(first[:, :8], second[:, :8])
+
+
+class _BatchTokenizer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(()))
+        self.encoded_shapes: list[tuple[int, ...]] = []
+
+    def encode(
+        self,
+        values: torch.Tensor,
+        *,
+        half: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert half
+        self.encoded_shapes.append(tuple(values.shape))
+        return values[..., :1], values[..., 1:2]
+
+
+class _BatchKronos(nn.Module):
+    d_model = 3
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(()))
+
+    def decode_s1(
+        self,
+        token_a: torch.Tensor,
+        token_b: torch.Tensor,
+        stamps: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        stamp_feature = stamps[..., :1].to(dtype=token_a.dtype)
+        context = torch.cat([token_a, token_b, stamp_feature], dim=-1) * self.scale
+        return token_a, context
+
+
+def test_kronos_loader_passes_independent_pinned_weight_revisions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    class LoaderTokenizer(_BatchTokenizer):
+        @classmethod
+        def from_pretrained(cls, repo_id: str, **kwargs: object) -> LoaderTokenizer:
+            calls.append(("tokenizer", repo_id, kwargs))
+            return cls()
+
+    class LoaderModel(_BatchKronos):
+        @classmethod
+        def from_pretrained(cls, repo_id: str, **kwargs: object) -> LoaderModel:
+            calls.append(("model", repo_id, kwargs))
+            return cls()
+
+    monkeypatch.setattr(
+        "fin_ts_multimodal.models.backbones.importlib.import_module",
+        lambda _name: SimpleNamespace(
+            Kronos=LoaderModel,
+            KronosTokenizer=LoaderTokenizer,
+        ),
+    )
+
+    KronosBackbone.from_pretrained(
+        "owner/model",
+        "owner/tokenizer",
+        model_revision="a" * 40,
+        tokenizer_revision="b" * 40,
+        local_files_only=True,
+    )
+
+    assert calls == [
+        (
+            "tokenizer",
+            "owner/tokenizer",
+            {"local_files_only": True, "revision": "b" * 40},
+        ),
+        (
+            "model",
+            "owner/model",
+            {"local_files_only": True, "revision": "a" * 40},
+        ),
+    ]
+
+
+def test_kronos_backbone_batches_equal_length_samples_together() -> None:
+    tokenizer = _BatchTokenizer()
+    backbone = KronosBackbone(
+        _BatchKronos(),
+        tokenizer,
+        max_context=4,
+    )
+    series = torch.rand(3, 4, 5)
+    mask = torch.tensor(
+        [
+            [True, True, True, True],
+            [True, True, False, False],
+            [True, True, True, True],
+        ]
+    )
+    timestamps = torch.zeros(3, 4, 5, dtype=torch.long)
+
+    output = backbone(series, attention_mask=mask, timestamps=timestamps)
+
+    assert tokenizer.encoded_shapes == [(1, 2, 6), (2, 4, 6)]
+    assert output.last_hidden_state.shape == (3, 4, 3)
+    assert torch.count_nonzero(output.last_hidden_state[1, 2:]) == 0
+    assert torch.equal(output.attention_mask, mask)
+
+
+def test_evaluation_restores_training_mode(
+    window_records: list[dict[str, object]],
+) -> None:
+    config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    dataset = FinancialWindowDataset(window_records, split="validation")
+    loader = DataLoader(
+        dataset,
+        batch_size=8,
+        shuffle=False,
+        collate_fn=FinancialBatchCollator(),
+    )
+    bundle = build_model_bundle(config, torch.device("cpu"))
+    bundle.model.train()
+
+    metrics = evaluate_loader(bundle, loader, config, torch.device("cpu"))
+
+    assert bundle.model.training
+    assert metrics["samples"] == len(dataset)
+    assert "aggregate" in metrics
+    assert set(metrics["per_horizon"]) == {
+        f"{horizon}d" for horizon in config.data.alpha_horizons
+    }
+    assert "selection_score" in metrics["primary_5d"]
+    assert metrics["primary_5d"]["selection_score"] == pytest.approx(
+        metrics["aggregate"]["selection_score"]
+    )
+    assert "postprocess_signal_distribution" in metrics
+    assert "macro_f1" not in repr(metrics).lower()
+    assert set(metrics["subgroups"]) == {"asset_type", "market", "provider", "year"}
+
+
+class _Predictor(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.transformer = nn.ModuleDict(
+            {
+                name: nn.Linear(4, 4)
+                for name in ("q_proj", "k_proj", "v_proj", "out_proj", "w1", "w2", "w3")
+            }
+        )
+        self.outside_q_proj = nn.Linear(4, 4)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        hidden = inputs
+        for layer in self.transformer.values():
+            hidden = layer(hidden)
+        return self.outside_q_proj(hidden)
+
+
+def test_lora_is_scoped_to_exact_kronos_predictor_targets() -> None:
+    predictor = _Predictor().requires_grad_(False)
+    targets = ("q_proj", "k_proj", "v_proj", "out_proj", "w1", "w2", "w3")
+    matched = inject_lora(
+        predictor,
+        target_modules=targets,
+        rank=2,
+        alpha=4.0,
+        dropout=0.0,
+    )
+
+    assert set(matched) == {f"transformer.{name}" for name in targets}
+    assert all(isinstance(predictor.transformer[name], LoRALinear) for name in targets)
+    assert isinstance(predictor.outside_q_proj, nn.Linear)
+    assert not predictor.outside_q_proj.weight.requires_grad
+    assert lora_parameter_names(predictor)
+    assert all(
+        parameter.requires_grad == (".lora_a." in name or ".lora_b." in name)
+        for name, parameter in predictor.named_parameters()
+    )
+
+    predictor(torch.rand(3, 4)).sum().backward()
+    assert all(
+        parameter.grad is not None
+        for name, parameter in predictor.named_parameters()
+        if name in lora_parameter_names(predictor)
+    )

@@ -1,0 +1,121 @@
+experiment_name: kronos-base-lora-stage1
+description: Quant-only script validation on an exact deterministic 15% training subset.
+
+data:
+  raw_path: ${DATA_ROOT:-/runpod-volume/data}/raw/market.parquet
+  processed_path: ${DATA_ROOT:-/runpod-volume/data}/processed/windows.parquet
+  manifest_path: ${DATA_ROOT:-/runpod-volume/data}/dataset-manifest.json
+  dataset_profile: ${FIN_TS_DATASET_PROFILE:-us_tw_eodhd}
+  input_length: 128
+  alpha_horizons: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+  benchmark_mapping_path: null
+  forecast_horizon: 5
+  diagnostic_horizons: [1, 20]
+  stride: 5
+  sample_stride: 1
+  train_fraction: 0.15
+  flat_volatility_multiplier: 0.25
+  max_abs_log_return: 0.5
+  embargo_trading_days: 5
+  effective_embargo_trading_days: 14
+  max_samples: null
+  require_ready_manifest: true
+
+model:
+  time_series_backend: kronos
+  time_series_model_id: NeoQuasar/Kronos-base
+  time_series_tokenizer_id: NeoQuasar/Kronos-Tokenizer-base
+  time_series_model_revision: 2b554741eca47781b64468546e77fef3e85130e6
+  time_series_tokenizer_revision: 0e0117387f39004a9016484a186a908917e22426
+  kronos_source_root: ${RUNPOD_VOLUME_ROOT:-/runpod-volume}/third_party/Kronos
+  kronos_source_revision: 67b630e67f6a18c9e9be918d9b4337c960db1e9a
+  local_files_only: true
+  dtype: bf16
+  gradient_checkpointing: false
+  encoder_dim: 512
+  latent_tokens: 32
+  resampler_layers: 2
+  resampler_heads: 8
+  projector_hidden_multiplier: 2
+  resampler_dropout: 0.05
+  benchmark_conditioner_heads: 8
+  benchmark_conditioner_dropout: 0.05
+  alpha_head_hidden_dim: 512
+  alpha_head_dropout: 0.05
+  alpha_quantiles: [0.1, 0.5, 0.9]
+  postprocess_alpha_threshold: 0.0
+  lora:
+    enabled: true
+    rank: 8
+    alpha: 16.0
+    dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, out_proj, w1, w2, w3]
+
+training:
+  stage: stage1
+  seed: 42
+  epochs: 1
+  max_steps: 200
+  batch_size: 8
+  evaluation_batch_size: 16
+  gradient_accumulation_steps: 2
+  learning_rate: 0.0001
+  lora_learning_rate: 0.00001
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  log_every_steps: 10
+  evaluate_every_steps: 50
+  checkpoint_every_steps: 50
+  checkpoint_save_top_k: 3
+  checkpoint_monitor: primary_5d/selection_score
+  checkpoint_mode: min
+  output_root: ${SAVED_MODEL_ROOT:-/runpod-volume/savedModel}
+  resume_checkpoint: null
+  mixed_precision: bf16
+  num_workers: 2
+
+wandb:
+  enabled: true
+  project: ${WANDB_PROJECT:-fin-ts-quant}
+  entity: ${WANDB_ENTITY:-}
+  group: kronos-base-lora
+  name: stage1-15pct
+  tags: [quant-only, kronos-base, lora, stage1]
+  directory: ${WANDB_DIR:-/runpod-volume}
+  mode: online
+  allow_offline_fallback: true
+  log_model_artifact: true
+
+validation:
+  enabled: true
+  auto_run_after_training: true
+  output_root: ${RUNPOD_VOLUME_ROOT:-/runpod-volume}/evaluations
+  models:
+    - always_buy
+    - zero_return
+    - momentum_5d
+    - reversal_5d
+    - ma_crossover
+    - rsi
+    - macd
+    - volatility_scaled
+    - gbdt
+    - gru
+    - dlinear
+    - patchtst
+    - kronos_full
+  seeds: [42]
+  neural_epochs: 30
+  neural_patience: 5
+  neural_batch_size: 64
+  neural_learning_rate: 0.001
+  recompute_full_model: false
+  resume_completed_models: true
+
+runtime:
+  max_runtime_seconds: 21600
+  auto_terminate_pod: true
+  termination_retry_seconds: 15
+  termination_max_attempts: 20
+  log_root: ${LOG_ROOT:-/runpod-volume/logs}
