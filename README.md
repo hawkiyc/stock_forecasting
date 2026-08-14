@@ -366,7 +366,7 @@ bash scripts/create_runpod_cpu_pod.sh
 由 RunPod Console 的 Connect 頁面取得 SSH 命令。登入 Pod 後執行：
 
 ```bash
-cd /runpod-volume/ts_multimodal_LLM
+cd /runpod-volume/stock_forecasting
 bash scripts/runpod_tmux_launch.sh cpu-prepare
 ```
 
@@ -438,7 +438,7 @@ bash scripts/create_runpod_cpu_pod.sh
 ```
 
 ```bash
-cd /runpod-volume/ts_multimodal_LLM
+cd /runpod-volume/stock_forecasting
 bash scripts/runpod_tmux_launch.sh cpu-finalize
 ```
 
@@ -479,7 +479,7 @@ RUNPOD_GPU_ID="NVIDIA GeForce RTX 5090" \
 Secret reference，並啟動獨立 hard-limit guard。由 Console SSH 登入後執行：
 
 ```bash
-cd /runpod-volume/ts_multimodal_LLM
+cd /runpod-volume/stock_forecasting
 bash scripts/runpod_tmux_launch.sh stage1-train
 ```
 
@@ -523,7 +523,7 @@ bash scripts/create_runpod_validation_pod.sh <run-id>
 SSH 登入後執行：
 
 ```bash
-cd /runpod-volume/ts_multimodal_LLM
+cd /runpod-volume/stock_forecasting
 bash scripts/runpod_tmux_launch.sh stage1-validate
 ```
 
@@ -1098,7 +1098,7 @@ run after SSH login. Obtain the SSH command from the RunPod Console Connect
 page. Inside the Pod, run:
 
 ```bash
-cd /runpod-volume/ts_multimodal_LLM
+cd /runpod-volume/stock_forecasting
 bash scripts/runpod_tmux_launch.sh cpu-prepare
 ```
 
@@ -1176,7 +1176,7 @@ bash scripts/create_runpod_cpu_pod.sh
 ```
 
 ```bash
-cd /runpod-volume/ts_multimodal_LLM
+cd /runpod-volume/stock_forecasting
 bash scripts/runpod_tmux_launch.sh cpu-finalize
 ```
 
@@ -1219,7 +1219,7 @@ injects a W&B Secret reference, and arms an independent hard-limit guard. SSH
 through the Console and run:
 
 ```bash
-cd /runpod-volume/ts_multimodal_LLM
+cd /runpod-volume/stock_forecasting
 bash scripts/runpod_tmux_launch.sh stage1-train
 ```
 
@@ -1266,7 +1266,7 @@ bash scripts/create_runpod_validation_pod.sh <run-id>
 After SSH login, run:
 
 ```bash
-cd /runpod-volume/ts_multimodal_LLM
+cd /runpod-volume/stock_forecasting
 bash scripts/runpod_tmux_launch.sh stage1-validate
 ```
 

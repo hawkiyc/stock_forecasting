@@ -26,7 +26,7 @@ fi
 source "${SCRIPT_DIR}/lib/runpod_paths.sh"
 
 NETWORK_VOLUME_ROOT="${NETWORK_VOLUME_ROOT:-${RUNPOD_VOLUME_ROOT:-/runpod-volume}}"
-PROJECT_ROOT="${PROJECT_ROOT:-${NETWORK_VOLUME_ROOT}/ts_multimodal_LLM}"
+PROJECT_ROOT="${PROJECT_ROOT:-${NETWORK_VOLUME_ROOT}/stock_forecasting}"
 LOG_ROOT="${LOG_ROOT:-${NETWORK_VOLUME_ROOT}/logs}"
 READINESS_HELPER="${SCRIPT_DIR}/runpod_readiness.py"
 RUNPOD_IMAGE_PYTHON="${RUNPOD_PYTHON_BIN:-/usr/local/bin/python}"

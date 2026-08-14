@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/runpod_paths.sh"
 
 NETWORK_VOLUME_ROOT="${NETWORK_VOLUME_ROOT:-/runpod-volume}"
-PROJECT_ROOT="${PROJECT_ROOT:-${NETWORK_VOLUME_ROOT}/ts_multimodal_LLM}"
+PROJECT_ROOT="${PROJECT_ROOT:-${NETWORK_VOLUME_ROOT}/stock_forecasting}"
 DATA_ROOT="${DATA_ROOT:-${NETWORK_VOLUME_ROOT}/data}"
 CACHE_ROOT="${CACHE_ROOT:-${NETWORK_VOLUME_ROOT}/cache}"
 LOG_ROOT="${LOG_ROOT:-${NETWORK_VOLUME_ROOT}/logs}"

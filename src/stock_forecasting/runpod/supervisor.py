@@ -83,7 +83,7 @@ class VolumeLayout:
     def from_environment(cls) -> VolumeLayout:
         network_root = canonical_network_volume_root()
 
-        project_default = network_root / "ts_multimodal_LLM"
+        project_default = network_root / "stock_forecasting"
         project_root = _validated_volume_path(
             Path(os.environ.get("PROJECT_ROOT", str(project_default))),
             network_root,

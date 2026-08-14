@@ -47,7 +47,7 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 127
 fi
 
-REMOTE_PROJECT_DIR="${RUNPOD_REMOTE_PROJECT_DIR:-ts_multimodal_LLM}"
+REMOTE_PROJECT_DIR="${RUNPOD_REMOTE_PROJECT_DIR:-stock_forecasting}"
 if [[ ! "${REMOTE_PROJECT_DIR}" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "RUNPOD_REMOTE_PROJECT_DIR contains invalid characters" >&2
     exit 2

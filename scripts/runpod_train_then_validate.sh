@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/runpod_paths.sh"
 
 NETWORK_VOLUME_ROOT="${NETWORK_VOLUME_ROOT:-${RUNPOD_VOLUME_ROOT:-/runpod-volume}}"
-PROJECT_ROOT="${PROJECT_ROOT:-${NETWORK_VOLUME_ROOT}/ts_multimodal_LLM}"
+PROJECT_ROOT="${PROJECT_ROOT:-${NETWORK_VOLUME_ROOT}/stock_forecasting}"
 RUNPOD_CONFIG="${1:-${RUNPOD_CONFIG:-configs/stage1_kronos_base_lora.yaml}}"
 PROJECT_VENV="${PROJECT_ROOT}/.venv"
 VALIDATION_LIFECYCLE_MARKER="${RUNPOD_VALIDATION_LIFECYCLE_MARKER:-${NETWORK_VOLUME_ROOT}/lifecycle/stage1/validation.json}"

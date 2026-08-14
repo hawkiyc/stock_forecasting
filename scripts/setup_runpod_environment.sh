@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/runpod_paths.sh"
 
 NETWORK_VOLUME_ROOT="${NETWORK_VOLUME_ROOT:-/runpod-volume}"
-PROJECT_ROOT="${PROJECT_ROOT:-${NETWORK_VOLUME_ROOT}/ts_multimodal_LLM}"
+PROJECT_ROOT="${PROJECT_ROOT:-${NETWORK_VOLUME_ROOT}/stock_forecasting}"
 POETRY_VERSION="${POETRY_VERSION:-2.4.0}"
 POETRY_ROOT="${NETWORK_VOLUME_ROOT}/tools/poetry/${POETRY_VERSION}"
 POETRY_BIN="${POETRY_ROOT}/bin/poetry"
