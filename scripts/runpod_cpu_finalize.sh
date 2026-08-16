@@ -86,6 +86,7 @@ if [[ ! -f "${STAGE2_CONFIG_PATH}" || -L "${STAGE2_CONFIG_PATH}" ]]; then
     echo "Stage 2 config is missing or is a symlink: ${STAGE2_CONFIG_PATH}" >&2
     exit 2
 fi
+bash "${SCRIPT_DIR}/verify_runpod_mounted_readiness.sh" --mount-only
 
 mkdir -p "${FINALIZE_DIR}" "${LIFECYCLE_ROOT}/stage1" "${RUNPOD_SHUTDOWN_DIR}"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -119,7 +120,9 @@ finish_cpu_finalize() {
         "${STARTED_AT}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${finalize_exit_code}" \
         "$([[ ${FINALIZE_SUCCEEDED} -eq 1 ]] && printf ready || printf failed)" \
         "${FINALIZE_LOG}" > "${METADATA_PATH}"
-    bash "${SCRIPT_DIR}/stop_runpod_pod.sh" || true
+    if [[ -z "${RUNPOD_TMUX_LOG_FILE:-}" ]]; then
+        bash "${SCRIPT_DIR}/runpod_self_terminate.sh" || true
+    fi
     exit "${finalize_exit_code}"
 }
 trap 'exit 124' TERM

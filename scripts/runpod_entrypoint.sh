@@ -70,6 +70,9 @@ if [[ "${WANDB_DIR}" != "${NETWORK_VOLUME_ROOT}" ]]; then
     exit 2
 fi
 
+# Prove the exact volume mount before acquiring leases or creating directories.
+bash "${SCRIPT_DIR}/verify_runpod_mounted_readiness.sh" --mount-only
+
 # A single shared lease protects both singleton training and validation lifecycle files.
 runpod_acquire_gpu_workflow_lease "${NETWORK_VOLUME_ROOT}"
 
@@ -274,7 +277,7 @@ shutdown_fallback() {
         fi
     fi
     if [[ -z "${RUNPOD_TMUX_LOG_FILE:-}" && ${lifecycle_published} -eq 1 ]]; then
-        bash "${SCRIPT_DIR}/stop_runpod_pod.sh" || true
+        bash "${SCRIPT_DIR}/runpod_self_terminate.sh" || true
     elif [[ -z "${RUNPOD_TMUX_LOG_FILE:-}" ]]; then
         echo "Pod shutdown skipped because terminal lifecycle publication failed" >&2
     fi

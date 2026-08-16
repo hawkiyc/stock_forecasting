@@ -78,6 +78,29 @@ def test_globally_back_adjusted_vendor_scale_cancels_at_each_cutoff(
     assert "adjusted_close" not in rescaled_records[0]["context"]
 
 
+def test_parallel_window_build_matches_serial_output(market_frame: pd.DataFrame) -> None:
+    serial_audit: dict[str, Any] = {}
+    parallel_audit: dict[str, Any] = {}
+
+    serial = build_causal_windows(
+        market_frame,
+        window_size=32,
+        stride=20,
+        workers=1,
+        audit=serial_audit,
+    )
+    parallel = build_causal_windows(
+        market_frame,
+        window_size=32,
+        stride=20,
+        workers=4,
+        audit=parallel_audit,
+    )
+
+    assert parallel == serial
+    assert parallel_audit == {**serial_audit, "execution_workers": 4}
+
+
 def test_future_benchmark_values_change_labels_but_never_the_model_context(
     market_frame: pd.DataFrame,
 ) -> None:

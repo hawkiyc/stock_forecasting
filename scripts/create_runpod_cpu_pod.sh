@@ -27,14 +27,18 @@ RUNPOD_HF_SECRET_NAME="${RUNPOD_HF_SECRET_NAME:-huggingface_token}"
 RUNPOD_EODHD_SECRET_NAME="${RUNPOD_EODHD_SECRET_NAME:-eodhd_api_token}"
 RUNPOD_CLOUD_TYPE="${RUNPOD_CLOUD_TYPE:-SECURE}"
 RUNPOD_DATACENTER_ID="${RUNPOD_DATACENTER_ID:-EU-RO-1}"
-RUNPOD_CONTAINER_DISK_GB="${RUNPOD_CPU_CONTAINER_DISK_GB:-30}"
+RUNPOD_CONTAINER_DISK_GB="${RUNPOD_CPU_CONTAINER_DISK_GB:-}"
 RUNPOD_API_BASE_URL="${RUNPOD_API_BASE_URL:-https://rest.runpod.io/v1}"
 RUNPOD_CPU_FLAVOR_ID="${RUNPOD_CPU_FLAVOR_ID:-cpu3g}"
 RUNPOD_CPU_VCPU_COUNT="${RUNPOD_CPU_VCPU_COUNT:-8}"
-RUNPOD_CPU_MAX_RUNTIME_SECONDS="${RUNPOD_CPU_MAX_RUNTIME_SECONDS:-28800}"
-RUNPOD_CPU_HARD_LIMIT_SECONDS="${RUNPOD_CPU_HARD_LIMIT_SECONDS:-32400}"
+RUNPOD_CPU_MAX_RUNTIME_SECONDS="${RUNPOD_CPU_MAX_RUNTIME_SECONDS:-21600}"
+RUNPOD_CPU_HARD_LIMIT_SECONDS="${RUNPOD_CPU_HARD_LIMIT_SECONDS:-25200}"
 RUNPOD_GUARD_LOG_DIR="${RUNPOD_GUARD_LOG_DIR:-${HOME:-/tmp}/.local/state/runpod-guards}"
 RUNPOD_GUARD_LAUNCHER="${SCRIPT_DIR}/launch_runpod_guard.sh"
+RUNPOD_CPU_TMUX_WORKFLOW=cpu-prepare
+if [[ "${RUNPOD_STAGE}" == "stage2" ]]; then
+    RUNPOD_CPU_TMUX_WORKFLOW=cpu-finalize
+fi
 
 if [[ -n "${RUNPOD_POD_ID:-}" && "${RUNPOD_TEST_MODE:-0}" != "1" ]]; then
     echo "create_runpod_cpu_pod.sh must run outside the RunPod Pod" >&2
@@ -67,20 +71,37 @@ if [[ ! "${RUNPOD_DATACENTER_ID}" =~ ^[A-Z0-9]+(-[A-Z0-9]+)+$ ]]; then
     echo "RUNPOD_DATACENTER_ID has an invalid format" >&2
     exit 2
 fi
-if [[ ! "${RUNPOD_CONTAINER_DISK_GB}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "RUNPOD_CPU_CONTAINER_DISK_GB must be a positive integer" >&2
-    exit 2
-fi
 if [[ ! "${RUNPOD_API_BASE_URL}" =~ ^https://[A-Za-z0-9._:-]+(/[A-Za-z0-9._/-]*)?$ ]]; then
     echo "RUNPOD_API_BASE_URL must be an HTTPS URL" >&2
     exit 2
 fi
-if [[ ! "${RUNPOD_CPU_FLAVOR_ID}" =~ ^cpu[35][cgm]$ ]]; then
-    echo "RUNPOD_CPU_FLAVOR_ID must be a supported CPU flavor group such as cpu3g" >&2
+case "${RUNPOD_CPU_FLAVOR_ID}" in
+    cpu3c|cpu3g|cpu3m|cpu5c|cpu5g|cpu5m) ;;
+    *)
+        echo "RUNPOD_CPU_FLAVOR_ID must be one of: cpu3c, cpu3g, cpu3m, cpu5c, cpu5g, cpu5m" >&2
+        exit 2
+        ;;
+esac
+if [[ ! "${RUNPOD_CPU_VCPU_COUNT}" =~ ^[1-9][0-9]*$ \
+    || "${RUNPOD_CPU_VCPU_COUNT}" -gt 32 ]]; then
+    echo "RUNPOD_CPU_VCPU_COUNT must be an integer from 1 through 32" >&2
     exit 2
 fi
-if [[ ! "${RUNPOD_CPU_VCPU_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "RUNPOD_CPU_VCPU_COUNT must be a positive integer" >&2
+case "${RUNPOD_CPU_FLAVOR_ID}" in
+    cpu3c|cpu3g|cpu3m) CONTAINER_DISK_GB_PER_VCPU=10 ;;
+    cpu5c|cpu5g|cpu5m) CONTAINER_DISK_GB_PER_VCPU=15 ;;
+esac
+MAX_CONTAINER_DISK_GB=$((RUNPOD_CPU_VCPU_COUNT * CONTAINER_DISK_GB_PER_VCPU))
+if [[ -z "${RUNPOD_CONTAINER_DISK_GB}" ]]; then
+    RUNPOD_CONTAINER_DISK_GB=30
+    if [[ "${RUNPOD_CONTAINER_DISK_GB}" -gt "${MAX_CONTAINER_DISK_GB}" ]]; then
+        RUNPOD_CONTAINER_DISK_GB="${MAX_CONTAINER_DISK_GB}"
+    fi
+elif [[ ! "${RUNPOD_CONTAINER_DISK_GB}" =~ ^[1-9][0-9]*$ \
+    || "${RUNPOD_CONTAINER_DISK_GB}" -gt "${MAX_CONTAINER_DISK_GB}" ]]; then
+    printf 'RUNPOD_CPU_CONTAINER_DISK_GB must be an integer from 1 through %d for %s with %s vCPUs\n' \
+        "${MAX_CONTAINER_DISK_GB}" "${RUNPOD_CPU_FLAVOR_ID}" \
+        "${RUNPOD_CPU_VCPU_COUNT}" >&2
     exit 2
 fi
 if [[ ! "${RUNPOD_CPU_MAX_RUNTIME_SECONDS}" =~ ^[1-9][0-9]*$ \
@@ -184,8 +205,9 @@ if [[ "${FIN_TS_DATASET_PROFILE}" == *eodhd* ]]; then
     EODHD_TOKEN_REFERENCE="{{ RUNPOD_SECRET_${RUNPOD_EODHD_SECRET_NAME} }}"
 fi
 POD_ENV_JSON="$(printf \
-    '{"NETWORK_VOLUME_ROOT":"%s","RUNPOD_VOLUME_ROOT":"%s","PROJECT_ROOT":"%s","DATA_ROOT":"%s","RUNPOD_CONFIG":"%s","RUNPOD_STAGE":"%s","RUNPOD_STAGE_CONFIG_SHA256":"%s","RUNPOD_SELECTION_ID":"%s","RUNPOD_SELECTION_SHA256":"%s","RUNPOD_DATASET_REQUEST_SHA256":"%s","RUNPOD_REMOTE_SELECTION_PATH":"%s","RUNPOD_ROLE":"cpu-prep","RUNPOD_CPU_MAX_RUNTIME_SECONDS":"%s","RUNPOD_SHUTDOWN_ACTION":"terminate","RUNPOD_IMAGE":"%s","RUNPOD_EXPECTED_TORCH_VERSION":"%s","RUNPOD_EXPECTED_CUDA_PREFIX":"%s","RUNPOD_EXPECTED_UBUNTU_VERSION":"%s","HF_TOKEN":"%s","EODHD_API_TOKEN":"%s","FIN_TS_DATASET_PROFILE":"%s","STAGE1_US_SYMBOLS":"%s","STAGE1_US_ETF_SYMBOLS":"%s","STAGE1_SYMBOL_LIMIT":"%s","STAGE1_DATA_START":"%s","STAGE1_DATA_END":"%s","STAGE1_MAX_API_CALLS":"%s","STAGE1_EODHD_QPS":"%s","STAGE1_TAIWAN_QPS":"%s"}' \
+    '{"NETWORK_VOLUME_ROOT":"%s","RUNPOD_VOLUME_ROOT":"%s","RUNPOD_EXPECTED_VOLUME_ID":"%s","RUNPOD_REQUESTED_CPU_COUNT":"%s","PROJECT_ROOT":"%s","DATA_ROOT":"%s","RUNPOD_CONFIG":"%s","RUNPOD_STAGE":"%s","RUNPOD_STAGE_CONFIG_SHA256":"%s","RUNPOD_SELECTION_ID":"%s","RUNPOD_SELECTION_SHA256":"%s","RUNPOD_DATASET_REQUEST_SHA256":"%s","RUNPOD_REMOTE_SELECTION_PATH":"%s","RUNPOD_ROLE":"cpu-prep","RUNPOD_CPU_MAX_RUNTIME_SECONDS":"%s","RUNPOD_SHUTDOWN_ACTION":"terminate","RUNPOD_IMAGE":"%s","RUNPOD_EXPECTED_TORCH_VERSION":"%s","RUNPOD_EXPECTED_CUDA_PREFIX":"%s","RUNPOD_EXPECTED_UBUNTU_VERSION":"%s","HF_TOKEN":"%s","EODHD_API_TOKEN":"%s","FIN_TS_DATASET_PROFILE":"%s","STAGE1_US_SYMBOLS":"%s","STAGE1_US_ETF_SYMBOLS":"%s","STAGE1_SYMBOL_LIMIT":"%s","STAGE1_DATA_START":"%s","STAGE1_DATA_END":"%s","STAGE1_MAX_API_CALLS":"%s","STAGE1_EODHD_QPS":"%s","STAGE1_TAIWAN_QPS":"%s"}' \
     "${RUNPOD_VOLUME_MOUNT_PATH}" "${RUNPOD_VOLUME_MOUNT_PATH}" \
+    "${RUNPOD_NETWORK_VOLUME_ID}" "${RUNPOD_CPU_VCPU_COUNT}" \
     "${PROJECT_ROOT}" "${DATA_ROOT}" "${RUNPOD_CONFIG}" "${RUNPOD_STAGE}" \
     "${RUNPOD_STAGE_CONFIG_SHA256}" "${RUNPOD_SELECTION_ID}" \
     "${RUNPOD_SELECTION_SHA256}" "${RUNPOD_DATASET_REQUEST_SHA256}" \
@@ -294,4 +316,5 @@ printf 'Created CPU preparation Pod: %s\n' "${POD_ID}"
 printf 'External guard PID: %s\n' "${GUARD_PID}"
 printf 'External guard log: %s\n' "${GUARD_LOG}"
 printf 'External guard readiness: %s\n' "${GUARD_LOG%.log}.ready.json"
-printf 'After SSH login, run: bash scripts/runpod_tmux_launch.sh cpu-prepare\n'
+printf 'After SSH login, run: bash scripts/runpod_tmux_launch.sh %s\n' \
+    "${RUNPOD_CPU_TMUX_WORKFLOW}"

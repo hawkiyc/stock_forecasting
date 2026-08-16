@@ -126,8 +126,53 @@ print("{:<12} {}".format("download", " ".join(fields)))
 '
 }
 
+summarize_wandb() {
+    local run_id=""
+    local lifecycle_payload=""
+    local status_key=""
+    local status_payload=""
+
+    for lifecycle_key in lifecycle/stage1/validation.json lifecycle/stage1/training.json; do
+        if lifecycle_payload="$(bash "${S3_WRAPPER}" s3 cp \
+            "s3://${RUNPOD_NETWORK_VOLUME_ID}/${lifecycle_key}" - \
+            --only-show-errors 2>/dev/null)"; then
+            run_id="$(printf '%s' "${lifecycle_payload}" | python3 -c '
+import json
+import re
+import sys
+payload = json.load(sys.stdin)
+value = str(payload.get("wandb_run_id", ""))
+if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", value) and "--" not in value:
+    print(value)
+')"
+        fi
+        [[ -n "${run_id}" ]] && break
+    done
+    [[ -n "${run_id}" ]] || return 0
+    status_key="lifecycle/runs/${run_id}/wandb.json"
+    if ! status_payload="$(bash "${S3_WRAPPER}" s3 cp \
+        "s3://${RUNPOD_NETWORK_VOLUME_ID}/${status_key}" - \
+        --only-show-errors 2>/dev/null)"; then
+        printf '%-12s missing run_id=%s\n' wandb "${run_id}"
+        return 0
+    fi
+    printf '%s' "${status_payload}" | python3 -c '
+import json
+import sys
+payload = json.load(sys.stdin)
+components = payload.get("components", {})
+fields = ["state=" + str(payload.get("state", "unknown")), "run_id=" + str(payload.get("run_id", ""))]
+for name in ("training", "validation"):
+    details = components.get(name)
+    if isinstance(details, dict):
+        fields.append(name + "=" + str(details.get("state", "unknown")))
+print("{:<12} {}".format("wandb", " ".join(fields)))
+'
+}
+
 summarize_marker lifecycle/stage1/code.json code
 summarize_marker lifecycle/stage1/dataset.json dataset
 summarize_download_progress
 summarize_marker lifecycle/stage1/training.json training
 summarize_marker lifecycle/stage1/validation.json validation
+summarize_wandb

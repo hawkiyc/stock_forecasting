@@ -149,9 +149,18 @@ def test_official_eodhd_limits_are_selection_defaults(tmp_path: Path) -> None:
     )
 
     assert arguments.max_api_calls == 100000
+    assert arguments.start == "2005-01-01"
+    assert arguments.end is None
     assert float(arguments.eodhd_qps) == pytest.approx(16.0)
     assert float(arguments.eodhd_qps) * 60.0 == pytest.approx(960.0)
     assert float(arguments.eodhd_qps) * 60.0 < 1000.0
+
+
+def test_selection_requires_an_explicit_end_date(tmp_path: Path) -> None:
+    project_root = _project_root(tmp_path)
+
+    with pytest.raises(SELECTION.SelectionError, match="end is required"):
+        SELECTION._build_selection(_arguments(end=None), project_root)
 
 
 def test_explicit_revision_creates_a_new_dataset_namespace(tmp_path: Path) -> None:

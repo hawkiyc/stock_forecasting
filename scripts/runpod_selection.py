@@ -9,7 +9,7 @@ import re
 import sys
 import tempfile
 from contextlib import suppress
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple, Union
 
@@ -150,8 +150,10 @@ def _validate_relative_path(value: Any, label: str) -> str:
 
 
 def _parse_date(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SelectionError(f"{label} is required and must use YYYY-MM-DD")
     try:
-        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+        parsed = datetime.strptime(value.strip(), "%Y-%m-%d").date()
     except ValueError as error:
         raise SelectionError(f"{label} must use YYYY-MM-DD") from error
     return parsed.isoformat()
@@ -548,6 +550,14 @@ def _prompt_text(label: str, default: str = "") -> str:
     return answer or default
 
 
+def _prompt_required_text(label: str) -> str:
+    while True:
+        answer = input(f"{label} (required): ").strip()
+        if answer:
+            return answer
+        print(f"{label} is required", file=sys.stderr)
+
+
 def _populate_interactive(arguments: argparse.Namespace) -> None:
     arguments.stage = _prompt_choice("Training stage", ("stage1", "stage2"), "stage1")
     arguments.data_profile = _prompt_choice(
@@ -556,8 +566,8 @@ def _populate_interactive(arguments: argparse.Namespace) -> None:
         "us_tw_eodhd",
     )
     arguments.dataset_revision = _prompt_text("Dataset revision label", "v1")
-    arguments.start = _prompt_text("Dataset start date (inclusive)", "2010-01-01")
-    arguments.end = _prompt_text("Dataset end date (exclusive)", date.today().isoformat())
+    arguments.start = _prompt_text("Dataset start date (inclusive)", "2005-01-01")
+    arguments.end = _prompt_required_text("Dataset end date (exclusive)")
     if arguments.data_profile == "tw_only":
         arguments.universe = "all"
         arguments.stocks = []
@@ -943,7 +953,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="v1",
         help="Explicit revision label used to create a new immutable data namespace.",
     )
-    create.add_argument("--start", help="Inclusive market-data start date (YYYY-MM-DD).")
+    create.add_argument(
+        "--start",
+        default="2005-01-01",
+        help="Inclusive market-data start date (default: 2005-01-01).",
+    )
     create.add_argument("--end", help="Exclusive market-data end date (YYYY-MM-DD).")
     create.add_argument("--universe", choices=("all", "explicit"))
     create.add_argument(

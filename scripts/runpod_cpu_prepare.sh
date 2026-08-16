@@ -51,13 +51,14 @@ FIN_TS_DATASET_PROFILE="${FIN_TS_DATASET_PROFILE:-us_tw_eodhd}"
 STAGE1_US_SYMBOLS="${STAGE1_US_SYMBOLS:-}"
 STAGE1_US_ETF_SYMBOLS="${STAGE1_US_ETF_SYMBOLS:-}"
 STAGE1_SYMBOL_LIMIT="${STAGE1_SYMBOL_LIMIT:-}"
-STAGE1_DATA_START="${STAGE1_DATA_START:-2010-01-01}"
-STAGE1_DATA_END="${STAGE1_DATA_END:-2026-07-27}"
+STAGE1_DATA_START="${STAGE1_DATA_START:-2005-01-01}"
+STAGE1_DATA_END="${STAGE1_DATA_END:-}"
 STAGE1_MAX_API_CALLS="${STAGE1_MAX_API_CALLS:-100000}"
 STAGE1_EODHD_QPS="${STAGE1_EODHD_QPS:-16}"
 STAGE1_TAIWAN_QPS="${STAGE1_TAIWAN_QPS:-0.5}"
-RUNPOD_PYTEST_WORKERS="${RUNPOD_PYTEST_WORKERS:-8}"
+RUNPOD_PYTEST_WORKERS="${RUNPOD_PYTEST_WORKERS:-auto}"
 RUNPOD_PYTEST_THREADS_PER_WORKER="${RUNPOD_PYTEST_THREADS_PER_WORKER:-1}"
+RUNPOD_REQUESTED_CPU_COUNT="${RUNPOD_REQUESTED_CPU_COUNT:-${RUNPOD_CPU_COUNT:-1}}"
 METADATA_PATH="${PREP_DIR}/metadata.json"
 RUNPOD_SHUTDOWN_DIR="${PREP_DIR}/shutdown"
 RUNPOD_SHUTDOWN_MARKER="${RUNPOD_SHUTDOWN_DIR}/shutdown.json"
@@ -108,6 +109,15 @@ if [[ ! "${RUNPOD_PYTEST_WORKERS}" =~ ^(auto|0|[1-9][0-9]*)$ ]]; then
 fi
 if [[ ! "${RUNPOD_PYTEST_THREADS_PER_WORKER}" =~ ^[1-9][0-9]*$ ]]; then
     echo "RUNPOD_PYTEST_THREADS_PER_WORKER must be a positive integer" >&2
+    exit 2
+fi
+if [[ ! "${RUNPOD_REQUESTED_CPU_COUNT}" =~ ^[1-9][0-9]*$ \
+    || "${RUNPOD_REQUESTED_CPU_COUNT}" -gt 32 ]]; then
+    echo "RUNPOD_REQUESTED_CPU_COUNT must be an integer from 1 through 32" >&2
+    exit 2
+fi
+if [[ -z "${STAGE1_DATA_END}" ]]; then
+    echo "STAGE1_DATA_END is required; rerun configure with an explicit --end date" >&2
     exit 2
 fi
 if [[ -n "${STAGE1_SYMBOL_LIMIT}" && ! "${STAGE1_SYMBOL_LIMIT}" =~ ^[1-9][0-9]*$ ]]; then
@@ -163,6 +173,38 @@ if [[ ! -x "${RUNPOD_PYTHON_BIN}" ]]; then
     echo "RunPod image Python is unavailable: ${RUNPOD_PYTHON_BIN}" >&2
     exit 127
 fi
+
+DETECTED_CPU_COUNT=""
+if command -v nproc >/dev/null 2>&1; then
+    DETECTED_CPU_COUNT="$(nproc)"
+elif command -v getconf >/dev/null 2>&1; then
+    DETECTED_CPU_COUNT="$(getconf _NPROCESSORS_ONLN)"
+fi
+if [[ ! "${DETECTED_CPU_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Unable to detect the CPU count available to this Pod" >&2
+    exit 2
+fi
+FIN_TS_CPU_WORKERS="${RUNPOD_REQUESTED_CPU_COUNT}"
+if [[ "${DETECTED_CPU_COUNT}" -lt "${FIN_TS_CPU_WORKERS}" ]]; then
+    FIN_TS_CPU_WORKERS="${DETECTED_CPU_COUNT}"
+fi
+if [[ -n "${RUNPOD_CPU_COUNT:-}" ]]; then
+    if [[ ! "${RUNPOD_CPU_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "RunPod provided an invalid RUNPOD_CPU_COUNT" >&2
+        exit 2
+    fi
+    if [[ "${RUNPOD_CPU_COUNT}" -lt "${FIN_TS_CPU_WORKERS}" ]]; then
+        FIN_TS_CPU_WORKERS="${RUNPOD_CPU_COUNT}"
+    fi
+fi
+if [[ "${RUNPOD_PYTEST_WORKERS}" == "auto" ]]; then
+    RUNPOD_PYTEST_WORKERS="${FIN_TS_CPU_WORKERS}"
+elif [[ "${RUNPOD_PYTEST_WORKERS}" != "0" \
+    && "${RUNPOD_PYTEST_WORKERS}" -gt "${FIN_TS_CPU_WORKERS}" ]]; then
+    RUNPOD_PYTEST_WORKERS="${FIN_TS_CPU_WORKERS}"
+fi
+export FIN_TS_CPU_WORKERS
+bash "${SCRIPT_DIR}/verify_runpod_mounted_readiness.sh" --mount-only
 
 EXISTING_FINAL_FILES=0
 for final_data_file in "${FINAL_DATA_FILES[@]}"; do
@@ -229,11 +271,14 @@ finish_cpu_prep() {
     if [[ ${PREP_SUCCEEDED} -ne 1 ]]; then
         write_lifecycle_state "${prep_state}" "${prep_exit_code}" || true
     fi
-    printf '{"started_at":"%s","ended_at":"%s","exit_code":%d,"state":"%s","log_path":"%s"}\n' \
+    printf '{"started_at":"%s","ended_at":"%s","exit_code":%d,"state":"%s","log_path":"%s","requested_cpu_count":%d,"detected_cpu_count":%d,"effective_workers":%d}\n' \
         "${STARTED_AT}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${prep_exit_code}" \
         "${prep_state}" \
-        "${PREP_LOG}" > "${METADATA_PATH}"
-    bash "${SCRIPT_DIR}/stop_runpod_pod.sh" || true
+        "${PREP_LOG}" "${RUNPOD_REQUESTED_CPU_COUNT}" "${DETECTED_CPU_COUNT}" \
+        "${FIN_TS_CPU_WORKERS}" > "${METADATA_PATH}"
+    if [[ -z "${RUNPOD_TMUX_LOG_FILE:-}" ]]; then
+        bash "${SCRIPT_DIR}/runpod_self_terminate.sh" || true
+    fi
     exit "${prep_exit_code}"
 }
 trap 'exit 124' TERM
@@ -327,6 +372,7 @@ DOWNLOAD_ARGUMENTS=(
     --max-api-calls "${STAGE1_MAX_API_CALLS}"
     --eodhd-qps "${STAGE1_EODHD_QPS}"
     --taiwan-qps "${STAGE1_TAIWAN_QPS}"
+    --workers "${FIN_TS_CPU_WORKERS}"
 )
 if [[ ${#US_SYMBOLS[@]} -gt 0 ]]; then
     DOWNLOAD_ARGUMENTS+=(--symbols "${US_SYMBOLS[@]}")
@@ -369,7 +415,8 @@ fi
     --validation-fraction 0.15 \
     --purge-bars 20 \
     --embargo-bars 5 \
-    --effective-embargo-bars 14
+    --effective-embargo-bars 14 \
+    --workers "${FIN_TS_CPU_WORKERS}"
 
 # Refuse to publish data if source changed during the CPU preparation run.
 "${RUNPOD_PYTHON_BIN}" "${SCRIPT_DIR}/runpod_readiness.py" check-code \

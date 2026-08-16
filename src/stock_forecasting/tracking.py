@@ -35,6 +35,7 @@ from stock_forecasting.run_paths import (
     validate_training_resume_path,
     validate_wandb_directory,
 )
+from stock_forecasting.wandb_status import update_wandb_status
 
 
 _SELECTION_ID_PATTERN = re.compile(r"selection-[0-9a-f]{16}")
@@ -334,6 +335,12 @@ class TrackingRun:
     directory: Path
     backend: Any | None
     mode: str
+    tracking_enabled: bool
+    project: str
+    entity: str | None
+    wandb_directory: Path
+    delivery_pending: bool = False
+    delivery_failed: bool = False
 
     @property
     def key(self) -> str:
@@ -342,38 +349,117 @@ class TrackingRun:
         return validate_run_id(self.id)
 
     def log(self, payload: dict[str, Any], step: int | None = None) -> None:
-        if self.backend is not None:
-            self.backend.log(payload, step=step)
         local_log = self.directory / "metrics.jsonl"
         record = {"step": step, "time": datetime.now(UTC).isoformat(), **payload}
-        with local_log.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        try:
+            with local_log.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except BaseException as error:
+            self._record_status("failed", error=error)
+            raise
+        if self.backend is not None:
+            try:
+                backend_payload = dict(payload)
+                if step is not None:
+                    backend_payload["trainer/global_step"] = step
+                self.backend.log(backend_payload)
+            except BaseException as error:
+                self._record_status(self._backend_failure_state(), error=error)
+                raise
 
     def update_summary(self, payload: dict[str, Any]) -> None:
-        if self.backend is not None:
-            for key, value in payload.items():
-                self.backend.summary[key] = value
         summary_path = self.directory / "summary.json"
         current: dict[str, Any] = {}
-        if summary_path.exists():
-            current = json.loads(summary_path.read_text(encoding="utf-8"))
-        current.update(payload)
-        summary_path.write_text(
-            json.dumps(current, indent=2, ensure_ascii=False, default=str), encoding="utf-8"
-        )
+        try:
+            if summary_path.exists():
+                current = json.loads(summary_path.read_text(encoding="utf-8"))
+            current.update(payload)
+            summary_path.write_text(
+                json.dumps(current, indent=2, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
+        except BaseException as error:
+            self._record_status("failed", error=error)
+            raise
+        if self.backend is not None:
+            try:
+                for key, value in payload.items():
+                    self.backend.summary[key] = value
+            except BaseException as error:
+                self._record_status(self._backend_failure_state(), error=error)
+                raise
 
     def log_model_artifact(self, checkpoint_dir: Path, aliases: list[str]) -> None:
         if self.backend is None:
             return
-        import wandb
+        try:
+            import wandb
 
-        artifact = wandb.Artifact(name=f"adapter-{self.id}", type="model")
-        artifact.add_dir(str(checkpoint_dir))
-        self.backend.log_artifact(artifact, aliases=aliases)
+            artifact = wandb.Artifact(name=f"adapter-{self.id}", type="model")
+            artifact.add_dir(str(checkpoint_dir))
+            self.backend.log_artifact(artifact, aliases=aliases)
+        except BaseException as error:
+            self._record_status(self._backend_failure_state(), error=error)
+            raise
 
     def finish(self, exit_code: int = 0) -> None:
         if self.backend is not None:
-            self.backend.finish(exit_code=exit_code)
+            try:
+                self.backend.finish(exit_code=exit_code)
+            except BaseException as error:
+                self._record_status(self._backend_failure_state(), error=error)
+                raise
+        if not self.tracking_enabled:
+            return
+        state = (
+            "failed"
+            if self.delivery_failed
+            else (
+                "offline_pending"
+                if self.mode == "offline" or self.delivery_pending
+                else "online_finished"
+            )
+        )
+        self._record_status(state)
+
+    def _backend_failure_state(self) -> str:
+        return "failed" if self.mode == "offline" else "offline_pending"
+
+    def _transaction_directory(self) -> Path | None:
+        if self.backend is None:
+            return None
+        value = getattr(self.backend, "dir", None)
+        if not value:
+            return None
+        directory = Path(str(value)).expanduser().resolve(strict=False)
+        return directory.parent if directory.name == "files" else directory
+
+    def _record_status(self, state: str, *, error: BaseException | None = None) -> None:
+        if not self.tracking_enabled:
+            return
+        if state in {"offline_pending", "sync_failed"}:
+            self.delivery_pending = True
+        if state == "failed":
+            self.delivery_failed = True
+        update_wandb_status(
+            run_id=self.id,
+            component="training",
+            state=state,
+            mode=self.mode,
+            project=self.project,
+            entity=self.entity,
+            wandb_directory=self.wandb_directory,
+            transaction_directory=self._transaction_directory(),
+            error=(f"{type(error).__name__}: {error}" if error is not None else None),
+        )
+
+
+def _define_training_metric_axes(run: Any) -> None:
+    """Use a custom optimizer-step axis so loss and validation rows can share a step."""
+
+    run.define_metric("trainer/global_step")
+    run.define_metric("train/*", step_metric="trainer/global_step")
+    run.define_metric("validation/*", step_metric="trainer/global_step")
 
 
 def _start_wandb(config: ExperimentConfig) -> Any:
@@ -384,8 +470,12 @@ def _start_wandb(config: ExperimentConfig) -> Any:
         os.environ.get("WANDB_RUN_ID"),
         os.environ.get("RUNPOD_RUN_KEY"),
     )
-    resume_policy = "must" if config.training.resume_checkpoint is not None else "never"
-    return wandb.init(
+    resume_policy = (
+        None
+        if config.wandb.mode == "offline"
+        else ("must" if config.training.resume_checkpoint is not None else "never")
+    )
+    run = wandb.init(
         project=config.wandb.project,
         entity=config.wandb.entity or None,
         group=config.wandb.group,
@@ -402,6 +492,15 @@ def _start_wandb(config: ExperimentConfig) -> Any:
         dir=str(config.wandb.directory),
         mode=config.wandb.mode,
     )
+    try:
+        _define_training_metric_axes(run)
+    except BaseException:
+        try:
+            run.finish(exit_code=1)
+        except BaseException:
+            pass
+        raise
+    return run
 
 
 def start_tracking(config: ExperimentConfig) -> TrackingRun:
@@ -416,12 +515,25 @@ def start_tracking(config: ExperimentConfig) -> TrackingRun:
     )
     backend: Any | None = None
     selected_mode = config.wandb.mode
+    fallback_error: BaseException | None = None
 
     if config.wandb.enabled and config.wandb.mode != "disabled":
         try:
             backend = _start_wandb(config)
-        except Exception:
+        except Exception as error:
+            fallback_error = error
             if not config.wandb.allow_offline_fallback:
+                if expected_run_id is not None:
+                    update_wandb_status(
+                        run_id=expected_run_id,
+                        component="training",
+                        state="failed",
+                        mode=config.wandb.mode,
+                        project=config.wandb.project,
+                        entity=config.wandb.entity,
+                        wandb_directory=config.wandb.directory,
+                        error=f"{type(error).__name__}: {error}",
+                    )
                 if config.training.resume_checkpoint is None:
                     _rollback_fresh_run_reservation(reservation)
                 raise
@@ -429,7 +541,6 @@ def start_tracking(config: ExperimentConfig) -> TrackingRun:
 
             selected_mode = "offline"
             run_id = expected_run_id
-            resume_policy = "must" if config.training.resume_checkpoint is not None else "never"
             try:
                 backend = wandb.init(
                     project=config.wandb.project,
@@ -437,7 +548,7 @@ def start_tracking(config: ExperimentConfig) -> TrackingRun:
                     group=config.wandb.group,
                     name=config.wandb.name,
                     id=run_id,
-                    resume=resume_policy if run_id else None,
+                    resume=None,
                     tags=[*config.wandb.tags, "offline-fallback"],
                     config={
                         **config.as_dict(),
@@ -448,7 +559,24 @@ def start_tracking(config: ExperimentConfig) -> TrackingRun:
                     dir=str(config.wandb.directory),
                     mode="offline",
                 )
-            except BaseException:
+                _define_training_metric_axes(backend)
+            except BaseException as offline_error:
+                if backend is not None:
+                    try:
+                        backend.finish(exit_code=1)
+                    except BaseException:
+                        pass
+                if expected_run_id is not None:
+                    update_wandb_status(
+                        run_id=expected_run_id,
+                        component="training",
+                        state="failed",
+                        mode="offline",
+                        project=config.wandb.project,
+                        entity=config.wandb.entity,
+                        wandb_directory=config.wandb.directory,
+                        error=f"{type(offline_error).__name__}: {offline_error}",
+                    )
                 if config.training.resume_checkpoint is None:
                     _rollback_fresh_run_reservation(reservation)
                 raise
@@ -484,6 +612,12 @@ def start_tracking(config: ExperimentConfig) -> TrackingRun:
         directory=config.training.output_root,
         backend=backend,
         mode=selected_mode,
+        tracking_enabled=bool(
+            config.wandb.enabled and config.wandb.mode != "disabled"
+        ),
+        project=config.wandb.project,
+        entity=config.wandb.entity,
+        wandb_directory=config.wandb.directory,
     )
     run_directory = checkpoint_run_directory(config.training.output_root, provisional.id)
     resume_checkpoint = config.training.resume_checkpoint
@@ -525,4 +659,8 @@ def start_tracking(config: ExperimentConfig) -> TrackingRun:
         if resume_checkpoint is None:
             _rollback_fresh_run_reservation(reservation)
         raise
+    provisional._record_status(
+        "offline_pending" if selected_mode == "offline" else "online_running",
+        error=fallback_error,
+    )
     return provisional

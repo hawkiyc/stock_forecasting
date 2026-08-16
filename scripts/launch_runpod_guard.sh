@@ -23,11 +23,18 @@ LOG_FILE="$4"
 STARTUP_TIMEOUT_SECONDS="${RUNPOD_GUARD_STARTUP_TIMEOUT_SECONDS:-15}"
 RUNPOD_GUARD_VOLUME_ROOT="${RUNPOD_GUARD_VOLUME_ROOT:-/runpod-volume}"
 RUNPOD_GUARD_RUN_ID="${RUNPOD_GUARD_RUN_ID:-}"
+RUNPOD_GUARD_KEEP_AWAKE="${RUNPOD_GUARD_KEEP_AWAKE:-auto}"
 
 if [[ ! "${POD_ID}" =~ ^[A-Za-z0-9_-]+$ \
     || ! "${DELAY_SECONDS}" =~ ^[1-9][0-9]*$ \
     || ! "${STARTUP_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "Guard launch identifiers and time limits are invalid" >&2
+    exit 2
+fi
+if [[ "${RUNPOD_GUARD_KEEP_AWAKE}" != "auto" \
+    && "${RUNPOD_GUARD_KEEP_AWAKE}" != "0" \
+    && "${RUNPOD_GUARD_KEEP_AWAKE}" != "1" ]]; then
+    echo "RUNPOD_GUARD_KEEP_AWAKE must be auto, 0, or 1" >&2
     exit 2
 fi
 if [[ ! "${RUNPOD_GUARD_VOLUME_ROOT}" =~ ^/[A-Za-z0-9._/-]+$ \
@@ -72,6 +79,8 @@ export RUNPOD_ENV_FILE
 mkdir -p "$(dirname "${LOG_FILE}")"
 READY_FILE="${LOG_FILE%.log}.ready.json"
 PID_FILE="${LOG_FILE%.log}.pid"
+CAFFEINATE_PID_FILE="${LOG_FILE%.log}.caffeinate.pid"
+KEEP_AWAKE_FILE="${LOG_FILE%.log}.keep-awake.json"
 ready_tmp="${READY_FILE}.tmp.$$"
 printf '{"state":"launching","pod_id":"%s"}\n' "${POD_ID}" > "${ready_tmp}"
 mv "${ready_tmp}" "${READY_FILE}"
@@ -107,6 +116,37 @@ with open(sys.argv[1], "r") as stream:
     payload = json.load(stream)
 raise SystemExit(0 if payload.get("state") == "armed" and payload.get("pod_id") == sys.argv[2] and payload.get("pid") == int(sys.argv[3]) else 1)' \
         "${READY_FILE}" "${POD_ID}" "${GUARD_PID}" 2>/dev/null; then
+        keep_awake_required=0
+        if [[ "${RUNPOD_GUARD_KEEP_AWAKE}" == "1" \
+            || ( "${RUNPOD_GUARD_KEEP_AWAKE}" == "auto" \
+                && "$(uname -s)" == "Darwin" ) ]]; then
+            keep_awake_required=1
+        fi
+        if [[ ${keep_awake_required} -eq 1 ]]; then
+            if ! command -v caffeinate >/dev/null 2>&1; then
+                echo "caffeinate is required to keep the local lifecycle guard awake" >&2
+                break
+            fi
+            nohup caffeinate -is -w "${GUARD_PID}" </dev/null >/dev/null 2>&1 &
+            CAFFEINATE_PID=$!
+            sleep 0.2
+            if ! kill -0 "${CAFFEINATE_PID}" 2>/dev/null; then
+                echo "caffeinate exited before the lifecycle guard was protected" >&2
+                break
+            fi
+            caffeinate_pid_tmp="${CAFFEINATE_PID_FILE}.tmp.$$"
+            printf '%s\n' "${CAFFEINATE_PID}" > "${caffeinate_pid_tmp}"
+            mv "${caffeinate_pid_tmp}" "${CAFFEINATE_PID_FILE}"
+            keep_awake_tmp="${KEEP_AWAKE_FILE}.tmp.$$"
+            printf '{"state":"armed","mechanism":"caffeinate","guard_pid":%d,"pid":%d}\n' \
+                "${GUARD_PID}" "${CAFFEINATE_PID}" > "${keep_awake_tmp}"
+            mv "${keep_awake_tmp}" "${KEEP_AWAKE_FILE}"
+        else
+            keep_awake_tmp="${KEEP_AWAKE_FILE}.tmp.$$"
+            printf '{"state":"not-required","platform":"%s","guard_pid":%d}\n' \
+                "$(uname -s)" "${GUARD_PID}" > "${keep_awake_tmp}"
+            mv "${keep_awake_tmp}" "${KEEP_AWAKE_FILE}"
+        fi
         printf '%s\n' "${GUARD_PID}"
         exit 0
     fi

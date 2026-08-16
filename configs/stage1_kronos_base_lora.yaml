@@ -64,7 +64,7 @@ training:
   weight_decay: 0.01
   warmup_ratio: 0.03
   max_grad_norm: 1.0
-  log_every_steps: 10
+  log_every_steps: 1
   evaluate_every_steps: 50
   checkpoint_every_steps: 50
   checkpoint_save_top_k: 3
@@ -114,7 +114,7 @@ validation:
   resume_completed_models: true
 
 runtime:
-  max_runtime_seconds: 21600
+  max_runtime_seconds: ${MAX_RUNTIME_SECONDS:-21600}
   auto_terminate_pod: true
   termination_retry_seconds: 15
   termination_max_attempts: 20

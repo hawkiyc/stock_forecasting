@@ -45,6 +45,7 @@ from stock_forecasting.run_paths import (
     validate_validation_lifecycle_path,
     validate_wandb_directory,
 )
+from stock_forecasting.wandb_status import update_wandb_status
 from stock_forecasting.training import (
     deterministic_stratified_indices,
     resolve_processed_dataset,
@@ -710,22 +711,126 @@ def log_validation_to_wandb(
     validate_wandb_directory(config.wandb.directory)
     import wandb
 
-    run = wandb.init(
-        id=run_id,
+    selected_mode = config.wandb.mode
+    run: Any | None = None
+    fallback_error: BaseException | None = None
+    init_arguments: dict[str, Any] = {
+        "id": run_id,
+        "project": config.wandb.project,
+        "entity": config.wandb.entity or None,
+        "job_type": "post-training-validation",
+        "dir": str(config.wandb.directory),
+        "config": {"post_training_validation": config.validation.model_dump(mode="json")},
+    }
+    try:
+        run = wandb.init(
+            **init_arguments,
+            resume=None if selected_mode == "offline" else "must",
+            mode=selected_mode,
+        )
+    except Exception as error:
+        fallback_error = error
+        if not config.wandb.allow_offline_fallback:
+            update_wandb_status(
+                run_id=run_id,
+                component="validation",
+                state="failed",
+                mode=selected_mode,
+                project=config.wandb.project,
+                entity=config.wandb.entity,
+                wandb_directory=config.wandb.directory,
+                error=f"{type(error).__name__}: {error}",
+            )
+            raise
+        selected_mode = "offline"
+        try:
+            run = wandb.init(
+                **init_arguments,
+                resume=None,
+                mode="offline",
+                tags=[*config.wandb.tags, "offline-validation-fallback"],
+            )
+        except BaseException as offline_error:
+            update_wandb_status(
+                run_id=run_id,
+                component="validation",
+                state="failed",
+                mode="offline",
+                project=config.wandb.project,
+                entity=config.wandb.entity,
+                wandb_directory=config.wandb.directory,
+                error=f"{type(offline_error).__name__}: {offline_error}",
+            )
+            raise
+
+    if run is None:
+        raise RuntimeError("W&B validation run was not initialized")
+    transaction_directory = Path(str(run.dir)).resolve(strict=False)
+    if transaction_directory.name == "files":
+        transaction_directory = transaction_directory.parent
+    update_wandb_status(
+        run_id=run_id,
+        component="validation",
+        state="offline_pending" if selected_mode == "offline" else "online_running",
+        mode=selected_mode,
         project=config.wandb.project,
-        entity=config.wandb.entity or None,
-        resume="must",
-        job_type="post-training-validation",
-        dir=str(config.wandb.directory),
-        mode=config.wandb.mode,
+        entity=config.wandb.entity,
+        wandb_directory=config.wandb.directory,
+        transaction_directory=transaction_directory,
+        error=(
+            f"{type(fallback_error).__name__}: {fallback_error}"
+            if fallback_error is not None
+            else None
+        ),
     )
-    if str(run.id) != run_id:
-        run.finish(exit_code=1)
-        raise RuntimeError("W&B returned a run ID different from validation run_id")
-    run.log(_flatten_numeric(payload.get("models", {}), "benchmark_validation"))
-    artifact = wandb.Artifact(f"validation-benchmark-{run_id}", type="evaluation")
-    artifact.add_file(str(output))
-    run.log_artifact(artifact, aliases=["validation", "latest"])
-    run.summary["benchmark_validation_completed"] = payload.get("state") == "ready"
-    run.summary["benchmark_validation_path"] = str(output)
-    run.finish()
+    try:
+        if str(run.id) != run_id:
+            raise RuntimeError("W&B returned a run ID different from validation run_id")
+        trainer_state = _read_json(Path(str(payload["checkpoint"])) / "trainer-state.json")
+        validation_step = int(trainer_state.get("global_step", 0))
+        if validation_step < 0:
+            raise ValueError("Validation checkpoint global_step must be non-negative")
+        validation_step_key = "benchmark_validation/global_step"
+        run.define_metric("benchmark_validation/*", step_metric=validation_step_key)
+        validation_history = _flatten_numeric(
+            payload.get("models", {}),
+            "benchmark_validation",
+        )
+        validation_history[validation_step_key] = validation_step
+        # The training run has already committed its final internal W&B step.
+        # Append a new history row and use the checkpoint step as its chart axis.
+        run.log(validation_history)
+        artifact = wandb.Artifact(f"validation-benchmark-{run_id}", type="evaluation")
+        artifact.add_file(str(output))
+        run.log_artifact(artifact, aliases=["validation", "latest"])
+        run.summary["benchmark_validation_completed"] = payload.get("state") == "ready"
+        run.summary["benchmark_validation_path"] = str(output)
+        run.summary["benchmark_validation_global_step"] = validation_step
+        run.finish()
+    except BaseException as error:
+        update_wandb_status(
+            run_id=run_id,
+            component="validation",
+            state=("failed" if selected_mode == "offline" else "offline_pending"),
+            mode=selected_mode,
+            project=config.wandb.project,
+            entity=config.wandb.entity,
+            wandb_directory=config.wandb.directory,
+            transaction_directory=transaction_directory,
+            error=f"{type(error).__name__}: {error}",
+        )
+        try:
+            run.finish(exit_code=1)
+        except BaseException:
+            pass
+        raise
+    update_wandb_status(
+        run_id=run_id,
+        component="validation",
+        state="offline_pending" if selected_mode == "offline" else "online_finished",
+        mode=selected_mode,
+        project=config.wandb.project,
+        entity=config.wandb.entity,
+        wandb_directory=config.wandb.directory,
+        transaction_directory=transaction_directory,
+    )

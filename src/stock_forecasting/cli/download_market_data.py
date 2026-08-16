@@ -96,6 +96,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=int(os.environ.get("FIN_TS_CPU_WORKERS", "1")),
+        help="Thread workers for independent symbols and trading dates.",
+    )
+    parser.add_argument(
         "--exclude-delisted",
         action="store_true",
         help="Exclude EODHD delisted symbols; active and delisted are included by default.",
@@ -131,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
         selection_id=args.selection_id,
         selection_sha256=args.selection_sha256,
         launch_id=args.launch_id,
+        workers=args.workers,
     )
     try:
         payload = ingest_daily_ohlcv(

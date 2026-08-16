@@ -1017,6 +1017,23 @@ def command_completed_training_run(arguments):
     return 0
 
 
+def command_resumable_training_run(arguments):
+    payload = _load_json(arguments.marker)
+    if payload.get("kind") != "stage1-training":
+        raise ValueError("Training lifecycle marker has the wrong kind")
+    if payload.get("state") not in {"failed", "timed_out"}:
+        raise ValueError("Training lifecycle is not failed or timed out")
+    if payload.get("training_completed") is True:
+        raise ValueError(
+            "Training already completed; resume standalone validation instead"
+        )
+    volume_root = arguments.network_volume_root.resolve(strict=False)
+    _validate_run_lifecycle_paths(payload, volume_root)
+    run_id = _validate_run_id(payload.get("wandb_run_id"), "Training lifecycle run ID")
+    sys.stdout.write(run_id + "\n")
+    return 0
+
+
 def _validate_training_completion_payload(payload, volume_root, expected_run_id):
     if payload.get("schema_version") != TRAINING_COMPLETION_SCHEMA_VERSION:
         raise ValueError("Training completion marker does not use the current immutable schema")
@@ -1244,6 +1261,51 @@ def _validated_checkpoint_leaderboard(leaderboard, run_id):
     return monitor, mode, checkpoints, contract_digest
 
 
+def _validated_best_checkpoint_pointer(
+    pointer,
+    leaderboard,
+    *,
+    run_id,
+    monitor,
+    mode,
+    checkpoints,
+    contract_digest,
+):
+    if pointer.get("run_id") != run_id or pointer.get("run_key") != run_id:
+        raise ValueError("Best-checkpoint pointer identity does not match its run directory")
+    if pointer.get("selection_source") != "validation":
+        raise ValueError("Best checkpoint must be selected from validation metrics")
+    if _checkpoint_artifact_contract_digest(pointer, "Best-checkpoint pointer") != contract_digest:
+        raise ValueError("Best-checkpoint pointer and leaderboard contracts disagree")
+    checkpoint_name = pointer.get("path")
+    checkpoint_names = [row["path"] for row in checkpoints]
+    if (
+        not isinstance(checkpoint_name, str)
+        or CHECKPOINT_NAME_PATTERN.fullmatch(checkpoint_name) is None
+        or leaderboard.get("best_checkpoint") != checkpoint_name
+        or checkpoint_names[0] != checkpoint_name
+    ):
+        raise ValueError("Best-checkpoint pointer and leaderboard disagree")
+    if pointer.get("monitor") != monitor or pointer.get("mode") != mode:
+        raise ValueError("Best-checkpoint pointer and leaderboard selection policy disagree")
+    pointer_value = pointer.get("value")
+    if (
+        not isinstance(pointer_value, (int, float))
+        or isinstance(pointer_value, bool)
+        or not math.isfinite(float(pointer_value))
+        or float(pointer_value) != float(checkpoints[0]["value"])
+    ):
+        raise ValueError("Best-checkpoint pointer and leaderboard values disagree")
+    transaction_id = leaderboard.get("transaction_id")
+    if (
+        not isinstance(transaction_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None
+        or pointer.get("transaction_id") != transaction_id
+    ):
+        raise ValueError("Best-checkpoint pointer and leaderboard transactions disagree")
+    return checkpoint_name
+
+
 def _validate_trainer_state_identity(
     trainer_state,
     *,
@@ -1294,42 +1356,19 @@ def command_best_checkpoint_name(arguments):
     pointer = _load_json(arguments.pointer)
     leaderboard = _load_json(arguments.leaderboard)
     trainer_state = _load_json(arguments.trainer_state)
-    if pointer.get("run_id") != run_id or pointer.get("run_key") != run_id:
-        raise ValueError("Best-checkpoint pointer identity does not match its run directory")
-    if pointer.get("selection_source") != "validation":
-        raise ValueError("Best checkpoint must be selected from validation metrics")
-    pointer_contract_digest = _checkpoint_artifact_contract_digest(
-        pointer,
-        "Best-checkpoint pointer",
-    )
-    checkpoint_name = pointer.get("path")
-    if (
-        not isinstance(checkpoint_name, str)
-        or CHECKPOINT_NAME_PATTERN.fullmatch(checkpoint_name) is None
-    ):
-        raise ValueError("Best checkpoint pointer contains a non-canonical checkpoint name")
     monitor, mode, checkpoints, contract_digest = _validated_checkpoint_leaderboard(
         leaderboard,
         run_id,
     )
-    if pointer_contract_digest != contract_digest:
-        raise ValueError("Best-checkpoint pointer and leaderboard contracts disagree")
-    checkpoint_names = [row["path"] for row in checkpoints]
-    if (
-        leaderboard.get("best_checkpoint") != checkpoint_name
-        or checkpoint_names[0] != checkpoint_name
-    ):
-        raise ValueError("Best-checkpoint pointer and leaderboard disagree")
-    if pointer.get("monitor") != monitor or pointer.get("mode") != mode:
-        raise ValueError("Best-checkpoint pointer and leaderboard selection policy disagree")
-    pointer_value = pointer.get("value")
-    if (
-        not isinstance(pointer_value, (int, float))
-        or isinstance(pointer_value, bool)
-        or not math.isfinite(float(pointer_value))
-        or float(pointer_value) != float(checkpoints[0]["value"])
-    ):
-        raise ValueError("Best-checkpoint pointer and leaderboard values disagree")
+    checkpoint_name = _validated_best_checkpoint_pointer(
+        pointer,
+        leaderboard,
+        run_id=run_id,
+        monitor=monitor,
+        mode=mode,
+        checkpoints=checkpoints,
+        contract_digest=contract_digest,
+    )
     _validate_trainer_state_identity(
         trainer_state,
         run_id=run_id,
@@ -1340,6 +1379,34 @@ def command_best_checkpoint_name(arguments):
         contract_digest=contract_digest,
     )
     sys.stdout.write(checkpoint_name + "\n")
+    return 0
+
+
+def command_checkpoint_download_names(arguments):
+    """Print the manifest-authoritative checkpoint names selected for download."""
+
+    run_id = _validate_run_id(arguments.run_id)
+    pointer = _load_json(arguments.pointer)
+    leaderboard = _load_json(arguments.leaderboard)
+    monitor, mode, checkpoints, contract_digest = _validated_checkpoint_leaderboard(
+        leaderboard,
+        run_id,
+    )
+    best_checkpoint = _validated_best_checkpoint_pointer(
+        pointer,
+        leaderboard,
+        run_id=run_id,
+        monitor=monitor,
+        mode=mode,
+        checkpoints=checkpoints,
+        contract_digest=contract_digest,
+    )
+    selected = (
+        [row["path"] for row in checkpoints]
+        if arguments.scope == "all"
+        else [best_checkpoint]
+    )
+    sys.stdout.write("\n".join(selected) + "\n")
     return 0
 
 
@@ -1590,6 +1657,11 @@ def build_parser():
     completed_training.add_argument("--network-volume-root", type=Path, required=True)
     completed_training.set_defaults(handler=command_completed_training_run)
 
+    resumable_training = subparsers.add_parser("resumable-training-run")
+    resumable_training.add_argument("--marker", required=True)
+    resumable_training.add_argument("--network-volume-root", type=Path, required=True)
+    resumable_training.set_defaults(handler=command_resumable_training_run)
+
     training_completion = subparsers.add_parser("check-training-completion")
     training_completion.add_argument("--marker", required=True)
     training_completion.add_argument("--network-volume-root", type=Path, required=True)
@@ -1652,6 +1724,13 @@ def build_parser():
     best_checkpoint.add_argument("--trainer-state", required=True)
     best_checkpoint.add_argument("--run-id", required=True)
     best_checkpoint.set_defaults(handler=command_best_checkpoint_name)
+
+    checkpoint_download = subparsers.add_parser("checkpoint-download-names")
+    checkpoint_download.add_argument("--pointer", required=True)
+    checkpoint_download.add_argument("--leaderboard", required=True)
+    checkpoint_download.add_argument("--run-id", required=True)
+    checkpoint_download.add_argument("--scope", choices=("all", "best"), required=True)
+    checkpoint_download.set_defaults(handler=command_checkpoint_download_names)
 
     checkpoint_pointer = subparsers.add_parser("checkpoint-pointer-name")
     checkpoint_pointer.add_argument("--pointer", required=True)

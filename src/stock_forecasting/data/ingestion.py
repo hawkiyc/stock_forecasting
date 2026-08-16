@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from collections import Counter
-from collections.abc import Iterable
+from collections import Counter, deque
+from collections.abc import Callable, Generator, Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import pandas as pd
 
@@ -40,6 +42,51 @@ from stock_forecasting.data.providers import (
 from stock_forecasting.data.schema import normalize_ohlcv_frame
 
 
+_InputT = TypeVar("_InputT")
+_ResultT = TypeVar("_ResultT")
+
+
+def _ordered_thread_map(
+    function: Callable[[_InputT], _ResultT],
+    items: Iterable[_InputT],
+    *,
+    max_workers: int,
+    thread_name_prefix: str,
+) -> Generator[_ResultT, None, None]:
+    """Yield deterministic results with a bounded two-task prefetch per worker."""
+
+    if max_workers < 1:
+        raise ValueError("max_workers must be positive")
+    iterator = iter(items)
+    executor = ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix=thread_name_prefix,
+    )
+    pending: deque[Future[_ResultT]] = deque()
+
+    def submit_next() -> bool:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return False
+        pending.append(executor.submit(function, item))
+        return True
+
+    try:
+        for _ in range(max_workers * 2):
+            if not submit_next():
+                break
+        while pending:
+            future = pending.popleft()
+            result = future.result()
+            submit_next()
+            yield result
+    finally:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
 @dataclass(frozen=True)
 class IngestionOptions:
     profile: DatasetProfile
@@ -61,6 +108,7 @@ class IngestionOptions:
     selection_id: str | None = None
     selection_sha256: str | None = None
     launch_id: str | None = None
+    workers: int = 1
 
 
 class _ParquetSink:
@@ -325,6 +373,8 @@ def ingest_daily_ohlcv(
         MassiveProvider().discover(include_delisted=options.include_delisted)
     if options.max_api_calls < 1:
         raise ValueError("max_api_calls must be positive")
+    if options.workers < 1:
+        raise ValueError("workers must be positive")
     has_explicit_us_universe = bool(
         options.explicit_us_symbols or options.explicit_us_etfs
     )
@@ -411,16 +461,14 @@ def ingest_daily_ohlcv(
                     f"Estimated HTTP requests ({estimated_calls}) exceed max_api_calls="
                     f"{options.max_api_calls}"
                 )
-            for instrument in instruments:
+
+            def fetch_eodhd_instrument(
+                instrument: Instrument,
+            ) -> tuple[Any, Any, Instrument]:
                 instrument_split_fetch = provider.fetch_historical_split_events(
                     instrument,
                     start=options.start,
                     end=provider_end,
-                )
-                request_log.append(instrument_split_fetch.requests)
-                corporate_action_rows += len(instrument_split_fetch.frame)
-                dropped_source_rows += int(
-                    instrument_split_fetch.metadata.get("dropped_rows", 0)
                 )
                 fetched = provider.fetch_instrument(
                     instrument,
@@ -430,17 +478,33 @@ def ingest_daily_ohlcv(
                     split_events=instrument_split_fetch.frame,
                     split_adjustment_source="historical_splits",
                 )
-                request_log.append(fetched.requests)
-                if fetched.frame.empty:
-                    empty_series += 1
-                    continue
-                if (
-                    not instrument.is_active
-                    and fetched.frame["timestamp"].max()
-                    < pd.Timestamp(EODHD_DELISTED_AUXILIARY_DATA_START, tz="UTC")
-                ):
-                    delisted_eod_only_symbols.add(instrument.canonical_symbol)
-                sink.write(fetched.frame)
+                return instrument_split_fetch, fetched, instrument
+
+            with closing(
+                _ordered_thread_map(
+                    fetch_eodhd_instrument,
+                    instruments,
+                    max_workers=min(options.workers, max(len(instruments), 1)),
+                    thread_name_prefix="eodhd",
+                )
+            ) as fetched_instruments:
+                for instrument_split_fetch, fetched, instrument in fetched_instruments:
+                    request_log.append(instrument_split_fetch.requests)
+                    corporate_action_rows += len(instrument_split_fetch.frame)
+                    dropped_source_rows += int(
+                        instrument_split_fetch.metadata.get("dropped_rows", 0)
+                    )
+                    request_log.append(fetched.requests)
+                    if fetched.frame.empty:
+                        empty_series += 1
+                        continue
+                    if (
+                        not instrument.is_active
+                        and fetched.frame["timestamp"].max()
+                        < pd.Timestamp(EODHD_DELISTED_AUXILIARY_DATA_START, tz="UTC")
+                    ):
+                        delisted_eod_only_symbols.add(instrument.canonical_symbol)
+                    sink.write(fetched.frame)
 
         if options.profile in {"tw_only", "us_tw_eodhd", "us_tw_massive"}:
             for provider_class in (TWSEProvider, TPExProvider):
@@ -466,30 +530,56 @@ def ingest_daily_ohlcv(
                     )
                 corporate_action_rows += len(action_fetch.frame)
                 dropped_source_rows += int(action_fetch.metadata.get("dropped_rows", 0))
-                for trading_date in taiwan_dates:
+
+                def fetch_taiwan_date(trading_date: str) -> tuple[Any, pd.DataFrame]:
                     fetched = provider.fetch_date(
                         date=trading_date,
                         dataset_profile=options.profile,
                     )
-                    request_log.append(fetched.requests)
-                    dropped_source_rows += int(fetched.metadata.get("dropped_rows", 0))
                     if not fetched.frame.empty:
                         adjusted = apply_cumulative_adjustments(
                             fetched.frame,
                             action_fetch.frame,
                         )
                         adjusted["adjustment_source"] = (
-                            "twse_twt49u" if provider_name == "twse_official" else "tpex_exdailyq"
+                            "twse_twt49u"
+                            if provider_name == "twse_official"
+                            else "tpex_exdailyq"
                         )
-                        sink.write(adjusted)
-                for month in taiwan_months:
-                    benchmark_fetch = provider.fetch_benchmark_month(
+                    else:
+                        adjusted = fetched.frame
+                    return fetched, adjusted
+
+                def fetch_taiwan_month(month: str) -> Any:
+                    return provider.fetch_benchmark_month(
                         month=month,
                         dataset_profile=options.profile,
                     )
-                    request_log.append(benchmark_fetch.requests)
-                    benchmark_rows += len(benchmark_fetch.frame)
-                    sink.write(benchmark_fetch.frame)
+
+                with closing(
+                    _ordered_thread_map(
+                        fetch_taiwan_date,
+                        taiwan_dates,
+                        max_workers=min(options.workers, max(len(taiwan_dates), 1)),
+                        thread_name_prefix=f"{provider_name}-date",
+                    )
+                ) as fetched_dates:
+                    for fetched, adjusted in fetched_dates:
+                        request_log.append(fetched.requests)
+                        dropped_source_rows += int(fetched.metadata.get("dropped_rows", 0))
+                        sink.write(adjusted)
+                with closing(
+                    _ordered_thread_map(
+                        fetch_taiwan_month,
+                        taiwan_months,
+                        max_workers=min(options.workers, max(len(taiwan_months), 1)),
+                        thread_name_prefix=f"{provider_name}-month",
+                    )
+                ) as fetched_months:
+                    for benchmark_fetch in fetched_months:
+                        request_log.append(benchmark_fetch.requests)
+                        benchmark_rows += len(benchmark_fetch.frame)
+                        sink.write(benchmark_fetch.frame)
 
         sink.close()
         request_log.close()
@@ -553,6 +643,7 @@ def ingest_daily_ohlcv(
                 EODHD_DEFAULT_REQUESTS_PER_MINUTE
             ),
             "taiwan_requests_per_second": options.taiwan_requests_per_second,
+            "execution_workers": options.workers,
             "include_delisted": options.include_delisted,
             "symbol_limit": options.symbol_limit,
             "symbol_limit_semantics": (

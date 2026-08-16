@@ -227,7 +227,7 @@ class TrainingConfig(StrictModel):
     weight_decay: float = Field(default=0.01, ge=0.0)
     warmup_ratio: float = Field(default=0.03, ge=0.0, lt=1.0)
     max_grad_norm: float = Field(default=1.0, gt=0.0)
-    log_every_steps: int = Field(default=10, ge=1)
+    log_every_steps: Literal[1] = 1
     evaluate_every_steps: int = Field(default=100, ge=1)
     checkpoint_every_steps: int = Field(default=100, ge=1)
     checkpoint_save_top_k: int = Field(default=3, ge=1, le=10)

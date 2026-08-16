@@ -29,10 +29,28 @@ NETWORK_VOLUME_ROOT="${NETWORK_VOLUME_ROOT:-${RUNPOD_VOLUME_ROOT:-/runpod-volume
 PROJECT_ROOT="${PROJECT_ROOT:-${NETWORK_VOLUME_ROOT}/stock_forecasting}"
 LOG_ROOT="${LOG_ROOT:-${NETWORK_VOLUME_ROOT}/logs}"
 READINESS_HELPER="${SCRIPT_DIR}/runpod_readiness.py"
+SELF_TERMINATE_SCRIPT="${SCRIPT_DIR}/runpod_self_terminate.sh"
 RUNPOD_IMAGE_PYTHON="${RUNPOD_PYTHON_BIN:-/usr/local/bin/python}"
 FINALIZE_LIFECYCLE_ON_EXIT=0
 PROVIDER_WAIT_EXIT_ALLOWED=0
 RUN_DIRECTORY_ID=""
+PRESERVE_POD_ON_LAUNCH_ERROR=0
+
+terminate_failed_launch() {
+    local launch_exit_code=$?
+    trap - EXIT
+    if [[ ${launch_exit_code} -ne 0 \
+        && ${PRESERVE_POD_ON_LAUNCH_ERROR} -ne 1 \
+        && "${RUNPOD_POD_ID:-}" =~ ^[A-Za-z0-9_-]+$ \
+        && "${RUNPOD_TEST_MODE:-0}" != "1" ]]; then
+        if ! bash "${SELF_TERMINATE_SCRIPT}"; then
+            echo "Early workflow launch failed and Pod self-termination also failed" >&2
+            echo "External lifecycle guard remains armed" >&2
+        fi
+    fi
+    exit "${launch_exit_code}"
+}
+trap terminate_failed_launch EXIT
 
 runpod_validate_absolute_path "${NETWORK_VOLUME_ROOT}" NETWORK_VOLUME_ROOT
 for path_name in PROJECT_ROOT LOG_ROOT; do
@@ -55,12 +73,13 @@ if [[ "${LOG_ROOT}" != "${NETWORK_VOLUME_ROOT}/logs" ]]; then
     echo "LOG_ROOT must equal NETWORK_VOLUME_ROOT/logs" >&2
     exit 2
 fi
+bash "${SCRIPT_DIR}/verify_runpod_mounted_readiness.sh" --mount-only
 case "$1" in
     cpu-prepare)
         SESSION_NAME=fin-ts-cpu-prepare
         JOB_SCRIPT="${SCRIPT_DIR}/runpod_cpu_prepare.sh"
         JOB_ROLE=cpu-prep
-        MAX_RUNTIME_SECONDS="${RUNPOD_CPU_MAX_RUNTIME_SECONDS:-7200}"
+        MAX_RUNTIME_SECONDS="${RUNPOD_CPU_MAX_RUNTIME_SECONDS:-21600}"
         JOB_TIMEOUT_GRACE_SECONDS=0
         FAILURE_LIFECYCLE_MARKER="${NETWORK_VOLUME_ROOT}/lifecycle/stage1/dataset.json"
         FAILURE_LIFECYCLE_KIND=stage1-dataset
@@ -70,7 +89,7 @@ case "$1" in
         SESSION_NAME=fin-ts-cpu-finalize
         JOB_SCRIPT="${SCRIPT_DIR}/runpod_cpu_finalize.sh"
         JOB_ROLE=cpu-prep
-        MAX_RUNTIME_SECONDS="${RUNPOD_CPU_FINALIZE_MAX_RUNTIME_SECONDS:-7200}"
+        MAX_RUNTIME_SECONDS="${RUNPOD_CPU_FINALIZE_MAX_RUNTIME_SECONDS:-${RUNPOD_CPU_MAX_RUNTIME_SECONDS:-21600}}"
         JOB_TIMEOUT_GRACE_SECONDS=0
         FAILURE_LIFECYCLE_MARKER="${NETWORK_VOLUME_ROOT}/lifecycle/stage1/mixed-finalization.json"
         FAILURE_LIFECYCLE_KIND=stage1-mixed-finalization
@@ -178,6 +197,7 @@ bash "${SCRIPT_DIR}/ensure_runpod_tmux.sh"
 
 TMUX_SOCKET="${SESSION_NAME}"
 if tmux -L "${TMUX_SOCKET}" has-session -t "${SESSION_NAME}" 2>/dev/null; then
+    PRESERVE_POD_ON_LAUNCH_ERROR=1
     echo "tmux session already exists: ${SESSION_NAME}" >&2
     echo "Attach with: tmux -L ${TMUX_SOCKET} attach -t ${SESSION_NAME}" >&2
     exit 3
@@ -365,6 +385,11 @@ mkdir -p "${JOB_DIR}"
     printf 'if [[ ${finalization_exit_code} -ne 0 ]]; then\n'
     printf '  if [[ ${job_exit_code} -eq 0 ]]; then job_exit_code=${finalization_exit_code}; fi\n'
     printf 'fi\n'
+    printf 'export RUNPOD_SHUTDOWN_DIR=%q\n' "${JOB_DIR}/pod-shutdown"
+    printf 'export RUNPOD_SHUTDOWN_MARKER=%q\n' "${JOB_DIR}/pod-shutdown/shutdown.json"
+    printf 'if ! bash %q; then\n' "${SELF_TERMINATE_SCRIPT}"
+    printf '  printf '\''Pod self-termination failed; external lifecycle guard remains armed\\n'\'' >&2\n'
+    printf 'fi\n'
     printf 'exit "${job_exit_code}"\n'
 } > "${RUNNER_TMP}"
 mv "${RUNNER_TMP}" "${RUNNER}"
@@ -375,6 +400,7 @@ tmux -L "${TMUX_SOCKET}" set-option -t "${SESSION_NAME}" remain-on-exit on
 tmux -L "${TMUX_SOCKET}" send-keys -t "${SESSION_NAME}" -l "exec bash ${RUNNER}"
 tmux -L "${TMUX_SOCKET}" send-keys -t "${SESSION_NAME}" Enter
 tmux -L "${TMUX_SOCKET}" has-session -t "${SESSION_NAME}"
+trap - EXIT
 
 printf 'Detached tmux session started: %s\n' "${SESSION_NAME}"
 printf 'Attach: tmux -L %s attach -t %s\n' "${TMUX_SOCKET}" "${SESSION_NAME}"

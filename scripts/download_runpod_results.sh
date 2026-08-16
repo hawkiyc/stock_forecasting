@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Download one completed run's immutable manifests, best checkpoint, and validation result.
+# Download one completed run's immutable manifests, retained checkpoints, and validation result.
 set -Eeuo pipefail
 umask 077
 
@@ -11,9 +11,11 @@ DOWNLOAD_ROOT="${PROJECT_ROOT}/artifacts/runpod"
 RUN_ID=""
 RUN_ID_WAS_EXPLICIT=0
 RESUME=0
+CHECKPOINT_SCOPE="all"
+CHECKPOINT_SCOPE_WAS_EXPLICIT=0
 
 usage() {
-    echo "Usage: bash scripts/download_runpod_results.sh [--resume] [RUN_ID]" >&2
+    echo "Usage: bash scripts/download_runpod_results.sh [--resume] [--checkpointScope all|best] [RUN_ID]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -21,6 +23,39 @@ while [[ $# -gt 0 ]]; do
         --resume)
             RESUME=1
             shift
+            ;;
+        --checkpointScope|--checkpoint-scope)
+            if [[ $# -lt 2 ]]; then
+                echo "$1 requires all or best" >&2
+                usage
+                exit 2
+            fi
+            if [[ "${CHECKPOINT_SCOPE_WAS_EXPLICIT}" == "1" ]]; then
+                echo "--checkpointScope may be specified only once" >&2
+                usage
+                exit 2
+            fi
+            case "$2" in
+                all|best)
+                    CHECKPOINT_SCOPE="$2"
+                    ;;
+                *)
+                    echo "--checkpointScope must be all or best" >&2
+                    usage
+                    exit 2
+                    ;;
+            esac
+            CHECKPOINT_SCOPE_WAS_EXPLICIT=1
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --*)
+            echo "Unknown download option: $1" >&2
+            usage
+            exit 2
             ;;
         *)
             if [[ -n "${RUN_ID}" ]]; then
@@ -104,23 +139,28 @@ download_file "savedModel/${RUN_ID}/resolved-config.yaml" resolved-config.yaml
 download_file "savedModel/${RUN_ID}/checkpoint-leaderboard.json" checkpoint-leaderboard.json
 download_file "savedModel/${RUN_ID}/best-checkpoint.json" best-checkpoint.json
 
-BEST_CHECKPOINT="$(python3 -c '
-import json
-import re
-import sys
+CHECKPOINT_NAMES="$(python3 "${SCRIPT_DIR}/runpod_readiness.py" \
+    checkpoint-download-names \
+    --leaderboard "${RUN_DOWNLOAD_ROOT}/checkpoint-leaderboard.json" \
+    --pointer "${RUN_DOWNLOAD_ROOT}/best-checkpoint.json" \
+    --run-id "${RUN_ID}" \
+    --scope "${CHECKPOINT_SCOPE}")"
+BEST_CHECKPOINT="${CHECKPOINT_NAMES%%$'\n'*}"
 
-with open(sys.argv[1], encoding="utf-8") as stream:
-    payload = json.load(stream)
-value = payload.get("path", "")
-if not isinstance(value, str) or re.fullmatch(r"checkpoint-[0-9]{6,}", value) is None:
-    raise SystemExit("Best-checkpoint pointer is invalid")
-print(value)
-' "${RUN_DOWNLOAD_ROOT}/best-checkpoint.json")"
-mkdir -p "${RUN_DOWNLOAD_ROOT}/${BEST_CHECKPOINT}"
-bash "${S3_WRAPPER}" s3 cp \
-    "s3://${RUNPOD_NETWORK_VOLUME_ID}/savedModel/${RUN_ID}/${BEST_CHECKPOINT}/" \
-    "${RUN_DOWNLOAD_ROOT}/${BEST_CHECKPOINT}/" \
-    --recursive --only-show-errors
+CHECKPOINT_COUNT=0
+while IFS= read -r checkpoint_name; do
+    [[ -n "${checkpoint_name}" ]] || continue
+    mkdir -p "${RUN_DOWNLOAD_ROOT}/${checkpoint_name}"
+    bash "${S3_WRAPPER}" s3 cp \
+        "s3://${RUNPOD_NETWORK_VOLUME_ID}/savedModel/${RUN_ID}/${checkpoint_name}/" \
+        "${RUN_DOWNLOAD_ROOT}/${checkpoint_name}/" \
+        --recursive --only-show-errors
+    CHECKPOINT_COUNT=$((CHECKPOINT_COUNT + 1))
+done <<< "${CHECKPOINT_NAMES}"
+if [[ "${CHECKPOINT_COUNT}" -lt 1 ]]; then
+    echo "No retained checkpoints were selected for download" >&2
+    exit 1
+fi
 
 download_file "evaluations/${RUN_ID}/validation-benchmark.json" validation-benchmark.json
 download_file \
@@ -144,5 +184,6 @@ else
         "${RUN_ID}"
 fi
 
-printf 'Downloaded RunPod result: run_id=%s best_checkpoint=%s target=%s\n' \
-    "${RUN_ID}" "${BEST_CHECKPOINT}" "${RUN_DOWNLOAD_ROOT}"
+printf 'Downloaded RunPod result: run_id=%s checkpoint_scope=%s checkpoint_count=%s best_checkpoint=%s target=%s\n' \
+    "${RUN_ID}" "${CHECKPOINT_SCOPE}" "${CHECKPOINT_COUNT}" \
+    "${BEST_CHECKPOINT}" "${RUN_DOWNLOAD_ROOT}"

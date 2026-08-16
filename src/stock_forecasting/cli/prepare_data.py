@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -59,6 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="RunPod compatibility sentinel.",
     )
     parser.add_argument("--effective-embargo-bars", type=int, default=14)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=int(os.environ.get("FIN_TS_CPU_WORKERS", "1")),
+        help="Thread workers used to build independent symbol windows.",
+    )
     return parser
 
 
@@ -146,6 +153,7 @@ def prepare_dataset(
         flat_volatility_multiplier=args.flat_volatility_multiplier,
         max_abs_log_return=args.max_abs_log_return,
         audit=window_audit,
+        workers=args.workers,
     )
     if not windows:
         raise ValueError(
@@ -203,6 +211,10 @@ def prepare_dataset(
         "quality": quality,
         "window_audit": window_audit,
         "label_statistics": label_statistics,
+        "execution": {
+            "parallelism": "thread_pool_by_symbol",
+            "workers": args.workers,
+        },
     }
     return assigned, summary, preparation_spec
 
@@ -265,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
             "quality_approved_windows": summary["candidate_windows_after_quality"],
             "purge_or_embargo_dropped_windows": summary["dropped_for_purge_or_embargo"],
         },
+        "execution": summary["execution"],
         "artifacts": {
             "raw": download["artifacts"]["raw"],
             "processed": processed_artifact,

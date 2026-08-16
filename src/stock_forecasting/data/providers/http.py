@@ -143,7 +143,7 @@ class NetworkRequestBudget:
 
 
 class CachedJsonClient:
-    """Share one HTTP session, throttle requests, and never overwrite raw responses."""
+    """Share one throttle across thread-local sessions and immutable responses."""
 
     def __init__(
         self,
@@ -167,11 +167,54 @@ class CachedJsonClient:
         self.minimum_interval = 1.0 / max_requests_per_second
         self.timeout_seconds = timeout_seconds
         self.max_attempts = max_attempts
-        self.session = session or requests.Session()
+        self.session = session
         self.request_budget = request_budget
         self.clock = clock
         self.sleeper = sleeper
         self._last_request_at: float | None = None
+        self._rate_lock = threading.Lock()
+        self._provided_session_lock = threading.Lock()
+        self._thread_local = threading.local()
+
+    def _session(self) -> requests.Session:
+        if self.session is not None:
+            return self.session
+        existing = getattr(self._thread_local, "session", None)
+        if isinstance(existing, requests.Session):
+            return existing
+        created = requests.Session()
+        self._thread_local.session = created
+        return created
+
+    def _reserve_request_slot(self) -> None:
+        """Serialize request starts so all workers obey one provider QPS contract."""
+
+        with self._rate_lock:
+            now = self.clock()
+            if self._last_request_at is not None:
+                remaining = self.minimum_interval - (now - self._last_request_at)
+                if remaining > 0.0:
+                    self.sleeper(remaining)
+            self._last_request_at = self.clock()
+
+    def _send(self, endpoint: str, params: Mapping[str, Any]) -> requests.Response:
+        session = self._session()
+        if self.session is None:
+            return session.get(
+                endpoint,
+                params=dict(params),
+                timeout=self.timeout_seconds,
+                headers={"User-Agent": "fin-ts-quant-research/0.2"},
+            )
+        # Injected sessions are primarily deterministic test doubles and are not
+        # assumed to be thread-safe.
+        with self._provided_session_lock:
+            return session.get(
+                endpoint,
+                params=dict(params),
+                timeout=self.timeout_seconds,
+                headers={"User-Agent": "fin-ts-quant-research/0.2"},
+            )
 
     def _identity(
         self,
@@ -245,22 +288,12 @@ class CachedJsonClient:
         last_rate_limit_limit: int | None = None
         last_rate_limit_remaining: int | None = None
         for attempt in range(1, self.max_attempts + 1):
-            now = self.clock()
-            if self._last_request_at is not None:
-                remaining = self.minimum_interval - (now - self._last_request_at)
-                if remaining > 0.0:
-                    self.sleeper(remaining)
+            self._reserve_request_slot()
             requested_at = datetime.now(UTC).isoformat()
             try:
-                self._last_request_at = self.clock()
                 if self.request_budget is not None:
                     self.request_budget.consume(self.provider)
-                response = self.session.get(
-                    endpoint,
-                    params=dict(params),
-                    timeout=self.timeout_seconds,
-                    headers={"User-Agent": "fin-ts-quant-research/0.2"},
-                )
+                response = self._send(endpoint, params)
                 if response.status_code == 429 or response.status_code >= 500:
                     raise requests.HTTPError(
                         f"Retryable HTTP {response.status_code}",

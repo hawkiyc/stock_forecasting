@@ -46,6 +46,9 @@ if [[ "${WANDB_DIR}" != "${NETWORK_VOLUME_ROOT}" ]]; then
     exit 2
 fi
 
+# Prove the exact volume mount before creating caches or evaluation directories.
+bash "${SCRIPT_DIR}/verify_runpod_mounted_readiness.sh" --mount-only
+
 # Auto-validation inherits the training lease; a standalone validation acquires it here.
 runpod_acquire_gpu_workflow_lease "${NETWORK_VOLUME_ROOT}"
 VALIDATION_TARGET_RUN_ID=""

@@ -9,7 +9,7 @@ dependencies = [
     "einops>=0.8.1,<1.0",
     "huggingface-hub>=0.34,<2.0",
     "safetensors>=0.5,<1.0",
-    "wandb>=0.21,<1.0",
+    "wandb==0.28.0",
     "pydantic>=2.11,<3.0",
     "PyYAML>=6.0,<7.0",
     "numpy>=1.26,<2.0",
@@ -30,6 +30,7 @@ fin-ts-infer = "stock_forecasting.cli.infer:main"
 fin-ts-preflight = "stock_forecasting.cli.preflight:main"
 fin-ts-benchmark = "stock_forecasting.cli.benchmark_baselines:main"
 fin-ts-validate-benchmarks = "stock_forecasting.cli.validate_benchmarks:main"
+fin-ts-wandb-sync = "stock_forecasting.cli.sync_wandb:main"
 fin-ts-verify-stage1-data = "stock_forecasting.cli.verify_stage1_data:main"
 fin-ts-supervise = "stock_forecasting.runpod.supervisor:main"
 

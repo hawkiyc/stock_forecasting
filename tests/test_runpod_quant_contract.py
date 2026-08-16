@@ -30,11 +30,17 @@ def test_runpod_entrypoint_scripts_remain_executable() -> None:
     entrypoints = (
         ROOT / "scripts/create_runpod_cpu_pod.sh",
         ROOT / "scripts/create_runpod_pod.sh",
+        ROOT / "scripts/create_runpod_resume_pod.sh",
+        ROOT / "scripts/create_runpod_validation_pod.sh",
         ROOT / "scripts/runpod_cpu_prepare.sh",
         ROOT / "scripts/runpod_cpu_finalize.sh",
         ROOT / "scripts/runpod_entrypoint.sh",
+        ROOT / "scripts/runpod_self_terminate.py",
+        ROOT / "scripts/runpod_self_terminate.sh",
         ROOT / "scripts/runpod_train_then_validate.sh",
         ROOT / "scripts/runpod_validation.sh",
+        ROOT / "scripts/runpod_wandb_sync.sh",
+        ROOT / "scripts/runpod_workflow.sh",
     )
     for path in entrypoints:
         assert path.stat().st_mode & stat.S_IXUSR, path
@@ -130,7 +136,9 @@ def test_stable_runpod_lifecycle_and_synchronization_boundaries_remain() -> None
     create_cpu = (ROOT / "scripts/create_runpod_cpu_pod.sh").read_text(encoding="utf-8")
     sync = (ROOT / "scripts/sync_project_to_runpod_volume.sh").read_text(encoding="utf-8")
     entrypoint = (ROOT / "scripts/runpod_entrypoint.sh").read_text(encoding="utf-8")
+    tmux = (ROOT / "scripts/runpod_tmux_launch.sh").read_text(encoding="utf-8")
     validation = (ROOT / "scripts/runpod_validation.sh").read_text(encoding="utf-8")
+    guard = (ROOT / "scripts/launch_runpod_guard.sh").read_text(encoding="utf-8")
 
     for script in (create_gpu, create_cpu):
         assert "RUNPOD_NETWORK_VOLUME_ID" in script
@@ -140,8 +148,221 @@ def test_stable_runpod_lifecycle_and_synchronization_boundaries_remain() -> None
     assert "--apply" in sync
     assert "runpod_project_s3_ready" in sync
     assert "runpod_train_then_validate.sh" in entrypoint
-    assert "terminate_runpod_after.sh" in entrypoint
+    assert "runpod_self_terminate.sh" in entrypoint
+    assert "runpod_self_terminate.sh" in tmux
+    assert "launch_runpod_guard.sh" in create_gpu
+    assert "launch_runpod_guard.sh" in create_cpu
+    assert 'caffeinate -is -w "${GUARD_PID}"' in guard
     assert "lifecycle/stage1/validation.json" in validation
+
+
+def test_network_volume_identity_and_exact_mount_are_fail_closed() -> None:
+    verifier = (ROOT / "scripts/verify_runpod_mounted_readiness.sh").read_text(
+        encoding="utf-8"
+    )
+    create_gpu = (ROOT / "scripts/create_runpod_pod.sh").read_text(encoding="utf-8")
+    create_cpu = (ROOT / "scripts/create_runpod_cpu_pod.sh").read_text(encoding="utf-8")
+    reexec = (ROOT / "scripts/runpod_reexec_with_pid1_env.py").read_text(encoding="utf-8")
+    volume_writers = (
+        ROOT / "scripts/runpod_tmux_launch.sh",
+        ROOT / "scripts/runpod_cpu_prepare.sh",
+        ROOT / "scripts/runpod_cpu_finalize.sh",
+        ROOT / "scripts/runpod_entrypoint.sh",
+        ROOT / "scripts/runpod_validation.sh",
+    )
+
+    assert 'RUNPOD_EXPECTED_VOLUME_ID":"%s"' in create_gpu
+    assert 'RUNPOD_EXPECTED_VOLUME_ID":"%s"' in create_cpu
+    assert '"RUNPOD_EXPECTED_VOLUME_ID"' in reexec
+    assert '"RUNPOD_VOLUME_ID"' in reexec
+    assert '"RUNPOD_API_KEY"' in reexec
+    assert '"RUNPOD_API_KEY",' not in reexec.split("FORBIDDEN_NAMES", maxsplit=1)[0]
+    assert '"RUNPOD_VOLUME_ID" != "${RUNPOD_EXPECTED_VOLUME_ID}"' not in verifier
+    assert '"${RUNPOD_VOLUME_ID}" != "${RUNPOD_EXPECTED_VOLUME_ID}"' in verifier
+    assert "mountpoint -q" in verifier
+    assert "findmnt -rn -M" in verifier
+    assert "/proc/self/mountinfo" in verifier
+    for path in volume_writers:
+        script = path.read_text(encoding="utf-8")
+        assert "verify_runpod_mounted_readiness.sh\" --mount-only" in script, path
+
+
+def test_workflow_exposes_bounded_cpu_gpu_resume_and_validation_options() -> None:
+    workflow = (ROOT / "scripts/runpod_workflow.sh").read_text(encoding="utf-8")
+    cpu_creator = (ROOT / "scripts/create_runpod_cpu_pod.sh").read_text(encoding="utf-8")
+    resume = (ROOT / "scripts/create_runpod_resume_pod.sh").read_text(encoding="utf-8")
+    validation = (ROOT / "scripts/create_runpod_validation_pod.sh").read_text(
+        encoding="utf-8"
+    )
+
+    for option in ("--maxRuntime", "--gpuId", "--cpuNumber", "--cpuFlavor"):
+        assert option in workflow
+    assert "cpu_max_runtime=6h" in workflow
+    assert "cpu_number=8" in workflow
+    assert "cpu_flavor=cpu3g" in workflow
+    assert "train_max_runtime=12h" in workflow
+    assert 'train_gpu_id="NVIDIA GeForce RTX 5090"' in workflow
+    assert "cpu3c|cpu3g|cpu3m|cpu5c|cpu5g|cpu5m" in cpu_creator
+    assert '"${RUNPOD_CPU_VCPU_COUNT}" -gt 32' in cpu_creator
+    assert "CONTAINER_DISK_GB_PER_VCPU=10" in cpu_creator
+    assert "CONTAINER_DISK_GB_PER_VCPU=15" in cpu_creator
+    assert "MAX_CONTAINER_DISK_GB" in cpu_creator
+    assert "resumable-training-run" in resume
+    assert "training-completed.json" in resume
+    assert "--maxRuntime" in validation
+    assert "--gpuId" in validation
+
+
+def test_download_defaults_to_all_retained_checkpoints_and_can_select_best() -> None:
+    workflow = (ROOT / "scripts/runpod_workflow.sh").read_text(encoding="utf-8")
+    download = (ROOT / "scripts/download_runpod_results.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "download [--resume] [--checkpointScope all|best] [RUN_ID]" in workflow
+    assert 'CHECKPOINT_SCOPE="all"' in download
+    assert "--checkpointScope|--checkpoint-scope" in download
+    assert "checkpoint-download-names" in download
+    assert 'BEST_CHECKPOINT="${CHECKPOINT_NAMES%%$\'\\n\'*}"' in download
+    assert 'checkpoint_scope=%s checkpoint_count=%s' in download
+    assert "list-objects-v2" not in download
+
+
+def test_checkpoint_download_names_follow_validated_retention_manifest(
+    tmp_path: Path,
+) -> None:
+    run_id = "download-contract-run"
+    contract_digest = "a" * 64
+    transaction_id = "b" * 32
+    checkpoints = [
+        {
+            "path": "checkpoint-000020",
+            "global_step": 20,
+            "value": 0.4,
+            "rank": 1,
+        },
+        {
+            "path": "checkpoint-000010",
+            "global_step": 10,
+            "value": 0.5,
+            "rank": 2,
+        },
+    ]
+    leaderboard = {
+        "schema_version": "3.0",
+        "run_id": run_id,
+        "run_key": run_id,
+        "training_resume_contract_sha256": contract_digest,
+        "selection_source": "validation",
+        "monitor": "primary_5d/selection_score",
+        "mode": "min",
+        "save_top_k": 2,
+        "transaction_id": transaction_id,
+        "best_checkpoint": "checkpoint-000020",
+        "checkpoints": checkpoints,
+    }
+    pointer = {
+        "schema_version": "3.0",
+        "run_id": run_id,
+        "run_key": run_id,
+        "training_resume_contract_sha256": contract_digest,
+        "selection_source": "validation",
+        "monitor": "primary_5d/selection_score",
+        "mode": "min",
+        "value": 0.4,
+        "transaction_id": transaction_id,
+        "path": "checkpoint-000020",
+    }
+    leaderboard_path = tmp_path / "checkpoint-leaderboard.json"
+    pointer_path = tmp_path / "best-checkpoint.json"
+    leaderboard_path.write_text(json.dumps(leaderboard), encoding="utf-8")
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+    for scope, expected in (
+        ("all", ["checkpoint-000020", "checkpoint-000010"]),
+        ("best", ["checkpoint-000020"]),
+    ):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/runpod_readiness.py"),
+                "checkpoint-download-names",
+                "--leaderboard",
+                str(leaderboard_path),
+                "--pointer",
+                str(pointer_path),
+                "--run-id",
+                run_id,
+                "--scope",
+                scope,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == expected
+
+    pointer["transaction_id"] = "c" * 32
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+    mismatch = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/runpod_readiness.py"),
+            "checkpoint-download-names",
+            "--leaderboard",
+            str(leaderboard_path),
+            "--pointer",
+            str(pointer_path),
+            "--run-id",
+            run_id,
+            "--scope",
+            "all",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert mismatch.returncode == 2
+    assert "transactions disagree" in mismatch.stderr
+
+
+def test_wandb_contract_logs_every_optimizer_step_and_validation_metrics() -> None:
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    config = (ROOT / "src/stock_forecasting/config.py").read_text(encoding="utf-8")
+    training = (ROOT / "src/stock_forecasting/training.py").read_text(encoding="utf-8")
+    validation = (ROOT / "src/stock_forecasting/validation_benchmark.py").read_text(
+        encoding="utf-8"
+    )
+    tracking = (ROOT / "src/stock_forecasting/tracking.py").read_text(encoding="utf-8")
+    wandb_sync = (ROOT / "src/stock_forecasting/cli/sync_wandb.py").read_text(
+        encoding="utf-8"
+    )
+    wandb_sync_script = (ROOT / "scripts/runpod_wandb_sync.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"wandb==0.28.0"' in pyproject
+    assert "log_every_steps: Literal[1] = 1" in config
+    assert '"train/loss": optimizer_step_loss' in training
+    assert "step=global_step" in training
+    assert '_flatten_metrics(validation_metrics, "validation")' in training
+    assert 'run.define_metric("trainer/global_step")' in tracking
+    assert 'run.define_metric("train/*", step_metric="trainer/global_step")' in tracking
+    assert 'run.define_metric("validation/*", step_metric="trainer/global_step")' in tracking
+    assert 'backend_payload["trainer/global_step"] = step' in tracking
+    assert '"benchmark_validation"' in validation
+    assert 'validation_step_key = "benchmark_validation/global_step"' in validation
+    assert 'run.define_metric("benchmark_validation/*"' in validation
+    assert "validation_history[validation_step_key] = validation_step" in validation
+    assert "config.as_dict()" in tracking
+    assert '"offline_pending"' in tracking
+    assert '"sync_failed"' in wandb_sync
+    assert '"online_running"' in wandb_sync
+    assert '"sync"' in wandb_sync
+    assert '"--include-offline"' in wandb_sync
+    assert '"--legacy"' in wandb_sync
+    assert "trap terminate_sync_pod EXIT" in wandb_sync_script
 
 
 def test_eodhd_secret_is_cpu_only() -> None:

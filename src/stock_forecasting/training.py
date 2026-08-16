@@ -500,6 +500,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
     validation_metrics: dict[str, Any] = {}
     best_checkpoint: Path | None = None
     last_ranking: dict[str, Any] = {}
+    accumulated_microbatch_losses: list[float] = []
 
     try:
         reconciliation = reconcile_checkpoint_storage(
@@ -563,6 +564,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                         config.training.gradient_accumulation_steps,
                     )
                     loss = output.loss / divisor
+                    accumulated_microbatch_losses.append(float(output.loss.detach().cpu()))
                 loss.backward()
                 should_step = (
                     batch_index + 1
@@ -576,23 +578,23 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
-
-                if global_step % config.training.log_every_steps == 0:
-                    tracking.log(
-                        {
-                            "train/loss": float(output.loss.detach().cpu()),
-                            "train/pinball_loss": float(output.loss.detach().cpu()),
-                            "train/epoch": float(epoch),
-                            "train/stage_fraction": config.data.train_fraction,
-                            "train/task_learning_rate": float(optimizer.param_groups[0]["lr"]),
-                            "train/lora_learning_rate": float(
-                                optimizer.param_groups[-1]["lr"]
-                                if len(optimizer.param_groups) > 1
-                                else 0.0
-                            ),
-                        },
-                        step=global_step,
-                    )
+                optimizer_step_loss = float(np.mean(accumulated_microbatch_losses))
+                accumulated_microbatch_losses.clear()
+                tracking.log(
+                    {
+                        "train/loss": optimizer_step_loss,
+                        "train/pinball_loss": optimizer_step_loss,
+                        "train/epoch": float(epoch),
+                        "train/stage_fraction": config.data.train_fraction,
+                        "train/task_learning_rate": float(optimizer.param_groups[0]["lr"]),
+                        "train/lora_learning_rate": float(
+                            optimizer.param_groups[-1]["lr"]
+                            if len(optimizer.param_groups) > 1
+                            else 0.0
+                        ),
+                    },
+                    step=global_step,
+                )
                 if (
                     global_step % config.training.evaluate_every_steps == 0
                     or global_step >= total_steps
@@ -722,14 +724,20 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
             validation_metrics=validation_metrics,
         )
     except BaseException:
-        tracking.update_summary(
-            {
-                "failed": True,
-                "global_step": global_step,
-                "training_stage": config.training.stage,
-            }
-        )
-        tracking.finish(exit_code=1)
+        try:
+            tracking.update_summary(
+                {
+                    "failed": True,
+                    "global_step": global_step,
+                    "training_stage": config.training.stage,
+                }
+            )
+        except BaseException:
+            pass
+        try:
+            tracking.finish(exit_code=1)
+        except BaseException:
+            pass
         raise
 
 

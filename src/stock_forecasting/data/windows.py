@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from collections.abc import Iterable, Mapping, MutableMapping
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -98,6 +99,7 @@ def build_causal_windows(
     target_horizon: int = 5,
     diagnostic_horizons: Iterable[int] = (1, 20),
     flat_volatility_multiplier: float = 0.25,
+    workers: int = 1,
 ) -> list[dict[str, Any]]:
     """Build next-open multi-horizon alpha labels and dual OHLCV contexts.
 
@@ -118,6 +120,8 @@ def build_causal_windows(
         raise ValueError("Legacy RunPod readiness diagnostic horizons must remain 1 and 20")
     if flat_volatility_multiplier < 0.0:
         raise ValueError("flat_volatility_multiplier must be non-negative")
+    if workers < 1:
+        raise ValueError("workers must be positive")
     horizons = _validate_horizons(alpha_horizons)
     maximum_horizon = max(horizons)
 
@@ -130,44 +134,47 @@ def build_causal_windows(
     eligible_symbols: set[str] = set()
     benchmark_symbols: set[str] = set()
     records: list[dict[str, Any]] = []
+    explicit_mapping = dict(benchmark_mapping or {})
 
-    for symbol, symbol_frame in symbol_frames.items():
+    def build_symbol(item: tuple[str, pd.DataFrame]) -> tuple[
+        list[dict[str, Any]], Counter[str], str | None, str | None
+    ]:
+        symbol, symbol_frame = item
+        symbol_exclusions: Counter[str] = Counter()
+        symbol_output: list[dict[str, Any]] = []
         metadata = _record_metadata(symbol_frame)
         asset_type = str(symbol_frame.loc[0, "asset_type"])
         decision = resolve_benchmark(
             symbol=symbol,
             asset_type=asset_type,
             market=str(metadata.get("market", "")),
-            explicit_mapping=dict(benchmark_mapping or {}),
+            explicit_mapping=explicit_mapping,
         )
         if not decision.eligible or decision.benchmark_symbol is None:
-            _increment(exclusions, decision.reason)
-            continue
+            _increment(symbol_exclusions, decision.reason)
+            return symbol_output, symbol_exclusions, None, None
         benchmark_symbol = decision.benchmark_symbol
         benchmark_frame = symbol_frames.get(benchmark_symbol)
         if benchmark_frame is None:
-            _increment(exclusions, f"missing_benchmark:{benchmark_symbol}")
-            continue
+            _increment(symbol_exclusions, f"missing_benchmark:{benchmark_symbol}")
+            return symbol_output, symbol_exclusions, None, None
         if len(symbol_frame) < window_size + maximum_horizon:
-            _increment(exclusions, "insufficient_asset_history")
-            continue
+            _increment(symbol_exclusions, "insufficient_asset_history")
+            return symbol_output, symbol_exclusions, None, None
 
-        eligible_symbols.add(symbol)
-        benchmark_symbols.add(benchmark_symbol)
         bad_transitions = _adjusted_transition_mask(symbol_frame, max_abs_log_return)
         final_cutoff_index = len(symbol_frame) - maximum_horizon - 1
-        symbol_records = 0
         for cutoff_index in range(window_size - 1, final_cutoff_index + 1, stride):
             start_index = cutoff_index - window_size + 1
             final_label_index = cutoff_index + maximum_horizon
             if bad_transitions[start_index:final_label_index].any():
-                _increment(exclusions, "extreme_adjusted_transition")
+                _increment(symbol_exclusions, "extreme_adjusted_transition")
                 continue
 
             observed_raw = symbol_frame.iloc[start_index : cutoff_index + 1].copy()
             benchmark_observed_raw = _aligned_rows(benchmark_frame, observed_raw["timestamp"])
             if benchmark_observed_raw is None:
-                _increment(exclusions, "benchmark_context_calendar_gap")
+                _increment(symbol_exclusions, "benchmark_context_calendar_gap")
                 continue
             holding_dates = symbol_frame.loc[
                 cutoff_index + 1 : cutoff_index + maximum_horizon,
@@ -179,7 +186,7 @@ def build_causal_windows(
                 for horizon in horizons
             }
             if _aligned_rows(benchmark_frame, holding_dates) is None:
-                _increment(exclusions, "benchmark_label_calendar_gap")
+                _increment(symbol_exclusions, "benchmark_label_calendar_gap")
                 continue
 
             asset_returns: dict[str, float] = {}
@@ -211,7 +218,7 @@ def build_causal_windows(
                 )
                 end_at[key] = _iso_timestamp(exit_at)
             if not valid_label:
-                _increment(exclusions, "invalid_execution_return")
+                _increment(symbol_exclusions, "invalid_execution_return")
                 continue
 
             observed = asof_adjusted_window(observed_raw)
@@ -229,7 +236,7 @@ def build_causal_windows(
                 "asset_total_returns": asset_returns,
                 "benchmark_total_returns": benchmark_returns,
             }
-            records.append(
+            symbol_output.append(
                 {
                     "schema_version": PROCESSED_SCHEMA_VERSION,
                     "sample_id": f"{symbol}-{cutoff_timestamp.strftime('%Y%m%dT%H%M%SZ')}",
@@ -255,9 +262,26 @@ def build_causal_windows(
                     },
                 }
             )
-            symbol_records += 1
-        if symbol_records == 0:
-            _increment(exclusions, "no_valid_windows")
+        if not symbol_output:
+            _increment(symbol_exclusions, "no_valid_windows")
+        return symbol_output, symbol_exclusions, symbol, benchmark_symbol
+
+    items = list(symbol_frames.items())
+    if workers == 1:
+        symbol_results = list(map(build_symbol, items))
+    else:
+        with ThreadPoolExecutor(
+            max_workers=min(workers, max(len(items), 1)),
+            thread_name_prefix="causal-window",
+        ) as executor:
+            symbol_results = list(executor.map(build_symbol, items))
+    for symbol_output, symbol_exclusions, eligible_symbol, benchmark_symbol in symbol_results:
+        records.extend(symbol_output)
+        exclusions.update(symbol_exclusions)
+        if eligible_symbol is not None:
+            eligible_symbols.add(eligible_symbol)
+        if benchmark_symbol is not None:
+            benchmark_symbols.add(benchmark_symbol)
 
     if audit is not None:
         audit.clear()
@@ -268,6 +292,7 @@ def build_causal_windows(
                 "excluded_counts_by_reason": dict(sorted(exclusions.items())),
                 "written_windows": len(records),
                 "alpha_horizons": list(horizons),
+                "execution_workers": workers,
             }
         )
     return sorted(records, key=lambda record: (record["cutoff_at"], record["symbol"]))
