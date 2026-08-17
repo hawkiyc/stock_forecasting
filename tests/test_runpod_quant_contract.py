@@ -162,7 +162,11 @@ def test_stable_runpod_lifecycle_and_synchronization_boundaries_remain() -> None
     assert "launch_runpod_guard.sh" in create_gpu
     assert "launch_runpod_guard.sh" in create_cpu
     assert 'caffeinate -is -w "${GUARD_PID}"' in guard
-    assert "lifecycle/stage1/validation.json" in validation
+    assert (
+        'RUNPOD_VALIDATION_LIFECYCLE_MARKER="${NETWORK_VOLUME_ROOT}'
+        '/lifecycle/stage1/validation.json"' in entrypoint
+    )
+    assert "stock_forecasting.cli.validate_benchmarks" in validation
 
 
 def test_cpu_log_lifecycle_and_downloader_share_canonical_paths() -> None:
