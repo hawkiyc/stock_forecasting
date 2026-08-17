@@ -81,6 +81,16 @@ def _marker(selection: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _selection_environment(
+    selection_path: Path,
+    selection: dict[str, object],
+) -> dict[str, str]:
+    environment = SELECTION._selection_exports(selection_path, selection)
+    environment["NETWORK_VOLUME_ROOT"] = "/runpod-volume"
+    environment["RUNPOD_REMOTE_SELECTION_PATH"] = str(selection_path)
+    return environment
+
+
 def test_exact_cpu_marker_matches_active_training_selection(tmp_path: Path) -> None:
     project_root = _project_root(tmp_path)
     selection = SELECTION._build_selection(_arguments(), project_root)
@@ -98,6 +108,57 @@ def test_cpu_tw_only_marker_rejects_us_tw_training_selection(tmp_path: Path) -> 
 
     with pytest.raises(SELECTION.SelectionError, match="dataset profile mismatch"):
         SELECTION._verify_marker(_marker(prepared), requested)
+
+
+def test_missing_optional_empty_pod_environment_values_are_normalized(
+    tmp_path: Path,
+) -> None:
+    project_root = _project_root(tmp_path)
+    selection = SELECTION._build_selection(
+        _arguments(data_profile="us_tw_eodhd", universe="all"),
+        project_root,
+    )
+    selection_path = tmp_path / "selection.json"
+    environment = _selection_environment(selection_path, selection)
+    for key in SELECTION.OPTIONAL_EMPTY_ENVIRONMENT_KEYS:
+        assert environment[key] == ""
+        environment.pop(key)
+
+    SELECTION._verify_environment(selection_path, selection, environment)
+
+
+def test_missing_nonempty_optional_pod_environment_value_is_rejected(
+    tmp_path: Path,
+) -> None:
+    project_root = _project_root(tmp_path)
+    selection = SELECTION._build_selection(
+        _arguments(
+            data_profile="us_tw_eodhd",
+            universe="explicit",
+            stocks=["AAPL"],
+            etfs=[],
+        ),
+        project_root,
+    )
+    selection_path = tmp_path / "selection.json"
+    environment = _selection_environment(selection_path, selection)
+    assert environment.pop("STAGE1_US_SYMBOLS") == "AAPL.US"
+
+    with pytest.raises(SELECTION.SelectionError, match="STAGE1_US_SYMBOLS mismatch"):
+        SELECTION._verify_environment(selection_path, selection, environment)
+
+
+def test_missing_required_pod_environment_value_remains_fail_closed(
+    tmp_path: Path,
+) -> None:
+    project_root = _project_root(tmp_path)
+    selection = SELECTION._build_selection(_arguments(), project_root)
+    selection_path = tmp_path / "selection.json"
+    environment = _selection_environment(selection_path, selection)
+    environment.pop("RUNPOD_STAGE")
+
+    with pytest.raises(SELECTION.SelectionError, match="RUNPOD_STAGE mismatch"):
+        SELECTION._verify_environment(selection_path, selection, environment)
 
 
 def test_date_or_universe_changes_dataset_request_identity(tmp_path: Path) -> None:

@@ -103,6 +103,17 @@ EXPORT_KEYS = (
     "RUNPOD_TERMINATE_AFTER",
 )
 
+# RunPod may omit user-supplied environment entries whose value is an empty
+# string. Only these selection fields define absence and an empty value as the
+# same runtime state; every non-empty or required field remains fail-closed.
+OPTIONAL_EMPTY_ENVIRONMENT_KEYS = frozenset(
+    {
+        "STAGE1_US_SYMBOLS",
+        "STAGE1_US_ETF_SYMBOLS",
+        "STAGE1_SYMBOL_LIMIT",
+    }
+)
+
 
 class SelectionError(ValueError):
     """Raised when a selection or readiness marker violates its contract."""
@@ -825,7 +836,14 @@ def _verify_environment(
     )
     expected["RUNPOD_REMOTE_SELECTION_PATH"] = str(selection_path)
     for key, expected_value in expected.items():
-        _assert_equal(environment.get(key), expected_value, f"Pod environment {key}")
+        actual_value = environment.get(key)
+        if (
+            key in OPTIONAL_EMPTY_ENVIRONMENT_KEYS
+            and expected_value == ""
+            and actual_value is None
+        ):
+            actual_value = ""
+        _assert_equal(actual_value, expected_value, f"Pod environment {key}")
 
 
 def command_create(arguments: argparse.Namespace) -> int:

@@ -195,7 +195,13 @@ def test_workflow_exposes_bounded_cpu_gpu_resume_and_validation_options() -> Non
         encoding="utf-8"
     )
 
-    for option in ("--maxRuntime", "--gpuId", "--cpuNumber", "--cpuFlavor"):
+    for option in (
+        "--interactive",
+        "--maxRuntime",
+        "--gpuId",
+        "--cpuNumber",
+        "--cpuFlavor",
+    ):
         assert option in workflow
     assert "cpu_max_runtime=6h" in workflow
     assert "cpu_number=8" in workflow
@@ -211,6 +217,28 @@ def test_workflow_exposes_bounded_cpu_gpu_resume_and_validation_options() -> Non
     assert "training-completed.json" in resume
     assert "--maxRuntime" in validation
     assert "--gpuId" in validation
+
+
+def test_cpu_prepare_without_options_is_interactive_and_cancel_safe() -> None:
+    result = subprocess.run(
+        ["bash", str(ROOT / "scripts/runpod_workflow.sh"), "cpu", "prepare"],
+        input="\n\n\n\n",
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "CPU preparation resource configuration" in combined
+    assert "Maximum runtime [6h]:" in combined
+    assert "vCPU count [8]:" in combined
+    assert "CPU flavor [cpu3g]:" in combined
+    assert "Maximum runtime: 6h" in combined
+    assert "vCPU count: 8" in combined
+    assert "CPU flavor: cpu3g" in combined
+    assert "Create this CPU preparation Pod? [y/N]:" in combined
+    assert "CPU preparation Pod creation cancelled; no Pod was created" in combined
 
 
 def test_download_defaults_to_all_retained_checkpoints_and_can_select_best() -> None:

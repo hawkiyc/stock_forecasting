@@ -513,17 +513,31 @@ artifact 不會上傳。`poetry.lock` 也不會上傳；它會依 approved RunPo
 #### 3. 遠端部署模型與離線資料層
 
 CPU Pod 只能使用 active selection；如果尚未執行 `configure`、config SHA 已改變，
-或 selection JSON 不完整，建立前就會失敗。在本機建立短生命週期 CPU Pod；預設
-workload 上限為 6 小時、8 vCPU、`cpu3g`：
+或 selection JSON 不完整，建立前就會失敗。在本機不帶資源參數執行時會進入
+互動模式，依序詢問 workload 最長執行時間、vCPU 數與 CPU flavor；按 Enter
+分別使用 6 小時、8 vCPU、`cpu3g`。最後還必須輸入 `y` 或 `yes` 才會建立可能
+計費的 Pod，直接按 Enter、輸入 `n` 或 `no` 都會安全取消：
 
 ```bash
 bash scripts/runpod_workflow.sh cpu prepare
 ```
 
-也可以直接在命令列調整，不需要修改 `.env`：
+只要提供任一資源參數，就會使用非互動模式，未提供的參數仍採用上述預設值；
+因此自動化腳本可明確提供全部參數，不需要修改 `.env`：
 
 ```bash
 bash scripts/runpod_workflow.sh cpu prepare \
+  --maxRuntime 10h \
+  --cpuNumber 16 \
+  --cpuFlavor cpu5g
+```
+
+若希望先在命令列提供互動提示的預設值，再由使用者確認或覆寫，可加入
+`--interactive`：
+
+```bash
+bash scripts/runpod_workflow.sh cpu prepare \
+  --interactive \
   --maxRuntime 10h \
   --cpuNumber 16 \
   --cpuFlavor cpu5g
@@ -1554,17 +1568,33 @@ selection, rerun CPU preparation as well. Never bypass the GPU gate.
 
 The CPU Pod accepts only the active selection. Pod creation fails before any
 compute is rented when `configure` has not run, the config SHA changed, or the
-selection JSON is incomplete. Create a short-lived CPU Pod locally; defaults
-are a 6-hour workload limit, 8 vCPUs, and `cpu3g`:
+selection JSON is incomplete. With no resource options, the local command is
+interactive: it prompts for the maximum workload runtime, vCPU count, and CPU
+flavor. Pressing Enter accepts the defaults of 6 hours, 8 vCPUs, and `cpu3g`.
+The final prompt requires `y` or `yes` before creating a potentially billable
+Pod; Enter, `n`, or `no` cancels safely:
 
 ```bash
 bash scripts/runpod_workflow.sh cpu prepare
 ```
 
-Override the resources directly on the command line without editing `.env`:
+Providing any resource option selects non-interactive mode, while omitted
+options retain their defaults. Automation can therefore provide all values
+explicitly without editing `.env`:
 
 ```bash
 bash scripts/runpod_workflow.sh cpu prepare \
+  --maxRuntime 10h \
+  --cpuNumber 16 \
+  --cpuFlavor cpu5g
+```
+
+Add `--interactive` to use command-line values as prompt defaults that the
+user can confirm or replace:
+
+```bash
+bash scripts/runpod_workflow.sh cpu prepare \
+  --interactive \
   --maxRuntime 10h \
   --cpuNumber 16 \
   --cpuFlavor cpu5g

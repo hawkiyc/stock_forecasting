@@ -16,7 +16,7 @@ Usage:
   bash scripts/runpod_workflow.sh configure [SELECTION OPTIONS]
   bash scripts/runpod_workflow.sh selection show
   bash scripts/runpod_workflow.sh sync [--dry-run|--apply]
-  bash scripts/runpod_workflow.sh cpu prepare [--maxRuntime DURATION] [--cpuNumber N] [--cpuFlavor FLAVOR]
+  bash scripts/runpod_workflow.sh cpu prepare [--interactive] [--maxRuntime DURATION] [--cpuNumber N] [--cpuFlavor FLAVOR]
   bash scripts/runpod_workflow.sh readiness [--code-only|--gpu]
   bash scripts/runpod_workflow.sh train [--maxRuntime DURATION] [--gpuId GPU_ID]
   bash scripts/runpod_workflow.sh resume [--maxRuntime DURATION] [--gpuId GPU_ID] [RUN_ID]
@@ -66,8 +66,16 @@ case "${COMMAND}" in
         cpu_max_runtime=6h
         cpu_number=8
         cpu_flavor=cpu3g
+        cpu_interactive=0
+        if [[ $# -eq 0 ]]; then
+            cpu_interactive=1
+        fi
         while [[ $# -gt 0 ]]; do
             case "$1" in
+                --interactive)
+                    cpu_interactive=1
+                    shift
+                    ;;
                 --maxRuntime|--max-runtime)
                     [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 2; }
                     cpu_max_runtime="$2"
@@ -90,9 +98,75 @@ case "${COMMAND}" in
                     ;;
             esac
         done
-        runpod_validate_cpu_number "${cpu_number}"
-        runpod_validate_cpu_flavor "${cpu_flavor}"
-        cpu_max_seconds="$(runpod_duration_seconds "${cpu_max_runtime}" --maxRuntime)"
+        if [[ ${cpu_interactive} -eq 1 ]]; then
+            cat >&2 <<'EOF'
+CPU preparation resource configuration
+Available flavors: cpu3c, cpu3g, cpu3m, cpu5c, cpu5g, cpu5m
+Press Enter to accept the value shown in brackets.
+EOF
+            while true; do
+                printf 'Maximum runtime [%s]: ' "${cpu_max_runtime}" >&2
+                if ! IFS= read -r cpu_entered_max_runtime; then
+                    echo "Input closed before CPU Pod creation" >&2
+                    exit 2
+                fi
+                cpu_candidate_max_runtime="${cpu_entered_max_runtime:-${cpu_max_runtime}}"
+                if cpu_max_seconds="$(runpod_duration_seconds \
+                    "${cpu_candidate_max_runtime}" --maxRuntime)"; then
+                    cpu_max_runtime="${cpu_candidate_max_runtime}"
+                    break
+                fi
+            done
+            while true; do
+                printf 'vCPU count [%s]: ' "${cpu_number}" >&2
+                if ! IFS= read -r cpu_entered_number; then
+                    echo "Input closed before CPU Pod creation" >&2
+                    exit 2
+                fi
+                cpu_candidate_number="${cpu_entered_number:-${cpu_number}}"
+                if runpod_validate_cpu_number "${cpu_candidate_number}"; then
+                    cpu_number="${cpu_candidate_number}"
+                    break
+                fi
+            done
+            while true; do
+                printf 'CPU flavor [%s]: ' "${cpu_flavor}" >&2
+                if ! IFS= read -r cpu_entered_flavor; then
+                    echo "Input closed before CPU Pod creation" >&2
+                    exit 2
+                fi
+                cpu_candidate_flavor="${cpu_entered_flavor:-${cpu_flavor}}"
+                if runpod_validate_cpu_flavor "${cpu_candidate_flavor}"; then
+                    cpu_flavor="${cpu_candidate_flavor}"
+                    break
+                fi
+            done
+            printf '\nCPU preparation Pod request:\n' >&2
+            printf '  Maximum runtime: %s\n' "${cpu_max_runtime}" >&2
+            printf '  External guard grace: 1h\n' >&2
+            printf '  vCPU count: %s\n' "${cpu_number}" >&2
+            printf '  CPU flavor: %s\n' "${cpu_flavor}" >&2
+            while true; do
+                printf 'Create this CPU preparation Pod? [y/N]: ' >&2
+                if ! IFS= read -r cpu_confirmation; then
+                    echo "Input closed; no CPU Pod was created" >&2
+                    exit 2
+                fi
+                case "${cpu_confirmation}" in
+                    [Yy]|[Yy][Ee][Ss]) break ;;
+                    ""|[Nn]|[Nn][Oo])
+                        echo "CPU preparation Pod creation cancelled; no Pod was created"
+                        exit 0
+                        ;;
+                    *) echo "Please answer y or n" >&2 ;;
+                esac
+            done
+        else
+            runpod_validate_cpu_number "${cpu_number}"
+            runpod_validate_cpu_flavor "${cpu_flavor}"
+            cpu_max_seconds="$(runpod_duration_seconds \
+                "${cpu_max_runtime}" --maxRuntime)"
+        fi
         export RUNPOD_CPU_MAX_RUNTIME_SECONDS="${cpu_max_seconds}"
         export RUNPOD_CPU_HARD_LIMIT_SECONDS="$((cpu_max_seconds + 3600))"
         export RUNPOD_CPU_VCPU_COUNT="${cpu_number}"
