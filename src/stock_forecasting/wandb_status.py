@@ -11,7 +11,6 @@ from typing import Any, Literal
 
 from stock_forecasting.run_paths import canonical_network_volume_root, validate_run_id
 
-
 WandbComponent = Literal["training", "validation"]
 COMPONENT_STATES = frozenset(
     {

@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple, Union
 
-
 SCHEMA_VERSION = 1
 SELECTION_ID_PATTERN = re.compile(r"selection-[0-9a-f]{16}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -188,7 +187,7 @@ def _positive_number_string(value: Any, label: str) -> str:
 def _normalize_symbols(
     values: Optional[Union[List[str], Tuple[str, ...]]], label: str
 ) -> List[str]:
-    normalized = set()  # type: Set[str]
+    normalized: Set[str] = set()
     for value in values or []:
         for candidate in re.split(r"[\s,]+", value.strip()):
             if not candidate:

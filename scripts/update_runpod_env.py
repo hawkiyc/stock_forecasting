@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, NoReturn, Optional, Set
 
-
 ALLOWED_KEYS = {
     "RUNPOD_API_KEY",
     "RUNPOD_NETWORK_VOLUME_ID",
@@ -116,8 +115,8 @@ def _validate_value(key: str, value: str) -> str:
 
 
 def _render_template(template_text: str, values: Dict[str, str]) -> str:
-    rendered = []  # type: List[str]
-    seen = set()  # type: Set[str]
+    rendered: List[str] = []
+    seen: Set[str] = set()
     for line_number, raw_line in enumerate(template_text.splitlines(), start=1):
         match = ASSIGNMENT_PATTERN.fullmatch(raw_line)
         if match is None:
@@ -181,7 +180,7 @@ def command_apply(arguments: argparse.Namespace) -> int:
     if datacenter and region and datacenter != region:
         _fail("RUNPOD_DATACENTER_ID and RUNPOD_S3_REGION must match")
     if region and endpoint:
-        expected_endpoint = "https://s3api-{}.runpod.io/".format(region.lower())
+        expected_endpoint = f"https://s3api-{region.lower()}.runpod.io/"
         if endpoint != expected_endpoint:
             _fail("RUNPOD_S3_ENDPOINT does not match RUNPOD_S3_REGION")
     for required_key in arguments.require_key:
@@ -195,7 +194,7 @@ def command_apply(arguments: argparse.Namespace) -> int:
         print(f"RunPod dotenv is already current: {env_path}")
         return 0
 
-    backup_path = None  # type: Optional[Path]
+    backup_path: Optional[Path] = None
     if env_path.exists():
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         backup_path = env_path.with_name(f"{env_path.name}.backup-{stamp}")

@@ -8,6 +8,7 @@ import math
 import os
 import time
 import uuid
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -45,11 +46,11 @@ from stock_forecasting.run_paths import (
     validate_validation_lifecycle_path,
     validate_wandb_directory,
 )
-from stock_forecasting.wandb_status import update_wandb_status
 from stock_forecasting.training import (
     deterministic_stratified_indices,
     resolve_processed_dataset,
 )
+from stock_forecasting.wandb_status import update_wandb_status
 
 LEARNED_BASELINES = ("gbdt", "gru", "dlinear", "patchtst")
 FULL_MODEL_NAME = "kronos_full"
@@ -819,10 +820,8 @@ def log_validation_to_wandb(
             transaction_directory=transaction_directory,
             error=f"{type(error).__name__}: {error}",
         )
-        try:
+        with suppress(BaseException):
             run.finish(exit_code=1)
-        except BaseException:
-            pass
         raise
     update_wandb_status(
         run_id=run_id,

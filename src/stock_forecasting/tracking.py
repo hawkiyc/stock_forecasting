@@ -12,7 +12,7 @@ import shutil
 import socket
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,7 +36,6 @@ from stock_forecasting.run_paths import (
     validate_wandb_directory,
 )
 from stock_forecasting.wandb_status import update_wandb_status
-
 
 _SELECTION_ID_PATTERN = re.compile(r"selection-[0-9a-f]{16}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -495,10 +494,8 @@ def _start_wandb(config: ExperimentConfig) -> Any:
     try:
         _define_training_metric_axes(run)
     except BaseException:
-        try:
+        with suppress(BaseException):
             run.finish(exit_code=1)
-        except BaseException:
-            pass
         raise
     return run
 
@@ -562,10 +559,8 @@ def start_tracking(config: ExperimentConfig) -> TrackingRun:
                 _define_training_metric_axes(backend)
             except BaseException as offline_error:
                 if backend is not None:
-                    try:
+                    with suppress(BaseException):
                         backend.finish(exit_code=1)
-                    except BaseException:
-                        pass
                 if expected_run_id is not None:
                     update_wandb_status(
                         run_id=expected_run_id,

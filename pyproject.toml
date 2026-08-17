@@ -41,7 +41,7 @@ packages = [{ include = "stock_forecasting", from = "src" }]
 pytest = ">=8.3,<10.0"
 pytest-cov = ">=6.0,<8.0"
 pytest-xdist = ">=3.6,<4.0"
-ruff = ">=0.12,<1.0"
+ruff = "0.15.21"
 mypy = ">=1.17,<2.0"
 types-PyYAML = ">=6.0,<7.0"
 types-requests = ">=2.32,<3.0"
@@ -65,10 +65,11 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 ignore = ["B008"]
 
 [tool.ruff.lint.per-file-ignores]
+# Keep control-plane scripts compatible with older system Python interpreters.
 "scripts/runpod_readiness.py" = ["UP017"]
-"scripts/runpod_selection.py" = ["UP006", "UP007", "UP017", "UP035"]
+"scripts/runpod_selection.py" = ["UP006", "UP007", "UP017", "UP035", "UP045"]
 "scripts/utc_deadline.py" = ["UP017"]
-"scripts/update_runpod_env.py" = ["UP006", "UP017", "UP035"]
+"scripts/update_runpod_env.py" = ["UP006", "UP017", "UP035", "UP045"]
 
 [tool.mypy]
 python_version = "3.12"

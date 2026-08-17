@@ -12,7 +12,6 @@ from stock_forecasting.data.schema import normalize_ohlcv_frame
 from .base import Instrument, ProviderFetch, RequestRecord
 from .http import CachedJsonClient
 
-
 EODHD_DEFAULT_DAILY_API_CALL_LIMIT = 100_000
 EODHD_DEFAULT_REQUESTS_PER_MINUTE = 1_000
 EODHD_DEFAULT_REQUESTS_PER_SECOND = float(

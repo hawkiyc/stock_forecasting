@@ -866,9 +866,11 @@ def command_check_dataset(arguments):
         arguments.expected_code_release_digest,
         stage_contract,
     )
-    if arguments.stage_config is not None:
-        if payload.get("stage_config_sha256") != _sha256(arguments.stage_config):
-            raise ValueError("Dataset was prepared for a different stage config revision")
+    if (
+        arguments.stage_config is not None
+        and payload.get("stage_config_sha256") != _sha256(arguments.stage_config)
+    ):
+        raise ValueError("Dataset was prepared for a different stage config revision")
     if arguments.network_volume_root is not None:
         _verify_dataset_artifacts(payload, arguments.network_volume_root)
     print(

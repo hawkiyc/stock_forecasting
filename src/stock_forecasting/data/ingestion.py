@@ -12,7 +12,7 @@ from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 import pandas as pd
 
@@ -26,11 +26,11 @@ from stock_forecasting.data.manifest import (
     atomic_write_json,
 )
 from stock_forecasting.data.providers import (
-    CachedJsonClient,
     EODHD_DEFAULT_DAILY_API_CALL_LIMIT,
     EODHD_DEFAULT_REQUESTS_PER_MINUTE,
     EODHD_DEFAULT_REQUESTS_PER_SECOND,
     EODHD_DELISTED_AUXILIARY_DATA_START,
+    CachedJsonClient,
     EODHDProvider,
     Instrument,
     MassiveProvider,
@@ -42,17 +42,13 @@ from stock_forecasting.data.providers import (
 from stock_forecasting.data.schema import normalize_ohlcv_frame
 
 
-_InputT = TypeVar("_InputT")
-_ResultT = TypeVar("_ResultT")
-
-
-def _ordered_thread_map(
-    function: Callable[[_InputT], _ResultT],
-    items: Iterable[_InputT],
+def _ordered_thread_map[InputT, ResultT](
+    function: Callable[[InputT], ResultT],
+    items: Iterable[InputT],
     *,
     max_workers: int,
     thread_name_prefix: str,
-) -> Generator[_ResultT, None, None]:
+) -> Generator[ResultT, None, None]:
     """Yield deterministic results with a bounded two-task prefetch per worker."""
 
     if max_workers < 1:
@@ -62,7 +58,7 @@ def _ordered_thread_map(
         max_workers=max_workers,
         thread_name_prefix=thread_name_prefix,
     )
-    pending: deque[Future[_ResultT]] = deque()
+    pending: deque[Future[ResultT]] = deque()
 
     def submit_next() -> bool:
         try:
@@ -531,27 +527,37 @@ def ingest_daily_ohlcv(
                 corporate_action_rows += len(action_fetch.frame)
                 dropped_source_rows += int(action_fetch.metadata.get("dropped_rows", 0))
 
-                def fetch_taiwan_date(trading_date: str) -> tuple[Any, pd.DataFrame]:
-                    fetched = provider.fetch_date(
+                def fetch_taiwan_date(
+                    trading_date: str,
+                    *,
+                    bound_provider: Any = provider,
+                    bound_action_frame: pd.DataFrame = action_fetch.frame,
+                    bound_provider_name: str = provider_name,
+                ) -> tuple[Any, pd.DataFrame]:
+                    fetched = bound_provider.fetch_date(
                         date=trading_date,
                         dataset_profile=options.profile,
                     )
                     if not fetched.frame.empty:
                         adjusted = apply_cumulative_adjustments(
                             fetched.frame,
-                            action_fetch.frame,
+                            bound_action_frame,
                         )
                         adjusted["adjustment_source"] = (
                             "twse_twt49u"
-                            if provider_name == "twse_official"
+                            if bound_provider_name == "twse_official"
                             else "tpex_exdailyq"
                         )
                     else:
                         adjusted = fetched.frame
                     return fetched, adjusted
 
-                def fetch_taiwan_month(month: str) -> Any:
-                    return provider.fetch_benchmark_month(
+                def fetch_taiwan_month(
+                    month: str,
+                    *,
+                    bound_provider: Any = provider,
+                ) -> Any:
+                    return bound_provider.fetch_benchmark_month(
                         month=month,
                         dataset_profile=options.profile,
                     )

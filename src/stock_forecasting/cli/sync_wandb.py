@@ -16,7 +16,6 @@ from stock_forecasting.wandb_status import (
     update_wandb_status,
 )
 
-
 PENDING_STATES = frozenset({"online_running", "offline_pending", "sync_failed"})
 COMPONENTS: tuple[WandbComponent, ...] = ("training", "validation")
 

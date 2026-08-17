@@ -149,7 +149,10 @@ def baseline_arrays(records: list[dict[str, Any]]) -> BaselineArrays:
         feature_row = [
             *asset_summary,
             *benchmark_summary,
-            *(asset - benchmark for asset, benchmark in zip(asset_summary, benchmark_summary)),
+            *(
+                asset - benchmark
+                for asset, benchmark in zip(asset_summary, benchmark_summary, strict=True)
+            ),
         ]
         asset_sequence = _relative_sequence(record["context"])
         benchmark_sequence = _relative_sequence(record["benchmark_context"])
@@ -531,7 +534,7 @@ def _fit_neural(
     model.to(device)
     scales = _robust_scales(train.targets)
     if hasattr(model, "robust_scales"):
-        setattr(model, "robust_scales", tuple(scales))
+        model.robust_scales = tuple(scales)
     scale_tensor = torch.tensor(scales, dtype=torch.float32, device=device)
     dataset = TensorDataset(
         torch.from_numpy(train.sequences),

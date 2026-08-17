@@ -14,6 +14,7 @@ from .projector import CausalPerceiverResampler, CausalTokenProjector
 from .quant import QuantForecastModel
 
 __all__ = [
+    "MODEL_OUTPUT_SCHEMA_VERSION",
     "CausalPerceiverResampler",
     "CausalTokenProjector",
     "DeterministicTimeSeriesBackbone",
@@ -21,7 +22,6 @@ __all__ = [
     "KronosBackbone",
     "LoRALinear",
     "ModelCapabilityError",
-    "MODEL_OUTPUT_SCHEMA_VERSION",
     "MultiHorizonAlphaHead",
     "OptionalDependencyError",
     "QuantEncoderOutput",

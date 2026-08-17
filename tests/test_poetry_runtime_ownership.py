@@ -96,6 +96,14 @@ def test_poetry_files_remain_valid_toml() -> None:
         assert tomllib.load(stream)["project"]["name"] == "fin-ts-multimodal"
 
 
+def test_runpod_lint_version_is_pinned() -> None:
+    project_root = Path(__file__).parents[1]
+    with (project_root / "pyproject.toml").open("rb") as stream:
+        pyproject = tomllib.load(stream)
+
+    assert pyproject["tool"]["poetry"]["group"]["dev"]["dependencies"]["ruff"] == "0.15.21"
+
+
 def test_lock_filter_preserves_authoritative_metadata_and_removes_image_packages() -> None:
     lock_filter = _load_lock_filter()
     lock_text = (

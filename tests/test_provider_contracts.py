@@ -486,8 +486,8 @@ def test_existing_vti_benchmark_is_not_added_twice() -> None:
 def test_eodhd_paid_plan_limits_define_pipeline_defaults() -> None:
     assert EODHD_DEFAULT_DAILY_API_CALL_LIMIT == 100000
     assert EODHD_DEFAULT_REQUESTS_PER_MINUTE == 1000
-    assert EODHD_DEFAULT_REQUESTS_PER_SECOND == pytest.approx(16.0)
-    assert EODHD_DEFAULT_REQUESTS_PER_SECOND * 60.0 == pytest.approx(960.0)
+    assert pytest.approx(16.0) == EODHD_DEFAULT_REQUESTS_PER_SECOND
+    assert pytest.approx(960.0) == EODHD_DEFAULT_REQUESTS_PER_SECOND * 60.0
     assert (
         EODHD_DEFAULT_REQUESTS_PER_SECOND * 60.0
         < EODHD_DEFAULT_REQUESTS_PER_MINUTE

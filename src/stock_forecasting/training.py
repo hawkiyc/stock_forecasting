@@ -7,7 +7,7 @@ import math
 import random
 from collections import defaultdict
 from collections.abc import Sized
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -724,7 +724,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
             validation_metrics=validation_metrics,
         )
     except BaseException:
-        try:
+        with suppress(BaseException):
             tracking.update_summary(
                 {
                     "failed": True,
@@ -732,12 +732,8 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                     "training_stage": config.training.stage,
                 }
             )
-        except BaseException:
-            pass
-        try:
+        with suppress(BaseException):
             tracking.finish(exit_code=1)
-        except BaseException:
-            pass
         raise
 
 

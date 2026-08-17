@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 HELPER_PATH = ROOT / "scripts/runpod_selection.py"
 SPEC = importlib.util.spec_from_file_location("runpod_selection_contract", HELPER_PATH)
