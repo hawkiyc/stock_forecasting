@@ -151,7 +151,11 @@ def test_stable_runpod_lifecycle_and_synchronization_boundaries_remain() -> None
     assert "pod create" in create_gpu
     assert "--dry-run" in sync
     assert "--apply" in sync
-    assert "runpod_project_s3_ready" in sync
+    assert 'CODE_MARKER_KEY="lifecycle/stage1/code.json"' in sync
+    syncing_index = sync.index("render_code_manifest syncing")
+    ready_index = sync.rindex("render_code_manifest ready")
+    verification_index = sync.rindex('python3 "${READINESS_HELPER}" check-code')
+    assert syncing_index < ready_index < verification_index
     assert "runpod_train_then_validate.sh" in entrypoint
     assert "runpod_self_terminate.sh" in entrypoint
     assert "runpod_self_terminate.sh" in tmux

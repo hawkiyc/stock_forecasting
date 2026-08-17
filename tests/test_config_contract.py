@@ -98,13 +98,18 @@ def test_stage_fraction_contract_fails_closed() -> None:
         ExperimentConfig.model_validate(payload)
 
 
-def test_production_stages_cannot_hide_a_sample_cap() -> None:
+def test_production_stages_cannot_hide_a_sample_cap(tmp_path: Path) -> None:
     path = ROOT / "configs/stage1_kronos_base_lora.yaml"
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     payload["data"]["max_samples"] = 100
+    modified_path = tmp_path / "stage1_with_sample_cap.yaml"
+    modified_path.write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValidationError, match="cannot cap max_samples"):
-        ExperimentConfig.model_validate(payload)
+        ExperimentConfig.from_yaml(modified_path)
 
 
 def test_model_config_has_no_language_or_fact_branch() -> None:
