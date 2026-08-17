@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 import requests
 
+from stock_forecasting.cli import download_market_data
 from stock_forecasting.data.adjustments import asof_adjusted_window
 from stock_forecasting.data.download_progress import DownloadProgress
 from stock_forecasting.data.ingestion import (
@@ -34,6 +35,7 @@ from stock_forecasting.data.providers.http import (
     CachedJsonClient,
     NetworkRequestBudget,
     NetworkRequestBudgetExceeded,
+    ProviderAcquisitionError,
     ProviderRequestError,
 )
 from stock_forecasting.data.providers.massive import MassiveProvider
@@ -332,6 +334,48 @@ def test_taiwan_retry_loop_exits_when_next_backoff_exceeds_maximum(
     }
 
 
+def test_taiwan_403_uses_bounded_backoff_and_browser_headers(tmp_path: Path) -> None:
+    class _ForbiddenSession:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def get(self, _endpoint: str, **kwargs: Any) -> requests.Response:
+            self.calls.append(kwargs)
+            response = requests.Response()
+            response.status_code = 403
+            response._content = b"{}"
+            response.headers = {}
+            return response
+
+    session = _ForbiddenSession()
+    waits: list[float] = []
+    client = CachedJsonClient(
+        provider="tpex_official",
+        raw_cache_root=tmp_path,
+        max_requests_per_second=10.0,
+        max_backoff_seconds=2.0,
+        headers={
+            "User-Agent": "Mozilla/5.0 fixture",
+            "Referer": "https://www.tpex.org.tw/",
+        },
+        retryable_status_codes={403, 429},
+        session=session,
+        clock=lambda: float(len(session.calls) * 10),
+        sleeper=waits.append,
+    )
+
+    with pytest.raises(ProviderRequestError) as captured:
+        client.get_json("https://example.invalid/tpex", params={})
+
+    assert len(session.calls) == 3
+    assert waits == [1.0, 2.0]
+    assert session.calls[0]["headers"]["User-Agent"] == "Mozilla/5.0 fixture"
+    assert session.calls[0]["headers"]["Referer"] == "https://www.tpex.org.tw/"
+    assert captured.value.category == "access_temporarily_denied"
+    assert captured.value.retryable
+    assert captured.value.status_code == 403
+
+
 def test_new_client_reuses_successful_cache_after_rate_limit_interruption(
     tmp_path: Path,
 ) -> None:
@@ -459,6 +503,44 @@ def test_eodhd_preserves_total_return_anchor_and_split_adjusted_volume() -> None
     assert fetched.frame.loc[0, "adjustment_source"] == (
         "eodhd_adjusted_close+historical_splits+reconstructed_raw_volume"
     )
+
+
+def test_eodhd_drops_zero_vendor_rows_without_synthesizing_prices() -> None:
+    client = _StubClient(
+        [
+            {
+                "date": "2023-11-06",
+                "open": 0,
+                "high": 0,
+                "low": 0,
+                "close": 0,
+                "adjusted_close": 0,
+                "volume": 0,
+            },
+            {
+                "date": "2023-11-20",
+                "open": 9.95,
+                "high": 10.1,
+                "low": 9.9,
+                "close": 10.0,
+                "adjusted_close": 10.0,
+                "volume": 100,
+            },
+        ]
+    )
+    instrument = Instrument("PLTL.US", "PLTL.US", "etf", "US", "USD", True)
+
+    fetched = EODHDProvider(client, api_token="fixture-token").fetch_instrument(
+        instrument,
+        start="2005-01-01",
+        end="2026-04-30",
+        dataset_profile="us_only_eodhd",
+    )
+
+    assert list(fetched.frame["timestamp"].dt.strftime("%Y-%m-%d")) == ["2023-11-20"]
+    assert fetched.metadata["source_rows"] == 2
+    assert fetched.metadata["dropped_rows"] == 1
+    assert fetched.metadata["invalid_row_counts"] == {"non_positive_price": 1}
 
 
 def test_eodhd_does_not_apply_split_adjustment_to_volume_twice() -> None:
@@ -659,6 +741,92 @@ def test_twse_parser_includes_four_digit_etf_and_stock() -> None:
     assert by_symbol.loc["2330.TW", "asset_type"] == "stock"
     assert set(by_symbol["provider"]) == {"twse_official"}
     assert by_symbol["is_active"].isna().all()
+
+
+def test_twse_historical_action_without_detail_keeps_price_factor_and_records_gap() -> None:
+    class _ActionClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get_json(
+            self,
+            endpoint: str,
+            *,
+            params: dict[str, Any],
+        ) -> tuple[Any, RequestRecord]:
+            del params
+            self.calls.append(endpoint)
+            if endpoint.endswith("TWT49UDetail"):
+                return {"stat": "無相關資料"}, _request("twse_official")
+            return (
+                {
+                    "fields": [
+                        "資料日期",
+                        "股票代號",
+                        "除權息前收盤價",
+                        "除權息參考價",
+                        "權/息",
+                    ],
+                    "data": [["94年01月11日", "6280", "33.00", "27.48", "權"]],
+                },
+                _request("twse_official"),
+            )
+
+    client = _ActionClient()
+    fetched = TWSEProvider(client).fetch_actions(start="2005-01-01", end="2005-12-31")
+
+    assert len(client.calls) == 2
+    assert fetched.frame.loc[0, "price_factor"] == pytest.approx(27.48 / 33.0)
+    assert fetched.frame.loc[0, "share_multiplier"] == pytest.approx(1.0)
+    assert fetched.frame.loc[0, "source"] == "twse_twt49u_price_only_missing_detail"
+    assert fetched.metadata["missing_share_multiplier_details"] == 1
+
+
+def test_download_cli_renders_fatal_provider_outcomes_without_a_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    error = ProviderAcquisitionError(
+        state="failed",
+        retryable=False,
+        provider_outcomes={
+            "eodhd": {
+                "state": "failed",
+                "last_error": {
+                    "category": "provider_data_contract_error",
+                    "provider": "eodhd",
+                    "operation": "daily_eod",
+                    "item": "PLTL.US",
+                    "error_type": "MarketDataValidationError",
+                    "retryable": False,
+                },
+            }
+        },
+    )
+
+    def fail_ingestion(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise error
+
+    monkeypatch.setattr(download_market_data, "ingest_daily_ohlcv", fail_ingestion)
+    exit_code = download_market_data.main(
+        [
+            "--profile",
+            "tw_only",
+            "--start",
+            "2026-01-01",
+            "--end",
+            "2026-02-01",
+            "--output",
+            str(tmp_path / "raw" / "market.parquet"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+    assert exit_code == 1
+    assert payload["provider_outcomes"]["eodhd"]["last_error"]["item"] == "PLTL.US"
+    assert "Traceback" not in captured.err
 
 
 def test_explicit_etf_only_universe_does_not_require_stock_symbols() -> None:

@@ -171,18 +171,17 @@ def main(argv: list[str] | None = None) -> int:
             eodhd_api_token=os.environ.get("EODHD_API_TOKEN"),
         )
     except ProviderAcquisitionError as error:
-        if not error.retryable:
-            raise
+        exit_code = TEMPORARY_PROVIDER_EXIT_CODE if error.retryable else 1
         waiting = {
             "state": error.state,
-            "exit_code": TEMPORARY_PROVIDER_EXIT_CODE,
+            "exit_code": exit_code,
             "progress_path": str(
                 options.progress_path or options.manifest_root / "download-progress.json"
             ),
             "provider_outcomes": error.provider_outcomes,
         }
         print(json.dumps(waiting, ensure_ascii=False, sort_keys=True), file=sys.stderr)
-        return TEMPORARY_PROVIDER_EXIT_CODE
+        return exit_code
     except ProviderRequestError as error:
         if not error.retryable:
             raise

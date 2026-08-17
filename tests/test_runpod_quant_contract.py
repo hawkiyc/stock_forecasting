@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -172,6 +173,152 @@ def test_downloaded_lifecycle_can_be_an_active_intermediate_checkpoint(
     assert "exit_code" not in payload
 
 
+def test_same_launch_terminal_finalizer_preserves_download_progress(
+    tmp_path: Path,
+) -> None:
+    volume_root = tmp_path / "runpod-volume"
+    digest = "c" * 64
+    progress_path = volume_root / "datasets" / digest / "download-progress.json"
+    progress_path.parent.mkdir(parents=True)
+    identity = {"dataset_request_sha256": digest}
+    progress_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "ohlcv-download-progress",
+                "state": "failed",
+                "identity": identity,
+                "identity_sha256": hashlib.sha256(
+                    json.dumps(
+                        identity,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    marker = volume_root / "lifecycle" / "stage1" / "dataset.json"
+    environment = {**os.environ, "RUNPOD_POD_ID": "test-pod"}
+    base_command = [
+        sys.executable,
+        str(ROOT / "scripts/runpod_readiness.py"),
+        "write-state",
+        "--output",
+        str(marker),
+        "--network-volume-root",
+        str(volume_root),
+        "--kind",
+        "stage1-dataset",
+        "--state",
+        "failed",
+        "--launch-id",
+        "test-launch",
+        "--exit-code",
+        "1",
+    ]
+    first = subprocess.run(
+        [*base_command, "--progress-path", str(progress_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    second = subprocess.run(
+        [*base_command, "--inherit-existing"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["state"] == "failed"
+    assert payload["pod_id"] == "test-pod"
+    assert payload["progress_path"] == str(progress_path.resolve())
+
+
+def test_tmux_resumable_dataset_validator_requires_matching_progress(
+    tmp_path: Path,
+) -> None:
+    volume_root = tmp_path / "runpod-volume"
+    digest = "d" * 64
+    progress_path = volume_root / "datasets" / digest / "download-progress.json"
+    progress_path.parent.mkdir(parents=True)
+    identity = {"dataset_request_sha256": digest}
+    progress_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "ohlcv-download-progress",
+                "state": "waiting_for_provider",
+                "identity": identity,
+                "identity_sha256": hashlib.sha256(
+                    json.dumps(
+                        identity,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    marker = volume_root / "lifecycle" / "stage1" / "dataset.json"
+    environment = {**os.environ, "RUNPOD_POD_ID": "test-pod"}
+    write_result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/runpod_readiness.py"),
+            "write-state",
+            "--output",
+            str(marker),
+            "--network-volume-root",
+            str(volume_root),
+            "--kind",
+            "stage1-dataset",
+            "--state",
+            "waiting_for_provider",
+            "--launch-id",
+            "test-launch",
+            "--exit-code",
+            "75",
+            "--progress-path",
+            str(progress_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    validate_result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/runpod_readiness.py"),
+            "resumable-dataset-lifecycle",
+            "--marker",
+            str(marker),
+            "--network-volume-root",
+            str(volume_root),
+            "--launch-id",
+            "test-launch",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert write_result.returncode == 0, write_result.stderr
+    assert validate_result.returncode == 0, validate_result.stderr
+    assert validate_result.stdout.strip() == "waiting_for_provider"
+
+
 def test_runpod_entrypoints_use_only_two_quant_stages() -> None:
     relevant = (
         ROOT / "scripts/create_runpod_pod.sh",
@@ -252,6 +399,8 @@ def test_cpu_acquisition_budget_is_resumable_and_reserves_preparation_time() -> 
     prepare = (ROOT / "scripts/runpod_cpu_prepare.sh").read_text(encoding="utf-8")
     guard = (ROOT / "scripts/terminate_runpod_after.sh").read_text(encoding="utf-8")
     status = (ROOT / "scripts/show_runpod_status.sh").read_text(encoding="utf-8")
+    tmux = (ROOT / "scripts/runpod_tmux_launch.sh").read_text(encoding="utf-8")
+    readiness = (ROOT / "scripts/runpod_readiness.py").read_text(encoding="utf-8")
 
     assert "Estimated HTTP requests" not in ingestion
     assert "exceed max_api_calls" not in ingestion
@@ -267,8 +416,13 @@ def test_cpu_acquisition_budget_is_resumable_and_reserves_preparation_time() -> 
     assert "ACQUISITION_DEADLINE_EPOCH" in prepare
     assert "RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS" in prepare
     assert 'error.get("provider_outcomes")' in status
+    assert 'for key in ("category", "error_type", "operation", "item", "status_code")' in status
     assert 'ln "${RAW_STAGING}" "${RAW_FINAL}"' in prepare
     assert "fin-ts-verify-download" in prepare
+    assert "resumable-dataset-lifecycle" in tmux
+    assert "${cpu_resumable_lifecycle_valid} -ne 1" in tmux
+    assert "The CPU worker publishes the precise waiting state" in tmux
+    assert "same_launch" in readiness
     for state in ("waiting_for_budget", "waiting_for_resume", "downloaded"):
         assert state in guard
     assert 'print("downloaded_active")' in guard

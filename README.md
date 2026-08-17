@@ -658,7 +658,8 @@ bash scripts/runpod_workflow.sh status
 ##### Provider quota 與跨 CPU Pod 續傳
 
 EODHD、TWSE 與 TPEx 使用彼此獨立的平行迴圈。retryable 的 429、暫時性網路錯誤或
-provider 5xx 都採指數退避，但退出條件不同：EODHD 以該 CPU attempt 的 EODHD
+provider 5xx 都採指數退避；台灣官方端點由 Pod IP/WAF 暫時回傳的 403 也視為
+retryable，但退出條件不同：EODHD 以該 CPU attempt 的 EODHD
 network-attempt count（`--max-api-calls`）為界；TWSE／TPEx 不設 request-count 上限，
 而在下一次退避將超過 `--maxBackoff`（預設 `1m`）時退出。共同 acquisition deadline
 仍可讓任何迴圈進入 `waiting_for_resume`，以保留 data cleaning 時間。流程遵守下列契約：
@@ -672,7 +673,8 @@ network-attempt count（`--max-api-calls`）為界；TWSE／TPEx 不設 request-
    EODHD limited count，以及每個 provider 的 `complete`、`waiting_for_budget`、
    `waiting_for_provider` 或 `waiting_for_resume` outcome；台灣錯誤另記已等待總秒數、
    最後等待、下一次 proposed backoff 與最大值。HTTP status、`Retry-After` 與
-   rate-limit headers 只在供應商有回傳時記錄；不記錄 token 或 response body。
+   rate-limit headers 只在供應商有回傳時記錄；資料契約錯誤另記安全的 provider、
+   operation、symbol/date/month 與 exception type，不記錄 token 或 response body。
 4. 若任一迴圈仍未完成，dataset lifecycle 依整體 outcome 進入
    `waiting_for_budget`、`waiting_for_provider` 或 `waiting_for_resume`，GPU readiness
    維持不通過，CPU Pod 才自動終止。若三者都完成，則以固定 provider 順序合併分片，
@@ -692,6 +694,14 @@ network-attempt count（`--max-api-calls`）為界；TWSE／TPEx 不設 request-
    manifest 與 selection gate 都通過後，lifecycle 才會變成 `ready`。`all` 模式的
    discovery response 也屬於同一份 immutable cache，因此跨日續傳不會重新取得一份
    已漂移的商品清單。
+
+EODHD 偶爾會在已上市商品的日資料中回傳全零或其他無法通過 canonical OHLCV contract
+的 placeholder row。下載器不補值、不改價，而是只丟棄無效 source rows，將數量記入
+`dropped_source_rows`，並繼續保留同檔商品的有效 observations。TWSE 的早期除權資料
+有時存在於 `TWT49U` 主表，但 detail 端點回傳「無相關資料」；此時保留可驗證的
+price factor，share multiplier 使用 identity `1.0`，並在
+`missing_share_multiplier_details_by_provider` 明確記錄 volume-adjustment coverage gap，
+不把未知比例偽造成完整資料。
 
 `bash scripts/runpod_workflow.sh status` 會在 dataset lifecycle 下方顯示 download
 attempt、已快取 response 數、此次 network request 數、可用的完整 request 估算與
@@ -1787,8 +1797,9 @@ bash scripts/runpod_workflow.sh status
 ##### Provider quotas and cross-Pod resume
 
 EODHD, TWSE, and TPEx use independent parallel loops. Retryable HTTP 429,
-temporary network failures, and provider 5xx responses use exponential backoff,
-but the exit conditions differ. EODHD is bounded by its network-attempt count
+temporary network failures, and provider 5xx responses use exponential backoff.
+A temporary HTTP 403 from a Taiwan official endpoint due to Pod IP/WAF policy is
+also retryable, but the exit conditions differ. EODHD is bounded by its network-attempt count
 for the CPU attempt (`--max-api-calls`). TWSE/TPEx have no request-count ceiling;
 they exit when the next retry delay would exceed `--maxBackoff` (default `1m`).
 The shared acquisition deadline can still place any loop in `waiting_for_resume`
@@ -1805,7 +1816,9 @@ to protect cleaning time. The workflow follows this contract:
    `waiting_for_budget`, `waiting_for_provider`, or `waiting_for_resume` outcome.
    Taiwan errors also record cumulative wait, last wait, next proposed backoff,
    and the maximum. HTTP status, `Retry-After`, and rate-limit headers are stored
-   when supplied; tokens and response bodies are not.
+   when supplied. Data-contract errors additionally identify the safe provider,
+   operation, symbol/date/month, and exception type. Tokens and response bodies
+   are not stored.
 4. If any loop is incomplete, the aggregate lifecycle becomes
    `waiting_for_budget`, `waiting_for_provider`, or `waiting_for_resume`; GPU
    readiness stays blocked, and only then does the CPU Pod terminate. If all
@@ -1828,6 +1841,16 @@ to protect cleaning time. The workflow follows this contract:
    after all data, manifests, and selection gates pass. The `all`-mode discovery
    response is part of the same immutable cache, so a cross-day resume does not
    replace it with a drifted instrument list.
+
+EODHD occasionally returns all-zero or otherwise invalid placeholder rows inside
+an instrument's daily history. The downloader neither imputes nor rewrites those
+prices: it drops only source rows that cannot satisfy the canonical OHLCV
+contract, counts them in `dropped_source_rows`, and retains the instrument's
+valid observations. Early TWSE actions can exist in the `TWT49U` main table while
+the detail endpoint returns no record. In that case the verified price factor is
+retained, the unknown share multiplier stays at identity `1.0`, and
+`missing_share_multiplier_details_by_provider` explicitly records the resulting
+volume-adjustment coverage gap instead of inventing a ratio.
 
 `bash scripts/runpod_workflow.sh status` prints the download attempt, cached
 response count, network requests in that attempt, the full request estimate when

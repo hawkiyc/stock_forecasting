@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from stock_forecasting.data.adjustments import apply_cumulative_adjustments
@@ -16,6 +17,81 @@ EODHD_DEFAULT_DAILY_API_CALL_LIMIT = 100_000
 EODHD_DEFAULT_REQUESTS_PER_MINUTE = 1_000
 EODHD_DEFAULT_REQUESTS_PER_SECOND = float(EODHD_DEFAULT_REQUESTS_PER_MINUTE // 60)
 EODHD_DELISTED_AUXILIARY_DATA_START = "2018-01-01"
+_EODHD_DAILY_COLUMNS = (
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "adjusted_close",
+    "volume",
+)
+
+
+def _clean_daily_rows(payload: list[Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Drop vendor rows that cannot satisfy the canonical OHLCV contract."""
+
+    source_rows = len(payload)
+    object_rows = [row for row in payload if isinstance(row, dict)]
+    non_object_rows = source_rows - len(object_rows)
+    if not object_rows:
+        return pd.DataFrame(), {
+            "source_rows": source_rows,
+            "dropped_rows": source_rows,
+            "invalid_row_counts": {"non_object": non_object_rows},
+        }
+
+    frame = pd.DataFrame(object_rows)
+    missing = sorted(set(_EODHD_DAILY_COLUMNS).difference(frame.columns))
+    if missing:
+        raise ValueError("EODHD EOD rows are missing required fields: " + ", ".join(missing))
+
+    timestamps = pd.to_datetime(frame["date"], errors="coerce", utc=True)
+    numeric_columns = [*_EODHD_DAILY_COLUMNS[1:]]
+    numeric = frame[numeric_columns].apply(pd.to_numeric, errors="coerce")
+    finite_numeric = pd.Series(
+        np.isfinite(numeric.to_numpy(dtype=np.float64)).all(axis=1),
+        index=frame.index,
+    )
+    positive_prices = (
+        numeric[["open", "high", "low", "close", "adjusted_close"]].gt(0.0).all(axis=1)
+    )
+    nonnegative_volume = numeric["volume"].ge(0.0)
+    tolerance = 1e-8
+    high_is_valid = numeric["high"].add(tolerance).ge(numeric[["open", "low", "close"]].max(axis=1))
+    low_is_valid = numeric["low"].sub(tolerance).le(numeric[["open", "high", "close"]].min(axis=1))
+    base_valid = (
+        timestamps.notna()
+        & finite_numeric
+        & positive_prices
+        & nonnegative_volume
+        & high_is_valid
+        & low_is_valid
+    )
+    duplicate_dates = pd.Series(False, index=frame.index)
+    valid_indexes = frame.index[base_valid]
+    duplicate_dates.loc[valid_indexes] = timestamps.loc[valid_indexes].duplicated(keep=False)
+    valid = base_valid & ~duplicate_dates
+
+    cleaned = frame.loc[valid].copy()
+    cleaned["date"] = timestamps.loc[valid]
+    cleaned.loc[:, numeric_columns] = numeric.loc[valid, numeric_columns]
+    invalid_row_counts = {
+        "non_object": non_object_rows,
+        "invalid_timestamp": int(timestamps.isna().sum()),
+        "non_finite_numeric": int((~finite_numeric).sum()),
+        "non_positive_price": int((~positive_prices).sum()),
+        "negative_volume": int((~nonnegative_volume).sum()),
+        "invalid_ohlc_bounds": int((~(high_is_valid & low_is_valid)).sum()),
+        "duplicate_date": int(duplicate_dates.sum()),
+    }
+    return cleaned, {
+        "source_rows": source_rows,
+        "dropped_rows": source_rows - len(cleaned),
+        "invalid_row_counts": {
+            key: value for key, value in invalid_row_counts.items() if value > 0
+        },
+    }
 
 
 class EODHDProvider:
@@ -127,9 +203,15 @@ class EODHDProvider:
             return ProviderFetch(
                 frame=pd.DataFrame(),
                 requests=(request,),
-                metadata={"empty": True},
+                metadata={"empty": True, "source_rows": 0, "dropped_rows": 0},
             )
-        frame = pd.DataFrame(payload)
+        frame, row_metadata = _clean_daily_rows(payload)
+        if frame.empty:
+            return ProviderFetch(
+                frame=frame,
+                requests=(request,),
+                metadata={"empty": True, **row_metadata},
+            )
         frame["symbol"] = instrument.canonical_symbol
         frame["asset_type"] = instrument.asset_type
         frame["provider"] = self.name
@@ -151,7 +233,7 @@ class EODHDProvider:
         return ProviderFetch(
             frame=normalize_ohlcv_frame(frame),
             requests=(request,),
-            metadata={"empty": False},
+            metadata={"empty": False, **row_metadata},
         )
 
     def fetch_historical_split_events(

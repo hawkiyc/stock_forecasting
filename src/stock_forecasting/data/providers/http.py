@@ -300,6 +300,8 @@ class CachedJsonClient:
         timeout_seconds: float = 30.0,
         max_attempts: int | None = None,
         max_backoff_seconds: float | None = None,
+        headers: Mapping[str, str] | None = None,
+        retryable_status_codes: frozenset[int] | set[int] | None = None,
         session: requests.Session | None = None,
         request_budget: NetworkRequestBudget | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -321,6 +323,20 @@ class CachedJsonClient:
         self.timeout_seconds = timeout_seconds
         self.max_attempts = max_attempts
         self.max_backoff_seconds = max_backoff_seconds
+        self.headers = {
+            "User-Agent": "fin-ts-quant-research/0.2",
+            **({} if headers is None else dict(headers)),
+        }
+        self.retryable_status_codes = frozenset(
+            {429} if retryable_status_codes is None else retryable_status_codes
+        )
+        if any(
+            not isinstance(status_code, int)
+            or isinstance(status_code, bool)
+            or not 400 <= status_code <= 599
+            for status_code in self.retryable_status_codes
+        ):
+            raise ValueError("Retryable HTTP status codes must be integers from 400 to 599")
         self.session = session
         self.request_budget = request_budget
         self.clock = clock
@@ -360,7 +376,7 @@ class CachedJsonClient:
                 endpoint,
                 params=dict(params),
                 timeout=self.timeout_seconds,
-                headers={"User-Agent": "fin-ts-quant-research/0.2"},
+                headers=self.headers,
             )
         # Injected sessions are primarily deterministic test doubles and are not
         # assumed to be thread-safe.
@@ -369,7 +385,7 @@ class CachedJsonClient:
                 endpoint,
                 params=dict(params),
                 timeout=self.timeout_seconds,
-                headers={"User-Agent": "fin-ts-quant-research/0.2"},
+                headers=self.headers,
             )
 
     def _identity(
@@ -459,7 +475,10 @@ class CachedJsonClient:
                 if self.request_budget is not None:
                     self.request_budget.consume(self.provider)
                 response = self._send(endpoint, params)
-                if response.status_code == 429 or response.status_code >= 500:
+                if (
+                    response.status_code in self.retryable_status_codes
+                    or response.status_code >= 500
+                ):
                     raise requests.HTTPError(
                         f"Retryable HTTP {response.status_code}",
                         response=response,
@@ -509,8 +528,15 @@ class CachedJsonClient:
                 elif response.status_code == 429:
                     last_category = "rate_limited"
                     last_retryable = True
-                elif response.status_code >= 500:
-                    last_category = "provider_unavailable"
+                elif (
+                    response.status_code in self.retryable_status_codes
+                    or response.status_code >= 500
+                ):
+                    last_category = (
+                        "access_temporarily_denied"
+                        if response.status_code == 403
+                        else "provider_unavailable"
+                    )
                     last_retryable = True
                 else:
                     last_category = "provider_rejected"

@@ -247,6 +247,7 @@ class _ProviderStats:
     empty_series: int = 0
     dropped_source_rows: int = 0
     corporate_action_rows: int = 0
+    missing_share_multiplier_details: int = 0
     benchmark_rows: int = 0
     taiwan_trading_dates: int | None = None
     delisted_eod_only_symbols: set[str] = field(default_factory=set)
@@ -275,6 +276,65 @@ class _ProviderLoopOutcome:
     error: Exception | None = None
 
 
+class _ProviderDataContractError(RuntimeError):
+    """Attach safe provider/item context to a non-HTTP data-contract failure."""
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        operation: str,
+        item: str,
+        error: Exception,
+    ) -> None:
+        self.provider = provider
+        self.operation = operation
+        self.item = item
+        self.error_type = type(error).__name__
+        detail = str(error).strip()
+        self.detail = detail[:500] if detail else None
+        super().__init__(f"{provider} {operation} failed for {item} ({self.error_type})")
+
+    def metadata(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "category": "provider_data_contract_error",
+            "provider": self.provider,
+            "operation": self.operation,
+            "item": self.item,
+            "error_type": self.error_type,
+            "retryable": False,
+        }
+        if self.detail is not None:
+            payload["detail"] = self.detail
+        return payload
+
+
+def _provider_data_call[ResultT](
+    *,
+    provider: str,
+    operation: str,
+    item: str,
+    function: Callable[[], ResultT],
+) -> ResultT:
+    """Preserve resumable transport errors and safely contextualize data errors."""
+
+    try:
+        return function()
+    except (
+        AcquisitionDeadlineExceeded,
+        NetworkRequestBudgetExceeded,
+        ProviderRequestError,
+    ):
+        raise
+    except Exception as error:
+        raise _ProviderDataContractError(
+            provider=provider,
+            operation=operation,
+            item=item,
+            error=error,
+        ) from error
+
+
 def _run_parallel_provider_loops(
     runners: Mapping[str, Callable[[], Any]],
 ) -> dict[str, _ProviderLoopOutcome]:
@@ -287,7 +347,24 @@ def _run_parallel_provider_loops(
         try:
             return _ProviderLoopOutcome(provider=provider, result=runner())
         except Exception as error:
-            return _ProviderLoopOutcome(provider=provider, error=error)
+            if isinstance(
+                error,
+                (
+                    AcquisitionDeadlineExceeded,
+                    NetworkRequestBudgetExceeded,
+                    ProviderRequestError,
+                    _ProviderDataContractError,
+                ),
+            ):
+                captured = error
+            else:
+                captured = _ProviderDataContractError(
+                    provider=provider,
+                    operation="provider_loop",
+                    item=provider,
+                    error=error,
+                )
+            return _ProviderLoopOutcome(provider=provider, error=captured)
 
     with ThreadPoolExecutor(
         max_workers=len(runners),
@@ -331,6 +408,8 @@ def _execute_provider_loop(
 
 
 def _safe_provider_outcome(error: Exception) -> dict[str, Any]:
+    if isinstance(error, _ProviderDataContractError):
+        return {"state": "failed", "last_error": error.metadata()}
     if isinstance(error, ProviderRequestError):
         return {
             "state": "waiting_for_provider" if error.retryable else "failed",
@@ -661,8 +740,13 @@ def ingest_daily_ohlcv(
                     )
                     discovery_requests: tuple[RequestRecord, ...] = ()
                 else:
-                    discovered, discovery_requests = provider.discover(
-                        include_delisted=options.include_delisted
+                    discovered, discovery_requests = _provider_data_call(
+                        provider="eodhd",
+                        operation="discover",
+                        item="US",
+                        function=lambda: provider.discover(
+                            include_delisted=options.include_delisted
+                        ),
                     )
                     instruments = discovered
                     log_part.append(discovery_requests)
@@ -675,18 +759,28 @@ def ingest_daily_ohlcv(
                 def fetch_eodhd_instrument(
                     instrument: Instrument,
                 ) -> tuple[Any, Any, Instrument]:
-                    instrument_split_fetch = provider.fetch_historical_split_events(
-                        instrument,
-                        start=options.start,
-                        end=provider_end,
+                    instrument_split_fetch = _provider_data_call(
+                        provider="eodhd",
+                        operation="historical_splits",
+                        item=instrument.canonical_symbol,
+                        function=lambda: provider.fetch_historical_split_events(
+                            instrument,
+                            start=options.start,
+                            end=provider_end,
+                        ),
                     )
-                    fetched = provider.fetch_instrument(
-                        instrument,
-                        start=options.start,
-                        end=provider_end,
-                        dataset_profile=options.profile,
-                        split_events=instrument_split_fetch.frame,
-                        split_adjustment_source="historical_splits",
+                    fetched = _provider_data_call(
+                        provider="eodhd",
+                        operation="daily_eod",
+                        item=instrument.canonical_symbol,
+                        function=lambda: provider.fetch_instrument(
+                            instrument,
+                            start=options.start,
+                            end=provider_end,
+                            dataset_profile=options.profile,
+                            split_events=instrument_split_fetch.frame,
+                            split_adjustment_source="historical_splits",
+                        ),
                     )
                     return instrument_split_fetch, fetched, instrument
 
@@ -706,6 +800,9 @@ def ingest_daily_ohlcv(
                             instrument_split_fetch.metadata.get("dropped_rows", 0)
                         )
                         log_part.append(fetched.requests)
+                        provider_stats.dropped_source_rows += int(
+                            fetched.metadata.get("dropped_rows", 0)
+                        )
                         if fetched.frame.empty:
                             provider_stats.empty_series += 1
                             continue
@@ -737,12 +834,32 @@ def ingest_daily_ohlcv(
                         raw_cache_root=options.raw_cache_root,
                         max_requests_per_second=options.taiwan_requests_per_second,
                         max_backoff_seconds=options.max_backoff_seconds,
+                        headers={
+                            "User-Agent": (
+                                "Mozilla/5.0 (X11; Linux x86_64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/140.0 Safari/537.36"
+                            ),
+                            "Accept": "application/json,text/plain,*/*",
+                            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+                            "Referer": (
+                                "https://www.twse.com.tw/"
+                                if provider_name == "twse_official"
+                                else "https://www.tpex.org.tw/"
+                            ),
+                        },
+                        retryable_status_codes={403, 408, 425, 429},
                         request_budget=request_budget,
                     )
                     provider = provider_class(client)
-                    action_fetch = provider.fetch_actions(
-                        start=options.start,
-                        end=_inclusive_end(options.end),
+                    action_fetch = _provider_data_call(
+                        provider=provider_name,
+                        operation="corporate_actions",
+                        item=f"{options.start}:{_inclusive_end(options.end)}",
+                        function=lambda: provider.fetch_actions(
+                            start=options.start,
+                            end=_inclusive_end(options.end),
+                        ),
                     )
                     log_part.append(action_fetch.requests)
                     provider_stats.estimated_calls += max(
@@ -753,32 +870,48 @@ def ingest_daily_ohlcv(
                     provider_stats.dropped_source_rows += int(
                         action_fetch.metadata.get("dropped_rows", 0)
                     )
+                    provider_stats.missing_share_multiplier_details += int(
+                        action_fetch.metadata.get("missing_share_multiplier_details", 0)
+                    )
 
                     def fetch_taiwan_date(
                         trading_date: str,
                     ) -> tuple[Any, pd.DataFrame]:
-                        fetched = provider.fetch_date(
-                            date=trading_date,
-                            dataset_profile=options.profile,
+                        def fetch_and_adjust() -> tuple[Any, pd.DataFrame]:
+                            fetched = provider.fetch_date(
+                                date=trading_date,
+                                dataset_profile=options.profile,
+                            )
+                            if not fetched.frame.empty:
+                                adjusted = apply_cumulative_adjustments(
+                                    fetched.frame,
+                                    action_fetch.frame,
+                                )
+                                adjusted["adjustment_source"] = (
+                                    "twse_twt49u"
+                                    if provider_name == "twse_official"
+                                    else "tpex_exdailyq"
+                                )
+                            else:
+                                adjusted = fetched.frame
+                            return fetched, adjusted
+
+                        return _provider_data_call(
+                            provider=provider_name,
+                            operation="daily_quotes",
+                            item=trading_date,
+                            function=fetch_and_adjust,
                         )
-                        if not fetched.frame.empty:
-                            adjusted = apply_cumulative_adjustments(
-                                fetched.frame,
-                                action_fetch.frame,
-                            )
-                            adjusted["adjustment_source"] = (
-                                "twse_twt49u"
-                                if provider_name == "twse_official"
-                                else "tpex_exdailyq"
-                            )
-                        else:
-                            adjusted = fetched.frame
-                        return fetched, adjusted
 
                     def fetch_taiwan_month(month: str) -> Any:
-                        return provider.fetch_benchmark_month(
-                            month=month,
-                            dataset_profile=options.profile,
+                        return _provider_data_call(
+                            provider=provider_name,
+                            operation="benchmark_month",
+                            item=month,
+                            function=lambda: provider.fetch_benchmark_month(
+                                month=month,
+                                dataset_profile=options.profile,
+                            ),
                         )
 
                     provider_trading_dates: set[str] = set()
@@ -889,6 +1022,11 @@ def ingest_daily_ohlcv(
     corporate_action_rows = sum(
         provider_stats.corporate_action_rows for provider_stats in stats.values()
     )
+    missing_share_multiplier_details = {
+        provider: provider_stats.missing_share_multiplier_details
+        for provider, provider_stats in sorted(stats.items())
+        if provider_stats.missing_share_multiplier_details > 0
+    }
     benchmark_rows = sum(provider_stats.benchmark_rows for provider_stats in stats.values())
     delisted_eod_only_symbols = set().union(
         *(provider_stats.delisted_eod_only_symbols for provider_stats in stats.values())
@@ -975,6 +1113,7 @@ def ingest_daily_ohlcv(
             "empty_symbol_histories": empty_series,
             "dropped_source_rows": dropped_source_rows,
             "corporate_action_rows": corporate_action_rows,
+            "missing_share_multiplier_details_by_provider": (missing_share_multiplier_details),
             "benchmark_rows": benchmark_rows,
             "delisted_pre_2018_auxiliary_coverage_warning": {
                 "count": len(delisted_eod_only_symbols),
@@ -992,6 +1131,10 @@ def ingest_daily_ohlcv(
                     "vendor_split_adjusted_volume_with_unadjusted_volume_reconstructed"
                 ),
                 "benchmark": "official_total_return_index_or_vti",
+                "taiwan_volume_adjustment_coverage": (
+                    "official_share_multiplier_when_available; identity_multiplier_"
+                    "for_missing_twse_historical_detail_with_gap_count"
+                ),
                 "delisted_before_2018": (
                     "eod_available_but_auxiliary_split_coverage_not_guaranteed"
                 ),

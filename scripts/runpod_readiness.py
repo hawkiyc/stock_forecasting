@@ -1202,6 +1202,55 @@ def command_active_run_lifecycle(arguments):
     return _validate_active_run_lifecycle(arguments, {"preparing", "finalizing"})
 
 
+def command_resumable_dataset_lifecycle(arguments):
+    """Validate a worker-published resumable dataset marker before tmux preserves it."""
+
+    payload = _load_json(arguments.marker)
+    state = payload.get("state")
+    if (
+        payload.get("schema_version") != LIFECYCLE_SCHEMA_VERSION
+        or payload.get("kind") != "stage1-dataset"
+        or state not in DATASET_RESUMABLE_STATES
+        or payload.get("exit_code") != 75
+    ):
+        raise ValueError("Dataset lifecycle is not a resumable terminal state")
+    volume_root = arguments.network_volume_root.resolve(strict=False)
+    _validate_run_lifecycle_paths(payload, volume_root)
+    pod_id = os.environ.get("RUNPOD_POD_ID", "")
+    if not pod_id or payload.get("pod_id") != pod_id:
+        raise ValueError("Dataset lifecycle belongs to a different Pod")
+    if payload.get("launch_id") != arguments.launch_id:
+        raise ValueError("Dataset lifecycle belongs to a different launch")
+
+    progress_path = Path(str(payload.get("progress_path", ""))).resolve(strict=False)
+    datasets_root = (volume_root / "datasets").resolve(strict=False)
+    try:
+        relative = progress_path.relative_to(datasets_root)
+    except ValueError as error:
+        raise ValueError("Dataset progress escapes the datasets root") from error
+    if (
+        len(relative.parts) != 2
+        or re.fullmatch(r"[0-9a-f]{64}", relative.parts[0]) is None
+        or relative.parts[1] != "download-progress.json"
+        or not progress_path.is_file()
+        or progress_path.is_symlink()
+    ):
+        raise ValueError("Dataset progress path is not canonical")
+    progress = _load_json(progress_path)
+    identity = progress.get("identity")
+    if (
+        progress.get("schema_version") != 1
+        or progress.get("kind") != "ohlcv-download-progress"
+        or progress.get("state") != state
+        or not isinstance(identity, dict)
+        or progress.get("identity_sha256") != _payload_sha256(identity)
+        or identity.get("dataset_request_sha256") != relative.parts[0]
+    ):
+        raise ValueError("Dataset progress does not match the resumable lifecycle")
+    sys.stdout.write(str(state) + "\n")
+    return 0
+
+
 def _validated_checkpoint_leaderboard(leaderboard, run_id):
     if leaderboard.get("run_id") != run_id or leaderboard.get("run_key") != run_id:
         raise ValueError(
@@ -1546,12 +1595,29 @@ def command_write_state(arguments):
         if existing.get("kind") != arguments.kind:
             raise ValueError("Existing lifecycle kind does not match this finalizer")
         existing_state = existing.get("state")
-        if existing_state in {"preparing", "finalizing"}:
-            current_pod_id = os.environ.get("RUNPOD_POD_ID", "")
+        active_states = {"preparing", "finalizing"}
+        terminal_states = {
+            "ready",
+            "failed",
+            "timed_out",
+            "waiting_for_provider",
+            "waiting_for_budget",
+            "waiting_for_resume",
+            "downloaded",
+        }
+        if existing_state not in active_states | terminal_states:
+            raise ValueError("Existing lifecycle state is unsupported for finalization")
+        current_pod_id = os.environ.get("RUNPOD_POD_ID", "")
+        same_launch = (
+            bool(current_pod_id)
+            and existing.get("pod_id") == current_pod_id
+            and existing.get("launch_id") == arguments.launch_id
+        )
+        if existing_state in active_states and not same_launch:
             if not current_pod_id or existing.get("pod_id") != current_pod_id:
                 raise ValueError("Existing lifecycle pod_id does not match this Pod")
-            if existing.get("launch_id") != arguments.launch_id:
-                raise ValueError("Existing lifecycle launch_id does not match this launch")
+            raise ValueError("Existing lifecycle launch_id does not match this launch")
+        if same_launch:
             requested_run_id = arguments.wandb_run_id or ""
             existing_run_id = existing.get("wandb_run_id") or ""
             if (requested_run_id or existing_run_id) and requested_run_id != existing_run_id:
@@ -1568,16 +1634,6 @@ def command_write_state(arguments):
             ):
                 if existing.get(key) not in (None, ""):
                     inherited[key] = existing[key]
-        elif existing_state not in {
-            "ready",
-            "failed",
-            "timed_out",
-            "waiting_for_provider",
-            "waiting_for_budget",
-            "waiting_for_resume",
-            "downloaded",
-        }:
-            raise ValueError("Existing lifecycle state is unsupported for finalization")
     payload = {
         **inherited,
         "schema_version": LIFECYCLE_SCHEMA_VERSION,
@@ -1725,6 +1781,12 @@ def build_parser():
     active_lifecycle.add_argument("--run-id", required=True)
     active_lifecycle.add_argument("--launch-id", required=True)
     active_lifecycle.set_defaults(handler=command_active_run_lifecycle)
+
+    resumable_dataset = subparsers.add_parser("resumable-dataset-lifecycle")
+    resumable_dataset.add_argument("--marker", type=Path, required=True)
+    resumable_dataset.add_argument("--network-volume-root", type=Path, required=True)
+    resumable_dataset.add_argument("--launch-id", required=True)
+    resumable_dataset.set_defaults(handler=command_resumable_dataset_lifecycle)
 
     best_checkpoint = subparsers.add_parser("best-checkpoint-name")
     best_checkpoint.add_argument("--pointer", required=True)

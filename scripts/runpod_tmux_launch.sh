@@ -368,9 +368,23 @@ mkdir -p "${JOB_DIR}"
         printf '  fi\n'
         printf 'fi\n'
     fi
+    printf 'cpu_resumable_lifecycle_valid=0\n'
+    if [[ ${PROVIDER_WAIT_EXIT_ALLOWED} -eq 1 ]]; then
+        printf 'if [[ ${job_exit_code} -eq 75 ]] && %q %q resumable-dataset-lifecycle --marker %q --network-volume-root %q --launch-id %q >/dev/null 2>&1; then\n' \
+            "${RUNPOD_IMAGE_PYTHON}" "${READINESS_HELPER}" \
+            "${FAILURE_LIFECYCLE_MARKER}" "${NETWORK_VOLUME_ROOT}" "${LAUNCH_ID}"
+        printf '  cpu_resumable_lifecycle_valid=1\n'
+        printf 'fi\n'
+    fi
     if [[ -n "${FAILURE_LIFECYCLE_MARKER:-}" ]]; then
-        printf 'if [[ ( ${job_exit_code} -ne 0 || %q == 1 ) && ${terminal_lifecycle_allowed} -eq 1 ]]; then\n' \
-            "${FINALIZE_LIFECYCLE_ON_EXIT}"
+        if [[ ${PROVIDER_WAIT_EXIT_ALLOWED} -eq 1 ]]; then
+            # The CPU worker publishes the precise waiting state and progress path.
+            printf 'if [[ ${cpu_resumable_lifecycle_valid} -ne 1 && ( ${job_exit_code} -ne 0 || %q == 1 ) && ${terminal_lifecycle_allowed} -eq 1 ]]; then\n' \
+                "${FINALIZE_LIFECYCLE_ON_EXIT}"
+        else
+            printf 'if [[ ( ${job_exit_code} -ne 0 || %q == 1 ) && ${terminal_lifecycle_allowed} -eq 1 ]]; then\n' \
+                "${FINALIZE_LIFECYCLE_ON_EXIT}"
+        fi
         printf '  lifecycle_state=failed\n'
         printf '  if [[ ${job_exit_code} -eq 0 ]]; then lifecycle_state=ready; fi\n'
         printf '  if [[ ${job_exit_code} -eq 124 ]]; then lifecycle_state=timed_out; fi\n'

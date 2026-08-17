@@ -36,6 +36,10 @@ TWSE／TPEx 採指數退避，下一次等待超過 `runpod_workflow.sh cpu prep
 （預設 `1m`）時才退出。任何 provider 先退出都不會取消其他迴圈，主流程 join 全部迴圈
 後才發布續傳狀態或固定順序合併 provider-local artifacts。budget、最大退避、暫時性
 provider 錯誤或 acquisition time 用完時都保存 cache 並由下一個 CPU Pod 續接。
+台灣官方端點由 Pod IP/WAF 暫時回傳的 HTTP 403 也使用同一個有限退避契約，不會立即
+把整體 acquisition 標成不可續傳。tmux finalizer 不得把 worker 已發布的精確
+`waiting_for_*` 狀態覆寫成一般 `failed`，同一次 launch 的 terminal rewrite 也必須保留
+`progress_path`。
 API calls 與 HTTP requests 是不同單位，實際帳戶已用額度與 provider headers 仍是
 執行時依據。
 
@@ -126,12 +130,17 @@ EODHD：
   的 cache misses/retries，不能用不完整 split history 靜默產生 volume anchor。
 - `adjusted_close` 保持 vendor total-return series；完整 split factors 用來反推未調整
   `volume`，`split_adjusted_volume` 保留 vendor 已調整值。
+- vendor history 內全零、非有限、負 volume、不合理 OHLC 或重複日期的 placeholder rows
+  不補值也不改寫；只丟棄無法符合 canonical contract 的 rows，並計入
+  `dropped_source_rows`。
 
 TWSE/TPEx：
 
 - 先從本來就必須下載的月度官方 benchmark rows 取得實際交易日，再抓 market-wide
   raw OHLCV；不把一般週一至週五全部視為開市日。
 - 每段日期各抓官方除權息資料；TWSE 權事件必要時讀 detail 取得無償配股比例。
+- 舊 TWSE 權事件若主表存在但 detail 回覆「無相關資料」，保留可驗證的 price factor，
+  未知 share multiplier 使用 `1.0`，並在 manifest 記錄 coverage gap；不推測比例。
 - 公司行動建立 price factor 與 share multiplier，再保留 raw fields 並新增 adjusted
   anchors。
 - `TAIEX.TW` 以官方 TAIEX price-index OHLC 配對官方發行量加權股價報酬指數。
@@ -285,7 +294,12 @@ delay exceeds `runpod_workflow.sh cpu prepare --maxBackoff` (default `1m`). One
 provider exiting never cancels another; the main process joins every loop before
 publishing a resume state or deterministically merging provider-local artifacts.
 Budget exhaustion, backoff boundaries, temporary provider failures, and
-acquisition-time exhaustion preserve cache state for the next CPU Pod. API calls
+acquisition-time exhaustion preserve cache state for the next CPU Pod. Temporary
+HTTP 403 responses from Taiwan official endpoints due to Pod IP/WAF
+policy use the same bounded-backoff contract instead of making the aggregate
+failure immediately non-resumable. The tmux finalizer must not replace a precise
+worker-published `waiting_for_*` state with generic `failed`, and same-launch
+terminal rewrites preserve `progress_path`. API calls
 and HTTP requests are different units, so account usage and provider headers
 remain authoritative at runtime.
 
@@ -371,12 +385,17 @@ are cacheable/resumable. The total estimate is informational, while
 `max_api_calls` caps only cache misses/retries in one attempt; incomplete split
 history is never silently labeled as a complete volume anchor. Split factors
 reconstruct unadjusted volume, while `split_adjusted_volume` retains the vendor
-value.
+value. All-zero, non-finite, negative-volume, inconsistent-OHLC, or duplicate-date
+vendor placeholder rows are neither imputed nor rewritten. Only rows that cannot
+satisfy the canonical contract are dropped and counted in `dropped_source_rows`.
 
 TWSE/TPEx first derive actual sessions from the already-required monthly official
 benchmark rows, then fetch market-wide raw OHLCV and official action data for
 those dates. Ordinary weekdays are not assumed to be open. TWSE may query action
-detail for free-share ratios. Price and
+detail for free-share ratios. If an early action exists in the main table but its
+detail endpoint returns no record, the verified price factor is retained, the
+unknown share multiplier remains `1.0`, and the manifest records the coverage
+gap instead of inferring a ratio. Price and
 share factors become separate adjusted anchors while raw fields remain.
 `TAIEX.TW` aligns official price-index OHLC with the official TAIEX total-return
 index; `TPEX.TWO` does the same with the official TPEx return index.

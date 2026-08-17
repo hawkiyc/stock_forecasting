@@ -65,6 +65,24 @@ def _first_table(payload: Any) -> tuple[list[Any], list[list[Any]]]:
     raise ValueError("Official Taiwan response has no data table")
 
 
+def _is_no_data_payload(payload: Any) -> bool:
+    """Recognize official empty-result responses without hiding schema drift."""
+
+    if not isinstance(payload, dict):
+        return False
+    status = str(payload.get("stat", payload.get("status", "")))
+    tables = payload.get("tables")
+    data = payload.get("data")
+    return (
+        "沒有符合條件" in status
+        or "無相關資料" in status
+        or "很抱歉" in status
+        or "no data" in status.lower()
+        or tables == []
+        or data == []
+    )
+
+
 def _index_frame(
     price_payload: Any,
     return_payload: Any,
@@ -96,8 +114,7 @@ def _index_frame(
             continue
         trading_date = _gregorian_date(raw[price_indexes["timestamp"]])
         prices = {
-            field: _number(raw[price_indexes[field]])
-            for field in ("open", "high", "low", "close")
+            field: _number(raw[price_indexes[field]]) for field in ("open", "high", "low", "close")
         }
         total_return = total_return_by_date.get(trading_date)
         if total_return is None or any(value is None for value in prices.values()):
@@ -261,18 +278,7 @@ class _TaiwanMarketProvider:
                 dataset_profile=dataset_profile,
             )
         except ValueError:
-            status = (
-                str(payload.get("stat", payload.get("status", "")))
-                if isinstance(payload, dict)
-                else ""
-            )
-            tables = payload.get("tables") if isinstance(payload, dict) else None
-            if (
-                "沒有符合條件" in status
-                or "很抱歉" in status
-                or "no data" in status.lower()
-                or tables == []
-            ):
+            if _is_no_data_payload(payload):
                 frame, dropped = pd.DataFrame(), 0
             else:
                 raise
@@ -335,6 +341,7 @@ class TWSEProvider(_TaiwanMarketProvider):
         rows: list[dict[str, Any]] = []
         requests: list[RequestRecord] = [request]
         dropped = 0
+        missing_share_multiplier_details = 0
         for raw in data:
             if len(raw) <= max(indexes.values()):
                 dropped += 1
@@ -347,6 +354,7 @@ class TWSEProvider(_TaiwanMarketProvider):
             symbol_code = str(raw[indexes["symbol"]]).strip().upper()
             effective_date = _gregorian_date(raw[indexes["timestamp"]])
             share_multiplier = 1.0
+            action_source = "twse_twt49u"
             if "權" in str(raw[indexes["kind"]]):
                 detail, detail_request = self.client.get_json(
                     "https://www.twse.com.tw/rwd/zh/exRight/TWT49UDetail",
@@ -357,17 +365,31 @@ class TWSEProvider(_TaiwanMarketProvider):
                     },
                 )
                 requests.append(detail_request)
-                detail_fields, detail_rows = _first_table(detail)
-                free_share_index = _field_index(
-                    detail_fields,
-                    {"A.按普通股股東持股比例每千股無償配股"},
-                )
-                if detail_rows and len(detail_rows[0]) > free_share_index:
-                    free_shares = _number(
-                        re.sub(r"[^0-9.+-]", "", str(detail_rows[0][free_share_index]))
+                if _is_no_data_payload(detail):
+                    missing_share_multiplier_details += 1
+                    action_source = "twse_twt49u_price_only_missing_detail"
+                else:
+                    detail_fields, detail_rows = _first_table(detail)
+                    free_share_index = _field_index(
+                        detail_fields,
+                        {"A.按普通股股東持股比例每千股無償配股"},
                     )
-                    if free_shares is not None and free_shares >= 0.0:
-                        share_multiplier += free_shares / 1000.0
+                    if detail_rows and len(detail_rows[0]) > free_share_index:
+                        free_shares = _number(
+                            re.sub(
+                                r"[^0-9.+-]",
+                                "",
+                                str(detail_rows[0][free_share_index]),
+                            )
+                        )
+                        if free_shares is not None and free_shares >= 0.0:
+                            share_multiplier += free_shares / 1000.0
+                        else:
+                            missing_share_multiplier_details += 1
+                            action_source = "twse_twt49u_price_only_missing_detail"
+                    else:
+                        missing_share_multiplier_details += 1
+                        action_source = "twse_twt49u_price_only_missing_detail"
             price_factor = reference_price / prior_close
             if not np.isfinite(price_factor) or price_factor <= 0.0:
                 dropped += 1
@@ -378,13 +400,17 @@ class TWSEProvider(_TaiwanMarketProvider):
                     "symbol": f"{symbol_code}.TW",
                     "price_factor": price_factor,
                     "share_multiplier": share_multiplier,
-                    "source": "twse_twt49u",
+                    "source": action_source,
                 }
             )
         return ProviderFetch(
             frame=pd.DataFrame(rows),
             requests=tuple(requests),
-            metadata={"corporate_actions": len(rows), "dropped_rows": dropped},
+            metadata={
+                "corporate_actions": len(rows),
+                "dropped_rows": dropped,
+                "missing_share_multiplier_details": missing_share_multiplier_details,
+            },
         )
 
     def fetch_benchmark_month(self, *, month: str, dataset_profile: str) -> ProviderFetch:

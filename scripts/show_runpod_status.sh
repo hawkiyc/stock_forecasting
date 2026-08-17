@@ -127,7 +127,21 @@ if isinstance(outcomes, dict):
     provider_states = []
     for provider, outcome in sorted(outcomes.items()):
         if isinstance(outcome, dict):
-            provider_states.append(provider + ":" + str(outcome.get("state", "unknown")))
+            provider_state = str(outcome.get("state", "unknown"))
+            provider_error = (
+                outcome.get("last_error")
+                if isinstance(outcome.get("last_error"), dict)
+                else {}
+            )
+            error_fields = []
+            for key in ("category", "error_type", "operation", "item", "status_code"):
+                value = provider_error.get(key)
+                if value is not None:
+                    error_fields.append(key + "=" + str(value))
+            rendered = provider + ":" + provider_state
+            if error_fields:
+                rendered += "(" + ",".join(error_fields) + ")"
+            provider_states.append(rendered)
     if provider_states:
         fields.append("providers=" + ",".join(provider_states))
 print("{:<12} {}".format("download", " ".join(fields)))
