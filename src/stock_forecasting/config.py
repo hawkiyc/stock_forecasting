@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _ENV_DEFAULT_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-([^}]*)}")
 DatasetProfile = Literal[
@@ -124,13 +124,13 @@ class KronosLoRAConfig(StrictModel):
         min_length=1,
     )
 
-    @model_validator(mode="after")
-    def validate_targets(self) -> KronosLoRAConfig:
-        targets = [target.strip() for target in self.target_modules]
+    @field_validator("target_modules")
+    @classmethod
+    def validate_targets(cls, values: list[str]) -> list[str]:
+        targets = [target.strip() for target in values]
         if any(not target for target in targets) or len(set(targets)) != len(targets):
             raise ValueError("lora.target_modules must contain unique non-empty names")
-        self.target_modules = targets
-        return self
+        return targets
 
 
 class ModelConfig(StrictModel):

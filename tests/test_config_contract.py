@@ -8,7 +8,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from stock_forecasting.config import DataConfig, ExperimentConfig
+from stock_forecasting.config import DataConfig, ExperimentConfig, KronosLoRAConfig
 from stock_forecasting.models import MODEL_OUTPUT_SCHEMA_VERSION
 from stock_forecasting.run_contract import (
     TRAINING_IMPLEMENTATION_PATHS,
@@ -19,6 +19,14 @@ from stock_forecasting.run_contract import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_lora_targets_normalize_without_recursive_assignment_validation() -> None:
+    config = KronosLoRAConfig(target_modules=[" q_proj ", "v_proj "])
+
+    assert config.target_modules == ["q_proj", "v_proj"]
+    with pytest.raises(ValidationError, match="unique non-empty names"):
+        config.target_modules = ["q_proj", " q_proj "]
 
 
 def test_stage_configs_share_one_model_architecture_and_start_fresh() -> None:

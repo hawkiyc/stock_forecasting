@@ -313,7 +313,7 @@ mkdir -p "${JOB_DIR}"
     printf '  while [[ ${finalization_attempt} -le 3 ]]; do\n'
     printf '    if %q %q write-state --output "${marker}" --network-volume-root %q --kind "${kind}" --state "${state}" --launch-id %q --exit-code "${lifecycle_exit_code}" --log-path %q --max-runtime-seconds %q --wandb-run-id %q --inherit-existing; then\n' \
         "${RUNPOD_IMAGE_PYTHON}" "${READINESS_HELPER}" \
-        "${NETWORK_VOLUME_ROOT}" "${LAUNCH_ID}" "${JOB_DIR}" \
+        "${NETWORK_VOLUME_ROOT}" "${LAUNCH_ID}" "${JOB_LOG}" \
         "${MAX_RUNTIME_SECONDS}" "${RUN_DIRECTORY_ID}"
     printf '      return 0\n'
     printf '    fi\n'

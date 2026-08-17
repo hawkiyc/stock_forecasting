@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -26,7 +25,7 @@ def test_all_shell_scripts_remain_syntax_valid() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_runpod_entrypoint_scripts_remain_executable() -> None:
+def test_runpod_entrypoint_scripts_declare_explicit_interpreters() -> None:
     entrypoints = (
         ROOT / "scripts/create_runpod_cpu_pod.sh",
         ROOT / "scripts/create_runpod_pod.sh",
@@ -43,7 +42,10 @@ def test_runpod_entrypoint_scripts_remain_executable() -> None:
         ROOT / "scripts/runpod_workflow.sh",
     )
     for path in entrypoints:
-        assert path.stat().st_mode & stat.S_IXUSR, path
+        expected_shebang = (
+            "#!/usr/bin/env python3" if path.suffix == ".py" else "#!/usr/bin/env bash"
+        )
+        assert path.read_text(encoding="utf-8").splitlines()[0] == expected_shebang, path
 
 
 def test_dataset_lifecycle_accepts_matching_provider_wait_progress(
@@ -113,6 +115,7 @@ def test_runpod_entrypoints_use_only_two_quant_stages() -> None:
         ROOT / "scripts/runpod_entrypoint.sh",
         ROOT / "scripts/runpod_train_then_validate.sh",
         ROOT / "scripts/runpod_validation.sh",
+        ROOT / "scripts/runpod_selection.py",
         ROOT / "scripts/verify_runpod_stage_readiness.sh",
     )
     combined = "\n".join(path.read_text(encoding="utf-8") for path in relevant)
@@ -143,7 +146,9 @@ def test_stable_runpod_lifecycle_and_synchronization_boundaries_remain() -> None
     for script in (create_gpu, create_cpu):
         assert "RUNPOD_NETWORK_VOLUME_ID" in script
         assert "RUNPOD_DATACENTER_ID" in script
-        assert "rest.runpod.io" in script
+    assert "rest.runpod.io" in create_cpu
+    assert "runpodctl_project.sh" in create_gpu
+    assert "pod create" in create_gpu
     assert "--dry-run" in sync
     assert "--apply" in sync
     assert "runpod_project_s3_ready" in sync
@@ -154,6 +159,18 @@ def test_stable_runpod_lifecycle_and_synchronization_boundaries_remain() -> None
     assert "launch_runpod_guard.sh" in create_cpu
     assert 'caffeinate -is -w "${GUARD_PID}"' in guard
     assert "lifecycle/stage1/validation.json" in validation
+
+
+def test_cpu_log_lifecycle_and_downloader_share_canonical_paths() -> None:
+    tmux = (ROOT / "scripts/runpod_tmux_launch.sh").read_text(encoding="utf-8")
+    download = (ROOT / "scripts/download_runpod_cpu_logs.sh").read_text(encoding="utf-8")
+
+    lifecycle_writer = tmux.split("publish_lifecycle() {", maxsplit=1)[1]
+    assert '"${NETWORK_VOLUME_ROOT}" "${LAUNCH_ID}" "${JOB_LOG}"' in lifecycle_writer
+    assert "expected_log_dir = expected_prefix + launch_id" in download
+    assert "expected_log_file = expected_log_dir + \"/combined.log\"" in download
+    assert "log_path == expected_log_dir" in download
+    assert "log_path == expected_log_file" in download
 
 
 def test_network_volume_identity_and_exact_mount_are_fail_closed() -> None:

@@ -141,7 +141,7 @@ def test_missing_nonempty_optional_pod_environment_value_is_rejected(
     )
     selection_path = tmp_path / "selection.json"
     environment = _selection_environment(selection_path, selection)
-    assert environment.pop("STAGE1_US_SYMBOLS") == "AAPL.US"
+    assert environment.pop("STAGE1_US_SYMBOLS") == "AAPL"
 
     with pytest.raises(SELECTION.SelectionError, match="STAGE1_US_SYMBOLS mismatch"):
         SELECTION._verify_environment(selection_path, selection, environment)

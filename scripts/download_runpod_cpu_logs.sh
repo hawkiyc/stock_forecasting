@@ -49,16 +49,20 @@ if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", launch_id) is None:
 
 log_path = str(payload.get("log_path", ""))
 expected_prefix = "/runpod-volume/logs/tmux/fin-ts-cpu-prepare/"
-expected_log_path = expected_prefix + launch_id + "/combined.log"
-if log_path != expected_log_path:
+expected_log_dir = expected_prefix + launch_id
+expected_log_file = expected_log_dir + "/combined.log"
+if log_path == expected_log_dir:
+    resolved_log_dir = log_path
+elif log_path == expected_log_file:
+    resolved_log_dir = expected_log_dir
+else:
     raise SystemExit(f"Unexpected CPU log_path: {log_path or '<missing>'}")
 
-print("\t".join((state, launch_id, log_path)))
+print("\t".join((state, launch_id, resolved_log_dir)))
 PY
 )"
-IFS=$'\t' read -r CPU_STATE CPU_LAUNCH_ID CPU_LOG_PATH <<< "${LIFECYCLE_FIELDS}"
+IFS=$'\t' read -r CPU_STATE CPU_LAUNCH_ID CPU_LOG_DIR <<< "${LIFECYCLE_FIELDS}"
 
-CPU_LOG_DIR="${CPU_LOG_PATH%/combined.log}"
 CPU_LOG_KEY="${CPU_LOG_DIR#/runpod-volume/}"
 LOCAL_CPU_LAUNCH_DIR="${LOCAL_CPU_ROOT}/${CPU_LAUNCH_ID}"
 mkdir -p "${LOCAL_CPU_LAUNCH_DIR}"
