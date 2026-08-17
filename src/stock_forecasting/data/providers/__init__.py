@@ -9,9 +9,11 @@ from .eodhd import (
     EODHDProvider,
 )
 from .http import (
+    AcquisitionDeadlineExceeded,
     CachedJsonClient,
     NetworkRequestBudget,
     NetworkRequestBudgetExceeded,
+    ProviderAcquisitionError,
     ProviderRequestError,
 )
 from .massive import MassiveProvider
@@ -22,6 +24,7 @@ __all__ = [
     "EODHD_DEFAULT_REQUESTS_PER_MINUTE",
     "EODHD_DEFAULT_REQUESTS_PER_SECOND",
     "EODHD_DELISTED_AUXILIARY_DATA_START",
+    "AcquisitionDeadlineExceeded",
     "CachedJsonClient",
     "DailyOHLCVProvider",
     "EODHDProvider",
@@ -29,6 +32,7 @@ __all__ = [
     "MassiveProvider",
     "NetworkRequestBudget",
     "NetworkRequestBudgetExceeded",
+    "ProviderAcquisitionError",
     "ProviderFetch",
     "ProviderRequestError",
     "RequestRecord",

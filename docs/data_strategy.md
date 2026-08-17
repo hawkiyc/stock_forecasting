@@ -25,10 +25,19 @@ EODHD 付費方案的官方預設值是每日 `100,000 API calls` 與每分鐘 `
 requests`。資料管線因此預設 `max_api_calls=100000`，但把每分鐘限制向下取整為
 `16 QPS`，也就是每分鐘最多 `960 requests`，保留 40 requests（4%）的餘裕；每個
 台灣官方 provider 維持 `0.5 QPS`。
-所有調整都透過 `runpod_workflow.sh configure`，不手動修改 `.env` 或 config。
-所有實際 network attempts（包含 retry）共用 project safety budget；cache hit 不扣
-新的 network attempt。API calls 與 HTTP requests 是不同單位，實際帳戶已用額度與
-provider headers 仍是執行時依據。
+QPS 與 EODHD network-attempt budget 透過 `runpod_workflow.sh configure` 調整，
+不手動修改 `.env` 或 config。`max_api_calls` 只計入單次 acquisition attempt 的 EODHD
+cache misses/retries；TWSE／TPEx network attempts 會被記錄，但沒有專案端 request-count
+上限。完整計畫的 request estimate 只作資訊，不是 dataset admission gate；台灣最終
+estimate 使用官方 benchmark sessions，並另外記錄 pre-calendar weekday upper bound。
+
+EODHD、TWSE 與 TPEx 是三個獨立的平行迴圈。EODHD 以本次 request count 為退出條件；
+TWSE／TPEx 採指數退避，下一次等待超過 `runpod_workflow.sh cpu prepare --maxBackoff`
+（預設 `1m`）時才退出。任何 provider 先退出都不會取消其他迴圈，主流程 join 全部迴圈
+後才發布續傳狀態或固定順序合併 provider-local artifacts。budget、最大退避、暫時性
+provider 錯誤或 acquisition time 用完時都保存 cache 並由下一個 CPU Pod 續接。
+API calls 與 HTTP requests 是不同單位，實際帳戶已用額度與 provider headers 仍是
+執行時依據。
 
 ### 3. 可選 dataset profiles
 
@@ -94,9 +103,11 @@ is_active
 dataset_profile
 ```
 
-`open/high/low/close/volume` 永遠是 provider raw fields；不能用 adjusted data 覆寫。
-`adjusted_close` 是 total-return anchor，`split_adjusted_volume` 只包含 share-change
-調整。所有 timestamps 正規化為 UTC，symbol 使用 canonical suffix，例如
+`open/high/low/close` 永遠是 provider raw fields；台股 `volume` 也是官方 raw field。
+EODHD EOD `volume` 依官方定義已做 split adjustment，管線以完整 Historical Splits
+response 反推當時的未調整 `volume`，並把原 vendor 值放在
+`split_adjusted_volume`，避免重複調整。`adjusted_close` 是 total-return anchor。
+所有 timestamps 正規化為 UTC，symbol 使用 canonical suffix，例如
 `AAPL.US`、`0050.TW`、`6488.TWO`、`TAIEX.TW`、`TPEX.TWO`。
 
 schema validator 會拒絕 duplicate `(symbol,timestamp)`、非正值 price、不合理 OHLC
@@ -106,19 +117,20 @@ range、負 volume、非有限數值與未知 asset type。
 
 EODHD：
 
-- EOD endpoint 提供 raw OHLCV 與 adjusted close。
-- 所有日期範圍都使用每個 symbol 的 Historical Splits API；官方將它列入 EOD
+- EOD endpoint 提供 raw OHLC、split-adjusted volume 與 adjusted close。
+- 每個 symbol 都使用不帶日期裁切的完整 Historical Splits API response；官方將它列入 EOD
   Historical Data — All World 且每個 request 為 1 API call。管線不使用需要
   Calendar-enabled 產品的 `calendar/splits`。
-- 每個商品是一個 EOD request 加一個 split-history request。額外成本會在任何歷史
-  資料請求前納入 `max_api_calls` 預檢，且兩種 response 都能跨 CPU Pod cache／續傳；
-  不能用不完整 split history 靜默產生 volume anchor。
-- `adjusted_close` 保持 vendor total-return series，`split_adjusted_volume` 由 split
-  event 產生。
+- 每個商品是一個 EOD request 加一個 split-history request。兩種 response 都能跨
+  CPU Pod cache／續傳；總 request 估算只作資訊，`max_api_calls` 只限制單次 attempt
+  的 cache misses/retries，不能用不完整 split history 靜默產生 volume anchor。
+- `adjusted_close` 保持 vendor total-return series；完整 split factors 用來反推未調整
+  `volume`，`split_adjusted_volume` 保留 vendor 已調整值。
 
 TWSE/TPEx：
 
-- 每個交易日抓 market-wide raw OHLCV。
+- 先從本來就必須下載的月度官方 benchmark rows 取得實際交易日，再抓 market-wide
+  raw OHLCV；不把一般週一至週五全部視為開市日。
 - 每段日期各抓官方除權息資料；TWSE 權事件必要時讀 detail 取得無償配股比例。
 - 公司行動建立 price factor 與 share multiplier，再保留 raw fields 並新增 adjusted
   anchors。
@@ -156,8 +168,16 @@ provider API
   -> dataset-manifest.json (state=ready)
 ```
 
-下載器具備 provider-level throttle、bounded exponential retry、shared fail-closed request
-budget、cache reuse、staging writes 與拒絕 silent overwrite。manifest 儲存 SHA-256、
+下載器具備 provider-level throttle、獨立平行 provider 迴圈、exponential retry、
+只限 EODHD 的單次 request budget、TWSE／TPEx 最大退避邊界、cache reuse、provider-local
+staging writes、固定順序合併與拒絕 silent overwrite。完整計畫 estimate 不阻止執行；
+CPU workflow 預設保留 max runtime 的 25%（最多 2 小時）給 data cleaning/window construction。
+可透過 `runpod_workflow.sh cpu prepare --prepareReserve DURATION` 明確調整，或使用
+`--prepareReserve auto` 保留自動值；明確值必須短於 max runtime。
+`--maxBackoff DURATION` 預設 `1m`；下一次台灣 provider 退避大於此值時，該迴圈退出，
+但其他 provider 仍會繼續到自己的退出條件。
+raw Parquet、request log 與 download manifest 先成為 durable `downloaded` checkpoint，
+後續 Pod 可不呼叫 provider 而直接準備 processed data。manifest 儲存 SHA-256、
 size、row count、profile、providers、symbols、date range、quality summary 與 request-log
 artifact。secret-like key 不得寫入 manifest。
 
@@ -251,12 +271,23 @@ EODHD's official paid-plan defaults are `100,000 API calls` per day and `1,000
 HTTP requests` per minute. The data pipeline therefore defaults to
 `max_api_calls=100000`, but floors the minute limit to `16 QPS`, or at most
 `960 requests` per minute, leaving 40 requests (4%) of headroom. Each Taiwan
-provider remains at `0.5 QPS`. Adjustments go through
-`runpod_workflow.sh configure`, never manual
-`.env` or config edits. All network attempts, including retries, share the
-project safety budget; cache hits create no new attempt. API calls and HTTP
-requests are different units, so used account quota and provider headers remain
-authoritative at runtime.
+provider remains at `0.5 QPS`. QPS and the EODHD network-attempt budget are
+adjusted through `runpod_workflow.sh configure`, never by editing `.env` or
+config files. `max_api_calls` counts only EODHD cache misses and retries in one
+acquisition; TWSE/TPEx attempts are recorded but have no project request-count
+ceiling. The complete-plan estimate is informational, not a dataset-admission
+gate. Taiwan's final estimate uses official benchmark sessions and records the
+pre-calendar weekday upper bound separately.
+
+EODHD, TWSE, and TPEx run as independent parallel loops. EODHD exits on its
+attempt counter, while TWSE/TPEx use exponential backoff and exit when the next
+delay exceeds `runpod_workflow.sh cpu prepare --maxBackoff` (default `1m`). One
+provider exiting never cancels another; the main process joins every loop before
+publishing a resume state or deterministically merging provider-local artifacts.
+Budget exhaustion, backoff boundaries, temporary provider failures, and
+acquisition-time exhaustion preserve cache state for the next CPU Pod. API calls
+and HTTP requests are different units, so account usage and provider headers
+remain authoritative at runtime.
 
 ### 3. Selectable dataset profiles
 
@@ -316,8 +347,11 @@ adjusted_close, split_adjusted_volume, adjustment_source,
 provider, market, currency, source_symbol, is_active, dataset_profile
 ```
 
-Raw O/H/L/C/V is never overwritten. `adjusted_close` is the total-return anchor;
-`split_adjusted_volume` contains share-change adjustments only. Timestamps are
+Raw O/H/L/C is never overwritten, and Taiwan volume remains the official raw
+field. EODHD defines EOD volume as already split-adjusted; the pipeline uses the
+complete Historical Splits response to reconstruct contemporaneous unadjusted
+`volume` and stores the vendor value in `split_adjusted_volume`, avoiding a
+second multiplication. `adjusted_close` is the total-return anchor. Timestamps are
 normalized to UTC. Symbols use canonical suffixes such as `AAPL.US`, `0050.TW`,
 `6488.TWO`, `TAIEX.TW`, and `TPEX.TWO`.
 
@@ -327,17 +361,22 @@ types.
 
 ### 6. Adjustments and benchmark series
 
-EODHD retains EOD raw OHLCV and adjusted close. Every date range uses the
-per-symbol Historical Splits API, which EODHD lists under EOD Historical Data —
+EODHD retains EOD raw OHLC, split-adjusted volume, and adjusted close. Every
+symbol uses the complete, non-date-truncated Historical Splits response, which
+EODHD lists under EOD Historical Data —
 All World at one API call per request. The pipeline does not use
 `calendar/splits`, which requires a Calendar-enabled product. Each instrument
 therefore needs one EOD request and one split-history request. Both responses
-are cacheable/resumable, and the extra cost is included in the fail-closed
-`max_api_calls` estimate before historical requests begin; incomplete split
-history is never silently labeled as a complete volume anchor.
+are cacheable/resumable. The total estimate is informational, while
+`max_api_calls` caps only cache misses/retries in one attempt; incomplete split
+history is never silently labeled as a complete volume anchor. Split factors
+reconstruct unadjusted volume, while `split_adjusted_volume` retains the vendor
+value.
 
-TWSE/TPEx fetch market-wide raw OHLCV by trading date and official action data
-for the range. TWSE may query action detail for free-share ratios. Price and
+TWSE/TPEx first derive actual sessions from the already-required monthly official
+benchmark rows, then fetch market-wide raw OHLCV and official action data for
+those dates. Ordinary weekdays are not assumed to be open. TWSE may query action
+detail for free-share ratios. Price and
 share factors become separate adjusted anchors while raw fields remain.
 `TAIEX.TW` aligns official price-index OHLC with the official TAIEX total-return
 index; `TPEX.TWO` does the same with the official TPEx return index.
@@ -374,9 +413,20 @@ provider API
   -> dataset-manifest.json (state=ready)
 ```
 
-The downloader provides provider throttles, bounded exponential retries, one
-shared fail-closed request budget, cache reuse, staging writes, and refusal to
-silently overwrite. Manifests bind SHA-256, size, row count, profile, providers,
+The downloader provides provider throttles, independent parallel provider loops,
+exponential retries, an EODHD-only per-attempt request budget, a TWSE/TPEx maximum
+backoff boundary, cache reuse, provider-local staging, deterministic merging, and
+refusal to silently overwrite. The complete-plan estimate never blocks execution. The CPU
+workflow reserves 25% of max runtime for cleaning/window construction by default,
+capped at 2 hours,
+with an explicit override available through
+`runpod_workflow.sh cpu prepare --prepareReserve DURATION`; `auto` retains the
+automatic value, and an explicit reserve must be shorter than max runtime.
+`--maxBackoff DURATION` defaults to `1m`; a Taiwan provider loop exits when its
+next delay exceeds that boundary while other providers continue. The workflow
+publishes raw Parquet, the request log, and download manifest as a durable
+`downloaded` checkpoint before preparation. A later Pod can skip provider calls.
+Manifests bind SHA-256, size, row count, profile, providers,
 symbols, dates, quality, and the request log. Secret-like keys are rejected.
 
 The CPU wrapper publishes fixed `DATA_ROOT` paths. Create a versioned

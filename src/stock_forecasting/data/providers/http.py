@@ -25,12 +25,42 @@ _SECRET_PARAMETER_NAMES = frozenset({"api_token", "api_key", "token", "password"
 class NetworkRequestBudgetExceeded(RuntimeError):
     """Signal that the project-side network-attempt safety ceiling was reached."""
 
-    def __init__(self, *, consumed: int, maximum: int) -> None:
+    def __init__(
+        self,
+        *,
+        consumed: int,
+        maximum: int,
+        provider: str | None = None,
+    ) -> None:
         self.consumed = consumed
         self.maximum = maximum
+        self.provider = provider
+        scope = "External API" if provider is None else provider
         super().__init__(
-            "External API network-attempt budget exhausted: "
-            f"{self.consumed}/{self.maximum}"
+            f"{scope} network-attempt budget exhausted: {self.consumed}/{self.maximum}"
+        )
+
+
+class AcquisitionDeadlineExceeded(RuntimeError):
+    """Signal that acquisition stopped to preserve CPU preparation time."""
+
+    def __init__(
+        self,
+        *,
+        deadline_epoch_seconds: float,
+        observed_epoch_seconds: float,
+        required_wait_seconds: float | None = None,
+    ) -> None:
+        self.deadline_epoch_seconds = deadline_epoch_seconds
+        self.observed_epoch_seconds = observed_epoch_seconds
+        self.required_wait_seconds = required_wait_seconds
+        wait_context = (
+            "" if required_wait_seconds is None else f", required_wait={required_wait_seconds:.3f}s"
+        )
+        super().__init__(
+            "Acquisition time budget exhausted before data preparation: "
+            f"deadline={deadline_epoch_seconds:.3f}, observed={observed_epoch_seconds:.3f}"
+            f"{wait_context}"
         )
 
 
@@ -48,6 +78,12 @@ class ProviderRequestError(RuntimeError):
         retry_after_seconds: float | None = None,
         rate_limit_limit: int | None = None,
         rate_limit_remaining: int | None = None,
+        backoff_wait_count: int = 0,
+        total_backoff_seconds: float = 0.0,
+        last_backoff_seconds: float | None = None,
+        proposed_backoff_seconds: float | None = None,
+        max_backoff_seconds: float | None = None,
+        exit_reason: str | None = None,
     ) -> None:
         self.provider = provider
         self.category = category
@@ -57,6 +93,12 @@ class ProviderRequestError(RuntimeError):
         self.retry_after_seconds = retry_after_seconds
         self.rate_limit_limit = rate_limit_limit
         self.rate_limit_remaining = rate_limit_remaining
+        self.backoff_wait_count = backoff_wait_count
+        self.total_backoff_seconds = total_backoff_seconds
+        self.last_backoff_seconds = last_backoff_seconds
+        self.proposed_backoff_seconds = proposed_backoff_seconds
+        self.max_backoff_seconds = max_backoff_seconds
+        self.exit_reason = exit_reason
         suffix = "" if attempts == 1 else "s"
         status = "" if status_code is None else f", HTTP {status_code}"
         super().__init__(
@@ -80,7 +122,53 @@ class ProviderRequestError(RuntimeError):
             "rate_limit_remaining": self.rate_limit_remaining,
         }
         payload.update({key: value for key, value in optional.items() if value is not None})
+        if self.backoff_wait_count or self.proposed_backoff_seconds is not None:
+            backoff: dict[str, Any] = {
+                "wait_count": self.backoff_wait_count,
+                "total_wait_seconds": self.total_backoff_seconds,
+            }
+            backoff_optional = {
+                "last_wait_seconds": self.last_backoff_seconds,
+                "proposed_wait_seconds": self.proposed_backoff_seconds,
+                "maximum_seconds": self.max_backoff_seconds,
+                "exit_reason": self.exit_reason,
+            }
+            backoff.update(
+                {key: value for key, value in backoff_optional.items() if value is not None}
+            )
+            payload["backoff"] = backoff
         return payload
+
+
+class ProviderAcquisitionError(RuntimeError):
+    """Summarize provider loops only after every parallel loop has exited."""
+
+    def __init__(
+        self,
+        *,
+        state: str,
+        provider_outcomes: Mapping[str, Mapping[str, Any]],
+        retryable: bool,
+    ) -> None:
+        self.state = state
+        self.provider_outcomes = {
+            provider: dict(outcome) for provider, outcome in sorted(provider_outcomes.items())
+        }
+        self.retryable = retryable
+        super().__init__(
+            "Parallel provider acquisition stopped after every provider loop exited "
+            f"(state={state})"
+        )
+
+    def metadata(self) -> dict[str, Any]:
+        """Return the aggregate state without retaining underlying exceptions."""
+
+        return {
+            "category": "parallel_provider_loops_exited",
+            "retryable": self.retryable,
+            "state": self.state,
+            "provider_outcomes": self.provider_outcomes,
+        }
 
 
 def _nonnegative_integer_header(response: requests.Response, name: str) -> int | None:
@@ -109,32 +197,90 @@ def _retry_after_seconds(response: requests.Response) -> float | None:
 
 
 class NetworkRequestBudget:
-    """Share one fail-closed network-attempt budget across provider clients."""
+    """Track every request while limiting only explicitly scoped providers."""
 
-    def __init__(self, max_network_requests: int) -> None:
+    def __init__(
+        self,
+        max_network_requests: int,
+        *,
+        deadline_epoch_seconds: float | None = None,
+        limited_providers: frozenset[str] | set[str] | None = None,
+        wall_clock: Callable[[], float] = time.time,
+    ) -> None:
         if max_network_requests < 1:
             raise ValueError("max_network_requests must be positive")
+        if deadline_epoch_seconds is not None and (
+            not math.isfinite(deadline_epoch_seconds) or deadline_epoch_seconds <= 0.0
+        ):
+            raise ValueError("deadline_epoch_seconds must be finite and positive")
         self.max_network_requests = max_network_requests
+        self.deadline_epoch_seconds = deadline_epoch_seconds
+        self.limited_providers = None if limited_providers is None else frozenset(limited_providers)
+        self.wall_clock = wall_clock
         self._network_requests = 0
+        self._limited_network_requests = 0
         self._provider_counts: dict[str, int] = {}
         self._lock = threading.Lock()
+
+    def _check_time_locked(self) -> None:
+        if self.deadline_epoch_seconds is None:
+            return
+        observed = self.wall_clock()
+        if observed >= self.deadline_epoch_seconds:
+            raise AcquisitionDeadlineExceeded(
+                deadline_epoch_seconds=self.deadline_epoch_seconds,
+                observed_epoch_seconds=observed,
+            )
+
+    def check_time(self) -> None:
+        """Stop cache replay and network work before the preparation reserve."""
+
+        with self._lock:
+            self._check_time_locked()
+
+    def check_wait(self, wait_seconds: float) -> None:
+        """Refuse a retry sleep that would consume the preparation reserve."""
+
+        if not math.isfinite(wait_seconds) or wait_seconds < 0.0:
+            raise ValueError("wait_seconds must be finite and non-negative")
+        with self._lock:
+            self._check_time_locked()
+            if self.deadline_epoch_seconds is None:
+                return
+            observed = self.wall_clock()
+            if observed + wait_seconds >= self.deadline_epoch_seconds:
+                raise AcquisitionDeadlineExceeded(
+                    deadline_epoch_seconds=self.deadline_epoch_seconds,
+                    observed_epoch_seconds=observed,
+                    required_wait_seconds=wait_seconds,
+                )
 
     def consume(self, provider: str) -> None:
         """Reserve one attempt before sending it so retries cannot exceed the cap."""
 
         with self._lock:
-            if self._network_requests >= self.max_network_requests:
+            self._check_time_locked()
+            is_limited = self.limited_providers is None or provider in self.limited_providers
+            if is_limited and self._limited_network_requests >= self.max_network_requests:
                 raise NetworkRequestBudgetExceeded(
-                    consumed=self._network_requests,
+                    consumed=self._limited_network_requests,
                     maximum=self.max_network_requests,
+                    provider=provider,
                 )
             self._network_requests += 1
+            if is_limited:
+                self._limited_network_requests += 1
             self._provider_counts[provider] = self._provider_counts.get(provider, 0) + 1
 
     @property
     def network_requests(self) -> int:
         with self._lock:
             return self._network_requests
+
+    @property
+    def limited_network_requests(self) -> int:
+        with self._lock:
+            return self._limited_network_requests
 
     @property
     def provider_counts(self) -> dict[str, int]:
@@ -152,7 +298,8 @@ class CachedJsonClient:
         raw_cache_root: str | Path,
         max_requests_per_second: float,
         timeout_seconds: float = 30.0,
-        max_attempts: int = 3,
+        max_attempts: int | None = None,
+        max_backoff_seconds: float | None = None,
         session: requests.Session | None = None,
         request_budget: NetworkRequestBudget | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -160,13 +307,20 @@ class CachedJsonClient:
     ) -> None:
         if max_requests_per_second <= 0.0:
             raise ValueError("max_requests_per_second must be positive")
-        if timeout_seconds <= 0.0 or max_attempts < 1:
-            raise ValueError("HTTP timeout and attempts must be positive")
+        if timeout_seconds <= 0.0:
+            raise ValueError("HTTP timeout must be positive")
+        if max_attempts is not None and max_attempts < 1:
+            raise ValueError("HTTP attempts must be positive when bounded")
+        if max_backoff_seconds is not None and (
+            not math.isfinite(max_backoff_seconds) or max_backoff_seconds <= 0.0
+        ):
+            raise ValueError("Maximum backoff must be finite and positive when bounded")
         self.provider = provider
         self.raw_cache_root = Path(raw_cache_root)
         self.minimum_interval = 1.0 / max_requests_per_second
         self.timeout_seconds = timeout_seconds
         self.max_attempts = max_attempts
+        self.max_backoff_seconds = max_backoff_seconds
         self.session = session
         self.request_budget = request_budget
         self.clock = clock
@@ -194,6 +348,8 @@ class CachedJsonClient:
             if self._last_request_at is not None:
                 remaining = self.minimum_interval - (now - self._last_request_at)
                 if remaining > 0.0:
+                    if self.request_budget is not None:
+                        self.request_budget.check_wait(remaining)
                     self.sleeper(remaining)
             self._last_request_at = self.clock()
 
@@ -264,6 +420,8 @@ class CachedJsonClient:
         *,
         params: Mapping[str, Any],
     ) -> tuple[Any, RequestRecord]:
+        if self.request_budget is not None:
+            self.request_budget.check_time()
         request_sha256, _identity = self._identity(endpoint=endpoint, params=params)
         cache_path = self._cache_path(request_sha256)
         if cache_path.is_file():
@@ -287,7 +445,14 @@ class CachedJsonClient:
         last_retry_after_seconds: float | None = None
         last_rate_limit_limit: int | None = None
         last_rate_limit_remaining: int | None = None
-        for attempt in range(1, self.max_attempts + 1):
+        attempt = 0
+        backoff_wait_count = 0
+        total_backoff_seconds = 0.0
+        last_backoff_seconds: float | None = None
+        proposed_backoff_seconds: float | None = None
+        exit_reason: str | None = None
+        while True:
+            attempt += 1
             self._reserve_request_slot()
             requested_at = datetime.now(UTC).isoformat()
             try:
@@ -351,12 +516,32 @@ class CachedJsonClient:
                     last_category = "provider_rejected"
                     last_retryable = False
                 if not last_retryable:
+                    exit_reason = "non_retryable_provider_response"
                     break
-                if attempt < self.max_attempts:
-                    delay = min(float(2 ** (attempt - 1)), 30.0)
-                    if last_retry_after_seconds is not None:
-                        delay = min(last_retry_after_seconds, 60.0)
-                    self.sleeper(delay)
+                proposed_backoff_seconds = min(
+                    float(2 ** min(attempt - 1, 12)),
+                    3600.0,
+                )
+                if last_retry_after_seconds is not None:
+                    proposed_backoff_seconds = max(
+                        proposed_backoff_seconds,
+                        last_retry_after_seconds,
+                    )
+                if self.max_attempts is not None and attempt >= self.max_attempts:
+                    exit_reason = "maximum_attempts_reached"
+                    break
+                if (
+                    self.max_backoff_seconds is not None
+                    and proposed_backoff_seconds > self.max_backoff_seconds
+                ):
+                    exit_reason = "proposed_backoff_exceeds_maximum"
+                    break
+                if self.request_budget is not None:
+                    self.request_budget.check_wait(proposed_backoff_seconds)
+                self.sleeper(proposed_backoff_seconds)
+                backoff_wait_count += 1
+                total_backoff_seconds += proposed_backoff_seconds
+                last_backoff_seconds = proposed_backoff_seconds
         raise ProviderRequestError(
             provider=self.provider,
             category=last_category,
@@ -366,4 +551,10 @@ class CachedJsonClient:
             retry_after_seconds=last_retry_after_seconds,
             rate_limit_limit=last_rate_limit_limit,
             rate_limit_remaining=last_rate_limit_remaining,
+            backoff_wait_count=backoff_wait_count,
+            total_backoff_seconds=total_backoff_seconds,
+            last_backoff_seconds=last_backoff_seconds,
+            proposed_backoff_seconds=proposed_backoff_seconds,
+            max_backoff_seconds=self.max_backoff_seconds,
+            exit_reason=exit_reason,
         ) from None

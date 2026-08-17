@@ -19,6 +19,7 @@ from stock_forecasting.data.manifest import (
     atomic_write_json,
     canonical_json_sha256,
     validate_dataset_preparation_contract,
+    validate_download_manifest,
     validate_training_dataset_manifest,
 )
 from stock_forecasting.data.schema import MarketDataValidationError, normalize_ohlcv_frame
@@ -45,9 +46,7 @@ def test_causal_records_have_paired_historical_inputs_and_future_labels_only(
     assert tuple(label["horizons"]) == DEFAULT_ALPHA_HORIZONS
     assert pd.Timestamp(str(label["entry_at"])) > cutoff
     assert all(pd.Timestamp(value) > cutoff for value in label["end_at"].values())
-    assert set(label["alpha_log_returns"]) == {
-        f"{horizon}d" for horizon in DEFAULT_ALPHA_HORIZONS
-    }
+    assert set(label["alpha_log_returns"]) == {f"{horizon}d" for horizon in DEFAULT_ALPHA_HORIZONS}
     assert label["entry_day_counts_as_holding_day_one"] is True
     assert not ({"text", "facts", "description", "future_benchmark"} & set(record))
 
@@ -65,13 +64,9 @@ def test_globally_back_adjusted_vendor_scale_cancels_at_each_cutoff(
     for original, adjusted in zip(original_records, rescaled_records, strict=True):
         assert adjusted["sample_id"] == original["sample_id"]
         for context_name in ("context", "benchmark_context"):
-            assert adjusted[context_name]["timestamp"] == original[context_name][
-                "timestamp"
-            ]
+            assert adjusted[context_name]["timestamp"] == original[context_name]["timestamp"]
             for field in ("open", "high", "low", "close", "volume"):
-                assert adjusted[context_name][field] == pytest.approx(
-                    original[context_name][field]
-                )
+                assert adjusted[context_name][field] == pytest.approx(original[context_name][field])
         assert adjusted["label"]["alpha_log_returns"] == pytest.approx(
             original["label"]["alpha_log_returns"]
         )
@@ -104,9 +99,7 @@ def test_parallel_window_build_matches_serial_output(market_frame: pd.DataFrame)
 def test_future_benchmark_values_change_labels_but_never_the_model_context(
     market_frame: pd.DataFrame,
 ) -> None:
-    cutoff = pd.Timestamp(
-        market_frame[market_frame["symbol"] == "AAPL.US"].iloc[200]["timestamp"]
-    )
+    cutoff = pd.Timestamp(market_frame[market_frame["symbol"] == "AAPL.US"].iloc[200]["timestamp"])
     changed = market_frame.copy()
     benchmark_mask = (changed["symbol"] == "VTI.US") & (changed["timestamp"] > cutoff)
     steps = np.arange(int(benchmark_mask.sum()), dtype=np.float64) + 1.0
@@ -120,9 +113,7 @@ def test_future_benchmark_values_change_labels_but_never_the_model_context(
         if record["symbol"] == "AAPL.US" and pd.Timestamp(record["cutoff_at"]) == cutoff
     )
     modified_record = next(
-        record
-        for record in modified
-        if record["sample_id"] == original_record["sample_id"]
+        record for record in modified if record["sample_id"] == original_record["sample_id"]
     )
 
     assert modified_record["context"] == original_record["context"]
@@ -144,10 +135,7 @@ def test_label_holding_interval_requires_every_benchmark_trading_date(
     cutoff = pd.Timestamp(asset_rows.loc[200, "timestamp"])
     missing_day_two = pd.Timestamp(asset_rows.loc[202, "timestamp"])
     incomplete = market_frame[
-        ~(
-            (market_frame["symbol"] == "VTI.US")
-            & (market_frame["timestamp"] == missing_day_two)
-        )
+        ~((market_frame["symbol"] == "VTI.US") & (market_frame["timestamp"] == missing_day_two))
     ].copy()
 
     original = build_causal_windows(market_frame, window_size=32, stride=1)
@@ -391,6 +379,36 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
             raw_path=raw,
             processed_path=processed,
         )
+
+
+def test_downloaded_checkpoint_binds_raw_and_request_log_integrity(tmp_path: Path) -> None:
+    raw = tmp_path / "raw" / "market.parquet"
+    request_log = tmp_path / "manifests" / "api-request-log.jsonl"
+    raw.parent.mkdir()
+    request_log.parent.mkdir()
+    raw.write_bytes(b"immutable raw parquet fixture")
+    request_log.write_text('{"provider":"fixture"}\n', encoding="utf-8")
+    manifest = tmp_path / "download-manifest.json"
+    atomic_write_json(
+        manifest,
+        {
+            "schema_version": "2.0",
+            "kind": "ohlcv-dataset",
+            "state": "downloaded",
+            "dataset_profile": "tw_only",
+            "artifacts": {
+                "raw": artifact_metadata(raw, root=tmp_path, row_count=10),
+                "request_log": artifact_metadata(request_log, root=tmp_path, row_count=1),
+            },
+        },
+    )
+
+    validated = validate_download_manifest(manifest, input_path=raw)
+    assert validated["state"] == "downloaded"
+
+    request_log.write_text('{"provider":"tampered"}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        validate_download_manifest(manifest, input_path=raw)
 
 
 def test_manifest_rejects_secret_like_fields(tmp_path: Path) -> None:

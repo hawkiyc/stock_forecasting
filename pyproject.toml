@@ -22,6 +22,7 @@ dependencies = [
 
 [project.scripts]
 fin-ts-download = "stock_forecasting.cli.download_market_data:main"
+fin-ts-verify-download = "stock_forecasting.cli.verify_download:main"
 fin-ts-synthetic = "stock_forecasting.cli.generate_synthetic_data:main"
 fin-ts-prepare = "stock_forecasting.cli.prepare_data:main"
 fin-ts-train = "stock_forecasting.cli.train:main"

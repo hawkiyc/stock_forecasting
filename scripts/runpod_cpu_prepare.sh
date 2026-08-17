@@ -21,6 +21,7 @@ RUNPOD_SELECTION_HELPER="${SCRIPT_DIR}/runpod_selection.py"
 RUNPOD_REMOTE_SELECTION_PATH="${RUNPOD_REMOTE_SELECTION_PATH:-}"
 RUNPOD_ROLE="${RUNPOD_ROLE:-cpu-prep}"
 LAUNCH_ID="${RUNPOD_LAUNCH_ID:-launch-$(date -u +%Y%m%dT%H%M%SZ)-${RANDOM}${RANDOM}}"
+WORKFLOW_STARTED_EPOCH="$(date +%s)"
 PREP_DIR="${LOG_ROOT}/cpu-prep/${LAUNCH_ID}"
 PREP_LOG="${RUNPOD_TMUX_LOG_FILE:-${PREP_DIR}/combined.log}"
 CODE_MARKER="${LIFECYCLE_ROOT}/stage1/code.json"
@@ -47,6 +48,15 @@ FINAL_DATA_FILES=(
     "${DATASET_MANIFEST_FINAL}"
     "${REQUEST_LOG_FINAL}"
 )
+ACQUISITION_FINAL_FILES=(
+    "${RAW_FINAL}"
+    "${DOWNLOAD_MANIFEST_FINAL}"
+    "${REQUEST_LOG_FINAL}"
+)
+PREPARATION_FINAL_FILES=(
+    "${PROCESSED_FINAL}"
+    "${DATASET_MANIFEST_FINAL}"
+)
 FIN_TS_DATASET_PROFILE="${FIN_TS_DATASET_PROFILE:-us_tw_eodhd}"
 STAGE1_US_SYMBOLS="${STAGE1_US_SYMBOLS:-}"
 STAGE1_US_ETF_SYMBOLS="${STAGE1_US_ETF_SYMBOLS:-}"
@@ -56,6 +66,9 @@ STAGE1_DATA_END="${STAGE1_DATA_END:-}"
 STAGE1_MAX_API_CALLS="${STAGE1_MAX_API_CALLS:-100000}"
 STAGE1_EODHD_QPS="${STAGE1_EODHD_QPS:-16}"
 STAGE1_TAIWAN_QPS="${STAGE1_TAIWAN_QPS:-0.5}"
+RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS="${RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS:-60}"
+RUNPOD_CPU_MAX_RUNTIME_SECONDS="${RUNPOD_CPU_MAX_RUNTIME_SECONDS:-21600}"
+RUNPOD_CPU_PREPARE_RESERVE_SECONDS="${RUNPOD_CPU_PREPARE_RESERVE_SECONDS:-}"
 RUNPOD_PYTEST_WORKERS="${RUNPOD_PYTEST_WORKERS:-auto}"
 RUNPOD_PYTEST_THREADS_PER_WORKER="${RUNPOD_PYTEST_THREADS_PER_WORKER:-1}"
 RUNPOD_REQUESTED_CPU_COUNT="${RUNPOD_REQUESTED_CPU_COUNT:-${RUNPOD_CPU_COUNT:-1}}"
@@ -131,6 +144,32 @@ for symbol_list in "${STAGE1_US_SYMBOLS}" "${STAGE1_US_ETF_SYMBOLS}"; do
         exit 2
     fi
 done
+if [[ ! "${RUNPOD_CPU_MAX_RUNTIME_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "RUNPOD_CPU_MAX_RUNTIME_SECONDS must be a positive integer" >&2
+    exit 2
+fi
+if [[ ! "${RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS must be a positive integer" >&2
+    exit 2
+fi
+if [[ -z "${RUNPOD_CPU_PREPARE_RESERVE_SECONDS}" ]]; then
+    RUNPOD_CPU_PREPARE_RESERVE_SECONDS=$((RUNPOD_CPU_MAX_RUNTIME_SECONDS / 4))
+    if [[ ${RUNPOD_CPU_PREPARE_RESERVE_SECONDS} -lt 1 ]]; then
+        RUNPOD_CPU_PREPARE_RESERVE_SECONDS=1
+    fi
+    if [[ ${RUNPOD_CPU_PREPARE_RESERVE_SECONDS} -gt 7200 ]]; then
+        RUNPOD_CPU_PREPARE_RESERVE_SECONDS=7200
+    fi
+elif [[ ! "${RUNPOD_CPU_PREPARE_RESERVE_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "RUNPOD_CPU_PREPARE_RESERVE_SECONDS must be a positive integer" >&2
+    exit 2
+fi
+if [[ ${RUNPOD_CPU_PREPARE_RESERVE_SECONDS} -ge ${RUNPOD_CPU_MAX_RUNTIME_SECONDS} ]]; then
+    echo "CPU data-preparation reserve must be shorter than the Pod workflow runtime" >&2
+    exit 2
+fi
+WORKFLOW_DEADLINE_EPOCH=$((WORKFLOW_STARTED_EPOCH + RUNPOD_CPU_MAX_RUNTIME_SECONDS))
+ACQUISITION_DEADLINE_EPOCH=$((WORKFLOW_DEADLINE_EPOCH - RUNPOD_CPU_PREPARE_RESERVE_SECONDS))
 
 runpod_validate_absolute_path "${NETWORK_VOLUME_ROOT}" NETWORK_VOLUME_ROOT
 if [[ "${RUNPOD_CONFIG}" == /* ]]; then
@@ -206,35 +245,79 @@ fi
 export FIN_TS_CPU_WORKERS
 bash "${SCRIPT_DIR}/verify_runpod_mounted_readiness.sh" --mount-only
 
-EXISTING_FINAL_FILES=0
-for final_data_file in "${FINAL_DATA_FILES[@]}"; do
-    if [[ -L "${final_data_file}" ]]; then
-        echo "Selected dataset namespace contains a symlink: ${final_data_file}" >&2
-        exit 2
-    fi
-    if [[ -e "${final_data_file}" ]]; then
-        EXISTING_FINAL_FILES=$((EXISTING_FINAL_FILES + 1))
-    fi
-done
-if [[ ${EXISTING_FINAL_FILES} -eq 0 ]]; then
-    REUSE_READY_DATASET=0
-elif [[ ${EXISTING_FINAL_FILES} -eq ${#FINAL_DATA_FILES[@]} ]]; then
-    REUSE_READY_DATASET=1
-else
-    echo "Selected dataset namespace is incomplete; choose a new dataset revision" >&2
-    exit 3
-fi
-
 read -r -a US_SYMBOLS <<< "${STAGE1_US_SYMBOLS}"
 read -r -a US_ETF_SYMBOLS <<< "${STAGE1_US_ETF_SYMBOLS}"
 mkdir -p "${PREP_DIR}" "${DATA_STAGING_ROOT}/raw" \
     "${DATA_STAGING_ROOT}/processed" "${DATA_STAGING_ROOT}/manifests" \
     "${LIFECYCLE_ROOT}/stage1" "${DATA_ROOT}/raw" "${DATA_ROOT}/processed" \
-    "${DATA_ROOT}/manifests" "${API_CACHE_ROOT}" "${RUNPOD_SHUTDOWN_DIR}" "${HF_HOME}"
+    "${DATA_ROOT}/manifests" "${DATA_ROOT}/quarantine" "${API_CACHE_ROOT}" \
+    "${RUNPOD_SHUTDOWN_DIR}" "${HF_HOME}"
+
+for final_data_file in "${FINAL_DATA_FILES[@]}"; do
+    if [[ -L "${final_data_file}" ]]; then
+        echo "Selected dataset namespace contains a symlink: ${final_data_file}" >&2
+        exit 2
+    fi
+done
+
+quarantine_known_files() {
+    local reason="$1"
+    shift
+    local quarantine_root="${DATA_ROOT}/quarantine/${reason}-${LAUNCH_ID}"
+    local source relative destination
+    runpod_validate_path_in_root \
+        "${quarantine_root}" "${DATA_ROOT}" quarantine_root DATA_ROOT
+    for source in "$@"; do
+        if [[ ! -e "${source}" ]]; then
+            continue
+        fi
+        relative="${source#"${DATA_ROOT}/"}"
+        if [[ "${relative}" == "${source}" || -z "${relative}" ]]; then
+            echo "Refusing to quarantine a path outside DATA_ROOT: ${source}" >&2
+            exit 2
+        fi
+        destination="${quarantine_root}/${relative}"
+        mkdir -p "$(dirname "${destination}")"
+        mv "${source}" "${destination}"
+    done
+    printf 'Quarantined incomplete dataset artifacts without deleting them: %s\n' \
+        "${quarantine_root}" >&2
+}
+
+ACQUISITION_FINAL_COUNT=0
+PREPARATION_FINAL_COUNT=0
+for final_data_file in "${ACQUISITION_FINAL_FILES[@]}"; do
+    if [[ -e "${final_data_file}" ]]; then
+        ACQUISITION_FINAL_COUNT=$((ACQUISITION_FINAL_COUNT + 1))
+    fi
+done
+for final_data_file in "${PREPARATION_FINAL_FILES[@]}"; do
+    if [[ -e "${final_data_file}" ]]; then
+        PREPARATION_FINAL_COUNT=$((PREPARATION_FINAL_COUNT + 1))
+    fi
+done
+REUSE_READY_DATASET=0
+REUSE_DOWNLOADED_DATASET=0
+if [[ ${ACQUISITION_FINAL_COUNT} -eq ${#ACQUISITION_FINAL_FILES[@]} ]]; then
+    if [[ ${PREPARATION_FINAL_COUNT} -eq ${#PREPARATION_FINAL_FILES[@]} ]]; then
+        REUSE_READY_DATASET=1
+    elif [[ ${PREPARATION_FINAL_COUNT} -eq 0 ]]; then
+        REUSE_DOWNLOADED_DATASET=1
+    else
+        quarantine_known_files incomplete-preparation "${PREPARATION_FINAL_FILES[@]}"
+        REUSE_DOWNLOADED_DATASET=1
+    fi
+elif [[ ${ACQUISITION_FINAL_COUNT} -eq 0 ]]; then
+    if [[ ${PREPARATION_FINAL_COUNT} -ne 0 ]]; then
+        quarantine_known_files orphaned-preparation "${PREPARATION_FINAL_FILES[@]}"
+    fi
+else
+    quarantine_known_files incomplete-acquisition "${FINAL_DATA_FILES[@]}"
+fi
+
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 PREP_SUCCEEDED=0
-PREP_WAITING_FOR_PROVIDER=0
-DOWNLOAD_ATTEMPTED=0
+PREP_RESUMABLE_STATE=""
 
 write_lifecycle_state() {
     local state="$1"
@@ -251,7 +334,7 @@ write_lifecycle_state() {
     if [[ -n "${exit_code}" ]]; then
         command+=(--exit-code "${exit_code}")
     fi
-    if [[ ${DOWNLOAD_ATTEMPTED} -eq 1 && -f "${DOWNLOAD_PROGRESS}" ]]; then
+    if [[ -f "${DOWNLOAD_PROGRESS}" ]]; then
         command+=(--progress-path "${DOWNLOAD_PROGRESS}")
     fi
     "${command[@]}"
@@ -263,19 +346,22 @@ finish_cpu_prep() {
     trap - EXIT INT TERM
     if [[ ${PREP_SUCCEEDED} -eq 1 ]]; then
         prep_state=ready
-    elif [[ ${PREP_WAITING_FOR_PROVIDER} -eq 1 ]]; then
-        prep_state=waiting_for_provider
+    elif [[ -n "${PREP_RESUMABLE_STATE}" ]]; then
+        prep_state="${PREP_RESUMABLE_STATE}"
     elif [[ ${prep_exit_code} -eq 124 ]]; then
         prep_state=timed_out
     fi
     if [[ ${PREP_SUCCEEDED} -ne 1 ]]; then
         write_lifecycle_state "${prep_state}" "${prep_exit_code}" || true
     fi
-    printf '{"started_at":"%s","ended_at":"%s","exit_code":%d,"state":"%s","log_path":"%s","requested_cpu_count":%d,"detected_cpu_count":%d,"effective_workers":%d}\n' \
+    printf '{"started_at":"%s","ended_at":"%s","exit_code":%d,"state":"%s","log_path":"%s","requested_cpu_count":%d,"detected_cpu_count":%d,"effective_workers":%d,"max_runtime_seconds":%d,"preparation_reserve_seconds":%d,"provider_max_backoff_seconds":%d,"acquisition_deadline_epoch_seconds":%d}\n' \
         "${STARTED_AT}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${prep_exit_code}" \
         "${prep_state}" \
         "${PREP_LOG}" "${RUNPOD_REQUESTED_CPU_COUNT}" "${DETECTED_CPU_COUNT}" \
-        "${FIN_TS_CPU_WORKERS}" > "${METADATA_PATH}"
+        "${FIN_TS_CPU_WORKERS}" "${RUNPOD_CPU_MAX_RUNTIME_SECONDS}" \
+        "${RUNPOD_CPU_PREPARE_RESERVE_SECONDS}" \
+        "${RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS}" "${ACQUISITION_DEADLINE_EPOCH}" \
+        > "${METADATA_PATH}"
     if [[ -z "${RUNPOD_TMUX_LOG_FILE:-}" ]]; then
         bash "${SCRIPT_DIR}/runpod_self_terminate.sh" || true
     fi
@@ -357,46 +443,115 @@ if [[ ${REUSE_READY_DATASET} -eq 1 ]]; then
     exit 0
 fi
 
-DOWNLOAD_ARGUMENTS=(
-    --profile "${FIN_TS_DATASET_PROFILE}"
-    --start "${STAGE1_DATA_START}"
-    --end "${STAGE1_DATA_END}"
-    --output "${RAW_STAGING}"
-    --manifest-root "${DATA_STAGING_ROOT}"
-    --raw-cache-root "${API_CACHE_ROOT}"
-    --progress-path "${DOWNLOAD_PROGRESS}"
-    --dataset-request-sha256 "${RUNPOD_DATASET_REQUEST_SHA256}"
-    --selection-id "${RUNPOD_SELECTION_ID}"
-    --selection-sha256 "${RUNPOD_SELECTION_SHA256}"
-    --launch-id "${LAUNCH_ID}"
-    --max-api-calls "${STAGE1_MAX_API_CALLS}"
-    --eodhd-qps "${STAGE1_EODHD_QPS}"
-    --taiwan-qps "${STAGE1_TAIWAN_QPS}"
-    --workers "${FIN_TS_CPU_WORKERS}"
-)
-if [[ ${#US_SYMBOLS[@]} -gt 0 ]]; then
-    DOWNLOAD_ARGUMENTS+=(--symbols "${US_SYMBOLS[@]}")
+publish_download_checkpoint() {
+    local destination
+    for destination in "${ACQUISITION_FINAL_FILES[@]}"; do
+        if [[ -e "${destination}" || -L "${destination}" ]]; then
+            echo "Refusing to overwrite acquisition checkpoint artifact: ${destination}" >&2
+            return 3
+        fi
+    done
+    # All paths are on the same network volume. Hard links publish the durable
+    # checkpoint without copying a potentially large raw Parquet file.
+    (
+        trap '' INT TERM
+        ln "${RAW_STAGING}" "${RAW_FINAL}"
+        ln "${REQUEST_LOG_STAGING}" "${REQUEST_LOG_FINAL}"
+        ln "${DOWNLOAD_MANIFEST_STAGING}" "${DOWNLOAD_MANIFEST_FINAL}"
+    )
+}
+
+restore_download_checkpoint_to_staging() {
+    local staging_path
+    for staging_path in \
+        "${RAW_STAGING}" "${REQUEST_LOG_STAGING}" "${DOWNLOAD_MANIFEST_STAGING}"; do
+        if [[ -e "${staging_path}" || -L "${staging_path}" ]]; then
+            echo "Refusing to overwrite a launch staging artifact: ${staging_path}" >&2
+            return 3
+        fi
+    done
+    ln "${RAW_FINAL}" "${RAW_STAGING}"
+    ln "${REQUEST_LOG_FINAL}" "${REQUEST_LOG_STAGING}"
+    ln "${DOWNLOAD_MANIFEST_FINAL}" "${DOWNLOAD_MANIFEST_STAGING}"
+}
+
+if [[ ${REUSE_DOWNLOADED_DATASET} -eq 1 ]]; then
+    if ! "${POETRY_BIN}" run fin-ts-verify-download \
+        --manifest "${DOWNLOAD_MANIFEST_FINAL}" \
+        --raw "${RAW_FINAL}"; then
+        quarantine_known_files invalid-acquisition "${FINAL_DATA_FILES[@]}"
+        REUSE_DOWNLOADED_DATASET=0
+        printf 'The invalid downloaded checkpoint was quarantined; rebuilding from verified provider cache entries.\n' >&2
+    else
+        restore_download_checkpoint_to_staging
+        printf 'Reused durable downloaded checkpoint; no provider API calls are required.\n'
+    fi
 fi
-if [[ ${#US_ETF_SYMBOLS[@]} -gt 0 ]]; then
-    DOWNLOAD_ARGUMENTS+=(--etf-symbols "${US_ETF_SYMBOLS[@]}")
+if [[ ${REUSE_DOWNLOADED_DATASET} -eq 0 ]]; then
+    DOWNLOAD_ARGUMENTS=(
+        --profile "${FIN_TS_DATASET_PROFILE}"
+        --start "${STAGE1_DATA_START}"
+        --end "${STAGE1_DATA_END}"
+        --output "${RAW_STAGING}"
+        --manifest-root "${DATA_STAGING_ROOT}"
+        --raw-cache-root "${API_CACHE_ROOT}"
+        --progress-path "${DOWNLOAD_PROGRESS}"
+        --dataset-request-sha256 "${RUNPOD_DATASET_REQUEST_SHA256}"
+        --selection-id "${RUNPOD_SELECTION_ID}"
+        --selection-sha256 "${RUNPOD_SELECTION_SHA256}"
+        --launch-id "${LAUNCH_ID}"
+        --max-api-calls "${STAGE1_MAX_API_CALLS}"
+        --eodhd-qps "${STAGE1_EODHD_QPS}"
+        --taiwan-qps "${STAGE1_TAIWAN_QPS}"
+        --max-backoff-seconds "${RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS}"
+        --workers "${FIN_TS_CPU_WORKERS}"
+        --acquisition-deadline-epoch-seconds "${ACQUISITION_DEADLINE_EPOCH}"
+        --preparation-reserve-seconds "${RUNPOD_CPU_PREPARE_RESERVE_SECONDS}"
+    )
+    if [[ ${#US_SYMBOLS[@]} -gt 0 ]]; then
+        DOWNLOAD_ARGUMENTS+=(--symbols "${US_SYMBOLS[@]}")
+    fi
+    if [[ ${#US_ETF_SYMBOLS[@]} -gt 0 ]]; then
+        DOWNLOAD_ARGUMENTS+=(--etf-symbols "${US_ETF_SYMBOLS[@]}")
+    fi
+    if [[ -n "${STAGE1_SYMBOL_LIMIT}" ]]; then
+        DOWNLOAD_ARGUMENTS+=(--symbol-limit "${STAGE1_SYMBOL_LIMIT}")
+    fi
+    set +e
+    "${POETRY_BIN}" run fin-ts-download "${DOWNLOAD_ARGUMENTS[@]}"
+    DOWNLOAD_EXIT_CODE=$?
+    set -e
+    if [[ ${DOWNLOAD_EXIT_CODE} -eq 75 ]]; then
+        PREP_RESUMABLE_STATE="$("${RUNPOD_PYTHON_BIN}" -c \
+            'import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    state = json.load(stream).get("state")
+allowed = {"waiting_for_provider", "waiting_for_budget", "waiting_for_resume"}
+if state not in allowed:
+    raise SystemExit("Download progress has no supported resumable state")
+print(state)' "${DOWNLOAD_PROGRESS}")"
+        printf 'Acquisition paused in state %s. Cached responses are saved at %s; rerun the same cpu prepare workflow.\n' \
+            "${PREP_RESUMABLE_STATE}" "${API_CACHE_ROOT}" >&2
+        exit 75
+    fi
+    if [[ ${DOWNLOAD_EXIT_CODE} -ne 0 ]]; then
+        exit "${DOWNLOAD_EXIT_CODE}"
+    fi
+    publish_download_checkpoint
+    "${POETRY_BIN}" run fin-ts-verify-download \
+        --manifest "${DOWNLOAD_MANIFEST_FINAL}" \
+        --raw "${RAW_FINAL}"
 fi
-if [[ -n "${STAGE1_SYMBOL_LIMIT}" ]]; then
-    DOWNLOAD_ARGUMENTS+=(--symbol-limit "${STAGE1_SYMBOL_LIMIT}")
-fi
-DOWNLOAD_ATTEMPTED=1
-set +e
-"${POETRY_BIN}" run fin-ts-download "${DOWNLOAD_ARGUMENTS[@]}"
-DOWNLOAD_EXIT_CODE=$?
-set -e
-if [[ ${DOWNLOAD_EXIT_CODE} -eq 75 ]]; then
-    PREP_WAITING_FOR_PROVIDER=1
-    printf 'Provider quota or temporary availability prevented completion. Progress is saved at %s. Rerun the same cpu prepare workflow after the provider permits requests again.\n' \
-        "${DOWNLOAD_PROGRESS}" >&2
+
+write_lifecycle_state downloaded
+REMAINING_WORKFLOW_SECONDS=$((WORKFLOW_DEADLINE_EPOCH - $(date +%s)))
+if [[ ${REMAINING_WORKFLOW_SECONDS} -lt ${RUNPOD_CPU_PREPARE_RESERVE_SECONDS} ]]; then
+    PREP_RESUMABLE_STATE=downloaded
+    printf 'Raw acquisition is durable, but only %s seconds remain versus the %s-second preparation reserve; data preparation is deferred to the next CPU Pod.\n' \
+        "${REMAINING_WORKFLOW_SECONDS}" "${RUNPOD_CPU_PREPARE_RESERVE_SECONDS}" >&2
     exit 75
 fi
-if [[ ${DOWNLOAD_EXIT_CODE} -ne 0 ]]; then
-    exit "${DOWNLOAD_EXIT_CODE}"
-fi
+write_lifecycle_state preparing
 
 "${POETRY_BIN}" run fin-ts-prepare \
     --input "${RAW_STAGING}" \
@@ -432,16 +587,13 @@ fi
     --launch-id "${LAUNCH_ID}" \
     --verify-only
 
-for final_data_file in "${FINAL_DATA_FILES[@]}"; do
+for final_data_file in "${PREPARATION_FINAL_FILES[@]}"; do
     if [[ -e "${final_data_file}" || -L "${final_data_file}" ]]; then
         echo "Refusing to overwrite an existing immutable dataset artifact: ${final_data_file}" >&2
         exit 3
     fi
 done
-mv "${RAW_STAGING}" "${RAW_FINAL}"
 mv "${PROCESSED_STAGING}" "${PROCESSED_FINAL}"
-mv "${REQUEST_LOG_STAGING}" "${REQUEST_LOG_FINAL}"
-mv "${DOWNLOAD_MANIFEST_STAGING}" "${DOWNLOAD_MANIFEST_FINAL}"
 mv "${DATASET_MANIFEST_STAGING}" "${DATASET_MANIFEST_FINAL}"
 
 "${POETRY_BIN}" run fin-ts-verify-stage1-data \

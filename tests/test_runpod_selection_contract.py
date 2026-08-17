@@ -184,6 +184,13 @@ def test_date_or_universe_changes_dataset_request_identity(tmp_path: Path) -> No
     assert baseline["dataset_request_sha256"] != explicit_universe["dataset_request_sha256"]
 
 
+def test_eodhd_volume_semantics_are_part_of_the_immutable_dataset_contract() -> None:
+    assert SELECTION.PREPARATION_CONTRACT["schema_version"] == 2
+    assert SELECTION.PREPARATION_CONTRACT["eodhd_split_policy"] == (
+        "per_symbol_full_historical_splits_reconstruct_unadjusted_volume_v2"
+    )
+
+
 def test_acquisition_rate_changes_selection_but_not_dataset_identity(tmp_path: Path) -> None:
     project_root = _project_root(tmp_path)
     baseline = SELECTION._build_selection(

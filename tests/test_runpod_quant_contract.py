@@ -48,7 +48,7 @@ def test_runpod_entrypoint_scripts_declare_explicit_interpreters() -> None:
         assert path.read_text(encoding="utf-8").splitlines()[0] == expected_shebang, path
 
 
-def test_dataset_lifecycle_accepts_matching_provider_wait_progress(
+def test_dataset_lifecycle_accepts_matching_resumable_progress(
     tmp_path: Path,
 ) -> None:
     volume_root = tmp_path / "runpod-volume"
@@ -64,14 +64,79 @@ def test_dataset_lifecycle_accepts_matching_provider_wait_progress(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+    marker = volume_root / "lifecycle" / "stage1" / "dataset.json"
+    for state in (
+        "waiting_for_provider",
+        "waiting_for_budget",
+        "waiting_for_resume",
+        "downloaded",
+    ):
+        progress_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "ohlcv-download-progress",
+                    "state": state,
+                    "identity": identity,
+                    "identity_sha256": identity_sha256,
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/runpod_readiness.py"),
+                "write-state",
+                "--output",
+                str(marker),
+                "--network-volume-root",
+                str(volume_root),
+                "--kind",
+                "stage1-dataset",
+                "--state",
+                state,
+                "--launch-id",
+                "test-launch",
+                "--exit-code",
+                "75",
+                "--progress-path",
+                str(progress_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        assert payload["state"] == state
+        assert payload["progress_path"] == str(progress_path.resolve())
+
+
+def test_downloaded_lifecycle_can_be_an_active_intermediate_checkpoint(
+    tmp_path: Path,
+) -> None:
+    volume_root = tmp_path / "runpod-volume"
+    digest = "b" * 64
+    progress_path = volume_root / "datasets" / digest / "download-progress.json"
+    progress_path.parent.mkdir(parents=True)
+    identity = {"dataset_request_sha256": digest}
     progress_path.write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "kind": "ohlcv-download-progress",
-                "state": "waiting_for_provider",
+                "state": "downloaded",
                 "identity": identity,
-                "identity_sha256": identity_sha256,
+                "identity_sha256": hashlib.sha256(
+                    json.dumps(
+                        identity,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
             }
         ),
         encoding="utf-8",
@@ -90,11 +155,9 @@ def test_dataset_lifecycle_accepts_matching_provider_wait_progress(
             "--kind",
             "stage1-dataset",
             "--state",
-            "waiting_for_provider",
+            "downloaded",
             "--launch-id",
             "test-launch",
-            "--exit-code",
-            "75",
             "--progress-path",
             str(progress_path),
         ],
@@ -105,8 +168,8 @@ def test_dataset_lifecycle_accepts_matching_provider_wait_progress(
 
     assert result.returncode == 0, result.stderr
     payload = json.loads(marker.read_text(encoding="utf-8"))
-    assert payload["state"] == "waiting_for_provider"
-    assert payload["progress_path"] == str(progress_path.resolve())
+    assert payload["state"] == "downloaded"
+    assert "exit_code" not in payload
 
 
 def test_runpod_entrypoints_use_only_two_quant_stages() -> None:
@@ -176,15 +239,44 @@ def test_cpu_log_lifecycle_and_downloader_share_canonical_paths() -> None:
     lifecycle_writer = tmux.split("publish_lifecycle() {", maxsplit=1)[1]
     assert '"${NETWORK_VOLUME_ROOT}" "${LAUNCH_ID}" "${JOB_LOG}"' in lifecycle_writer
     assert "expected_log_dir = expected_prefix + launch_id" in download
-    assert "expected_log_file = expected_log_dir + \"/combined.log\"" in download
+    assert 'expected_log_file = expected_log_dir + "/combined.log"' in download
     assert "log_path == expected_log_dir" in download
     assert "log_path == expected_log_file" in download
 
 
-def test_network_volume_identity_and_exact_mount_are_fail_closed() -> None:
-    verifier = (ROOT / "scripts/verify_runpod_mounted_readiness.sh").read_text(
+def test_cpu_acquisition_budget_is_resumable_and_reserves_preparation_time() -> None:
+    ingestion = (ROOT / "src/stock_forecasting/data/ingestion.py").read_text(encoding="utf-8")
+    progress = (ROOT / "src/stock_forecasting/data/download_progress.py").read_text(
         encoding="utf-8"
     )
+    prepare = (ROOT / "scripts/runpod_cpu_prepare.sh").read_text(encoding="utf-8")
+    guard = (ROOT / "scripts/terminate_runpod_after.sh").read_text(encoding="utf-8")
+    status = (ROOT / "scripts/show_runpod_status.sh").read_text(encoding="utf-8")
+
+    assert "Estimated HTTP requests" not in ingestion
+    assert "exceed max_api_calls" not in ingestion
+    assert "plan_with_official_trading_sessions" in ingestion
+    assert "taiwan_pre_calendar_weekday_upper_bound_calls" in ingestion
+    assert 'limited_providers={"eodhd"}' in ingestion
+    assert "_run_parallel_provider_loops(runners)" in ingestion
+    assert "max_backoff_seconds=options.max_backoff_seconds" in ingestion
+    assert "parallel_independent_loops_joined_before_process_exit" in ingestion
+    assert '"waiting_for_budget"' in progress
+    assert '"waiting_for_resume"' in progress
+    assert "RUNPOD_CPU_PREPARE_RESERVE_SECONDS" in prepare
+    assert "ACQUISITION_DEADLINE_EPOCH" in prepare
+    assert "RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS" in prepare
+    assert 'error.get("provider_outcomes")' in status
+    assert 'ln "${RAW_STAGING}" "${RAW_FINAL}"' in prepare
+    assert "fin-ts-verify-download" in prepare
+    for state in ("waiting_for_budget", "waiting_for_resume", "downloaded"):
+        assert state in guard
+    assert 'print("downloaded_active")' in guard
+    assert 'payload.get("exit_code") != 75' in guard
+
+
+def test_network_volume_identity_and_exact_mount_are_fail_closed() -> None:
+    verifier = (ROOT / "scripts/verify_runpod_mounted_readiness.sh").read_text(encoding="utf-8")
     create_gpu = (ROOT / "scripts/create_runpod_pod.sh").read_text(encoding="utf-8")
     create_cpu = (ROOT / "scripts/create_runpod_cpu_pod.sh").read_text(encoding="utf-8")
     reexec = (ROOT / "scripts/runpod_reexec_with_pid1_env.py").read_text(encoding="utf-8")
@@ -209,26 +301,29 @@ def test_network_volume_identity_and_exact_mount_are_fail_closed() -> None:
     assert "/proc/self/mountinfo" in verifier
     for path in volume_writers:
         script = path.read_text(encoding="utf-8")
-        assert "verify_runpod_mounted_readiness.sh\" --mount-only" in script, path
+        assert 'verify_runpod_mounted_readiness.sh" --mount-only' in script, path
 
 
 def test_workflow_exposes_bounded_cpu_gpu_resume_and_validation_options() -> None:
     workflow = (ROOT / "scripts/runpod_workflow.sh").read_text(encoding="utf-8")
     cpu_creator = (ROOT / "scripts/create_runpod_cpu_pod.sh").read_text(encoding="utf-8")
+    reexec = (ROOT / "scripts/runpod_reexec_with_pid1_env.py").read_text(encoding="utf-8")
     resume = (ROOT / "scripts/create_runpod_resume_pod.sh").read_text(encoding="utf-8")
-    validation = (ROOT / "scripts/create_runpod_validation_pod.sh").read_text(
-        encoding="utf-8"
-    )
+    validation = (ROOT / "scripts/create_runpod_validation_pod.sh").read_text(encoding="utf-8")
 
     for option in (
         "--interactive",
         "--maxRuntime",
+        "--prepareReserve",
+        "--maxBackoff",
         "--gpuId",
         "--cpuNumber",
         "--cpuFlavor",
     ):
         assert option in workflow
     assert "cpu_max_runtime=6h" in workflow
+    assert "cpu_prepare_reserve=auto" in workflow
+    assert "cpu_max_backoff=1m" in workflow
     assert "cpu_number=8" in workflow
     assert "cpu_flavor=cpu3g" in workflow
     assert "train_max_runtime=12h" in workflow
@@ -238,6 +333,10 @@ def test_workflow_exposes_bounded_cpu_gpu_resume_and_validation_options() -> Non
     assert "CONTAINER_DISK_GB_PER_VCPU=10" in cpu_creator
     assert "CONTAINER_DISK_GB_PER_VCPU=15" in cpu_creator
     assert "MAX_CONTAINER_DISK_GB" in cpu_creator
+    assert "RUNPOD_CPU_PREPARE_RESERVE_SECONDS" in cpu_creator
+    assert "RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS" in cpu_creator
+    assert '"RUNPOD_CPU_PREPARE_RESERVE_SECONDS"' in reexec
+    assert '"RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS"' in reexec
     assert "resumable-training-run" in resume
     assert "training-completed.json" in resume
     assert "--maxRuntime" in validation
@@ -247,7 +346,7 @@ def test_workflow_exposes_bounded_cpu_gpu_resume_and_validation_options() -> Non
 def test_cpu_prepare_without_options_is_interactive_and_cancel_safe() -> None:
     result = subprocess.run(
         ["bash", str(ROOT / "scripts/runpod_workflow.sh"), "cpu", "prepare"],
-        input="\n\n\n\n",
+        input="\n\n\n\n\n\n",
         check=False,
         capture_output=True,
         text=True,
@@ -257,27 +356,69 @@ def test_cpu_prepare_without_options_is_interactive_and_cancel_safe() -> None:
     assert result.returncode == 0, combined
     assert "CPU preparation resource configuration" in combined
     assert "Maximum runtime [6h]:" in combined
+    assert "Time reserved for data cleaning/window construction [auto]:" in combined
+    assert "Maximum TWSE/TPEx retry backoff [1m]:" in combined
     assert "vCPU count [8]:" in combined
     assert "CPU flavor [cpu3g]:" in combined
     assert "Maximum runtime: 6h" in combined
+    assert "Cleaning/window reserve: automatic" in combined
+    assert "Maximum TWSE/TPEx retry backoff: 1m" in combined
     assert "vCPU count: 8" in combined
     assert "CPU flavor: cpu3g" in combined
     assert "Create this CPU preparation Pod? [y/N]:" in combined
     assert "CPU preparation Pod creation cancelled; no Pod was created" in combined
 
 
+def test_cpu_prepare_rejects_a_reserve_that_consumes_the_complete_runtime() -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/runpod_workflow.sh"),
+            "cpu",
+            "prepare",
+            "--maxRuntime",
+            "6h",
+            "--prepareReserve",
+            "6h",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "--prepareReserve must be shorter than --maxRuntime" in result.stderr
+
+
+def test_cpu_prepare_rejects_an_invalid_maximum_provider_backoff() -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/runpod_workflow.sh"),
+            "cpu",
+            "prepare",
+            "--maxBackoff",
+            "60",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "--maxBackoff must use a positive duration" in result.stderr
+
+
 def test_download_defaults_to_all_retained_checkpoints_and_can_select_best() -> None:
     workflow = (ROOT / "scripts/runpod_workflow.sh").read_text(encoding="utf-8")
-    download = (ROOT / "scripts/download_runpod_results.sh").read_text(
-        encoding="utf-8"
-    )
+    download = (ROOT / "scripts/download_runpod_results.sh").read_text(encoding="utf-8")
 
     assert "download [--resume] [--checkpointScope all|best] [RUN_ID]" in workflow
     assert 'CHECKPOINT_SCOPE="all"' in download
     assert "--checkpointScope|--checkpoint-scope" in download
     assert "checkpoint-download-names" in download
-    assert 'BEST_CHECKPOINT="${CHECKPOINT_NAMES%%$\'\\n\'*}"' in download
-    assert 'checkpoint_scope=%s checkpoint_count=%s' in download
+    assert "BEST_CHECKPOINT=\"${CHECKPOINT_NAMES%%$'\\n'*}\"" in download
+    assert "checkpoint_scope=%s checkpoint_count=%s" in download
     assert "list-objects-v2" not in download
 
 
@@ -388,12 +529,8 @@ def test_wandb_contract_logs_every_optimizer_step_and_validation_metrics() -> No
         encoding="utf-8"
     )
     tracking = (ROOT / "src/stock_forecasting/tracking.py").read_text(encoding="utf-8")
-    wandb_sync = (ROOT / "src/stock_forecasting/cli/sync_wandb.py").read_text(
-        encoding="utf-8"
-    )
-    wandb_sync_script = (ROOT / "scripts/runpod_wandb_sync.sh").read_text(
-        encoding="utf-8"
-    )
+    wandb_sync = (ROOT / "src/stock_forecasting/cli/sync_wandb.py").read_text(encoding="utf-8")
+    wandb_sync_script = (ROOT / "scripts/runpod_wandb_sync.sh").read_text(encoding="utf-8")
 
     assert '"wandb==0.28.0"' in pyproject
     assert "log_every_steps: Literal[1] = 1" in config

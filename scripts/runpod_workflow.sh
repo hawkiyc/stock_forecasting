@@ -16,7 +16,7 @@ Usage:
   bash scripts/runpod_workflow.sh configure [SELECTION OPTIONS]
   bash scripts/runpod_workflow.sh selection show
   bash scripts/runpod_workflow.sh sync [--dry-run|--apply]
-  bash scripts/runpod_workflow.sh cpu prepare [--interactive] [--maxRuntime DURATION] [--cpuNumber N] [--cpuFlavor FLAVOR]
+  bash scripts/runpod_workflow.sh cpu prepare [--interactive] [--maxRuntime DURATION] [--prepareReserve DURATION|auto] [--maxBackoff DURATION] [--cpuNumber N] [--cpuFlavor FLAVOR]
   bash scripts/runpod_workflow.sh readiness [--code-only|--gpu]
   bash scripts/runpod_workflow.sh train [--maxRuntime DURATION] [--gpuId GPU_ID]
   bash scripts/runpod_workflow.sh resume [--maxRuntime DURATION] [--gpuId GPU_ID] [RUN_ID]
@@ -64,6 +64,10 @@ case "${COMMAND}" in
         [[ "${1:-}" == "prepare" ]] || { usage; exit 2; }
         shift
         cpu_max_runtime=6h
+        cpu_prepare_reserve=auto
+        cpu_prepare_reserve_seconds=""
+        cpu_max_backoff=1m
+        cpu_max_backoff_seconds=60
         cpu_number=8
         cpu_flavor=cpu3g
         cpu_interactive=0
@@ -79,6 +83,16 @@ case "${COMMAND}" in
                 --maxRuntime|--max-runtime)
                     [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 2; }
                     cpu_max_runtime="$2"
+                    shift 2
+                    ;;
+                --prepareReserve|--prepare-reserve)
+                    [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 2; }
+                    cpu_prepare_reserve="$2"
+                    shift 2
+                    ;;
+                --maxBackoff|--max-backoff)
+                    [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 2; }
+                    cpu_max_backoff="$2"
                     shift 2
                     ;;
                 --cpuNumber|--cpu-number)
@@ -118,6 +132,45 @@ EOF
                 fi
             done
             while true; do
+                printf 'Time reserved for data cleaning/window construction [%s]: ' \
+                    "${cpu_prepare_reserve}" >&2
+                if ! IFS= read -r cpu_entered_prepare_reserve; then
+                    echo "Input closed before CPU Pod creation" >&2
+                    exit 2
+                fi
+                cpu_candidate_prepare_reserve="${cpu_entered_prepare_reserve:-${cpu_prepare_reserve}}"
+                if [[ "${cpu_candidate_prepare_reserve}" == "auto" ]]; then
+                    cpu_prepare_reserve=auto
+                    cpu_prepare_reserve_seconds=""
+                    break
+                fi
+                if cpu_candidate_prepare_reserve_seconds="$(runpod_duration_seconds \
+                    "${cpu_candidate_prepare_reserve}" --prepareReserve)"; then
+                    if [[ ${cpu_candidate_prepare_reserve_seconds} -ge ${cpu_max_seconds} ]]; then
+                        echo "--prepareReserve must be shorter than --maxRuntime" >&2
+                        continue
+                    fi
+                    cpu_prepare_reserve="${cpu_candidate_prepare_reserve}"
+                    cpu_prepare_reserve_seconds="${cpu_candidate_prepare_reserve_seconds}"
+                    break
+                fi
+            done
+            while true; do
+                printf 'Maximum TWSE/TPEx retry backoff [%s]: ' \
+                    "${cpu_max_backoff}" >&2
+                if ! IFS= read -r cpu_entered_max_backoff; then
+                    echo "Input closed before CPU Pod creation" >&2
+                    exit 2
+                fi
+                cpu_candidate_max_backoff="${cpu_entered_max_backoff:-${cpu_max_backoff}}"
+                if cpu_candidate_max_backoff_seconds="$(runpod_duration_seconds \
+                    "${cpu_candidate_max_backoff}" --maxBackoff)"; then
+                    cpu_max_backoff="${cpu_candidate_max_backoff}"
+                    cpu_max_backoff_seconds="${cpu_candidate_max_backoff_seconds}"
+                    break
+                fi
+            done
+            while true; do
                 printf 'vCPU count [%s]: ' "${cpu_number}" >&2
                 if ! IFS= read -r cpu_entered_number; then
                     echo "Input closed before CPU Pod creation" >&2
@@ -143,6 +196,12 @@ EOF
             done
             printf '\nCPU preparation Pod request:\n' >&2
             printf '  Maximum runtime: %s\n' "${cpu_max_runtime}" >&2
+            if [[ "${cpu_prepare_reserve}" == "auto" ]]; then
+                printf '  Cleaning/window reserve: automatic (25%% of max runtime, capped at 2h)\n' >&2
+            else
+                printf '  Cleaning/window reserve: %s\n' "${cpu_prepare_reserve}" >&2
+            fi
+            printf '  Maximum TWSE/TPEx retry backoff: %s\n' "${cpu_max_backoff}" >&2
             printf '  External guard grace: 1h\n' >&2
             printf '  vCPU count: %s\n' "${cpu_number}" >&2
             printf '  CPU flavor: %s\n' "${cpu_flavor}" >&2
@@ -166,9 +225,25 @@ EOF
             runpod_validate_cpu_flavor "${cpu_flavor}"
             cpu_max_seconds="$(runpod_duration_seconds \
                 "${cpu_max_runtime}" --maxRuntime)"
+            cpu_max_backoff_seconds="$(runpod_duration_seconds \
+                "${cpu_max_backoff}" --maxBackoff)"
+            if [[ "${cpu_prepare_reserve}" != "auto" ]]; then
+                cpu_prepare_reserve_seconds="$(runpod_duration_seconds \
+                    "${cpu_prepare_reserve}" --prepareReserve)"
+                if [[ ${cpu_prepare_reserve_seconds} -ge ${cpu_max_seconds} ]]; then
+                    echo "--prepareReserve must be shorter than --maxRuntime" >&2
+                    exit 2
+                fi
+            fi
         fi
         export RUNPOD_CPU_MAX_RUNTIME_SECONDS="${cpu_max_seconds}"
+        export RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS="${cpu_max_backoff_seconds}"
         export RUNPOD_CPU_HARD_LIMIT_SECONDS="$((cpu_max_seconds + 3600))"
+        if [[ -n "${cpu_prepare_reserve_seconds}" ]]; then
+            export RUNPOD_CPU_PREPARE_RESERVE_SECONDS="${cpu_prepare_reserve_seconds}"
+        else
+            unset RUNPOD_CPU_PREPARE_RESERVE_SECONDS
+        fi
         export RUNPOD_CPU_VCPU_COUNT="${cpu_number}"
         export RUNPOD_CPU_FLAVOR_ID="${cpu_flavor}"
         exec bash "${SCRIPT_DIR}/create_runpod_cpu_pod.sh"

@@ -40,8 +40,23 @@ with open(path, encoding="utf-8") as handle:
     payload = json.load(handle)
 
 state = str(payload.get("state", ""))
-if state not in {"ready", "failed", "timed_out", "waiting_for_provider"}:
+if state not in {
+    "ready",
+    "failed",
+    "timed_out",
+    "waiting_for_provider",
+    "waiting_for_budget",
+    "waiting_for_resume",
+    "downloaded",
+}:
     raise SystemExit(f"CPU dataset lifecycle is not terminal: {state or '<missing>'}")
+if state in {
+    "waiting_for_provider",
+    "waiting_for_budget",
+    "waiting_for_resume",
+    "downloaded",
+} and payload.get("exit_code") != 75:
+    raise SystemExit(f"CPU dataset lifecycle is still active: {state}")
 
 launch_id = str(payload.get("launch_id", ""))
 if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", launch_id) is None:

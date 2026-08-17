@@ -259,7 +259,7 @@ mkdir -p "${JOB_DIR}"
     printf 'if [[ ${job_exit_code} -eq 0 ]]; then status_state=succeeded; fi\n'
     printf 'if [[ ${job_exit_code} -eq 124 ]]; then status_state=timed_out; fi\n'
     if [[ ${PROVIDER_WAIT_EXIT_ALLOWED} -eq 1 ]]; then
-        printf 'if [[ ${job_exit_code} -eq 75 ]]; then status_state=waiting_for_provider; fi\n'
+        printf 'if [[ ${job_exit_code} -eq 75 ]]; then status_state=resumable; fi\n'
     fi
     printf 'status_tmp=%q\n' "${JOB_STATUS}.tmp.$$.$RANDOM"
     printf 'publish_status() {\n'

@@ -104,6 +104,7 @@ done < <(
 
 DATA_PIPELINE_PATHS=(
     src/stock_forecasting/cli/download_market_data.py
+    src/stock_forecasting/cli/verify_download.py
     src/stock_forecasting/cli/prepare_data.py
     src/stock_forecasting/cli/prefetch_models.py
     src/stock_forecasting/cli/verify_stage1_data.py

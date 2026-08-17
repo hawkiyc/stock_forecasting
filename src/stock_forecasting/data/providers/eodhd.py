@@ -14,9 +14,7 @@ from .http import CachedJsonClient
 
 EODHD_DEFAULT_DAILY_API_CALL_LIMIT = 100_000
 EODHD_DEFAULT_REQUESTS_PER_MINUTE = 1_000
-EODHD_DEFAULT_REQUESTS_PER_SECOND = float(
-    EODHD_DEFAULT_REQUESTS_PER_MINUTE // 60
-)
+EODHD_DEFAULT_REQUESTS_PER_SECOND = float(EODHD_DEFAULT_REQUESTS_PER_MINUTE // 60)
 EODHD_DELISTED_AUXILIARY_DATA_START = "2018-01-01"
 
 
@@ -141,13 +139,14 @@ class EODHDProvider:
         frame["is_active"] = instrument.is_active
         frame["dataset_profile"] = dataset_profile
         frame["adjustment_source"] = (
-            f"eodhd_adjusted_close+{split_adjustment_source}"
+            f"eodhd_adjusted_close+{split_adjustment_source}+reconstructed_raw_volume"
         )
         frame = normalize_ohlcv_frame(frame)
         frame = apply_cumulative_adjustments(
             frame,
             split_events,
             preserve_adjusted_close=True,
+            source_volume_is_split_adjusted=True,
         )
         return ProviderFetch(
             frame=normalize_ohlcv_frame(frame),
@@ -162,15 +161,15 @@ class EODHDProvider:
         start: str,
         end: str,
     ) -> ProviderFetch:
-        """Fetch full-history split factors from the All World plan endpoint."""
+        """Fetch all split factors needed to undo EODHD's global volume adjustment."""
+
+        requested_range = {"start": start, "end": end}
 
         payload, request = self.client.get_json(
             f"{self.base_url}/splits/{instrument.provider_symbol}",
             params={
                 "api_token": self._api_token,
                 "fmt": "json",
-                "from": start,
-                "to": end,
             },
         )
         if not isinstance(payload, list):
@@ -209,6 +208,7 @@ class EODHDProvider:
             metadata={
                 "split_events": len(rows),
                 "dropped_rows": dropped,
-                "coverage": "provider_historical_splits_response",
+                "coverage": "provider_full_historical_splits_response",
+                "requested_eod_range": requested_range,
             },
         )

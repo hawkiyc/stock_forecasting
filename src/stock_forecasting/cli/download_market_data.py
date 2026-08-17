@@ -12,6 +12,9 @@ from stock_forecasting.data.ingestion import IngestionOptions, ingest_daily_ohlc
 from stock_forecasting.data.providers import (
     EODHD_DEFAULT_DAILY_API_CALL_LIMIT,
     EODHD_DEFAULT_REQUESTS_PER_SECOND,
+    AcquisitionDeadlineExceeded,
+    NetworkRequestBudgetExceeded,
+    ProviderAcquisitionError,
     ProviderRequestError,
 )
 
@@ -75,8 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=EODHD_DEFAULT_DAILY_API_CALL_LIMIT,
         help=(
-            "Project-side HTTP request safety ceiling; defaults to the official "
-            "paid-plan daily API-call limit but remains distinct from provider usage."
+            "Project-side EODHD network-attempt ceiling for one acquisition; "
+            "TWSE and TPEx requests are tracked but do not consume this ceiling."
         ),
     )
     parser.add_argument(
@@ -94,12 +97,33 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="Short-term TWSE/TPEx request pacing.",
     )
-    parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument(
+        "--max-backoff-seconds",
+        type=float,
+        default=float(os.environ.get("RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS", "60")),
+        help=(
+            "Maximum proposed TWSE/TPEx exponential-backoff delay; a provider loop "
+            "exits when its next delay would exceed this value."
+        ),
+    )
     parser.add_argument(
         "--workers",
         type=int,
         default=int(os.environ.get("FIN_TS_CPU_WORKERS", "1")),
         help="Thread workers for independent symbols and trading dates.",
+    )
+    parser.add_argument(
+        "--acquisition-deadline-epoch-seconds",
+        type=float,
+        help=(
+            "Stop cache replay and provider acquisition at this Unix timestamp so "
+            "CPU time remains for data preparation."
+        ),
+    )
+    parser.add_argument(
+        "--preparation-reserve-seconds",
+        type=int,
+        help="CPU runtime reserved for canonical data cleaning and window preparation.",
     )
     parser.add_argument(
         "--exclude-delisted",
@@ -131,19 +155,34 @@ def main(argv: list[str] | None = None) -> int:
         max_api_calls=args.max_api_calls,
         eodhd_requests_per_second=args.eodhd_qps,
         taiwan_requests_per_second=args.taiwan_qps,
-        max_attempts=args.max_attempts,
+        max_backoff_seconds=args.max_backoff_seconds,
         progress_path=args.progress_path,
         dataset_request_sha256=args.dataset_request_sha256,
         selection_id=args.selection_id,
         selection_sha256=args.selection_sha256,
         launch_id=args.launch_id,
         workers=args.workers,
+        acquisition_deadline_epoch_seconds=(args.acquisition_deadline_epoch_seconds),
+        preparation_reserve_seconds=args.preparation_reserve_seconds,
     )
     try:
         payload = ingest_daily_ohlcv(
             options,
             eodhd_api_token=os.environ.get("EODHD_API_TOKEN"),
         )
+    except ProviderAcquisitionError as error:
+        if not error.retryable:
+            raise
+        waiting = {
+            "state": error.state,
+            "exit_code": TEMPORARY_PROVIDER_EXIT_CODE,
+            "progress_path": str(
+                options.progress_path or options.manifest_root / "download-progress.json"
+            ),
+            "provider_outcomes": error.provider_outcomes,
+        }
+        print(json.dumps(waiting, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+        return TEMPORARY_PROVIDER_EXIT_CODE
     except ProviderRequestError as error:
         if not error.retryable:
             raise
@@ -151,10 +190,43 @@ def main(argv: list[str] | None = None) -> int:
             "state": "waiting_for_provider",
             "exit_code": TEMPORARY_PROVIDER_EXIT_CODE,
             "progress_path": str(
-                options.progress_path
-                or options.manifest_root / "download-progress.json"
+                options.progress_path or options.manifest_root / "download-progress.json"
             ),
             "provider_error": error.metadata(),
+        }
+        print(json.dumps(waiting, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+        return TEMPORARY_PROVIDER_EXIT_CODE
+    except NetworkRequestBudgetExceeded as error:
+        waiting = {
+            "state": "waiting_for_budget",
+            "exit_code": TEMPORARY_PROVIDER_EXIT_CODE,
+            "progress_path": str(
+                options.progress_path or options.manifest_root / "download-progress.json"
+            ),
+            "budget": {
+                "category": "network_request_safety_budget_exhausted",
+                "consumed": error.consumed,
+                "maximum": error.maximum,
+                "provider": error.provider,
+                "retryable": True,
+            },
+        }
+        print(json.dumps(waiting, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+        return TEMPORARY_PROVIDER_EXIT_CODE
+    except AcquisitionDeadlineExceeded as error:
+        waiting = {
+            "state": "waiting_for_resume",
+            "exit_code": TEMPORARY_PROVIDER_EXIT_CODE,
+            "progress_path": str(
+                options.progress_path or options.manifest_root / "download-progress.json"
+            ),
+            "time_budget": {
+                "category": "acquisition_time_budget_exhausted",
+                "deadline_epoch_seconds": error.deadline_epoch_seconds,
+                "observed_epoch_seconds": error.observed_epoch_seconds,
+                "required_wait_seconds": error.required_wait_seconds,
+                "retryable": True,
+            },
         }
         print(json.dumps(waiting, ensure_ascii=False, sort_keys=True), file=sys.stderr)
         return TEMPORARY_PROVIDER_EXIT_CODE

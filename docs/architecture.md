@@ -43,7 +43,10 @@ alpha_h = log(G_asset(h)) - log(G_benchmark(h))
 
 ### 4. Corporate-action adjustment
 
-raw O/H/L/C/V 永久保留在 canonical Parquet。模型視窗使用 point-in-time 調整：
+raw O/H/L/C 永久保留在 canonical Parquet，台股 volume 也保留官方 raw field。
+EODHD EOD volume 本身已做 split adjustment，因此 canonical `volume` 由完整
+Historical Splits response 反推，vendor 值保存為 `split_adjusted_volume`。模型視窗使用
+point-in-time 調整：
 
 - O/H/L/C 使用 total-return adjustment factor，並除以 `cutoff_at` 當日 factor；
   因此 vendor 對整段歷史的共同 back-adjustment scale 會抵消，未來事件也不會改寫
@@ -52,10 +55,10 @@ raw O/H/L/C/V 永久保留在 canonical Parquet。模型視窗使用 point-in-ti
 - label 的 entry 是 raw open 乘以當日 total-return factor，exit 是 adjusted close；
   商品與 benchmark 使用完全相同日期。
 
-EODHD 保留 `adjusted_close`。2015 年起以 exchange-wide split calendar 建立
-`split_adjusted_volume`；更早的歷史改走 per-symbol Historical Splits API，避免
-calendar 覆蓋不足造成靜默錯誤。TWSE/TPEx 使用官方除權息資料；TAIEX/TPEx
-benchmark 另以官方 price index OHLC 與 total-return index 對齊。這個設計避免分割
+EODHD 保留 `adjusted_close`，並對每個 symbol 取得不帶日期裁切的完整 Historical
+Splits response，以反推未調整 volume；不會對 vendor 已調整 volume 再乘一次 split
+factor。TWSE/TPEx 使用官方除權息資料，並由既有月度 benchmark rows 取得實際交易日；
+TAIEX/TPEx benchmark 另以官方 price index OHLC 與 total-return index 對齊。這個設計避免分割
 與除權息造成的非經濟跳空，同時保留下一日開盤進場的可交易語意。
 
 ### 5. 模型資料流
@@ -237,7 +240,10 @@ serialized contexts stop at `cutoff_at`.
 
 ### 4. Corporate-action adjustment
 
-Canonical Parquet permanently retains raw O/H/L/C/V. Model windows use a
+Canonical Parquet permanently retains raw O/H/L/C, plus official raw Taiwan
+volume. EODHD EOD volume is already split-adjusted, so canonical `volume` is
+reconstructed with the complete Historical Splits response and the vendor value
+is retained as `split_adjusted_volume`. Model windows use a
 point-in-time adjustment:
 
 - O/H/L/C uses the total-return factor normalized by the factor at `cutoff_at`.
@@ -247,11 +253,12 @@ point-in-time adjustment:
 - Label entry is raw open times its contemporaneous total-return factor; exit
   is adjusted close. Instrument and benchmark use identical dates.
 
-EODHD retains `adjusted_close`. It uses the exchange-wide split calendar for
-`split_adjusted_volume` from 2015 onward and the per-symbol Historical Splits
-API for earlier history, avoiding silent gaps outside calendar coverage.
-TWSE/TPEx use official corporate-action records; their benchmarks align
-official price-index OHLC with official total-return indices. This removes
+EODHD retains `adjusted_close` and fetches the complete, non-date-truncated
+Historical Splits response per symbol to reconstruct unadjusted volume. It never
+multiplies vendor-adjusted volume by a split factor again. TWSE/TPEx use official
+corporate-action records and derive actual sessions from existing monthly
+benchmark rows; their benchmarks align official price-index OHLC with official
+total-return indices. This removes
 artificial corporate-action gaps while preserving tradable next-open entry
 semantics.
 

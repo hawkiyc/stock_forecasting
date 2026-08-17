@@ -255,9 +255,27 @@ if state not in (
     "failed",
     "timed_out",
     "waiting_for_provider",
+    "waiting_for_budget",
+    "waiting_for_resume",
+    "downloaded",
 ):
     raise SystemExit(2)
-if state == "waiting_for_provider" and expected_kind != "stage1-dataset":
+if state in (
+    "waiting_for_provider",
+    "waiting_for_budget",
+    "waiting_for_resume",
+    "downloaded",
+) and expected_kind != "stage1-dataset":
+    raise SystemExit(2)
+if state == "downloaded" and payload.get("exit_code") is None:
+    print("downloaded_active")
+    raise SystemExit(0)
+if state in (
+    "waiting_for_provider",
+    "waiting_for_budget",
+    "waiting_for_resume",
+    "downloaded",
+) and (type(payload.get("exit_code")) is not int or payload.get("exit_code") != 75):
     raise SystemExit(2)
 if state == "ready":
     if expected_kind == "stage1-training" and payload.get("training_completed") is not True:
@@ -294,7 +312,10 @@ print(state)' \
                 if [[ "${marker_state}" == "ready" \
                     || "${marker_state}" == "failed" \
                     || "${marker_state}" == "timed_out" \
-                    || "${marker_state}" == "waiting_for_provider" ]]; then
+                    || "${marker_state}" == "waiting_for_provider" \
+                    || "${marker_state}" == "waiting_for_budget" \
+                    || "${marker_state}" == "waiting_for_resume" \
+                    || "${marker_state}" == "downloaded" ]]; then
                     terminal_state="${marker_state}"
                     terminal_key="${lifecycle_candidate}"
                     break

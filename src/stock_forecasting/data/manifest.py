@@ -163,6 +163,33 @@ def load_dataset_manifest(
     return payload
 
 
+def validate_download_manifest(
+    path: str | Path,
+    *,
+    input_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Validate the complete immutable acquisition checkpoint."""
+
+    manifest_path = Path(path).resolve(strict=True)
+    payload = load_dataset_manifest(manifest_path, required_state="downloaded")
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != {"raw", "request_log"}:
+        raise ValueError("Download manifest must bind raw Parquet and API request log")
+    raw_path, _ = _validate_artifact(
+        artifacts["raw"],
+        manifest_root=manifest_path.parent,
+        label="raw",
+    )
+    _validate_artifact(
+        artifacts["request_log"],
+        manifest_root=manifest_path.parent,
+        label="API request log",
+    )
+    if input_path is not None and raw_path != Path(input_path).resolve(strict=False):
+        raise ValueError("Input Parquet does not match the download manifest")
+    return payload
+
+
 def validate_training_dataset_manifest(
     path: str | Path,
     *,
@@ -284,9 +311,7 @@ def validate_dataset_preparation_contract(
             str(symbol).strip().upper(): str(benchmark).strip().upper()
             for symbol, benchmark in mapping_payload.items()
         }
-    if preparation_spec.get("benchmark_mapping_sha256") != canonical_json_sha256(
-        benchmark_mapping
-    ):
+    if preparation_spec.get("benchmark_mapping_sha256") != canonical_json_sha256(benchmark_mapping):
         raise ValueError("Dataset benchmark mapping does not match the experiment config")
     actual_diagnostics = preparation_spec.get("diagnostic_horizons")
     if not isinstance(actual_diagnostics, list) or sorted(actual_diagnostics) != sorted(

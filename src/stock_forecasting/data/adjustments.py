@@ -41,9 +41,7 @@ def normalize_action_frame(events: pd.DataFrame) -> pd.DataFrame:
     normalized["symbol"] = normalized["symbol"].astype("string").str.strip().str.upper()
     normalized["source"] = normalized["source"].astype("string").str.strip()
     normalized["price_factor"] = pd.to_numeric(normalized["price_factor"], errors="coerce")
-    normalized["share_multiplier"] = pd.to_numeric(
-        normalized["share_multiplier"], errors="coerce"
-    )
+    normalized["share_multiplier"] = pd.to_numeric(normalized["share_multiplier"], errors="coerce")
     if (
         normalized[["timestamp", "symbol", "source"]].isna().any(axis=None)
         or (normalized["symbol"].str.len() == 0).any()
@@ -72,8 +70,9 @@ def apply_cumulative_adjustments(
     events: pd.DataFrame | None,
     *,
     preserve_adjusted_close: bool = False,
+    source_volume_is_split_adjusted: bool = False,
 ) -> pd.DataFrame:
-    """Back-adjust bars while preserving every raw OHLCV field unchanged."""
+    """Build global adjustment anchors while retaining causal raw-volume scale."""
 
     enriched = ensure_adjustment_columns(frame)
     if events is None or events.empty:
@@ -97,13 +96,20 @@ def apply_cumulative_adjustments(
             ordered[ADJUSTED_CLOSE_FIELD] = (
                 ordered["close"].to_numpy(dtype=np.float64) * price_factor
             )
-        ordered[ADJUSTED_VOLUME_FIELD] = (
-            ordered["volume"].to_numpy(dtype=np.float64) * share_factor
-        )
+        source_volume = ordered["volume"].to_numpy(dtype=np.float64)
+        if source_volume_is_split_adjusted:
+            # EODHD already applies all known future splits to volume. Reconstruct
+            # the historical share scale so cutoff normalization remains causal.
+            ordered["volume"] = source_volume / share_factor
+            ordered[ADJUSTED_VOLUME_FIELD] = source_volume
+        else:
+            ordered[ADJUSTED_VOLUME_FIELD] = source_volume * share_factor
         output.append(ordered)
-    return pd.concat(output, ignore_index=True).sort_values(
-        ["symbol", "timestamp"], kind="stable"
-    ).reset_index(drop=True)
+    return (
+        pd.concat(output, ignore_index=True)
+        .sort_values(["symbol", "timestamp"], kind="stable")
+        .reset_index(drop=True)
+    )
 
 
 def asof_adjusted_window(window: pd.DataFrame) -> pd.DataFrame:

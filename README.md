@@ -130,15 +130,20 @@ VTI：若已選到便不重複，否則額外補入。這讓 N 個 ETF target ca
 benchmark 占掉一席；raw universe 最多是 `N ETF + N stock + 1 VTI`，但實際可訓練
 target 數仍可能因資料長度、benchmark mapping 或品質 gate 而更少。
 
-raw O/H/L/C/V 永久保留。模型視窗把 vendor/官方 total-return factor 正規化到
+raw O/H/L/C 永久保留；台灣 `volume` 也是官方 raw field。EODHD 官方定義的
+`volume` 已做 split adjustment，因此管線用完整 Historical Splits response 反推出
+當時的未調整 `volume`，並把 vendor 值保留為 `split_adjusted_volume`，不會再乘一次
+split factor。模型視窗把 vendor/官方 total-return factor 正規化到
 `cutoff_at`，再套用到歷史 O/H/L/C，因此收盤後推論不會因未來公司行動而回寫輸入；
 volume 只依 split/share change 調整，不用現金股利調整。EODHD 保留
 `adjusted_close`；所有日期範圍都對每個 symbol 使用 Historical Splits API。官方將
 這個 endpoint 列入 EOD Historical Data — All World 且每個 request 為 1 API call；
 管線不使用另屬 Calendar 產品的 `calendar/splits`。每個 symbol 因此需要一個 EOD
-history request 加一個 split-history request，兩者都可 cache／續傳，也會在下載前
-納入 `STAGE1_MAX_API_CALLS` 預估；provider 對 2018 年前下市商品的上述輔助覆蓋例外
-則依前述 warning 顯式保留。台股使用 TWSE/TPEx 官方除權息資料與官方報酬指數。
+history request 加一個 split-history request，兩者都可 cache／續傳，也會列入資訊性
+request 估算；估算值不會阻止完整資料集執行。provider 對 2018 年前下市商品的上述
+輔助覆蓋例外則依前述 warning 顯式保留。台股使用 TWSE/TPEx 官方除權息資料與官方
+報酬指數，並從既有月度官方 benchmark rows 取得實際交易日，不會把一般週一至週五
+一律當成開市日。
 這可避免股票分割或除權息造成的人為跳空，同時維持下一日 raw open 的可交易 entry
 語意。
 
@@ -175,13 +180,24 @@ Stage 1 / Stage 2 訓練（完全離線）
 資料下載器具備：
 
 - provider-specific QPS throttle。
-- 指數退避與有限次重試。
-- `max_api_calls` 同時限制完整計畫的預估 HTTP requests，以及單次 CPU attempt
-  跨 provider、含 retry 的實際 network attempts；cache hit 不扣額度。
+- EODHD、TWSE、TPEx 以獨立迴圈平行抓取；retryable request 使用指數退避。
+- 完整計畫的預估 HTTP requests 只作資訊與容量規劃；台灣最終 plan 使用官方
+  benchmark sessions，另保留 pre-calendar weekday upper bound；兩者都不作
+  dataset admission gate。
+- `max_api_calls` 只限制單次 CPU attempt 的 EODHD network attempts（含 retry）；
+  TWSE／TPEx 不受 request-count 上限限制，而由預設 1 分鐘的 `--maxBackoff` 決定退出。
+  cache hit 不扣額度，未完成時保留進度並由下一個 Pod 續接。
+- 任一 provider 先退出都不會取消其他 provider；只有全部 provider 迴圈退出後，流程才
+  發布續傳狀態或固定順序合併 provider-local artifacts。
 - QPS 與 `max_api_calls` 都不是 provider 的每日／每週 quota，也不代表 EODHD
   不同 endpoint 的計費 call units。
-- 暫時性 provider 錯誤或 429 重試耗盡時，保留成功的 raw responses、寫入
-  `download-progress.json`，並允許下一個 CPU Pod 只補未快取的 requests。
+- 暫時性 provider 錯誤、429、單次 request budget 或 acquisition time budget
+  耗盡時，保留成功的 raw responses、寫入 `download-progress.json`，並允許下一個
+  CPU Pod 只補未快取的 requests。
+- CPU workflow 預設保留 max runtime 的 25% 給 canonical data cleaning 與 causal
+  window construction（最多 2 小時，亦可用 `--prepareReserve` 明確設定）；下載完成的 raw Parquet、request log
+  與 download manifest 會先發布成 durable `downloaded` checkpoint。後續 Pod 可完全
+  跳過 API，只有 processed data 與 readiness 都驗證通過才成為 `ready`。
 - API token 不進 cache key、request log 或 manifest。
 - raw cache 與直接執行的下載／準備 CLI 拒絕靜默覆寫。
 - Parquet 與 manifest 的 SHA-256、row count 與 provenance 綁定。
@@ -361,7 +377,7 @@ common stocks 與 ETFs；使用含美國資料的 profile、`--universe all`，�
 | `--stocks` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的美國股票，例如 `"AAPL,MSFT"`；不影響台股 |
 | `--etfs` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的美國 ETF，例如 `"SPY,QQQ"`；不影響台股 |
 | `--symbol-limit` | 正整數 N | **小規模容量／流程驗證用，不是完整美國市場模式。**只適用於含美國資料的 `all` 模式。discovery 後把 ETF 與 stock 分開，各自依 active → delisted、ticker 字母順序取最多 N 檔；若某一類少於 N 就全取。這不是隨機或代表性抽樣。接著確認必要的 `VTI.US` benchmark：已在 N 檔 ETF 內就不重複，否則額外補入，所以 raw universe 最多 `2N+1` 檔。要完整美股與美國 ETF 就不要提供此選項 |
-| `--max-api-calls` | 正整數；預設 `100000` | 專案端 request safety budget，不是抽樣數。預設數字對齊 EODHD 付費方案官方的 100,000 daily API calls，但程式仍以它限制完整計畫的預估 HTTP requests 與單次 CPU attempt（含 retry）的 network attempts；超過時 fail closed，不會縮小資料範圍。它不會讀取帳戶已用額度，也不把任意 endpoint 的 HTTP request 誤當成固定一個計費 call unit |
+| `--max-api-calls` | 正整數；預設 `100000` | 專案端 EODHD「單次 acquisition attempt」的 network-attempt safety budget，不是抽樣數、完整資料集上限、Pod 建立條件或帳戶實際每日餘額。只計入 EODHD cache miss 與 retry；TWSE／TPEx requests 會被記錄但不消耗此上限。EODHD 達上限時只退出自己的迴圈，其他 provider 繼續執行；全部 provider 迴圈退出後才進入可續傳的 `waiting_for_budget`。它不把任意 endpoint 的 HTTP request 誤當成固定一個計費 call unit |
 | `--eodhd-qps` | 大於零的數字；預設 `16` | EODHD requests/second pacing；官方上限為每分鐘 1,000 requests，但預設值會向下取整為每秒 16 requests（每分鐘最多 960 requests），保留每分鐘 40 requests（4%）的餘裕。client 會平均分散 requests；此設定不取代 daily call quota，`tw_only` 也不會呼叫 EODHD |
 | `--taiwan-qps` | 大於零的數字；預設 `0.5` | TWSE／TPEx 最大 requests/second，只控制短時間 pacing；`us_only_eodhd` 不會呼叫台灣 provider |
 | `--interactive` | 無值 flag | 明確開啟互動式選單；直接執行 `configure` 而不帶選項時會自動使用此模式 |
@@ -398,9 +414,11 @@ bash scripts/runpod_workflow.sh configure \
   --taiwan-qps 0.5
 ```
 
-`--max-api-calls 10000` 只是此日期範圍的安全上限，不會把台股或美股截成
-10,000 筆資料。若改成不足以涵蓋完整台灣逐日請求的 `5000`，CPU preparation
-會拒絕執行，而不是默默縮小資料範圍。
+`--max-api-calls 10000` 只限制單次 acquisition attempt 的 EODHD network attempts，
+不會把台股或美股截成 10,000 筆資料，也不要求整份資料能在 10,000 次 requests 內完成。
+EODHD 達到上限後會退出自己的迴圈，但平行執行中的 TWSE／TPEx 仍會繼續。三個 provider
+迴圈都退出後，CPU preparation 才保存 cache 與 `waiting_for_budget` 進度並結束；下一個
+Pod 沿用同一 immutable selection 補齊缺少的 responses。
 
 供應商額度是另一層限制。EODHD 官方價格頁目前列出 `EOD Historical Data — All
 World` 個人方案月繳 USD 19.99；官方限制文件指出付費方案預設每日 100,000 API
@@ -411,9 +429,9 @@ calls、每分鐘 1,000 HTTP requests，且訂閱方案的每日額度在午夜 
 降低 `--eodhd-qps`。可參考
 [EODHD Pricing](https://eodhd.com/pricing)、
 [EODHD API Limits](https://eodhd.com/financial-apis/api-limits) 與
-[EODHD User API](https://eodhd.com/financial-apis/user-api)。因此若要完整下載美股與
-美國 ETF，`--max-api-calls` 必須足以容納完整 request 計畫，供應商每日／每週額度
-則由後述的 CPU Pod 續傳流程跨多次執行處理。
+[EODHD User API](https://eodhd.com/financial-apis/user-api)。完整美股與美國 ETF 的
+request 計畫可以大於 `--max-api-calls`；專案與供應商額度邊界都由後述的 CPU Pod
+續傳流程跨多次執行處理。
 
 完整 EODHD discovery 範圍加完整台灣市場的設定不提供 `--stocks`、`--etfs` 或
 `--symbol-limit`：
@@ -427,9 +445,10 @@ bash scripts/runpod_workflow.sh configure \
   --universe all
 ```
 
-若 discovery 後估算的完整 HTTP request 計畫超過預設 `100000`，準備流程會明確回報
-估算值並停止；使用該值評估費用後，以更高的 `--max-api-calls` 重新 `configure`。
-這只提高安全上限，不會改成抽樣，也不會繞過 provider quota。
+discovery 後的完整 HTTP request 計畫即使超過預設 `100000`，也只會記錄為資訊，不會
+阻止 Pod 建立或縮小資料範圍。EODHD 每個 CPU attempt 最多送出設定的 network attempts，
+達上限後由下一個 Pod 使用 cache 續傳；可依成本與使用情況調高或調低
+`--max-api-calls`，但它不會繞過 provider quota。
 
 如果要使用相同的美國 explicit universe、但**完全不下載台股**，必須把 profile
 改成 `us_only_eodhd`：
@@ -514,9 +533,11 @@ artifact 不會上傳。`poetry.lock` 也不會上傳；它會依 approved RunPo
 
 CPU Pod 只能使用 active selection；如果尚未執行 `configure`、config SHA 已改變，
 或 selection JSON 不完整，建立前就會失敗。在本機不帶資源參數執行時會進入
-互動模式，依序詢問 workload 最長執行時間、vCPU 數與 CPU flavor；按 Enter
-分別使用 6 小時、8 vCPU、`cpu3g`。最後還必須輸入 `y` 或 `yes` 才會建立可能
-計費的 Pod，直接按 Enter、輸入 `n` 或 `no` 都會安全取消：
+互動模式，依序詢問 workload 最長執行時間、data cleaning/window construction
+保留時間、TWSE／TPEx 最大單次退避、vCPU 數與 CPU flavor；按 Enter 分別使用 6 小時、
+自動保留、1 分鐘、8 vCPU、`cpu3g`。自動保留是 max runtime 的 25%，最多 2 小時；預設 6 小時會保留 90
+分鐘。最後還必須輸入 `y` 或 `yes` 才會建立可能計費的 Pod，直接按 Enter、輸入
+`n` 或 `no` 都會安全取消：
 
 ```bash
 bash scripts/runpod_workflow.sh cpu prepare
@@ -528,6 +549,8 @@ bash scripts/runpod_workflow.sh cpu prepare
 ```bash
 bash scripts/runpod_workflow.sh cpu prepare \
   --maxRuntime 10h \
+  --prepareReserve 2h \
+  --maxBackoff 1m \
   --cpuNumber 16 \
   --cpuFlavor cpu5g
 ```
@@ -539,13 +562,18 @@ bash scripts/runpod_workflow.sh cpu prepare \
 bash scripts/runpod_workflow.sh cpu prepare \
   --interactive \
   --maxRuntime 10h \
+  --prepareReserve auto \
+  --maxBackoff 1m \
   --cpuNumber 16 \
   --cpuFlavor cpu5g
 ```
 
-`--maxRuntime` 接受正整數加 `m`、`h` 或 `d`；`--cpuNumber` 必須是 1～32。
-`--cpuFlavor` 只接受下表六個 RunPod 值，其他值或超過 32 vCPU 會在建立 Pod
-前失敗：
+`--maxRuntime`、明確的 `--prepareReserve` 與 `--maxBackoff` 都接受正整數加 `m`、`h` 或 `d`；
+`--prepareReserve auto` 使用上述自動公式，明確值必須短於 max runtime。
+`--maxBackoff` 預設為 `1m`，只控制 TWSE／TPEx：若下一次由指數退避或
+`Retry-After` 得到的等待時間**超過**此值，該 provider 迴圈會退出（等於上限仍會等待）。
+`--cpuNumber` 必須是 1～32。`--cpuFlavor` 只接受下表六個 RunPod 值，其他值或
+超過 32 vCPU 會在建立 Pod 前失敗：
 
 | Flavor | 世代 | 類型 | RAM / vCPU | 32 vCPU RAM | Container disk 上限 |
 | --- | ---: | --- | ---: | ---: | ---: |
@@ -583,22 +611,30 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    config SHA-256 與 Pod environment，再依該 selection 下載資料；cache hit 不會
    再次呼叫 provider。腳本會同時讀取使用者要求的 vCPU 數、RunPod 提供的
    `RUNPOD_CPU_COUNT` 與容器實際可見核心數，採三者最小值作為 worker 數；
-   provider 下載依商品／交易日使用 thread pool，因果視窗依商品平行建立，pytest
-   worker 也不會超過這個有效核心數。所有下載 worker 共用同一個 provider QPS
-   limiter 與 API request budget，不會因平行化突破速率或額度限制。
+   EODHD、TWSE 與 TPEx 以三個獨立頂層迴圈平行抓取，迴圈內再依商品／官方 benchmark
+   所列實際交易日使用 thread pool；因果視窗依商品平行建立，pytest worker 也不會超過
+   這個有效核心數。每個 provider 有自己的 QPS limiter。`--max-api-calls` 只限制 EODHD，
+   TWSE／TPEx 沒有專案端 request-count ceiling，而由 `--maxBackoff` 控制暫停邊界。
+   任一 provider 先退出都不會取消另外兩個；主流程 join 全部迴圈後才合併 provider-local
+   Parquet/request-log 分片或發布續傳狀態。完整 request 估算只作資訊；workflow 自動保留 max runtime 的 25%（最多 2 小時；預設 6 小時即
+   90 分鐘）給 data cleaning/window construction，也可用 `--prepareReserve` 調整。
 4. 建立並驗證下列 persistent artifacts：
    | 遠端路徑                                                                  | 內容                                              |
    | ------------------------------------------------------------------------- | ------------------------------------------------- |
    | `/runpod-volume/datasets/<dataset-request-sha256>/api-cache/`            | provider raw response cache                       |
-   | `/runpod-volume/datasets/<dataset-request-sha256>/download-progress.json` | 續傳 attempt、cache 數量與安全的 provider 等待資訊 |
-   | `/runpod-volume/datasets/<dataset-request-sha256>/raw/market.parquet`    | canonical daily OHLCV                             |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/download-progress.json` | 續傳 attempt、cache 數量與 provider／budget／runtime 等待狀態 |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/raw/market.parquet`    | durable `downloaded` checkpoint 的 canonical daily OHLCV |
    | `/runpod-volume/datasets/<dataset-request-sha256>/processed/windows.parquet` | 因果訓練視窗                                  |
    | `/runpod-volume/datasets/<dataset-request-sha256>/download-manifest.json` | 實際 provider、profile、symbols 與下載 provenance |
    | `/runpod-volume/datasets/<dataset-request-sha256>/dataset-manifest.json` | split counts、hash 與資料契約                     |
    | `/runpod-volume/datasets/<dataset-request-sha256>/manifests/api-request-log.jsonl` | 不含 token 的 request audit             |
    | `/runpod-volume/cache/huggingface/`                                      | 離線 Kronos model/tokenizer cache                 |
    | `/runpod-volume/cache/hf-models.json`                                    | 固定 model revisions 與 cache manifest            |
-5. 將 selection ID/SHA、dataset request SHA、stage/config SHA、requested
+5. raw Parquet、download manifest 與 request log 完整驗證後先發布 `downloaded`
+   lifecycle。沒有 exit code 的 `downloaded` 是同一 Pod 內的中間 checkpoint，外部 guard
+   不會誤判為終態；若剩餘時間少於 cleaning reserve，腳本才以 exit code 75 將它標記為
+   可續傳終態，下一個 CPU Pod 直接從 checkpoint 執行清理，不再呼叫 provider。其後才將
+   selection ID/SHA、dataset request SHA、stage/config SHA、requested
    profile/date/universe 與 resolved artifact hashes 綁入
    `/runpod-volume/lifecycle/stage1/dataset.json`；只有全部檢查成功才發布並
    自動終止 Pod。
@@ -621,17 +657,27 @@ bash scripts/runpod_workflow.sh status
 
 ##### Provider quota 與跨 CPU Pod 續傳
 
-若下載遇到 429、暫時性網路錯誤或 provider 5xx，下載器會先做有限次重試；仍無法
-完成時會採取下列動作：
+EODHD、TWSE 與 TPEx 使用彼此獨立的平行迴圈。retryable 的 429、暫時性網路錯誤或
+provider 5xx 都採指數退避，但退出條件不同：EODHD 以該 CPU attempt 的 EODHD
+network-attempt count（`--max-api-calls`）為界；TWSE／TPEx 不設 request-count 上限，
+而在下一次退避將超過 `--maxBackoff`（預設 `1m`）時退出。共同 acquisition deadline
+仍可讓任何迴圈進入 `waiting_for_resume`，以保留 data cleaning 時間。流程遵守下列契約：
 
 1. 已成功取得的每個 raw JSON response 仍保留在該 dataset request 專屬的
    `api-cache/`，不發布不完整 Parquet 或 `state=ready` marker。
-2. `download-progress.json` 記錄 attempt number、各 provider 的 cache 數量、此次
-   network attempts，以及供應商有回傳時的 HTTP status、`Retry-After` 與
-   rate-limit headers；不記錄 token 或 response body。
-3. dataset lifecycle 進入 `waiting_for_provider`，GPU readiness 維持不通過，CPU
-   Pod 自動終止，不會為每日／每週重置時間持續空轉計費。
-4. 額度恢復後，**不要重新 `configure`、不要改 `--dataset-revision`、不要刪除
+2. EODHD 先達 `--max-api-calls` 時只退出 EODHD 迴圈，TWSE／TPEx 繼續；任一台灣
+   provider 先超過最大退避時，也不會停止 EODHD 或另一個台灣 provider。主流程一定
+   等到所有已選 provider 迴圈退出，才決定下一步與允許 CPU Pod 結束。
+3. `download-progress.json` 記錄 attempt number、各 provider cache／network counts、
+   EODHD limited count，以及每個 provider 的 `complete`、`waiting_for_budget`、
+   `waiting_for_provider` 或 `waiting_for_resume` outcome；台灣錯誤另記已等待總秒數、
+   最後等待、下一次 proposed backoff 與最大值。HTTP status、`Retry-After` 與
+   rate-limit headers 只在供應商有回傳時記錄；不記錄 token 或 response body。
+4. 若任一迴圈仍未完成，dataset lifecycle 依整體 outcome 進入
+   `waiting_for_budget`、`waiting_for_provider` 或 `waiting_for_resume`，GPU readiness
+   維持不通過，CPU Pod 才自動終止。若三者都完成，則以固定 provider 順序合併分片，
+   繼續 data cleaning，不會提早關閉 Pod。
+5. 額度恢復後，**不要重新 `configure`、不要改 `--dataset-revision`、不要刪除
    cache**。在本機再次建立 CPU Pod，登入後重新啟動同一個 workflow：
 
    ```bash
@@ -641,7 +687,7 @@ bash scripts/runpod_workflow.sh status
    bash scripts/runpod_tmux_launch.sh cpu-prepare
    ```
 
-5. 新 attempt 會用相同 dataset request identity 重新播放已快取 responses，只對缺少
+6. 新 attempt 會用相同 dataset request identity 重新播放已快取 responses，只對缺少
    的 request 呼叫 provider；Parquet 會由完整 response 集合重新建立。只有全部資料、
    manifest 與 selection gate 都通過後，lifecycle 才會變成 `ready`。`all` 模式的
    discovery response 也屬於同一份 immutable cache，因此跨日續傳不會重新取得一份
@@ -653,12 +699,14 @@ attempt、已快取 response 數、此次 network request 數、可用的完整 
 
 這是 request-level 續傳，不是 HTTP response 的 byte-range 續傳。每個成功完成的 API
 request 都是續傳單位。若 `download-progress.json` 的 identity 與目前 dataset request
-不同，流程會 fail closed，避免混用不同 profile、日期或 universe。401／403、過小的
-`--max-api-calls` 或其他設定錯誤會標記為 `failed`；先修正 Secret 或重新執行
-`configure` 調高 safety budget，再以相同 dataset request 重跑。只有確實要建立新的
+不同，流程會 fail closed，避免混用不同 profile、日期或 universe。過小的
+`--max-api-calls` 會產生可續傳的 `waiting_for_budget`，不是失敗，也不要求重新
+`configure`；可用相同 selection 直接建立下一個 CPU Pod。401／403 或其他非暫時性
+設定錯誤才標記為 `failed`，應先修正 Secret。只有確實要建立新的
 provider 資料快照時才改 `--dataset-revision`，新 revision 不會沿用舊 snapshot cache。
 
-若狀態是 `waiting_for_provider`、`failed` 或 `timed_out`，先從 lifecycle 讀取
+若狀態是 `waiting_for_budget`、`waiting_for_provider`、`waiting_for_resume`、`failed`
+或 `timed_out`，先從 lifecycle 讀取
 `launch_id`、`log_path` 與可用的 `progress_path`。tmux log 目錄固定為
 `logs/tmux/fin-ts-cpu-prepare/<launch-id>/`；由腳本解析並下載到本機診斷目錄：
 
@@ -1150,7 +1198,11 @@ the benchmark from consuming one of the N ETF candidate slots. The raw universe
 is therefore at most `N ETFs + N stocks + 1 VTI`, while data-length, benchmark
 mapping, and quality gates can reduce the actual trainable-target count.
 
-Raw O/H/L/C/V is retained permanently. Model windows normalize each vendor or
+Raw O/H/L/C is retained permanently, as is official Taiwan raw volume. EODHD
+defines its EOD `volume` as already split-adjusted, so the pipeline uses the
+complete Historical Splits response to reconstruct contemporaneous unadjusted
+`volume` and retains the vendor value as `split_adjusted_volume`; it never
+multiplies that value by the split factor again. Model windows normalize each vendor or
 official total-return factor to `cutoff_at` before applying it to historical
 O/H/L/C, so future corporate actions cannot rewrite an after-close inference
 input. Volume is adjusted only for splits/share changes, never for cash
@@ -1159,10 +1211,12 @@ Splits API for every date range. EODHD lists that endpoint under EOD
 Historical Data — All World at one API call per request; the pipeline does not
 use `calendar/splits`, which belongs to Calendar-enabled products. Each symbol
 therefore requires one EOD-history request plus one split-history request. Both
-are cacheable/resumable and included in the pre-download
-`STAGE1_MAX_API_CALLS` estimate; the provider's pre-2018 delisting exception is
-retained explicitly in the warning described above. Taiwan uses official TWSE/TPEx ex-right/ex-dividend
-data and official return indices. This removes artificial corporate-action
+are cacheable/resumable and included in the informational request estimate; the
+estimate never blocks a complete dataset. The provider's pre-2018 delisting
+exception is retained explicitly in the warning described above. Taiwan uses
+official TWSE/TPEx ex-right/ex-dividend data and return indices. Existing monthly
+benchmark rows provide the actual trading sessions, so ordinary weekdays are
+not blindly treated as open sessions. This removes artificial corporate-action
 gaps while retaining the tradable next-day raw-open entry semantics.
 
 Raw OHLCV Parquet is written incrementally, but processed-window preparation
@@ -1199,15 +1253,30 @@ Stage 1 / Stage 2 training (fully offline)
 The downloader provides:
 
 - Provider-specific QPS throttling.
-- Bounded retries with exponential backoff.
-- `max_api_calls` limits both estimated HTTP requests for the complete plan and
-  actual network attempts, including retries, across providers in one CPU
-  attempt; cache hits do not consume it.
+- Independent parallel EODHD, TWSE, and TPEx loops with exponential backoff for
+  retryable requests.
+- Estimated HTTP requests for the complete plan are informational capacity data.
+  The final Taiwan plan uses official benchmark sessions and records its
+  pre-calendar weekday upper bound separately; neither is an admission gate.
+- `max_api_calls` limits only EODHD network attempts, including retries, in one
+  CPU attempt. TWSE/TPEx have no request-count ceiling and instead exit at the
+  default one-minute `--maxBackoff` boundary. Cache hits do not consume the
+  EODHD counter; incomplete work is saved for another Pod.
+- One provider exiting never cancels another. Only after every provider loop
+  exits does the workflow publish a resume state or deterministically merge
+  provider-local artifacts.
 - Neither QPS nor `max_api_calls` represents a provider's daily/weekly quota or
   EODHD's endpoint-specific billed call units.
-- After retry exhaustion on a temporary provider failure or HTTP 429,
-  successful raw responses remain cached, `download-progress.json` is updated,
-  and a later CPU Pod requests only missing cache entries.
+- After a temporary provider failure, HTTP 429, per-attempt request-budget
+  exhaustion, or acquisition-time exhaustion, successful raw responses remain
+  cached, `download-progress.json` is updated, and a later CPU Pod requests only
+  missing cache entries.
+- The CPU workflow reserves 25% of max runtime for canonical cleaning and causal
+  window construction by default, capped at 2 hours and explicitly configurable
+  through `--prepareReserve`. Once
+  acquisition completes, raw Parquet, the request log, and the download manifest
+  become a durable `downloaded` checkpoint. A later Pod can skip every API call;
+  only verified processed data and readiness can become `ready`.
 - Cache identities, request logs, and manifests that exclude API tokens.
 - A raw cache and direct download/preparation CLIs that refuse silent overwrite.
 - SHA-256, row-count, and provenance bindings for artifacts.
@@ -1405,7 +1474,7 @@ All user-facing `configure` options are:
 | `--stocks` | Comma- or space-separated US tickers; repeatable | US stocks in `explicit` mode, such as `"AAPL,MSFT"`; does not affect Taiwan data |
 | `--etfs` | Comma- or space-separated US tickers; repeatable | US ETFs in `explicit` mode, such as `"SPY,QQQ"`; does not affect Taiwan data |
 | `--symbol-limit` | Positive integer N | **A bounded capacity/workflow check, not a complete-US-market mode.** Only valid for a US-containing `all` profile. After discovery, split ETFs and stocks, then keep up to N of each by active → delisted and ticker order; take all when a type has fewer than N. This is neither random nor representative sampling. Then ensure the required `VTI.US` benchmark is present: do not duplicate it if it is among the N ETFs, otherwise add it, so the raw universe is at most `2N+1`. Omit this option for all discovered US stocks and ETFs |
-| `--max-api-calls` | Positive integer; default `100000` | Project-side request safety budget, not a sample count. Its default number matches EODHD's official 100,000 daily API calls for paid plans, but the code still uses it to limit estimated complete-plan HTTP requests and network attempts, including retries, in one CPU attempt. Exceeding it fails closed without shrinking the dataset. It neither reads already-consumed account quota nor assumes every endpoint's HTTP request always costs exactly one billed call unit |
+| `--max-api-calls` | Positive integer; default `100000` | Project-side EODHD network-attempt safety budget for one acquisition—not a sample count, complete-dataset ceiling, Pod-creation rule, or actual remaining daily account quota. Only EODHD cache misses and retries consume it; TWSE/TPEx requests are recorded but unlimited by this counter. At the ceiling, only the EODHD loop exits while other provider loops continue. The workflow enters resumable `waiting_for_budget` only after every provider loop has exited. It does not assume every endpoint request costs exactly one billed call unit |
 | `--eodhd-qps` | Positive number; default `16` | EODHD requests-per-second pacing. The official limit is 1,000 requests per minute, while the default is floored to 16 requests per second (at most 960 per minute), leaving 40 requests per minute (4%) of headroom. The client spaces requests evenly. This does not replace the daily call quota, and `tw_only` never calls EODHD |
 | `--taiwan-qps` | Positive number; default `0.5` | Maximum TWSE/TPEx requests per second. It controls short-term pacing; `us_only_eodhd` never calls a Taiwan provider |
 | `--interactive` | Flag with no value | Explicitly open the interactive prompts; invoking `configure` with no options enables this mode automatically |
@@ -1444,10 +1513,12 @@ bash scripts/runpod_workflow.sh configure \
   --taiwan-qps 0.5
 ```
 
-`--max-api-calls 10000` is only a safety ceiling for this date range; it does
-not truncate either market to 10,000 rows. Using `5000`, which is too small for
-the complete Taiwan day-by-day requests over this period, makes CPU preparation
-fail instead of silently reducing the dataset scope.
+`--max-api-calls 10000` limits only EODHD network attempts in one acquisition.
+It neither truncates either market to 10,000 rows nor requires the full dataset
+to finish within 10,000 requests. At the ceiling, the EODHD loop exits while the
+parallel TWSE/TPEx loops continue. CPU preparation saves cache and
+`waiting_for_budget` progress only after all three loops exit; another Pod fills
+missing responses under the same immutable selection.
 
 Provider quotas are a separate boundary. EODHD's current pricing page lists the
 personal `EOD Historical Data — All World` plan at USD 19.99 per month. Its
@@ -1460,10 +1531,9 @@ pacing to 16 requests per second (960 per minute); lower `--eodhd-qps` further
 if another client uses the same account concurrently. See
 [EODHD Pricing](https://eodhd.com/pricing),
 [EODHD API Limits](https://eodhd.com/financial-apis/api-limits) and the
-[EODHD User API](https://eodhd.com/financial-apis/user-api). For a complete US
-stock and ETF download, `--max-api-calls` must cover the complete request plan;
-the resumable CPU workflow below handles provider daily/weekly quotas across
-multiple attempts.
+[EODHD User API](https://eodhd.com/financial-apis/user-api). A complete US stock
+and ETF request plan may exceed `--max-api-calls`; the resumable CPU workflow
+handles both project and provider boundaries across multiple attempts.
 
 For the complete EODHD discovery scope plus the complete Taiwan market, provide
 none of `--stocks`, `--etfs`, or `--symbol-limit`:
@@ -1477,10 +1547,11 @@ bash scripts/runpod_workflow.sh configure \
   --universe all
 ```
 
-If the post-discovery complete HTTP request estimate exceeds the default
-`100000`, preparation reports the estimate and stops. Assess cost, then rerun
-`configure` with a larger `--max-api-calls`. Raising this safety ceiling does
-not enable sampling or bypass provider quotas.
+Even when the post-discovery complete HTTP request estimate exceeds the default
+`100000`, it remains informational: it neither prevents Pod creation nor shrinks
+the dataset. Each CPU attempt sends at most the configured EODHD network attempts
+and the next Pod resumes from cache. Adjust `--max-api-calls` for cost and usage
+control; it never bypasses provider quotas.
 
 To use the same explicit US universe while downloading **no Taiwan data**, set
 the profile to `us_only_eodhd`:
@@ -1569,8 +1640,12 @@ selection, rerun CPU preparation as well. Never bypass the GPU gate.
 The CPU Pod accepts only the active selection. Pod creation fails before any
 compute is rented when `configure` has not run, the config SHA changed, or the
 selection JSON is incomplete. With no resource options, the local command is
-interactive: it prompts for the maximum workload runtime, vCPU count, and CPU
-flavor. Pressing Enter accepts the defaults of 6 hours, 8 vCPUs, and `cpu3g`.
+interactive: it prompts for the maximum workload runtime, the time reserved for
+data cleaning/window construction, maximum TWSE/TPEx retry backoff, vCPU count,
+and CPU flavor. Pressing Enter accepts 6 hours, an automatic reserve, 1 minute,
+8 vCPUs, and `cpu3g`. The automatic
+reserve is 25% of max runtime, capped at 2 hours; the six-hour default reserves
+90 minutes.
 The final prompt requires `y` or `yes` before creating a potentially billable
 Pod; Enter, `n`, or `no` cancels safely:
 
@@ -1585,6 +1660,8 @@ explicitly without editing `.env`:
 ```bash
 bash scripts/runpod_workflow.sh cpu prepare \
   --maxRuntime 10h \
+  --prepareReserve 2h \
+  --maxBackoff 1m \
   --cpuNumber 16 \
   --cpuFlavor cpu5g
 ```
@@ -1596,14 +1673,20 @@ user can confirm or replace:
 bash scripts/runpod_workflow.sh cpu prepare \
   --interactive \
   --maxRuntime 10h \
+  --prepareReserve auto \
+  --maxBackoff 1m \
   --cpuNumber 16 \
   --cpuFlavor cpu5g
 ```
 
-`--maxRuntime` accepts a positive integer followed by `m`, `h`, or `d`.
-`--cpuNumber` must be between 1 and 32. `--cpuFlavor` accepts only the six
-RunPod values below; any other value or more than 32 vCPUs fails before Pod
-creation:
+`--maxRuntime`, an explicit `--prepareReserve`, and `--maxBackoff` accept a
+positive integer followed by `m`, `h`, or `d`. `--prepareReserve auto` uses the
+formula above; an explicit reserve must be shorter than max runtime.
+`--maxBackoff` defaults to `1m` and applies only to TWSE/TPEx. A provider loop
+exits when its next exponential or `Retry-After` delay would **exceed** this
+limit; a delay equal to the limit is still performed. `--cpuNumber` must be
+between 1 and 32. `--cpuFlavor` accepts only the six RunPod values below; any
+other value or more than 32 vCPUs fails before Pod creation:
 
 | Flavor | Generation | Type | RAM / vCPU | RAM at 32 vCPUs | Container-disk limit |
 | --- | ---: | --- | ---: | ---: | ---: |
@@ -1646,24 +1729,38 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    environment from the mounted immutable selection before downloading. Cache
    hits do not call the provider again. The script reads the requested vCPU
    count, RunPod's `RUNPOD_CPU_COUNT`, and the cores visible to the container,
-   then uses the minimum as its worker count. Provider acquisition uses thread
-   pools across instruments/trading dates, causal-window construction runs
-   across symbols, and pytest workers never exceed the effective CPU count.
-   Every download worker shares one provider QPS limiter and API request budget,
-   so concurrency cannot bypass pacing or quota safety.
+   then uses the minimum as its worker count. EODHD, TWSE, and TPEx run as three
+   independent top-level acquisition loops; each loop uses a thread pool across
+   instruments or actual sessions listed by official benchmark history.
+   Causal-window construction runs across symbols, and pytest workers never
+   exceed the effective CPU count. Each provider has its own QPS limiter.
+   `--max-api-calls` limits only EODHD; TWSE/TPEx have no project-side request
+   counter ceiling and instead use `--maxBackoff`. One provider exiting never
+   cancels the other two. The process joins all loops before deterministically
+   merging provider-local Parquet/request-log parts or publishing a resume state. The
+   complete-plan estimate is informational. The workflow automatically reserves
+   25% of max runtime for cleaning/window construction (90 minutes for the
+   default six-hour runtime and capped at 2 hours), configurable with
+   `--prepareReserve`.
 4. Creates and verifies these persistent artifacts:
    | Remote path                                                                        | Contents                                                    |
    | ---------------------------------------------------------------------------------- | ----------------------------------------------------------- |
    | `/runpod-volume/datasets/<dataset-request-sha256>/api-cache/`                     | Provider raw-response cache                                 |
-   | `/runpod-volume/datasets/<dataset-request-sha256>/download-progress.json`          | Resume attempt, cache counts, and safe provider-wait details |
-   | `/runpod-volume/datasets/<dataset-request-sha256>/raw/market.parquet`             | Canonical daily OHLCV                                       |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/download-progress.json`          | Resume attempt, cache counts, and provider/budget/runtime wait state |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/raw/market.parquet`             | Canonical daily OHLCV in the durable `downloaded` checkpoint |
    | `/runpod-volume/datasets/<dataset-request-sha256>/processed/windows.parquet`      | Causal training windows                                     |
    | `/runpod-volume/datasets/<dataset-request-sha256>/download-manifest.json`         | Actual providers, profile, symbols, and download provenance |
    | `/runpod-volume/datasets/<dataset-request-sha256>/dataset-manifest.json`          | Split counts, hashes, and data contract                     |
    | `/runpod-volume/datasets/<dataset-request-sha256>/manifests/api-request-log.jsonl` | Request audit without tokens                               |
    | `/runpod-volume/cache/huggingface/`                                             | Offline Kronos model/tokenizer cache                        |
    | `/runpod-volume/cache/hf-models.json`                                           | Pinned model revisions and cache manifest                   |
-5. Binds the selection ID/SHA, dataset request SHA, stage/config SHA, requested
+5. Publishes a `downloaded` lifecycle after validating raw Parquet, the download
+   manifest, and the request log. A `downloaded` marker without an exit code is an
+   intermediate checkpoint in the same Pod, so the external guard does not treat it
+   as terminal. Only when the remaining time is below the cleaning reserve does exit
+   code 75 make it a resumable terminal state; the next CPU Pod then cleans directly
+   from the checkpoint without provider calls. It binds the selection ID/SHA,
+   dataset request SHA, stage/config SHA, requested
    profile/date/universe, and resolved artifact hashes into
    `/runpod-volume/lifecycle/stage1/dataset.json`. It publishes the marker only
    after every check passes, then terminates automatically.
@@ -1689,20 +1786,32 @@ bash scripts/runpod_workflow.sh status
 
 ##### Provider quotas and cross-Pod resume
 
-When a download receives HTTP 429, a temporary network error, or provider 5xx,
-the downloader first performs bounded retries. If completion is still
-impossible, it follows this contract:
+EODHD, TWSE, and TPEx use independent parallel loops. Retryable HTTP 429,
+temporary network failures, and provider 5xx responses use exponential backoff,
+but the exit conditions differ. EODHD is bounded by its network-attempt count
+for the CPU attempt (`--max-api-calls`). TWSE/TPEx have no request-count ceiling;
+they exit when the next retry delay would exceed `--maxBackoff` (default `1m`).
+The shared acquisition deadline can still place any loop in `waiting_for_resume`
+to protect cleaning time. The workflow follows this contract:
 
 1. Every successful raw JSON response remains in the dataset request's
    `api-cache/`. No incomplete Parquet or `state=ready` marker is published.
-2. `download-progress.json` records the attempt number, per-provider cache
-   counts, network attempts in this execution, and—when supplied—HTTP status,
-   `Retry-After`, and rate-limit headers. It stores neither tokens nor response
-   bodies.
-3. The dataset lifecycle becomes `waiting_for_provider`, GPU readiness remains
-   blocked, and the CPU Pod terminates instead of accruing cost while waiting
-   for a daily or weekly reset.
-4. After quota becomes available, **do not reconfigure, change
+2. If EODHD reaches `--max-api-calls` first, only its loop exits; TWSE/TPEx
+   continue. A Taiwan provider crossing its backoff boundary likewise does not
+   stop EODHD or the other Taiwan provider. The main process always waits for
+   every selected provider loop to exit before the CPU Pod may finish.
+3. `download-progress.json` records the attempt, per-provider cache/network
+   counts, the limited EODHD count, and each provider's `complete`,
+   `waiting_for_budget`, `waiting_for_provider`, or `waiting_for_resume` outcome.
+   Taiwan errors also record cumulative wait, last wait, next proposed backoff,
+   and the maximum. HTTP status, `Retry-After`, and rate-limit headers are stored
+   when supplied; tokens and response bodies are not.
+4. If any loop is incomplete, the aggregate lifecycle becomes
+   `waiting_for_budget`, `waiting_for_provider`, or `waiting_for_resume`; GPU
+   readiness stays blocked, and only then does the CPU Pod terminate. If all
+   loops complete, provider-local parts are merged in a fixed order and cleaning
+   continues instead of closing the Pod early.
+5. After quota becomes available, **do not reconfigure, change
    `--dataset-revision`, or delete the cache**. Create another CPU Pod locally,
    connect to it, and start the same workflow:
 
@@ -1713,7 +1822,7 @@ impossible, it follows this contract:
    bash scripts/runpod_tmux_launch.sh cpu-prepare
    ```
 
-5. The new attempt replays cached responses under the same dataset request
+6. The new attempt replays cached responses under the same dataset request
    identity and calls the provider only for missing requests. It rebuilds
    Parquet from the complete response set. The lifecycle becomes `ready` only
    after all data, manifests, and selection gates pass. The `all`-mode discovery
@@ -1728,13 +1837,15 @@ JSON file needs to be opened manually.
 This is request-level resume, not byte-range resume within one HTTP response.
 Each successfully completed API request is the resume unit. A progress identity
 that differs from the current profile, dates, universe, or dataset request
-fails closed. A 401/403, an undersized `--max-api-calls`, or another
-configuration error produces `failed`: correct the Secret or rerun `configure`
-with a larger safety budget, then retry the same dataset request. Change
+fails closed. An undersized `--max-api-calls` produces resumable
+`waiting_for_budget`, not failure; create another CPU Pod with the same selection.
+A 401/403 or other non-temporary configuration error produces `failed` and
+requires correcting the Secret. Change
 `--dataset-revision` only for an intentional new provider snapshot; a new
 revision does not reuse the old snapshot cache.
 
-If the state is `waiting_for_provider`, `failed`, or `timed_out`, first read
+If the state is `waiting_for_budget`, `waiting_for_provider`,
+`waiting_for_resume`, `failed`, or `timed_out`, first read
 `launch_id`, `log_path`, and any `progress_path` from the lifecycle. The tmux log directory is
 `logs/tmux/fin-ts-cpu-prepare/<launch-id>/`; let the script resolve and download
 it into the local diagnostic directory:

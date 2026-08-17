@@ -47,7 +47,7 @@ STAGE_RUNTIME = {
 
 # These settings define dataset semantics and must change the dataset request digest.
 PREPARATION_CONTRACT = {
-    "schema_version": 1,
+    "schema_version": 2,
     "processed_schema_version": "3.0",
     "window_size": 128,
     "stride": 5,
@@ -59,10 +59,8 @@ PREPARATION_CONTRACT = {
     "entry_day_counts_as_holding_day_one": True,
     "exit_timing": "regular_session_close_t_plus_h",
     "input_adjustment": "point_in_time_total_return_ohlc_split_adjusted_volume",
-    "eodhd_split_policy": "per_symbol_historical_splits_all_ranges",
-    "us_symbol_limit_policy": (
-        "up_to_n_etfs_and_n_stocks_active_then_delisted_ticker_plus_vti"
-    ),
+    "eodhd_split_policy": "per_symbol_full_historical_splits_reconstruct_unadjusted_volume_v2",
+    "us_symbol_limit_policy": "up_to_n_etfs_and_n_stocks_active_then_delisted_ticker_plus_vti",
     "benchmark_mapping_sha256": (
         "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
     ),
@@ -231,9 +229,7 @@ def _active_pointer_path(project_root: Path) -> Path:
 
 def _atomic_write_json(path: Path, payload: Dict[str, Any], mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.tmp-", dir=str(path.parent)
-    )
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=str(path.parent))
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, mode)
@@ -400,8 +396,7 @@ def _validate_selection(
         not isinstance(stocks, list)
         or stocks != sorted(set(stocks))
         or any(
-            not isinstance(value, str) or not SYMBOL_PATTERN.fullmatch(value)
-            for value in stocks
+            not isinstance(value, str) or not SYMBOL_PATTERN.fullmatch(value) for value in stocks
         )
         or not isinstance(etfs, list)
         or etfs != sorted(set(etfs))
@@ -593,8 +588,7 @@ def _populate_interactive(arguments: argparse.Namespace) -> None:
             arguments.stocks = []
             arguments.etfs = []
             limit = _prompt_text(
-                "Optional per-type US discovery limit: up to N ETFs and N stocks "
-                "(blank means all)"
+                "Optional per-type US discovery limit: up to N ETFs and N stocks (blank means all)"
             )
             arguments.symbol_limit = int(limit) if limit else None
     arguments.max_api_calls = int(
@@ -665,9 +659,7 @@ def _assert_equal(actual: Any, expected: Any, label: str) -> None:
         _fail(f"{label} mismatch: prepared={actual!r}, selected={expected!r}")
 
 
-def _validate_marker_artifact_paths(
-    marker: Dict[str, Any], dataset_request_sha256: str
-) -> None:
+def _validate_marker_artifact_paths(marker: Dict[str, Any], dataset_request_sha256: str) -> None:
     dataset_prefix = f"datasets/{dataset_request_sha256}/"
     for name in ("raw", "processed", "dataset_manifest", "download_manifest", "request_log"):
         artifact = marker.get(name)
@@ -830,17 +822,11 @@ def _verify_environment(
             "STAGE1_TAIWAN_QPS",
         )
     }
-    expected["DATA_ROOT"] = (
-        f"{network_volume_root}/datasets/{selection['dataset_request_sha256']}"
-    )
+    expected["DATA_ROOT"] = f"{network_volume_root}/datasets/{selection['dataset_request_sha256']}"
     expected["RUNPOD_REMOTE_SELECTION_PATH"] = str(selection_path)
     for key, expected_value in expected.items():
         actual_value = environment.get(key)
-        if (
-            key in OPTIONAL_EMPTY_ENVIRONMENT_KEYS
-            and expected_value == ""
-            and actual_value is None
-        ):
+        if key in OPTIONAL_EMPTY_ENVIRONMENT_KEYS and expected_value == "" and actual_value is None:
             actual_value = ""
         _assert_equal(actual_value, expected_value, f"Pod environment {key}")
 

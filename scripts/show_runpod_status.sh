@@ -122,6 +122,14 @@ for key in ("category", "provider", "status_code", "retry_after_seconds"):
     value = error.get(key)
     if value is not None:
         fields.append(key + "=" + str(value))
+outcomes = error.get("provider_outcomes")
+if isinstance(outcomes, dict):
+    provider_states = []
+    for provider, outcome in sorted(outcomes.items()):
+        if isinstance(outcome, dict):
+            provider_states.append(provider + ":" + str(outcome.get("state", "unknown")))
+    if provider_states:
+        fields.append("providers=" + ",".join(provider_states))
 print("{:<12} {}".format("download", " ".join(fields)))
 '
 }

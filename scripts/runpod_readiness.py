@@ -27,6 +27,14 @@ ISO_TIMESTAMP_PATTERN = re.compile(
 )
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
 CHECKPOINT_NAME_PATTERN = re.compile(r"^checkpoint-[0-9]{6,}$")
+DATASET_RESUMABLE_STATES = frozenset(
+    {
+        "waiting_for_provider",
+        "waiting_for_budget",
+        "waiting_for_resume",
+        "downloaded",
+    }
+)
 
 
 StageContract = namedtuple(
@@ -626,9 +634,7 @@ def _validate_quant_dataset_payload(
         r"selection-[0-9a-f]{16}", selection_id
     ):
         raise ValueError("Dataset readiness selection_id is invalid")
-    if not isinstance(selection_sha256, str) or not re.fullmatch(
-        r"[0-9a-f]{64}", selection_sha256
-    ):
+    if not isinstance(selection_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", selection_sha256):
         raise ValueError("Dataset readiness selection digest is invalid")
     if not isinstance(dataset_request_sha256, str) or not re.fullmatch(
         r"[0-9a-f]{64}", dataset_request_sha256
@@ -866,9 +872,8 @@ def command_check_dataset(arguments):
         arguments.expected_code_release_digest,
         stage_contract,
     )
-    if (
-        arguments.stage_config is not None
-        and payload.get("stage_config_sha256") != _sha256(arguments.stage_config)
+    if arguments.stage_config is not None and payload.get("stage_config_sha256") != _sha256(
+        arguments.stage_config
     ):
         raise ValueError("Dataset was prepared for a different stage config revision")
     if arguments.network_volume_root is not None:
@@ -1026,9 +1031,7 @@ def command_resumable_training_run(arguments):
     if payload.get("state") not in {"failed", "timed_out"}:
         raise ValueError("Training lifecycle is not failed or timed out")
     if payload.get("training_completed") is True:
-        raise ValueError(
-            "Training already completed; resume standalone validation instead"
-        )
+        raise ValueError("Training already completed; resume standalone validation instead")
     volume_root = arguments.network_volume_root.resolve(strict=False)
     _validate_run_lifecycle_paths(payload, volume_root)
     run_id = _validate_run_id(payload.get("wandb_run_id"), "Training lifecycle run ID")
@@ -1404,9 +1407,7 @@ def command_checkpoint_download_names(arguments):
         contract_digest=contract_digest,
     )
     selected = (
-        [row["path"] for row in checkpoints]
-        if arguments.scope == "all"
-        else [best_checkpoint]
+        [row["path"] for row in checkpoints] if arguments.scope == "all" else [best_checkpoint]
     )
     sys.stdout.write("\n".join(selected) + "\n")
     return 0
@@ -1488,8 +1489,12 @@ def command_write_state(arguments):
         raise ValueError("Lifecycle kind is unsupported")
     if output != expected_output.resolve(strict=False):
         raise ValueError(f"{arguments.kind} lifecycle must equal {expected_output}")
-    if arguments.state == "waiting_for_provider" and arguments.kind != "stage1-dataset":
-        raise ValueError("waiting_for_provider is valid only for stage1-dataset")
+    if arguments.state in DATASET_RESUMABLE_STATES and arguments.kind != "stage1-dataset":
+        raise ValueError(f"{arguments.state} is valid only for stage1-dataset")
+    if arguments.state in DATASET_RESUMABLE_STATES - {"downloaded"} and arguments.exit_code != 75:
+        raise ValueError(f"{arguments.state} lifecycle requires exit_code=75")
+    if arguments.state == "downloaded" and arguments.exit_code not in {None, 75}:
+        raise ValueError("downloaded lifecycle accepts only no exit code or exit_code=75")
     resolved_progress_path = None
     if arguments.progress_path:
         if arguments.kind != "stage1-dataset":
@@ -1520,19 +1525,17 @@ def command_write_state(arguments):
             progress_payload.get("schema_version") != 1
             or progress_payload.get("kind") != "ohlcv-download-progress"
             or not isinstance(progress_identity, dict)
-            or progress_payload.get("identity_sha256")
-            != _payload_sha256(progress_identity)
-            or progress_identity.get("dataset_request_sha256")
-            != progress_relative.parts[0]
+            or progress_payload.get("identity_sha256") != _payload_sha256(progress_identity)
+            or progress_identity.get("dataset_request_sha256") != progress_relative.parts[0]
         ):
             raise ValueError("Download progress identity does not match its dataset namespace")
         if (
-            arguments.state == "waiting_for_provider"
-            and progress_payload.get("state") != "waiting_for_provider"
+            arguments.state in DATASET_RESUMABLE_STATES
+            and progress_payload.get("state") != arguments.state
         ):
-            raise ValueError("Provider-wait lifecycle requires provider-wait download progress")
-    elif arguments.state == "waiting_for_provider":
-        raise ValueError("Provider-wait lifecycle requires --progress-path")
+            raise ValueError(f"{arguments.state} lifecycle requires matching download progress")
+    elif arguments.state in DATASET_RESUMABLE_STATES:
+        raise ValueError(f"{arguments.state} lifecycle requires --progress-path")
     inherited = {}
     if arguments.inherit_existing and output.is_file():
         with output.open("r", encoding="utf-8") as stream:
@@ -1570,6 +1573,9 @@ def command_write_state(arguments):
             "failed",
             "timed_out",
             "waiting_for_provider",
+            "waiting_for_budget",
+            "waiting_for_resume",
+            "downloaded",
         }:
             raise ValueError("Existing lifecycle state is unsupported for finalization")
     payload = {
@@ -1764,6 +1770,9 @@ def build_parser():
             "failed",
             "timed_out",
             "waiting_for_provider",
+            "waiting_for_budget",
+            "waiting_for_resume",
+            "downloaded",
         ),
         required=True,
     )

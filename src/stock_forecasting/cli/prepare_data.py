@@ -17,8 +17,8 @@ from stock_forecasting.data.manifest import (
     artifact_metadata,
     atomic_write_json,
     canonical_json_sha256,
-    load_dataset_manifest,
     sha256_file,
+    validate_download_manifest,
 )
 from stock_forecasting.data.quality import assess_ohlcv_quality
 from stock_forecasting.data.schema import read_market_data
@@ -106,30 +106,6 @@ def _load_benchmark_mapping(path: Path | None) -> tuple[dict[str, str], str]:
     return mapping, canonical_json_sha256(mapping)
 
 
-def _validate_download_manifest(
-    manifest_path: Path,
-    *,
-    input_path: Path,
-) -> dict[str, Any]:
-    payload = load_dataset_manifest(manifest_path, required_state="downloaded")
-    artifacts = payload.get("artifacts")
-    if not isinstance(artifacts, dict) or set(artifacts) != {"raw", "request_log"}:
-        raise ValueError("Download manifest must bind raw Parquet and API request log")
-    raw = artifacts["raw"]
-    if not isinstance(raw, dict):
-        raise ValueError("Download manifest raw artifact is invalid")
-    expected_path = manifest_path.parent / str(raw.get("relative_path", ""))
-    if expected_path.resolve(strict=False) != input_path.resolve(strict=False):
-        raise ValueError("Input Parquet does not match the download manifest")
-    if (
-        not input_path.is_file()
-        or input_path.stat().st_size != raw.get("size_bytes")
-        or sha256_file(input_path) != raw.get("sha256")
-    ):
-        raise ValueError("Raw Parquet integrity does not match the download manifest")
-    return payload
-
-
 def prepare_dataset(
     args: argparse.Namespace,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
@@ -138,9 +114,7 @@ def prepare_dataset(
         frame,
         max_abs_log_return=args.max_abs_log_return,
     )
-    benchmark_mapping, benchmark_mapping_sha256 = _load_benchmark_mapping(
-        args.benchmark_mapping
-    )
+    benchmark_mapping, benchmark_mapping_sha256 = _load_benchmark_mapping(args.benchmark_mapping)
     window_audit: dict[str, Any] = {}
     windows = build_causal_windows(
         frame,
@@ -235,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
         raise FileExistsError(
             f"Refusing to overwrite ready dataset manifest: {dataset_manifest_path}"
         )
-    download = _validate_download_manifest(
+    download = validate_download_manifest(
         download_manifest_path,
         input_path=args.input,
     )

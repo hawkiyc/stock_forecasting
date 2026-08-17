@@ -9,8 +9,10 @@ from typing import Any
 
 from stock_forecasting.data.manifest import atomic_write_json, canonical_json_sha256
 from stock_forecasting.data.providers.http import (
+    AcquisitionDeadlineExceeded,
     NetworkRequestBudget,
     NetworkRequestBudgetExceeded,
+    ProviderAcquisitionError,
     ProviderRequestError,
 )
 
@@ -60,19 +62,31 @@ def _cache_inventory(raw_cache_root: Path) -> dict[str, Any]:
 
 
 def _safe_error_metadata(error: BaseException) -> tuple[str, dict[str, Any]]:
+    if isinstance(error, ProviderAcquisitionError):
+        return error.state, error.metadata()
     if isinstance(error, ProviderRequestError):
         state = "waiting_for_provider" if error.retryable else "failed"
         return state, error.metadata()
     if isinstance(error, NetworkRequestBudgetExceeded):
-        return (
-            "failed",
-            {
-                "category": "network_request_safety_budget_exhausted",
-                "retryable": False,
-                "consumed": error.consumed,
-                "maximum": error.maximum,
-            },
-        )
+        payload: dict[str, Any] = {
+            "category": "network_request_safety_budget_exhausted",
+            "retryable": True,
+            "consumed": error.consumed,
+            "maximum": error.maximum,
+        }
+        if error.provider is not None:
+            payload["provider"] = error.provider
+        return "waiting_for_budget", payload
+    if isinstance(error, AcquisitionDeadlineExceeded):
+        payload = {
+            "category": "acquisition_time_budget_exhausted",
+            "retryable": True,
+            "deadline_epoch_seconds": error.deadline_epoch_seconds,
+            "observed_epoch_seconds": error.observed_epoch_seconds,
+        }
+        if error.required_wait_seconds is not None:
+            payload["required_wait_seconds"] = error.required_wait_seconds
+        return "waiting_for_resume", payload
     return (
         "failed",
         {
@@ -134,9 +148,7 @@ class DownloadProgress:
         estimated_http_requests: int | None = None,
     ) -> dict[str, Any]:
         first_started_at = self.started_at
-        if self.existing is not None and isinstance(
-            self.existing.get("first_started_at"), str
-        ):
+        if self.existing is not None and isinstance(self.existing.get("first_started_at"), str):
             first_started_at = self.existing["first_started_at"]
         payload: dict[str, Any] = {
             "schema_version": DOWNLOAD_PROGRESS_SCHEMA_VERSION,
@@ -152,7 +164,15 @@ class DownloadProgress:
                 "started_at": self.started_at,
                 "network_requests": request_budget.network_requests,
                 "network_requests_by_provider": request_budget.provider_counts,
+                "limited_network_requests": request_budget.limited_network_requests,
+                "limited_providers": (
+                    None
+                    if request_budget.limited_providers is None
+                    else sorted(request_budget.limited_providers)
+                ),
                 "max_network_requests": request_budget.max_network_requests,
+                "max_network_requests_semantics": "limited_providers_only",
+                "acquisition_deadline_epoch_seconds": (request_budget.deadline_epoch_seconds),
             },
             "cache": _cache_inventory(self.raw_cache_root),
             "resume": {
@@ -171,7 +191,7 @@ class DownloadProgress:
 
         atomic_write_json(
             self.path,
-            self._base_payload(state="in_progress", request_budget=request_budget),
+            self._base_payload(state="acquiring", request_budget=request_budget),
         )
 
     def fail(
@@ -202,7 +222,7 @@ class DownloadProgress:
         """Mark the raw download complete only after its immutable manifest exists."""
 
         payload = self._base_payload(
-            state="complete",
+            state="downloaded",
             request_budget=request_budget,
             estimated_http_requests=estimated_http_requests,
         )
