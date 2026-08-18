@@ -102,8 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=float(os.environ.get("RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS", "60")),
         help=(
-            "Maximum proposed TWSE/TPEx exponential-backoff delay; a provider loop "
-            "exits when its next delay would exceed this value."
+            "Maximum proposed EODHD/TWSE/TPEx exponential-backoff delay; the "
+            "affected provider loop exits when its next delay would exceed this value."
         ),
     )
     parser.add_argument(

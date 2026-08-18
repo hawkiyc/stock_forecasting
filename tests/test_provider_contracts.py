@@ -201,6 +201,40 @@ def test_parallel_provider_loops_wait_for_every_provider_after_eodhd_exits() -> 
     assert outcomes["tpex_official"].result == "tpex_official"
 
 
+def test_eodhd_backoff_exit_does_not_cancel_taiwan_provider_loops() -> None:
+    completed: list[str] = []
+
+    def eodhd() -> None:
+        raise ProviderRequestError(
+            provider="eodhd",
+            category="rate_limited",
+            attempts=1,
+            retryable=True,
+            proposed_backoff_seconds=120.0,
+            max_backoff_seconds=60.0,
+            exit_reason="proposed_backoff_exceeds_maximum",
+        )
+
+    def taiwan(provider: str) -> str:
+        completed.append(provider)
+        return provider
+
+    outcomes = _run_parallel_provider_loops(
+        {
+            "eodhd": eodhd,
+            "twse_official": lambda: taiwan("twse_official"),
+            "tpex_official": lambda: taiwan("tpex_official"),
+        }
+    )
+
+    assert set(completed) == {"twse_official", "tpex_official"}
+    eodhd_error = outcomes["eodhd"].error
+    assert isinstance(eodhd_error, ProviderRequestError)
+    assert eodhd_error.exit_reason == "proposed_backoff_exceeds_maximum"
+    assert outcomes["twse_official"].result == "twse_official"
+    assert outcomes["tpex_official"].result == "tpex_official"
+
+
 def test_acquisition_deadline_stops_work_before_the_preparation_reserve() -> None:
     budget = NetworkRequestBudget(
         max_network_requests=10,
@@ -292,6 +326,56 @@ def test_rate_limit_failure_exposes_safe_resume_metadata(tmp_path: Path) -> None
     }
 
 
+def test_eodhd_retry_after_above_shared_maximum_stops_without_another_request(
+    tmp_path: Path,
+) -> None:
+    class _RateLimitedSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get(self, _endpoint: str, **_kwargs: Any) -> requests.Response:
+            self.calls += 1
+            response = requests.Response()
+            response.status_code = 429
+            response._content = b'{"error":"rate limited"}'
+            response.headers = {"Retry-After": "86400"}
+            return response
+
+    session = _RateLimitedSession()
+    waits: list[float] = []
+    budget = NetworkRequestBudget(100, limited_providers={"eodhd"})
+    client = CachedJsonClient(
+        provider="eodhd",
+        raw_cache_root=tmp_path,
+        max_requests_per_second=10.0,
+        max_backoff_seconds=60.0,
+        session=session,
+        request_budget=budget,
+        clock=lambda: 1.0,
+        sleeper=waits.append,
+    )
+
+    with pytest.raises(ProviderRequestError) as captured:
+        client.get_json("https://example.invalid/eod/AAPL.US", params={})
+
+    assert session.calls == 1
+    assert waits == []
+    assert budget.limited_network_requests == 1
+    assert captured.value.category == "rate_limited"
+    assert captured.value.metadata()["backoff"] == {
+        "wait_count": 0,
+        "total_wait_seconds": 0.0,
+        "proposed_wait_seconds": 86400.0,
+        "maximum_seconds": 60.0,
+        "exit_reason": "proposed_backoff_exceeds_maximum",
+    }
+    with pytest.raises(ProviderRequestError) as stopped:
+        client.get_json("https://example.invalid/eod/MSFT.US", params={})
+    assert session.calls == 1
+    assert budget.limited_network_requests == 1
+    assert stopped.value.exit_reason == "proposed_backoff_exceeds_maximum"
+
+
 def test_taiwan_retry_loop_exits_when_next_backoff_exceeds_maximum(
     tmp_path: Path,
 ) -> None:
@@ -328,6 +412,54 @@ def test_taiwan_retry_loop_exits_when_next_backoff_exceeds_maximum(
     assert waits == [1.0, 2.0]
     assert budget.network_requests == 3
     assert budget.limited_network_requests == 0
+    assert captured.value.metadata()["backoff"] == {
+        "wait_count": 2,
+        "total_wait_seconds": 3.0,
+        "last_wait_seconds": 2.0,
+        "proposed_wait_seconds": 4.0,
+        "maximum_seconds": 2.0,
+        "exit_reason": "proposed_backoff_exceeds_maximum",
+    }
+
+
+def test_eodhd_retry_loop_exits_when_next_backoff_exceeds_shared_maximum(
+    tmp_path: Path,
+) -> None:
+    class _UnavailableSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get(self, _endpoint: str, **_kwargs: Any) -> requests.Response:
+            self.calls += 1
+            response = requests.Response()
+            response.status_code = 503
+            response._content = b"{}"
+            response.headers = {}
+            return response
+
+    session = _UnavailableSession()
+    waits: list[float] = []
+    budget = NetworkRequestBudget(100, limited_providers={"eodhd"})
+    client = CachedJsonClient(
+        provider="eodhd",
+        raw_cache_root=tmp_path,
+        max_requests_per_second=10.0,
+        max_backoff_seconds=2.0,
+        session=session,
+        request_budget=budget,
+        clock=lambda: float(session.calls * 10),
+        sleeper=waits.append,
+    )
+
+    with pytest.raises(ProviderRequestError) as captured:
+        client.get_json("https://example.invalid/eod/AAPL.US", params={})
+
+    assert session.calls == 3
+    assert waits == [1.0, 2.0]
+    assert budget.network_requests == 3
+    assert budget.limited_network_requests == 3
+    assert captured.value.provider == "eodhd"
+    assert captured.value.retryable
     assert captured.value.metadata()["backoff"] == {
         "wait_count": 2,
         "total_wait_seconds": 3.0,
@@ -1029,12 +1161,15 @@ def test_launch_acquisition_policy_is_context_not_dataset_identity(tmp_path: Pat
         max_api_calls=25,
         eodhd_requests_per_second=8.0,
         taiwan_requests_per_second=0.25,
+        max_backoff_seconds=30.0,
     )
 
     assert _progress_identity(first) == _progress_identity(second)
-    assert _progress_context(first)["acquisition_policy"] != _progress_context(second)[
-        "acquisition_policy"
-    ]
+    first_policy = _progress_context(first)["acquisition_policy"]
+    second_policy = _progress_context(second)["acquisition_policy"]
+    assert first_policy != second_policy
+    assert first_policy["provider_max_backoff_seconds"] == 60.0
+    assert second_policy["provider_max_backoff_seconds"] == 30.0
 
 
 def test_massive_channel_is_reserved_but_typed() -> None:

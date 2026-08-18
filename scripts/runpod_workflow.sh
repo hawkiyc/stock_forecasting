@@ -219,7 +219,7 @@ EOF
                 fi
             done
             while true; do
-                printf 'Maximum TWSE/TPEx retry backoff [%s]: ' \
+                printf 'Maximum provider retry backoff [%s]: ' \
                     "${cpu_max_backoff}" >&2
                 if ! IFS= read -r cpu_entered_max_backoff; then
                     echo "Input closed before CPU Pod creation" >&2
@@ -269,7 +269,7 @@ EOF
             printf '  EODHD requests per second: %s\n' "${cpu_eodhd_qps}" >&2
             printf '  TWSE/TPEx requests per second per provider: %s\n' \
                 "${cpu_taiwan_qps}" >&2
-            printf '  Maximum TWSE/TPEx retry backoff: %s\n' "${cpu_max_backoff}" >&2
+            printf '  Maximum provider retry backoff: %s\n' "${cpu_max_backoff}" >&2
             printf '  External guard grace: 1h\n' >&2
             printf '  vCPU count: %s\n' "${cpu_number}" >&2
             printf '  CPU flavor: %s\n' "${cpu_flavor}" >&2

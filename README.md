@@ -185,11 +185,12 @@ Stage 1 / Stage 2 訓練（完全離線）
   benchmark sessions，另保留 pre-calendar weekday upper bound；兩者都不作
   dataset admission gate。
 - `max_api_calls` 只限制單次 CPU attempt 的 EODHD network attempts（含 retry）；
-  TWSE／TPEx 不受 request-count 上限限制，而由預設 1 分鐘的 `--maxBackoff` 決定退出。
-  cache hit 不扣額度，未完成時保留進度並由下一個 Pod 續接。
-- `--max-api-calls`、`--eodhd-qps` 與 `--taiwan-qps` 是每次 CPU Pod launch 的
-  acquisition policy，由 `runpod_workflow.sh cpu prepare` 設定；它們不屬於 immutable
-  dataset selection，也不會改變 dataset request identity。
+  TWSE／TPEx 不受 request-count 上限限制。EODHD、TWSE 與 TPEx 都以同一個預設
+  1 分鐘的 `--maxBackoff` 作為各自的退避退出邊界。cache hit 不扣額度，未完成時
+  保留進度並由下一個 Pod 續接。
+- `--max-api-calls`、`--eodhd-qps`、`--taiwan-qps` 與 `--maxBackoff` 是每次 CPU Pod
+  launch 的 acquisition policy，由 `runpod_workflow.sh cpu prepare` 設定；它們不屬於
+  immutable dataset selection，也不會改變 dataset request identity。
 - 任一 provider 先退出都不會取消其他 provider；只有全部 provider 迴圈退出後，流程才
   發布續傳狀態或固定順序合併 provider-local artifacts。
 - QPS 與 `max_api_calls` 都不是 provider 的每日／每週 quota，也不代表 EODHD
@@ -384,9 +385,9 @@ common stocks 與 ETFs；使用含美國資料的 profile、`--universe all`，�
 
 互動模式的預設值是 `stage1`、`us_tw_eodhd`、dataset revision `v1`、起始日
 `2005-01-01` 與 US universe `all`。`--end` 刻意沒有預設值，提示時若留白會繼續
-要求輸入，不會自動採用本機當日。Provider budget 與 QPS 不在 `configure` 設定；若在
-此命令提供 `--max-api-calls`、`--eodhd-qps` 或 `--taiwan-qps`，會以未知選項拒絕，
-不會建立另一個 selection。
+要求輸入，不會自動採用本機當日。Provider acquisition policy 不在 `configure` 設定；
+若在此命令提供 `--max-api-calls`、`--eodhd-qps`、`--taiwan-qps` 或 `--maxBackoff`，
+會以未知選項拒絕，不會建立另一個 selection。
 底層 helper 的 `--project-root` 由 `runpod_workflow.sh` 自動注入，不是使用者
 設定資料範圍的選項，不要自行提供。
 
@@ -483,8 +484,8 @@ bash scripts/runpod_workflow.sh configure \
 selection，因此更新程式碼後必須重新執行 `configure`，不會自動轉換。修改 `--end`
 會按設計建立新的 dataset request namespace；既有 network-volume 檔案不會被刪除。
 profile、日期、universe、symbol limit、資料處理契約或 stage config SHA-256
-任一不同，都會得到不同 identity。QPS 與 API budget 只記錄在 CPU launch metadata、
-download progress 與 download manifest，不會進入 selection identity。
+任一不同，都會得到不同 identity。QPS、API budget 與最大退避只記錄在 CPU launch
+metadata、download progress 與 download manifest，不會進入 selection identity。
 
 若 provider 可能修訂歷史資料，且確實要為相同 profile/date/universe 建立新快照，
 請在 `configure` 明確加入新的 `--dataset-revision <label>`；CPU workflow 不會
@@ -535,8 +536,9 @@ CPU Pod 只能使用 active selection；如果尚未執行 `configure`、config 
 或 selection JSON 不完整，建立前就會失敗。在本機不帶任何選項執行時會進入
 互動模式，依序詢問 workload 最長執行時間、這次 Pod 可新增的 EODHD network-attempt
 上限、EODHD QPS、TWSE／TPEx 每個 provider 的 QPS、data cleaning/window construction
-保留時間、TWSE／TPEx 最大單次退避、vCPU 數與 CPU flavor。`--max-api-calls` 沒有
-可直接按 Enter 接受的預設值，必須依帳戶當下剩餘額度明確輸入；其他項目按 Enter 分別
+保留時間、三個 provider 共用的最大單次退避、vCPU 數與 CPU flavor。
+`--max-api-calls` 沒有可直接按 Enter 接受的預設值，必須依帳戶當下剩餘額度明確輸入；
+其他項目按 Enter 分別
 使用 6 小時、16 QPS、每個台灣 provider 0.5 QPS、自動保留、1 分鐘、8 vCPU 與
 `cpu3g`。自動保留是 max runtime 的 25%，最多 2 小時；預設 6 小時會保留 90 分鐘。
 最後還必須輸入 `y` 或 `yes` 才會建立可能計費的 Pod，直接按 Enter、輸入 `n` 或
@@ -584,8 +586,10 @@ bash scripts/runpod_workflow.sh cpu prepare \
 各自的 limiter，因此 TWSE 與 TPEx 同時執行時是兩個獨立的 0.5 QPS 上限。
 `--maxRuntime`、明確的 `--prepareReserve` 與 `--maxBackoff` 都接受正整數加 `m`、`h` 或 `d`；
 `--prepareReserve auto` 使用上述自動公式，明確值必須短於 max runtime。
-`--maxBackoff` 預設為 `1m`，只控制 TWSE／TPEx：若下一次由指數退避或
-`Retry-After` 得到的等待時間**超過**此值，該 provider 迴圈會退出（等於上限仍會等待）。
+`--maxBackoff` 預設為 `1m`，同時套用於 EODHD、TWSE 與 TPEx：若下一次由指數退避或
+`Retry-After` 得到的等待時間**超過**此值，只有該 provider 迴圈會退出（等於上限仍會
+等待）。EODHD 會在 `--max-api-calls` 用完或超過這個退避邊界時停止，兩者任一先發生
+即生效。
 `--cpuNumber` 必須是 1～32。`--cpuFlavor` 只接受下表六個 RunPod 值，其他值或
 超過 32 vCPU 會在建立 Pod 前失敗：
 
@@ -628,7 +632,8 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    EODHD、TWSE 與 TPEx 以三個獨立頂層迴圈平行抓取，迴圈內再依商品／官方 benchmark
    所列實際交易日使用 thread pool；因果視窗依商品平行建立，pytest worker 也不會超過
    這個有效核心數。每個 provider 有自己的 QPS limiter。`--max-api-calls` 只限制 EODHD，
-   TWSE／TPEx 沒有專案端 request-count ceiling，而由 `--maxBackoff` 控制暫停邊界。
+   TWSE／TPEx 沒有專案端 request-count ceiling；三個 provider 都由同一個
+   `--maxBackoff` 值控制各自的退避邊界。
    任一 provider 先退出都不會取消另外兩個；主流程 join 全部迴圈後才合併 provider-local
    Parquet/request-log 分片或發布續傳狀態。完整 request 估算只作資訊；workflow 自動保留 max runtime 的 25%（最多 2 小時；預設 6 小時即
    90 分鐘）給 data cleaning/window construction，也可用 `--prepareReserve` 調整。
@@ -673,20 +678,24 @@ bash scripts/runpod_workflow.sh status
 
 EODHD、TWSE 與 TPEx 使用彼此獨立的平行迴圈。retryable 的 429、暫時性網路錯誤或
 provider 5xx 都採指數退避；台灣官方端點由 Pod IP/WAF 暫時回傳的 403 也視為
-retryable，但退出條件不同：EODHD 以該 CPU attempt 的 EODHD
-network-attempt count（`--max-api-calls`）為界；TWSE／TPEx 不設 request-count 上限，
-而在下一次退避將超過 `--maxBackoff`（預設 `1m`）時退出。共同 acquisition deadline
-仍可讓任何迴圈進入 `waiting_for_resume`，以保留 data cleaning 時間。流程遵守下列契約：
+retryable。三個 provider 共用同一個 `--maxBackoff` 設定（預設 `1m`），但各自獨立
+計算退避並在下一次等待超過該值時退出。EODHD 另外受到該 CPU attempt 的
+`--max-api-calls` 限制，兩個 EODHD 邊界任一先發生就停止其迴圈；TWSE／TPEx 則沒有
+request-count 上限。共同 acquisition deadline 仍可讓任何迴圈進入
+`waiting_for_resume`，以保留 data cleaning 時間。流程遵守下列契約：
 
 1. 已成功取得的每個 raw JSON response 仍保留在該 dataset request 專屬的
    `api-cache/`，不發布不完整 Parquet 或 `state=ready` marker。
-2. EODHD 先達 `--max-api-calls` 時只退出 EODHD 迴圈，TWSE／TPEx 繼續；任一台灣
-   provider 先超過最大退避時，也不會停止 EODHD 或另一個台灣 provider。主流程一定
-   等到所有已選 provider 迴圈退出，才決定下一步與允許 CPU Pod 結束。
+2. EODHD 先達 `--max-api-calls` 或先超過最大退避時，都只退出 EODHD 迴圈，
+   TWSE／TPEx 繼續；任一台灣 provider 先超過最大退避時，也不會停止 EODHD 或另一個
+   台灣 provider。最大退避越界會開啟該 provider client 的共享 circuit breaker；
+   已送出的 in-flight request 可能完成，但同一 provider 的其他 worker 不會再啟動新
+   request。主流程一定等到所有已選 provider 迴圈退出，才決定下一步與允許 CPU Pod
+   結束。
 3. `download-progress.json` 記錄 attempt number、各 provider cache／network counts、
    EODHD limited count，以及每個 provider 的 `complete`、`waiting_for_budget`、
-   `waiting_for_provider` 或 `waiting_for_resume` outcome；台灣錯誤另記已等待總秒數、
-   最後等待、下一次 proposed backoff、最大值，以及該次 launch 實際使用的
+   `waiting_for_provider` 或 `waiting_for_resume` outcome；provider 錯誤另記已等待總秒數、
+   最後等待、下一次 proposed backoff、三者共用的最大值，以及該次 launch 實際使用的
    `max-api-calls`／EODHD QPS／Taiwan QPS。HTTP status、`Retry-After` 與
    rate-limit headers 只在供應商有回傳時記錄；資料契約錯誤另記安全的 provider、
    operation、symbol/date/month 與 exception type，不記錄 token 或 response body。
@@ -1286,13 +1295,14 @@ The downloader provides:
   The final Taiwan plan uses official benchmark sessions and records its
   pre-calendar weekday upper bound separately; neither is an admission gate.
 - `max_api_calls` limits only EODHD network attempts, including retries, in one
-  CPU attempt. TWSE/TPEx have no request-count ceiling and instead exit at the
-  default one-minute `--maxBackoff` boundary. Cache hits do not consume the
-  EODHD counter; incomplete work is saved for another Pod.
-- `--max-api-calls`, `--eodhd-qps`, and `--taiwan-qps` are acquisition policy
-  values for one CPU Pod launch. They are set by `runpod_workflow.sh cpu prepare`,
-  are not part of the immutable dataset selection, and cannot change dataset
-  request identity.
+  CPU attempt. TWSE/TPEx have no request-count ceiling. EODHD, TWSE, and TPEx
+  each use the same default one-minute `--maxBackoff` value as their independent
+  backoff exit boundary. Cache hits do not consume the EODHD counter; incomplete
+  work is saved for another Pod.
+- `--max-api-calls`, `--eodhd-qps`, `--taiwan-qps`, and `--maxBackoff` are
+  acquisition policy values for one CPU Pod launch. They are set by
+  `runpod_workflow.sh cpu prepare`, are not part of the immutable dataset
+  selection, and cannot change dataset request identity.
 - One provider exiting never cancels another. Only after every provider loop
   exits does the workflow publish a resume state or deterministically merge
   provider-local artifacts.
@@ -1510,9 +1520,9 @@ All user-facing `configure` options are:
 Interactive defaults are `stage1`, `us_tw_eodhd`, dataset revision `v1`, start
 date `2005-01-01`, and US universe `all`. `--end` intentionally has no default:
 leaving its prompt blank asks again instead of selecting the local current date.
-Provider budgets and QPS are not configured here. Supplying `--max-api-calls`,
-`--eodhd-qps`, or `--taiwan-qps` to this command is rejected as an unknown option
-instead of creating another selection. The lower-level helper's
+Provider acquisition policy is not configured here. Supplying `--max-api-calls`,
+`--eodhd-qps`, `--taiwan-qps`, or `--maxBackoff` to this command is rejected as
+an unknown option instead of creating another selection. The lower-level helper's
 `--project-root` is injected by `runpod_workflow.sh`; it is not a user-facing
 dataset-scope option and should not be supplied manually.
 
@@ -1616,8 +1626,8 @@ updating the code. Changing `--end` intentionally creates a new dataset request
 namespace; existing network-volume files are not deleted. A different profile,
 date range, universe, symbol limit, data
 preparation contract, or stage-config SHA-256 produces a different identity.
-QPS and API budget are recorded only in CPU launch metadata, download progress,
-and the download manifest; they never enter selection identity.
+QPS, API budget, and maximum backoff are recorded only in CPU launch metadata,
+download progress, and the download manifest; they never enter selection identity.
 
 When provider history may have been revised and a new snapshot is intentional
 for the same profile/date/universe, pass a new explicit
@@ -1671,8 +1681,9 @@ compute is rented when `configure` has not run, the config SHA changed, or the
 selection JSON is incomplete. With no options, the local command is interactive:
 it prompts for maximum workload runtime, the maximum additional EODHD network
 attempts for this Pod, EODHD QPS, per-provider TWSE/TPEx QPS, time reserved for
-data cleaning/window construction, maximum TWSE/TPEx retry backoff, vCPU count,
-and CPU flavor. `--max-api-calls` has no Enter-to-accept default and must be
+data cleaning/window construction, the maximum retry backoff shared by all three
+providers, vCPU count, and CPU flavor. `--max-api-calls` has no Enter-to-accept
+default and must be
 entered explicitly from the account's current remaining quota. Pressing Enter
 accepts 6 hours, 16 EODHD QPS, 0.5 QPS for each Taiwan provider, an automatic
 reserve, 1 minute, 8 vCPUs, and `cpu3g`. The automatic reserve is 25% of max
@@ -1723,12 +1734,14 @@ Pod does not automatically subtract account usage by earlier Pods.
 `--eodhd-qps` and `--taiwan-qps` must be positive, defaulting to `16` and `0.5`.
 The Taiwan value is per provider, so concurrent TWSE and TPEx loops each have an
 independent 0.5-QPS limiter. `--maxRuntime`, an explicit `--prepareReserve`, and
-`--maxBackoff` accept a
-positive integer followed by `m`, `h`, or `d`. `--prepareReserve auto` uses the
+`--maxBackoff` accept a positive integer followed by `m`, `h`, or `d`.
+`--prepareReserve auto` uses the
 formula above; an explicit reserve must be shorter than max runtime.
-`--maxBackoff` defaults to `1m` and applies only to TWSE/TPEx. A provider loop
-exits when its next exponential or `Retry-After` delay would **exceed** this
-limit; a delay equal to the limit is still performed. `--cpuNumber` must be
+`--maxBackoff` defaults to `1m` and applies to EODHD, TWSE, and TPEx. Only the
+affected provider loop exits when its next exponential or `Retry-After` delay
+would **exceed** this limit; a delay equal to the limit is still performed.
+EODHD stops at whichever comes first: `--max-api-calls` exhaustion or this
+backoff boundary. `--cpuNumber` must be
 between 1 and 32. `--cpuFlavor` accepts only the six RunPod values below; any
 other value or more than 32 vCPUs fails before Pod creation:
 
@@ -1779,7 +1792,8 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    Causal-window construction runs across symbols, and pytest workers never
    exceed the effective CPU count. Each provider has its own QPS limiter.
    `--max-api-calls` limits only EODHD; TWSE/TPEx have no project-side request
-   counter ceiling and instead use `--maxBackoff`. One provider exiting never
+   counter ceiling. All three providers use the same `--maxBackoff` value for
+   their independent retry boundary. One provider exiting never
    cancels the other two. The process joins all loops before deterministically
    merging provider-local Parquet/request-log parts or publishing a resume state. The
    complete-plan estimate is informational. The workflow automatically reserves
@@ -1833,24 +1847,29 @@ bash scripts/runpod_workflow.sh status
 EODHD, TWSE, and TPEx use independent parallel loops. Retryable HTTP 429,
 temporary network failures, and provider 5xx responses use exponential backoff.
 A temporary HTTP 403 from a Taiwan official endpoint due to Pod IP/WAF policy is
-also retryable, but the exit conditions differ. EODHD is bounded by its network-attempt count
-for the CPU attempt (`--max-api-calls`). TWSE/TPEx have no request-count ceiling;
-they exit when the next retry delay would exceed `--maxBackoff` (default `1m`).
-The shared acquisition deadline can still place any loop in `waiting_for_resume`
-to protect cleaning time. The workflow follows this contract:
+also retryable. All three providers share one `--maxBackoff` setting (default
+`1m`) but maintain independent backoff state and exit when their next delay
+would exceed it. EODHD is additionally bounded by the CPU attempt's
+`--max-api-calls`; whichever EODHD boundary is reached first stops its loop.
+TWSE/TPEx have no request-count ceiling. The shared acquisition deadline can
+still place any loop in `waiting_for_resume` to protect cleaning time. The
+workflow follows this contract:
 
 1. Every successful raw JSON response remains in the dataset request's
    `api-cache/`. No incomplete Parquet or `state=ready` marker is published.
-2. If EODHD reaches `--max-api-calls` first, only its loop exits; TWSE/TPEx
-   continue. A Taiwan provider crossing its backoff boundary likewise does not
-   stop EODHD or the other Taiwan provider. The main process always waits for
-   every selected provider loop to exit before the CPU Pod may finish.
+2. If EODHD reaches `--max-api-calls` or its backoff boundary first, only its
+   loop exits; TWSE/TPEx continue. A Taiwan provider crossing its backoff boundary
+   likewise does not stop EODHD or the other Taiwan provider. Crossing the
+   boundary opens a shared circuit breaker for that provider client. Requests
+   already in flight may finish, but sibling workers cannot start another request
+   for the stopped provider. The main process always waits for every selected
+   provider loop to exit before the CPU Pod may finish.
 3. `download-progress.json` records the attempt, per-provider cache/network
    counts, the limited EODHD count, and each provider's `complete`,
    `waiting_for_budget`, `waiting_for_provider`, or `waiting_for_resume` outcome.
-   Taiwan errors also record cumulative wait, last wait, next proposed backoff,
-   the maximum, and the launch's effective `max-api-calls`, EODHD QPS, and Taiwan
-   QPS. HTTP status, `Retry-After`, and rate-limit headers are stored
+   Provider errors also record cumulative wait, last wait, next proposed backoff,
+   the shared maximum, and the launch's effective `max-api-calls`, EODHD QPS,
+   and Taiwan QPS. HTTP status, `Retry-After`, and rate-limit headers are stored
    when supplied. Data-contract errors additionally identify the safe provider,
    operation, symbol/date/month, and exception type. Tokens and response bodies
    are not stored.

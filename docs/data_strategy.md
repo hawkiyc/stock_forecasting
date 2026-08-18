@@ -32,11 +32,14 @@ cache misses/retries；TWSE／TPEx network attempts 會被記錄，但沒有專�
 上限。完整計畫的 request estimate 只作資訊，不是 dataset admission gate；台灣最終
 estimate 使用官方 benchmark sessions，並另外記錄 pre-calendar weekday upper bound。
 
-EODHD、TWSE 與 TPEx 是三個獨立的平行迴圈。EODHD 以本次 request count 為退出條件；
-TWSE／TPEx 採指數退避，下一次等待超過 `runpod_workflow.sh cpu prepare --maxBackoff`
-（預設 `1m`）時才退出。任何 provider 先退出都不會取消其他迴圈，主流程 join 全部迴圈
-後才發布續傳狀態或固定順序合併 provider-local artifacts。budget、最大退避、暫時性
+EODHD、TWSE 與 TPEx 是三個獨立的平行迴圈。三者都採指數退避並共用
+`runpod_workflow.sh cpu prepare --maxBackoff`（預設 `1m`）設定；各自的下一次等待超過
+此值時只退出自己的迴圈。EODHD 另外以本次 `--max-api-calls` 為退出條件，兩個邊界
+任一先發生就停止。任何 provider 先退出都不會取消其他迴圈，主流程 join 全部迴圈後
+才發布續傳狀態或固定順序合併 provider-local artifacts。budget、最大退避、暫時性
 provider 錯誤或 acquisition time 用完時都保存 cache 並由下一個 CPU Pod 續接。
+最大退避越界會開啟該 provider client 的共享 circuit breaker；in-flight request
+可以完成，但同一 provider 的其他 worker 不會再啟動新的 request。
 台灣官方端點由 Pod IP/WAF 暫時回傳的 HTTP 403 也使用同一個有限退避契約，不會立即
 把整體 acquisition 標成不可續傳。tmux finalizer 不得把 worker 已發布的精確
 `waiting_for_*` 狀態覆寫成一般 `failed`，同一次 launch 的 terminal rewrite 也必須保留
@@ -179,15 +182,17 @@ provider API
 ```
 
 下載器具備 provider-level throttle、獨立平行 provider 迴圈、exponential retry、
-只限 EODHD 的單次 request budget、TWSE／TPEx 最大退避邊界、cache reuse、provider-local
-staging writes、固定順序合併與拒絕 silent overwrite。完整計畫 estimate 不阻止執行；
-`--max-api-calls`、`--eodhd-qps` 與 `--taiwan-qps` 都由每次
+只限 EODHD 的單次 request budget、三個 provider 共用設定但獨立計算的最大退避邊界、
+cache reuse、provider-local staging writes、固定順序合併與拒絕 silent overwrite。
+完整計畫 estimate 不阻止執行；
+`--max-api-calls`、`--eodhd-qps`、`--taiwan-qps` 與 `--maxBackoff` 都由每次
 `runpod_workflow.sh cpu prepare` 設定，不屬於 dataset identity；
 CPU workflow 預設保留 max runtime 的 25%（最多 2 小時）給 data cleaning/window construction。
 可透過 `runpod_workflow.sh cpu prepare --prepareReserve DURATION` 明確調整，或使用
 `--prepareReserve auto` 保留自動值；明確值必須短於 max runtime。
-`--maxBackoff DURATION` 預設 `1m`；下一次台灣 provider 退避大於此值時，該迴圈退出，
-但其他 provider 仍會繼續到自己的退出條件。
+`--maxBackoff DURATION` 預設 `1m`；EODHD、TWSE 或 TPEx 的下一次退避大於此值時，
+只有該迴圈退出，其他 provider 仍會繼續到自己的退出條件。EODHD 也會在先達到
+`--max-api-calls` 時退出。
 raw Parquet、request log 與 download manifest 先成為 durable `downloaded` checkpoint，
 後續 Pod 可不呼叫 provider 而直接準備 processed data。manifest 儲存 SHA-256、
 size、row count、profile、providers、symbols、date range、quality summary 與 request-log
@@ -292,14 +297,19 @@ ceiling. The complete-plan estimate is informational, not a dataset-admission
 gate. Taiwan's final estimate uses official benchmark sessions and records the
 pre-calendar weekday upper bound separately.
 
-EODHD, TWSE, and TPEx run as independent parallel loops. EODHD exits on its
-attempt counter, while TWSE/TPEx use exponential backoff and exit when the next
-delay exceeds `runpod_workflow.sh cpu prepare --maxBackoff` (default `1m`). One
-provider exiting never cancels another; the main process joins every loop before
-publishing a resume state or deterministically merging provider-local artifacts.
+EODHD, TWSE, and TPEx run as independent parallel loops. All three use
+exponential backoff and the same `runpod_workflow.sh cpu prepare --maxBackoff`
+setting (default `1m`); each exits independently when its next delay exceeds the
+boundary. EODHD additionally exits when it reaches `--max-api-calls`, whichever
+condition occurs first. One provider exiting never cancels another; the main
+process joins every loop before publishing a resume state or deterministically
+merging provider-local artifacts.
 Budget exhaustion, backoff boundaries, temporary provider failures, and
-acquisition-time exhaustion preserve cache state for the next CPU Pod. Temporary
-HTTP 403 responses from Taiwan official endpoints due to Pod IP/WAF
+acquisition-time exhaustion preserve cache state for the next CPU Pod.
+Crossing the maximum backoff opens a shared circuit breaker for that provider
+client. In-flight requests may finish, but sibling workers cannot start another
+request for the stopped provider. Temporary HTTP 403 responses from Taiwan
+official endpoints due to Pod IP/WAF
 policy use the same bounded-backoff contract instead of making the aggregate
 failure immediately non-resumable. The tmux finalizer must not replace a precise
 worker-published `waiting_for_*` state with generic `failed`, and same-launch
@@ -437,17 +447,20 @@ provider API
 ```
 
 The downloader provides provider throttles, independent parallel provider loops,
-exponential retries, an EODHD-only per-attempt request budget, a TWSE/TPEx maximum
-backoff boundary, cache reuse, provider-local staging, deterministic merging, and
-refusal to silently overwrite. `--max-api-calls`, `--eodhd-qps`, and
-`--taiwan-qps` are supplied for every `runpod_workflow.sh cpu prepare` launch and
-are not part of dataset identity. The complete-plan estimate never blocks
-execution. The CPU workflow reserves 25% of max runtime for cleaning/window
+exponential retries, an EODHD-only per-attempt request budget, one maximum
+backoff setting independently enforced by EODHD/TWSE/TPEx, cache reuse,
+provider-local staging, deterministic merging, and
+refusal to silently overwrite. `--max-api-calls`, `--eodhd-qps`,
+`--taiwan-qps`, and `--maxBackoff` are supplied for every
+`runpod_workflow.sh cpu prepare` launch and are not part of dataset identity.
+The complete-plan estimate never blocks execution. The CPU workflow reserves
+25% of max runtime for cleaning/window
 construction by default, capped at 2 hours, with an explicit override available through
 `runpod_workflow.sh cpu prepare --prepareReserve DURATION`; `auto` retains the
 automatic value, and an explicit reserve must be shorter than max runtime.
-`--maxBackoff DURATION` defaults to `1m`; a Taiwan provider loop exits when its
-next delay exceeds that boundary while other providers continue. The workflow
+`--maxBackoff DURATION` defaults to `1m`; an EODHD, TWSE, or TPEx loop exits when
+its next delay exceeds that boundary while other providers continue. EODHD also
+exits if it reaches `--max-api-calls` first. The workflow
 publishes raw Parquet, the request log, and download manifest as a durable
 `downloaded` checkpoint before preparation. A later Pod can skip provider calls.
 Manifests bind SHA-256, size, row count, profile, providers,

@@ -139,6 +139,26 @@ class ProviderRequestError(RuntimeError):
             payload["backoff"] = backoff
         return payload
 
+    def _clone(self) -> ProviderRequestError:
+        """Copy structured provider state without sharing traceback objects across threads."""
+
+        return ProviderRequestError(
+            provider=self.provider,
+            category=self.category,
+            attempts=self.attempts,
+            retryable=self.retryable,
+            status_code=self.status_code,
+            retry_after_seconds=self.retry_after_seconds,
+            rate_limit_limit=self.rate_limit_limit,
+            rate_limit_remaining=self.rate_limit_remaining,
+            backoff_wait_count=self.backoff_wait_count,
+            total_backoff_seconds=self.total_backoff_seconds,
+            last_backoff_seconds=self.last_backoff_seconds,
+            proposed_backoff_seconds=self.proposed_backoff_seconds,
+            max_backoff_seconds=self.max_backoff_seconds,
+            exit_reason=self.exit_reason,
+        )
+
 
 class ProviderAcquisitionError(RuntimeError):
     """Summarize provider loops only after every parallel loop has exited."""
@@ -344,7 +364,24 @@ class CachedJsonClient:
         self._last_request_at: float | None = None
         self._rate_lock = threading.Lock()
         self._provided_session_lock = threading.Lock()
+        self._provider_stop_lock = threading.Lock()
+        self._provider_stop_error: ProviderRequestError | None = None
         self._thread_local = threading.local()
+
+    def _raise_if_provider_stopped(self) -> None:
+        with self._provider_stop_lock:
+            error = (
+                None
+                if self._provider_stop_error is None
+                else self._provider_stop_error._clone()
+            )
+        if error is not None:
+            raise error from None
+
+    def _stop_provider(self, error: ProviderRequestError) -> None:
+        with self._provider_stop_lock:
+            if self._provider_stop_error is None:
+                self._provider_stop_error = error._clone()
 
     def _session(self) -> requests.Session:
         if self.session is not None:
@@ -436,6 +473,7 @@ class CachedJsonClient:
         *,
         params: Mapping[str, Any],
     ) -> tuple[Any, RequestRecord]:
+        self._raise_if_provider_stopped()
         if self.request_budget is not None:
             self.request_budget.check_time()
         request_sha256, _identity = self._identity(endpoint=endpoint, params=params)
@@ -468,8 +506,10 @@ class CachedJsonClient:
         proposed_backoff_seconds: float | None = None
         exit_reason: str | None = None
         while True:
+            self._raise_if_provider_stopped()
             attempt += 1
             self._reserve_request_slot()
+            self._raise_if_provider_stopped()
             requested_at = datetime.now(UTC).isoformat()
             try:
                 if self.request_budget is not None:
@@ -568,7 +608,7 @@ class CachedJsonClient:
                 backoff_wait_count += 1
                 total_backoff_seconds += proposed_backoff_seconds
                 last_backoff_seconds = proposed_backoff_seconds
-        raise ProviderRequestError(
+        request_error = ProviderRequestError(
             provider=self.provider,
             category=last_category,
             attempts=attempt,
@@ -583,4 +623,7 @@ class CachedJsonClient:
             proposed_backoff_seconds=proposed_backoff_seconds,
             max_backoff_seconds=self.max_backoff_seconds,
             exit_reason=exit_reason,
-        ) from None
+        )
+        if exit_reason == "proposed_backoff_exceeds_maximum":
+            self._stop_provider(request_error)
+        raise request_error from None

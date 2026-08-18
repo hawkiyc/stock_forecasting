@@ -408,7 +408,11 @@ def test_cpu_acquisition_budget_is_resumable_and_reserves_preparation_time() -> 
     assert "taiwan_pre_calendar_weekday_upper_bound_calls" in ingestion
     assert 'limited_providers={"eodhd"}' in ingestion
     assert "_run_parallel_provider_loops(runners)" in ingestion
-    assert "max_backoff_seconds=options.max_backoff_seconds" in ingestion
+    assert ingestion.count("max_backoff_seconds=options.max_backoff_seconds") == 2
+    assert (
+        '"provider_max_backoff_scope": ["eodhd", "tpex_official", "twse_official"]'
+        in ingestion
+    )
     assert "parallel_independent_loops_joined_before_process_exit" in ingestion
     assert '"waiting_for_budget"' in progress
     assert '"waiting_for_resume"' in progress
@@ -533,7 +537,7 @@ def test_cpu_prepare_without_options_is_interactive_and_cancel_safe() -> None:
     assert "EODHD requests per second [16]:" in combined
     assert "TWSE/TPEx requests per second per provider [0.5]:" in combined
     assert "Time reserved for data cleaning/window construction [auto]:" in combined
-    assert "Maximum TWSE/TPEx retry backoff [1m]:" in combined
+    assert "Maximum provider retry backoff [1m]:" in combined
     assert "vCPU count [8]:" in combined
     assert "CPU flavor [cpu3g]:" in combined
     assert "Maximum runtime: 6h" in combined
@@ -541,7 +545,7 @@ def test_cpu_prepare_without_options_is_interactive_and_cancel_safe() -> None:
     assert "Maximum additional EODHD network attempts: 100000" in combined
     assert "EODHD requests per second: 16" in combined
     assert "TWSE/TPEx requests per second per provider: 0.5" in combined
-    assert "Maximum TWSE/TPEx retry backoff: 1m" in combined
+    assert "Maximum provider retry backoff: 1m" in combined
     assert "vCPU count: 8" in combined
     assert "CPU flavor: cpu3g" in combined
     assert "Create this CPU preparation Pod? [y/N]:" in combined

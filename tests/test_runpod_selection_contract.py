@@ -201,6 +201,7 @@ def test_provider_acquisition_values_cannot_change_selection_identity(tmp_path: 
             max_api_calls=1,
             eodhd_qps="1",
             taiwan_qps="1",
+            max_backoff_seconds=1,
         ),
         project_root,
     )
@@ -222,7 +223,10 @@ def test_provider_acquisition_values_cannot_change_selection_identity(tmp_path: 
         assert key not in exports
 
 
-@pytest.mark.parametrize("option", ("--max-api-calls", "--eodhd-qps", "--taiwan-qps"))
+@pytest.mark.parametrize(
+    "option",
+    ("--max-api-calls", "--eodhd-qps", "--taiwan-qps", "--maxBackoff"),
+)
 def test_provider_acquisition_options_are_rejected_by_configure(
     tmp_path: Path,
     option: str,
@@ -246,7 +250,7 @@ def test_selection_defaults_only_cover_dataset_semantics(tmp_path: Path) -> None
 
     assert arguments.start == "2005-01-01"
     assert arguments.end is None
-    for name in ("max_api_calls", "eodhd_qps", "taiwan_qps"):
+    for name in ("max_api_calls", "eodhd_qps", "taiwan_qps", "max_backoff_seconds"):
         assert not hasattr(arguments, name)
 
 

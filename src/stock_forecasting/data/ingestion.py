@@ -641,7 +641,8 @@ def _progress_context(options: IngestionOptions) -> dict[str, Any]:
             "max_api_calls_limited_providers": ["eodhd"],
             "eodhd_requests_per_second": options.eodhd_requests_per_second,
             "taiwan_requests_per_second_per_provider": options.taiwan_requests_per_second,
-            "taiwan_max_backoff_seconds": options.max_backoff_seconds,
+            "provider_max_backoff_seconds": options.max_backoff_seconds,
+            "provider_max_backoff_scope": ["eodhd", "tpex_official", "twse_official"],
         }
     }
     optional = {
@@ -739,6 +740,7 @@ def ingest_daily_ohlcv(
                     provider="eodhd",
                     raw_cache_root=options.raw_cache_root,
                     max_requests_per_second=options.eodhd_requests_per_second,
+                    max_backoff_seconds=options.max_backoff_seconds,
                     request_budget=request_budget,
                 )
                 provider = EODHDProvider(eod_client, api_token=eodhd_api_token)
@@ -1100,7 +1102,8 @@ def ingest_daily_ohlcv(
             "eodhd_official_default_requests_per_minute": (EODHD_DEFAULT_REQUESTS_PER_MINUTE),
             "taiwan_requests_per_second": options.taiwan_requests_per_second,
             "taiwan_requests_per_second_scope": "per_provider",
-            "taiwan_max_backoff_seconds": options.max_backoff_seconds,
+            "provider_max_backoff_seconds": options.max_backoff_seconds,
+            "provider_max_backoff_scope": ["eodhd", "tpex_official", "twse_official"],
             "taiwan_request_count_ceiling": None,
             "provider_execution": (
                 "parallel_independent_loops_joined_before_process_exit_and_deterministic_merge"
