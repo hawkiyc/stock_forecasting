@@ -461,6 +461,7 @@ def test_network_volume_identity_and_exact_mount_are_fail_closed() -> None:
 def test_workflow_exposes_bounded_cpu_gpu_resume_and_validation_options() -> None:
     workflow = (ROOT / "scripts/runpod_workflow.sh").read_text(encoding="utf-8")
     cpu_creator = (ROOT / "scripts/create_runpod_cpu_pod.sh").read_text(encoding="utf-8")
+    gpu_creator = (ROOT / "scripts/create_runpod_pod.sh").read_text(encoding="utf-8")
     reexec = (ROOT / "scripts/runpod_reexec_with_pid1_env.py").read_text(encoding="utf-8")
     resume = (ROOT / "scripts/create_runpod_resume_pod.sh").read_text(encoding="utf-8")
     validation = (ROOT / "scripts/create_runpod_validation_pod.sh").read_text(encoding="utf-8")
@@ -469,6 +470,9 @@ def test_workflow_exposes_bounded_cpu_gpu_resume_and_validation_options() -> Non
         "--interactive",
         "--maxRuntime",
         "--prepareReserve",
+        "--maxApiCalls",
+        "--eodhdQps",
+        "--taiwanQps",
         "--maxBackoff",
         "--gpuId",
         "--cpuNumber",
@@ -477,6 +481,9 @@ def test_workflow_exposes_bounded_cpu_gpu_resume_and_validation_options() -> Non
         assert option in workflow
     assert "cpu_max_runtime=6h" in workflow
     assert "cpu_prepare_reserve=auto" in workflow
+    assert 'cpu_max_api_calls=""' in workflow
+    assert "cpu_eodhd_qps=16" in workflow
+    assert "cpu_taiwan_qps=0.5" in workflow
     assert "cpu_max_backoff=1m" in workflow
     assert "cpu_number=8" in workflow
     assert "cpu_flavor=cpu3g" in workflow
@@ -488,8 +495,20 @@ def test_workflow_exposes_bounded_cpu_gpu_resume_and_validation_options() -> Non
     assert "CONTAINER_DISK_GB_PER_VCPU=15" in cpu_creator
     assert "MAX_CONTAINER_DISK_GB" in cpu_creator
     assert "RUNPOD_CPU_PREPARE_RESERVE_SECONDS" in cpu_creator
+    assert "RUNPOD_CPU_MAX_API_CALLS" in cpu_creator
+    assert "RUNPOD_CPU_EODHD_QPS" in cpu_creator
+    assert "RUNPOD_CPU_TAIWAN_QPS" in cpu_creator
+    for setting in (
+        "RUNPOD_CPU_MAX_API_CALLS",
+        "RUNPOD_CPU_EODHD_QPS",
+        "RUNPOD_CPU_TAIWAN_QPS",
+    ):
+        assert setting not in gpu_creator
     assert "RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS" in cpu_creator
     assert '"RUNPOD_CPU_PREPARE_RESERVE_SECONDS"' in reexec
+    assert '"RUNPOD_CPU_MAX_API_CALLS"' in reexec
+    assert '"RUNPOD_CPU_EODHD_QPS"' in reexec
+    assert '"RUNPOD_CPU_TAIWAN_QPS"' in reexec
     assert '"RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS"' in reexec
     assert "resumable-training-run" in resume
     assert "training-completed.json" in resume
@@ -500,7 +519,7 @@ def test_workflow_exposes_bounded_cpu_gpu_resume_and_validation_options() -> Non
 def test_cpu_prepare_without_options_is_interactive_and_cancel_safe() -> None:
     result = subprocess.run(
         ["bash", str(ROOT / "scripts/runpod_workflow.sh"), "cpu", "prepare"],
-        input="\n\n\n\n\n\n",
+        input="\n100000\n\n\n\n\n\n\n\n",
         check=False,
         capture_output=True,
         text=True,
@@ -508,14 +527,20 @@ def test_cpu_prepare_without_options_is_interactive_and_cancel_safe() -> None:
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
-    assert "CPU preparation resource configuration" in combined
+    assert "CPU preparation acquisition and resource configuration" in combined
     assert "Maximum runtime [6h]:" in combined
+    assert "Maximum additional EODHD network attempts for this CPU Pod (required):" in combined
+    assert "EODHD requests per second [16]:" in combined
+    assert "TWSE/TPEx requests per second per provider [0.5]:" in combined
     assert "Time reserved for data cleaning/window construction [auto]:" in combined
     assert "Maximum TWSE/TPEx retry backoff [1m]:" in combined
     assert "vCPU count [8]:" in combined
     assert "CPU flavor [cpu3g]:" in combined
     assert "Maximum runtime: 6h" in combined
     assert "Cleaning/window reserve: automatic" in combined
+    assert "Maximum additional EODHD network attempts: 100000" in combined
+    assert "EODHD requests per second: 16" in combined
+    assert "TWSE/TPEx requests per second per provider: 0.5" in combined
     assert "Maximum TWSE/TPEx retry backoff: 1m" in combined
     assert "vCPU count: 8" in combined
     assert "CPU flavor: cpu3g" in combined
@@ -542,6 +567,58 @@ def test_cpu_prepare_rejects_a_reserve_that_consumes_the_complete_runtime() -> N
 
     assert result.returncode == 2
     assert "--prepareReserve must be shorter than --maxRuntime" in result.stderr
+
+
+def test_noninteractive_cpu_prepare_requires_an_explicit_api_budget() -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/runpod_workflow.sh"),
+            "cpu",
+            "prepare",
+            "--maxRuntime",
+            "6h",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "--max-api-calls must be a positive integer" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    (
+        ("--max-api-calls", "0", "--max-api-calls must be a positive integer"),
+        ("--eodhd-qps", "0", "--eodhd-qps must be a positive number"),
+        ("--taiwan-qps", "invalid", "--taiwan-qps must be a positive number"),
+    ),
+)
+def test_cpu_prepare_rejects_invalid_acquisition_settings(
+    option: str,
+    value: str,
+    message: str,
+) -> None:
+    arguments = [
+        "bash",
+        str(ROOT / "scripts/runpod_workflow.sh"),
+        "cpu",
+        "prepare",
+        "--max-api-calls",
+        "1",
+    ]
+    arguments.extend((option, value))
+    result = subprocess.run(
+        arguments,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert message in result.stderr
 
 
 def test_cpu_prepare_rejects_an_invalid_maximum_provider_backoff() -> None:

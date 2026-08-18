@@ -48,3 +48,22 @@ runpod_validate_cpu_number() {
         return 2
     fi
 }
+
+runpod_validate_positive_integer() {
+    local value="$1"
+    local label="${2:-value}"
+    if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s must be a positive integer\n' "${label}" >&2
+        return 2
+    fi
+}
+
+runpod_validate_positive_number() {
+    local value="$1"
+    local label="${2:-value}"
+    if [[ ! "${value}" =~ ^(0|[1-9][0-9]*)([.][0-9]+)?$ \
+        || "${value}" =~ ^0([.]0+)?$ ]]; then
+        printf '%s must be a positive number\n' "${label}" >&2
+        return 2
+    fi
+}

@@ -16,7 +16,7 @@ Usage:
   bash scripts/runpod_workflow.sh configure [SELECTION OPTIONS]
   bash scripts/runpod_workflow.sh selection show
   bash scripts/runpod_workflow.sh sync [--dry-run|--apply]
-  bash scripts/runpod_workflow.sh cpu prepare [--interactive] [--maxRuntime DURATION] [--prepareReserve DURATION|auto] [--maxBackoff DURATION] [--cpuNumber N] [--cpuFlavor FLAVOR]
+  bash scripts/runpod_workflow.sh cpu prepare [--interactive] [--max-api-calls N] [--eodhd-qps QPS] [--taiwan-qps QPS] [--maxRuntime DURATION] [--prepareReserve DURATION|auto] [--maxBackoff DURATION] [--cpuNumber N] [--cpuFlavor FLAVOR]
   bash scripts/runpod_workflow.sh readiness [--code-only|--gpu]
   bash scripts/runpod_workflow.sh train [--maxRuntime DURATION] [--gpuId GPU_ID]
   bash scripts/runpod_workflow.sh resume [--maxRuntime DURATION] [--gpuId GPU_ID] [RUN_ID]
@@ -66,6 +66,9 @@ case "${COMMAND}" in
         cpu_max_runtime=6h
         cpu_prepare_reserve=auto
         cpu_prepare_reserve_seconds=""
+        cpu_max_api_calls=""
+        cpu_eodhd_qps=16
+        cpu_taiwan_qps=0.5
         cpu_max_backoff=1m
         cpu_max_backoff_seconds=60
         cpu_number=8
@@ -88,6 +91,21 @@ case "${COMMAND}" in
                 --prepareReserve|--prepare-reserve)
                     [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 2; }
                     cpu_prepare_reserve="$2"
+                    shift 2
+                    ;;
+                --maxApiCalls|--max-api-calls)
+                    [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 2; }
+                    cpu_max_api_calls="$2"
+                    shift 2
+                    ;;
+                --eodhdQps|--eodhd-qps)
+                    [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 2; }
+                    cpu_eodhd_qps="$2"
+                    shift 2
+                    ;;
+                --taiwanQps|--taiwan-qps)
+                    [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 2; }
+                    cpu_taiwan_qps="$2"
                     shift 2
                     ;;
                 --maxBackoff|--max-backoff)
@@ -114,7 +132,7 @@ case "${COMMAND}" in
         done
         if [[ ${cpu_interactive} -eq 1 ]]; then
             cat >&2 <<'EOF'
-CPU preparation resource configuration
+CPU preparation acquisition and resource configuration
 Available flavors: cpu3c, cpu3g, cpu3m, cpu5c, cpu5g, cpu5m
 Press Enter to accept the value shown in brackets.
 EOF
@@ -128,6 +146,51 @@ EOF
                 if cpu_max_seconds="$(runpod_duration_seconds \
                     "${cpu_candidate_max_runtime}" --maxRuntime)"; then
                     cpu_max_runtime="${cpu_candidate_max_runtime}"
+                    break
+                fi
+            done
+            while true; do
+                if [[ -n "${cpu_max_api_calls}" ]]; then
+                    printf 'Maximum additional EODHD network attempts for this CPU Pod [%s]: ' \
+                        "${cpu_max_api_calls}" >&2
+                else
+                    printf 'Maximum additional EODHD network attempts for this CPU Pod (required): ' >&2
+                fi
+                if ! IFS= read -r cpu_entered_max_api_calls; then
+                    echo "Input closed before CPU Pod creation" >&2
+                    exit 2
+                fi
+                cpu_candidate_max_api_calls="${cpu_entered_max_api_calls:-${cpu_max_api_calls}}"
+                if runpod_validate_positive_integer \
+                    "${cpu_candidate_max_api_calls}" --max-api-calls; then
+                    cpu_max_api_calls="${cpu_candidate_max_api_calls}"
+                    break
+                fi
+            done
+            while true; do
+                printf 'EODHD requests per second [%s]: ' "${cpu_eodhd_qps}" >&2
+                if ! IFS= read -r cpu_entered_eodhd_qps; then
+                    echo "Input closed before CPU Pod creation" >&2
+                    exit 2
+                fi
+                cpu_candidate_eodhd_qps="${cpu_entered_eodhd_qps:-${cpu_eodhd_qps}}"
+                if runpod_validate_positive_number \
+                    "${cpu_candidate_eodhd_qps}" --eodhd-qps; then
+                    cpu_eodhd_qps="${cpu_candidate_eodhd_qps}"
+                    break
+                fi
+            done
+            while true; do
+                printf 'TWSE/TPEx requests per second per provider [%s]: ' \
+                    "${cpu_taiwan_qps}" >&2
+                if ! IFS= read -r cpu_entered_taiwan_qps; then
+                    echo "Input closed before CPU Pod creation" >&2
+                    exit 2
+                fi
+                cpu_candidate_taiwan_qps="${cpu_entered_taiwan_qps:-${cpu_taiwan_qps}}"
+                if runpod_validate_positive_number \
+                    "${cpu_candidate_taiwan_qps}" --taiwan-qps; then
+                    cpu_taiwan_qps="${cpu_candidate_taiwan_qps}"
                     break
                 fi
             done
@@ -201,6 +264,11 @@ EOF
             else
                 printf '  Cleaning/window reserve: %s\n' "${cpu_prepare_reserve}" >&2
             fi
+            printf '  Maximum additional EODHD network attempts: %s\n' \
+                "${cpu_max_api_calls}" >&2
+            printf '  EODHD requests per second: %s\n' "${cpu_eodhd_qps}" >&2
+            printf '  TWSE/TPEx requests per second per provider: %s\n' \
+                "${cpu_taiwan_qps}" >&2
             printf '  Maximum TWSE/TPEx retry backoff: %s\n' "${cpu_max_backoff}" >&2
             printf '  External guard grace: 1h\n' >&2
             printf '  vCPU count: %s\n' "${cpu_number}" >&2
@@ -235,8 +303,14 @@ EOF
                     exit 2
                 fi
             fi
+            runpod_validate_positive_integer "${cpu_max_api_calls}" --max-api-calls
+            runpod_validate_positive_number "${cpu_eodhd_qps}" --eodhd-qps
+            runpod_validate_positive_number "${cpu_taiwan_qps}" --taiwan-qps
         fi
         export RUNPOD_CPU_MAX_RUNTIME_SECONDS="${cpu_max_seconds}"
+        export RUNPOD_CPU_MAX_API_CALLS="${cpu_max_api_calls}"
+        export RUNPOD_CPU_EODHD_QPS="${cpu_eodhd_qps}"
+        export RUNPOD_CPU_TAIWAN_QPS="${cpu_taiwan_qps}"
         export RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS="${cpu_max_backoff_seconds}"
         export RUNPOD_CPU_HARD_LIMIT_SECONDS="$((cpu_max_seconds + 3600))"
         if [[ -n "${cpu_prepare_reserve_seconds}" ]]; then

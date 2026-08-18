@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -16,11 +17,14 @@ from stock_forecasting.cli import download_market_data
 from stock_forecasting.data.adjustments import asof_adjusted_window
 from stock_forecasting.data.download_progress import DownloadProgress
 from stock_forecasting.data.ingestion import (
+    IngestionOptions,
     _benchmark_trading_dates,
     _ensure_us_benchmark,
     _explicit_instruments,
     _inclusive_end,
     _limit_instruments,
+    _progress_context,
+    _progress_identity,
     _run_parallel_provider_loops,
 )
 from stock_forecasting.data.providers.base import Instrument, RequestRecord
@@ -1005,6 +1009,32 @@ def test_download_progress_rejects_a_different_dataset_identity(tmp_path: Path) 
             raw_cache_root=tmp_path / "api-cache",
             identity={"dataset_request_sha256": "b" * 64},
         )
+
+
+def test_launch_acquisition_policy_is_context_not_dataset_identity(tmp_path: Path) -> None:
+    first = IngestionOptions(
+        profile="us_tw_eodhd",
+        start="2020-01-01",
+        end="2024-01-01",
+        output=tmp_path / "raw.parquet",
+        manifest_root=tmp_path,
+        raw_cache_root=tmp_path / "api-cache",
+        dataset_request_sha256="a" * 64,
+        max_api_calls=100,
+        eodhd_requests_per_second=16.0,
+        taiwan_requests_per_second=0.5,
+    )
+    second = replace(
+        first,
+        max_api_calls=25,
+        eodhd_requests_per_second=8.0,
+        taiwan_requests_per_second=0.25,
+    )
+
+    assert _progress_identity(first) == _progress_identity(second)
+    assert _progress_context(first)["acquisition_policy"] != _progress_context(second)[
+        "acquisition_policy"
+    ]
 
 
 def test_massive_channel_is_reserved_but_typed() -> None:

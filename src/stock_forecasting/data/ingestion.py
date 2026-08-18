@@ -635,6 +635,15 @@ def _progress_identity(options: IngestionOptions) -> dict[str, Any]:
 
 
 def _progress_context(options: IngestionOptions) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "acquisition_policy": {
+            "max_api_calls": options.max_api_calls,
+            "max_api_calls_limited_providers": ["eodhd"],
+            "eodhd_requests_per_second": options.eodhd_requests_per_second,
+            "taiwan_requests_per_second_per_provider": options.taiwan_requests_per_second,
+            "taiwan_max_backoff_seconds": options.max_backoff_seconds,
+        }
+    }
     optional = {
         "selection_id": options.selection_id,
         "selection_sha256": options.selection_sha256,
@@ -642,9 +651,9 @@ def _progress_context(options: IngestionOptions) -> dict[str, Any]:
         "launch_id": options.launch_id,
         "acquisition_deadline_epoch_seconds": (options.acquisition_deadline_epoch_seconds),
         "preparation_reserve_seconds": options.preparation_reserve_seconds,
-        "taiwan_max_backoff_seconds": options.max_backoff_seconds,
     }
-    return {key: value for key, value in optional.items() if value is not None}
+    context.update({key: value for key, value in optional.items() if value is not None})
+    return context
 
 
 def ingest_daily_ohlcv(
@@ -1090,6 +1099,7 @@ def ingest_daily_ohlcv(
             "eodhd_official_default_daily_api_call_limit": (EODHD_DEFAULT_DAILY_API_CALL_LIMIT),
             "eodhd_official_default_requests_per_minute": (EODHD_DEFAULT_REQUESTS_PER_MINUTE),
             "taiwan_requests_per_second": options.taiwan_requests_per_second,
+            "taiwan_requests_per_second_scope": "per_provider",
             "taiwan_max_backoff_seconds": options.max_backoff_seconds,
             "taiwan_request_count_ceiling": None,
             "provider_execution": (

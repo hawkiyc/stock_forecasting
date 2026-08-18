@@ -41,9 +41,6 @@ def _arguments(**overrides: object) -> argparse.Namespace:
         "stocks": [],
         "etfs": [],
         "symbol_limit": None,
-        "max_api_calls": 100000,
-        "eodhd_qps": "16",
-        "taiwan_qps": "0.5",
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -191,36 +188,66 @@ def test_eodhd_volume_semantics_are_part_of_the_immutable_dataset_contract() -> 
     )
 
 
-def test_acquisition_rate_changes_selection_but_not_dataset_identity(tmp_path: Path) -> None:
+def test_provider_acquisition_values_cannot_change_selection_identity(tmp_path: Path) -> None:
     project_root = _project_root(tmp_path)
     baseline = SELECTION._build_selection(
         _arguments(data_profile="us_only_eodhd", universe="all"),
         project_root,
     )
-    slower = SELECTION._build_selection(
-        _arguments(data_profile="us_only_eodhd", universe="all", eodhd_qps="1"),
+    with_transient_values = SELECTION._build_selection(
+        _arguments(
+            data_profile="us_only_eodhd",
+            universe="all",
+            max_api_calls=1,
+            eodhd_qps="1",
+            taiwan_qps="1",
+        ),
         project_root,
     )
 
-    assert baseline["dataset_request_sha256"] == slower["dataset_request_sha256"]
-    assert baseline["selection_sha256"] != slower["selection_sha256"]
+    assert (
+        baseline["dataset_request_sha256"]
+        == with_transient_values["dataset_request_sha256"]
+    )
+    assert baseline["selection_sha256"] == with_transient_values["selection_sha256"]
+    assert baseline["schema_version"] == SELECTION.SELECTION_SCHEMA_VERSION == 2
+    assert baseline["dataset_request"]["schema_version"] == 1
+    assert "acquisition_policy" not in baseline
+    exports = SELECTION._selection_exports(tmp_path / "selection.json", baseline)
+    for key in (
+        "STAGE1_MAX_API_CALLS",
+        "STAGE1_EODHD_QPS",
+        "STAGE1_TAIWAN_QPS",
+    ):
+        assert key not in exports
 
 
-def test_official_eodhd_limits_are_selection_defaults(tmp_path: Path) -> None:
+@pytest.mark.parametrize("option", ("--max-api-calls", "--eodhd-qps", "--taiwan-qps"))
+def test_provider_acquisition_options_are_rejected_by_configure(
+    tmp_path: Path,
+    option: str,
+) -> None:
+    with pytest.raises(SystemExit):
+        SELECTION.build_parser().parse_args(
+            [
+                "create",
+                "--project-root",
+                str(tmp_path),
+                option,
+                "1",
+            ]
+        )
+
+
+def test_selection_defaults_only_cover_dataset_semantics(tmp_path: Path) -> None:
     arguments = SELECTION.build_parser().parse_args(
-        [
-            "create",
-            "--project-root",
-            str(tmp_path),
-        ]
+        ["create", "--project-root", str(tmp_path)]
     )
 
-    assert arguments.max_api_calls == 100000
     assert arguments.start == "2005-01-01"
     assert arguments.end is None
-    assert float(arguments.eodhd_qps) == pytest.approx(16.0)
-    assert float(arguments.eodhd_qps) * 60.0 == pytest.approx(960.0)
-    assert float(arguments.eodhd_qps) * 60.0 < 1000.0
+    for name in ("max_api_calls", "eodhd_qps", "taiwan_qps"):
+        assert not hasattr(arguments, name)
 
 
 def test_selection_requires_an_explicit_end_date(tmp_path: Path) -> None:

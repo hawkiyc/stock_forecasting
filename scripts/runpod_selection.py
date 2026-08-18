@@ -13,16 +13,14 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple, Union
 
-SCHEMA_VERSION = 1
+SELECTION_SCHEMA_VERSION = 2
+DATASET_REQUEST_SCHEMA_VERSION = 1
+ACTIVE_POINTER_SCHEMA_VERSION = 1
 SELECTION_ID_PATTERN = re.compile(r"selection-[0-9a-f]{16}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 SYMBOL_PATTERN = re.compile(r"[A-Z0-9.^_-]+")
 SAFE_RELATIVE_PATH_PATTERN = re.compile(r"[A-Za-z0-9._/-]+")
 REVISION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-EODHD_DEFAULT_DAILY_API_CALL_LIMIT = 100_000
-EODHD_DEFAULT_REQUESTS_PER_MINUTE = 1_000
-EODHD_DEFAULT_QPS = str(EODHD_DEFAULT_REQUESTS_PER_MINUTE // 60)
-
 PROFILE_DATASETS = {
     "tw_only": ["tpex_official", "twse_official"],
     "us_only_eodhd": ["eodhd_us"],
@@ -92,9 +90,6 @@ EXPORT_KEYS = (
     "STAGE1_SYMBOL_LIMIT",
     "STAGE1_DATA_START",
     "STAGE1_DATA_END",
-    "STAGE1_MAX_API_CALLS",
-    "STAGE1_EODHD_QPS",
-    "STAGE1_TAIWAN_QPS",
     "MAX_RUNTIME_SECONDS",
     "RUNPOD_HARD_LIMIT_SECONDS",
     "RUNPOD_TERMINATE_AFTER",
@@ -173,15 +168,6 @@ def _positive_int(value: Any, label: str) -> int:
     return value
 
 
-def _positive_number_string(value: Any, label: str) -> str:
-    text = str(value).strip()
-    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", text):
-        _fail(f"{label} must be a positive number")
-    if float(text) <= 0:
-        _fail(f"{label} must be greater than zero")
-    return text
-
-
 def _normalize_symbols(
     values: Optional[Union[List[str], Tuple[str, ...]]], label: str
 ) -> List[str]:
@@ -202,7 +188,6 @@ def _selection_core(payload: Dict[str, Any]) -> Dict[str, Any]:
         "schema_version": payload.get("schema_version"),
         "stage": payload.get("stage"),
         "dataset_request": payload.get("dataset_request"),
-        "acquisition_policy": payload.get("acquisition_policy"),
         "runtime": payload.get("runtime"),
     }
 
@@ -267,7 +252,7 @@ def _resolve_selection_path(
     if selection is None:
         pointer_path = _active_pointer_path(project_root)
         pointer = _load_json_path(pointer_path, "Active selection pointer")
-        if pointer.get("schema_version") != SCHEMA_VERSION:
+        if pointer.get("schema_version") != ACTIVE_POINTER_SCHEMA_VERSION:
             _fail("Active selection pointer schema is unsupported")
         relative_path = _validate_relative_path(pointer.get("selection_path"), "selection_path")
         candidate = (project_root / relative_path).resolve()
@@ -306,12 +291,11 @@ def _validate_selection(
         "stage",
         "dataset_request",
         "dataset_request_sha256",
-        "acquisition_policy",
         "runtime",
     }
     if set(payload) != expected_selection_keys:
         _fail("Training selection fields are incomplete or unsupported")
-    if payload.get("schema_version") != SCHEMA_VERSION:
+    if payload.get("schema_version") != SELECTION_SCHEMA_VERSION:
         _fail("Training selection schema is unsupported")
     selection_id = payload.get("selection_id")
     selection_sha256 = payload.get("selection_sha256")
@@ -349,7 +333,10 @@ def _validate_selection(
             )
 
     request = payload.get("dataset_request")
-    if not isinstance(request, dict) or request.get("schema_version") != SCHEMA_VERSION:
+    if (
+        not isinstance(request, dict)
+        or request.get("schema_version") != DATASET_REQUEST_SCHEMA_VERSION
+    ):
         _fail("Dataset request is invalid")
     if set(request) != {
         "schema_version",
@@ -422,15 +409,6 @@ def _validate_selection(
     if _payload_sha256(_dataset_request_core(request)) != dataset_request_sha256:
         _fail("Dataset request digest is inconsistent")
 
-    acquisition = payload.get("acquisition_policy")
-    if not isinstance(acquisition, dict):
-        _fail("Dataset acquisition policy is invalid")
-    if set(acquisition) != {"max_api_calls", "eodhd_qps", "taiwan_qps"}:
-        _fail("Dataset acquisition policy fields are incomplete or unsupported")
-    _positive_int(acquisition.get("max_api_calls"), "max_api_calls")
-    _positive_number_string(acquisition.get("eodhd_qps"), "eodhd_qps")
-    _positive_number_string(acquisition.get("taiwan_qps"), "taiwan_qps")
-
     if payload.get("runtime") != STAGE_RUNTIME[stage["name"]]:
         _fail("Training runtime contract is unsupported")
     expected_selection_sha256 = _payload_sha256(_selection_core(payload))
@@ -477,7 +455,7 @@ def _build_selection(arguments: argparse.Namespace, project_root: Path) -> Dict[
     if not isinstance(revision, str) or not REVISION_PATTERN.fullmatch(revision):
         _fail("dataset revision must be a safe 1-64 character label")
     request = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": DATASET_REQUEST_SCHEMA_VERSION,
         "profile": profile,
         "revision": revision,
         "selected_datasets": PROFILE_DATASETS[profile],
@@ -495,7 +473,7 @@ def _build_selection(arguments: argparse.Namespace, project_root: Path) -> Dict[
         "preparation": PREPARATION_CONTRACT,
     }
     payload = {  # type: Dict[str, Any]
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SELECTION_SCHEMA_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "stage": {
             "name": stage_name,
@@ -504,11 +482,6 @@ def _build_selection(arguments: argparse.Namespace, project_root: Path) -> Dict[
         },
         "dataset_request": request,
         "dataset_request_sha256": _payload_sha256(_dataset_request_core(request)),
-        "acquisition_policy": {
-            "max_api_calls": _positive_int(arguments.max_api_calls, "max_api_calls"),
-            "eodhd_qps": _positive_number_string(arguments.eodhd_qps, "eodhd_qps"),
-            "taiwan_qps": _positive_number_string(arguments.taiwan_qps, "taiwan_qps"),
-        },
         "runtime": STAGE_RUNTIME[stage_name],
     }
     payload["selection_sha256"] = _payload_sha256(_selection_core(payload))
@@ -530,7 +503,7 @@ def _activate_selection(project_root: Path, payload: Dict[str, Any]) -> Path:
     _atomic_write_json(
         _active_pointer_path(project_root),
         {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": ACTIVE_POINTER_SCHEMA_VERSION,
             "selection_id": payload["selection_id"],
             "selection_sha256": payload["selection_sha256"],
             "selection_path": relative_selection_path,
@@ -591,23 +564,11 @@ def _populate_interactive(arguments: argparse.Namespace) -> None:
                 "Optional per-type US discovery limit: up to N ETFs and N stocks (blank means all)"
             )
             arguments.symbol_limit = int(limit) if limit else None
-    arguments.max_api_calls = int(
-        _prompt_text(
-            "HTTP request safety ceiling (official paid-plan default is 100000)",
-            str(EODHD_DEFAULT_DAILY_API_CALL_LIMIT),
-        )
-    )
-    arguments.eodhd_qps = _prompt_text(
-        "EODHD requests per second (default 16 = 960 requests/minute)",
-        EODHD_DEFAULT_QPS,
-    )
-    arguments.taiwan_qps = _prompt_text("Taiwan requests per second", "0.5")
 
 
 def _selection_exports(selection_path: Path, payload: Dict[str, Any]) -> Dict[str, str]:
     request = payload["dataset_request"]
     universe = request["universe"]
-    acquisition = payload["acquisition_policy"]
     runtime = payload["runtime"]
     digest = payload["dataset_request_sha256"]
     selection_id = payload["selection_id"]
@@ -630,9 +591,6 @@ def _selection_exports(selection_path: Path, payload: Dict[str, Any]) -> Dict[st
         ),
         "STAGE1_DATA_START": request["date_range"]["start_inclusive"],
         "STAGE1_DATA_END": request["date_range"]["end_exclusive"],
-        "STAGE1_MAX_API_CALLS": str(acquisition["max_api_calls"]),
-        "STAGE1_EODHD_QPS": str(acquisition["eodhd_qps"]),
-        "STAGE1_TAIWAN_QPS": str(acquisition["taiwan_qps"]),
         "MAX_RUNTIME_SECONDS": str(runtime["max_runtime_seconds"]),
         "RUNPOD_HARD_LIMIT_SECONDS": str(runtime["hard_limit_seconds"]),
         "RUNPOD_TERMINATE_AFTER": runtime["terminate_after"],
@@ -817,9 +775,6 @@ def _verify_environment(
             "STAGE1_SYMBOL_LIMIT",
             "STAGE1_DATA_START",
             "STAGE1_DATA_END",
-            "STAGE1_MAX_API_CALLS",
-            "STAGE1_EODHD_QPS",
-            "STAGE1_TAIWAN_QPS",
         )
     }
     expected["DATA_ROOT"] = f"{network_volume_root}/datasets/{selection['dataset_request_sha256']}"
@@ -983,24 +938,6 @@ def build_parser() -> argparse.ArgumentParser:
             "ETFs and N stocks, then add VTI if required."
         ),
     )
-    create.add_argument(
-        "--max-api-calls",
-        type=int,
-        default=EODHD_DEFAULT_DAILY_API_CALL_LIMIT,
-        help=(
-            "Project-side HTTP request safety ceiling; default 100000 matches the "
-            "official paid-plan daily API-call limit."
-        ),
-    )
-    create.add_argument(
-        "--eodhd-qps",
-        default=EODHD_DEFAULT_QPS,
-        help=(
-            "Even requests/second pacing; default floors the official 1000/minute "
-            "limit to 16 requests/second (960/minute)."
-        ),
-    )
-    create.add_argument("--taiwan-qps", default="0.5")
     create.set_defaults(handler=command_create)
 
     show = subparsers.add_parser("show")

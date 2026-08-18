@@ -22,11 +22,12 @@ K-line 預訓練。
 | 美國擴充 | Massive Developer | 保留型別化 provider 與 profile | side-project 目前沒有足夠商業授權，因此 fail closed，不執行下載 |
 
 EODHD 付費方案的官方預設值是每日 `100,000 API calls` 與每分鐘 `1,000 HTTP
-requests`。資料管線因此預設 `max_api_calls=100000`，但把每分鐘限制向下取整為
-`16 QPS`，也就是每分鐘最多 `960 requests`，保留 40 requests（4%）的餘裕；每個
-台灣官方 provider 維持 `0.5 QPS`。
-QPS 與 EODHD network-attempt budget 透過 `runpod_workflow.sh configure` 調整，
-不手動修改 `.env` 或 config。`max_api_calls` 只計入單次 acquisition attempt 的 EODHD
+requests`。每次 `runpod_workflow.sh cpu prepare` 都必須依帳戶當下剩餘額度明確設定
+`--max-api-calls`；QPS 預設把每分鐘限制向下取整為 `16 QPS`，也就是每分鐘最多
+`960 requests`，保留 40 requests（4%）的餘裕。每個台灣官方 provider 預設維持
+`0.5 QPS`。這三個值是 per-launch acquisition policy，不寫入 `configure` 建立的
+immutable selection，也不手動修改 `.env` 或 config。`max_api_calls` 只計入單次
+acquisition attempt 的 EODHD
 cache misses/retries；TWSE／TPEx network attempts 會被記錄，但沒有專案端 request-count
 上限。完整計畫的 request estimate 只作資訊，不是 dataset admission gate；台灣最終
 estimate 使用官方 benchmark sessions，並另外記錄 pre-calendar weekday upper bound。
@@ -180,6 +181,8 @@ provider API
 下載器具備 provider-level throttle、獨立平行 provider 迴圈、exponential retry、
 只限 EODHD 的單次 request budget、TWSE／TPEx 最大退避邊界、cache reuse、provider-local
 staging writes、固定順序合併與拒絕 silent overwrite。完整計畫 estimate 不阻止執行；
+`--max-api-calls`、`--eodhd-qps` 與 `--taiwan-qps` 都由每次
+`runpod_workflow.sh cpu prepare` 設定，不屬於 dataset identity；
 CPU workflow 預設保留 max runtime 的 25%（最多 2 小時）給 data cleaning/window construction。
 可透過 `runpod_workflow.sh cpu prepare --prepareReserve DURATION` 明確調整，或使用
 `--prepareReserve auto` 保留自動值；明確值必須短於 max runtime。
@@ -277,13 +280,14 @@ pretraining evidence.
 | US expansion | Massive Developer | Typed provider/profile remains reserved | No suitable side-project commercial license now, so it fails closed |
 
 EODHD's official paid-plan defaults are `100,000 API calls` per day and `1,000
-HTTP requests` per minute. The data pipeline therefore defaults to
-`max_api_calls=100000`, but floors the minute limit to `16 QPS`, or at most
-`960 requests` per minute, leaving 40 requests (4%) of headroom. Each Taiwan
-provider remains at `0.5 QPS`. QPS and the EODHD network-attempt budget are
-adjusted through `runpod_workflow.sh configure`, never by editing `.env` or
-config files. `max_api_calls` counts only EODHD cache misses and retries in one
-acquisition; TWSE/TPEx attempts are recorded but have no project request-count
+HTTP requests` per minute. Every `runpod_workflow.sh cpu prepare` launch requires
+an explicit `--max-api-calls` based on the account's current remaining quota.
+QPS defaults floor the minute limit to `16 QPS`, or at most `960 requests` per
+minute, leaving 40 requests (4%) of headroom. Each Taiwan provider defaults to
+`0.5 QPS`. These three values are per-launch acquisition policy: they are not
+stored in the immutable selection created by `configure` and are never set by
+editing `.env` or config files. `max_api_calls` counts only EODHD cache misses
+and retries in one acquisition; TWSE/TPEx attempts are recorded but have no project request-count
 ceiling. The complete-plan estimate is informational, not a dataset-admission
 gate. Taiwan's final estimate uses official benchmark sessions and records the
 pre-calendar weekday upper bound separately.
@@ -435,10 +439,11 @@ provider API
 The downloader provides provider throttles, independent parallel provider loops,
 exponential retries, an EODHD-only per-attempt request budget, a TWSE/TPEx maximum
 backoff boundary, cache reuse, provider-local staging, deterministic merging, and
-refusal to silently overwrite. The complete-plan estimate never blocks execution. The CPU
-workflow reserves 25% of max runtime for cleaning/window construction by default,
-capped at 2 hours,
-with an explicit override available through
+refusal to silently overwrite. `--max-api-calls`, `--eodhd-qps`, and
+`--taiwan-qps` are supplied for every `runpod_workflow.sh cpu prepare` launch and
+are not part of dataset identity. The complete-plan estimate never blocks
+execution. The CPU workflow reserves 25% of max runtime for cleaning/window
+construction by default, capped at 2 hours, with an explicit override available through
 `runpod_workflow.sh cpu prepare --prepareReserve DURATION`; `auto` retains the
 automatic value, and an explicit reserve must be shorter than max runtime.
 `--maxBackoff DURATION` defaults to `1m`; a Taiwan provider loop exits when its

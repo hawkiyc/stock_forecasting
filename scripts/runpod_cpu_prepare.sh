@@ -63,9 +63,9 @@ STAGE1_US_ETF_SYMBOLS="${STAGE1_US_ETF_SYMBOLS:-}"
 STAGE1_SYMBOL_LIMIT="${STAGE1_SYMBOL_LIMIT:-}"
 STAGE1_DATA_START="${STAGE1_DATA_START:-2005-01-01}"
 STAGE1_DATA_END="${STAGE1_DATA_END:-}"
-STAGE1_MAX_API_CALLS="${STAGE1_MAX_API_CALLS:-100000}"
-STAGE1_EODHD_QPS="${STAGE1_EODHD_QPS:-16}"
-STAGE1_TAIWAN_QPS="${STAGE1_TAIWAN_QPS:-0.5}"
+RUNPOD_CPU_MAX_API_CALLS="${RUNPOD_CPU_MAX_API_CALLS:-}"
+RUNPOD_CPU_EODHD_QPS="${RUNPOD_CPU_EODHD_QPS:-}"
+RUNPOD_CPU_TAIWAN_QPS="${RUNPOD_CPU_TAIWAN_QPS:-}"
 RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS="${RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS:-60}"
 RUNPOD_CPU_MAX_RUNTIME_SECONDS="${RUNPOD_CPU_MAX_RUNTIME_SECONDS:-21600}"
 RUNPOD_CPU_PREPARE_RESERVE_SECONDS="${RUNPOD_CPU_PREPARE_RESERVE_SECONDS:-}"
@@ -79,6 +79,7 @@ export RUNPOD_SHUTDOWN_DIR RUNPOD_SHUTDOWN_MARKER
 export NETWORK_VOLUME_ROOT RUNPOD_VOLUME_ROOT="${NETWORK_VOLUME_ROOT}"
 export PROJECT_ROOT DATA_ROOT LOG_ROOT LIFECYCLE_ROOT RUNPOD_ROLE RUNPOD_CONFIG
 export FIN_TS_DATASET_PROFILE
+export RUNPOD_CPU_MAX_API_CALLS RUNPOD_CPU_EODHD_QPS RUNPOD_CPU_TAIWAN_QPS
 # The image may export cache paths under ephemeral /workspace; never inherit them.
 export HF_HOME="${NETWORK_VOLUME_ROOT}/cache/huggingface"
 export TRANSFORMERS_CACHE="${HF_HOME}/hub"
@@ -146,6 +147,14 @@ for symbol_list in "${STAGE1_US_SYMBOLS}" "${STAGE1_US_ETF_SYMBOLS}"; do
 done
 if [[ ! "${RUNPOD_CPU_MAX_RUNTIME_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "RUNPOD_CPU_MAX_RUNTIME_SECONDS must be a positive integer" >&2
+    exit 2
+fi
+if [[ ! "${RUNPOD_CPU_MAX_API_CALLS}" =~ ^[1-9][0-9]*$ \
+    || ! "${RUNPOD_CPU_EODHD_QPS}" =~ ^(0|[1-9][0-9]*)([.][0-9]+)?$ \
+    || "${RUNPOD_CPU_EODHD_QPS}" =~ ^0([.]0+)?$ \
+    || ! "${RUNPOD_CPU_TAIWAN_QPS}" =~ ^(0|[1-9][0-9]*)([.][0-9]+)?$ \
+    || "${RUNPOD_CPU_TAIWAN_QPS}" =~ ^0([.]0+)?$ ]]; then
+    echo "CPU acquisition budget and QPS settings are invalid" >&2
     exit 2
 fi
 if [[ ! "${RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -354,12 +363,14 @@ finish_cpu_prep() {
     if [[ ${PREP_SUCCEEDED} -ne 1 ]]; then
         write_lifecycle_state "${prep_state}" "${prep_exit_code}" || true
     fi
-    printf '{"started_at":"%s","ended_at":"%s","exit_code":%d,"state":"%s","log_path":"%s","requested_cpu_count":%d,"detected_cpu_count":%d,"effective_workers":%d,"max_runtime_seconds":%d,"preparation_reserve_seconds":%d,"provider_max_backoff_seconds":%d,"acquisition_deadline_epoch_seconds":%d}\n' \
+    printf '{"started_at":"%s","ended_at":"%s","exit_code":%d,"state":"%s","log_path":"%s","requested_cpu_count":%d,"detected_cpu_count":%d,"effective_workers":%d,"max_runtime_seconds":%d,"preparation_reserve_seconds":%d,"max_api_calls":%s,"eodhd_qps":"%s","taiwan_qps":"%s","provider_max_backoff_seconds":%d,"acquisition_deadline_epoch_seconds":%d}\n' \
         "${STARTED_AT}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${prep_exit_code}" \
         "${prep_state}" \
         "${PREP_LOG}" "${RUNPOD_REQUESTED_CPU_COUNT}" "${DETECTED_CPU_COUNT}" \
         "${FIN_TS_CPU_WORKERS}" "${RUNPOD_CPU_MAX_RUNTIME_SECONDS}" \
         "${RUNPOD_CPU_PREPARE_RESERVE_SECONDS}" \
+        "${RUNPOD_CPU_MAX_API_CALLS}" "${RUNPOD_CPU_EODHD_QPS}" \
+        "${RUNPOD_CPU_TAIWAN_QPS}" \
         "${RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS}" "${ACQUISITION_DEADLINE_EPOCH}" \
         > "${METADATA_PATH}"
     if [[ -z "${RUNPOD_TMUX_LOG_FILE:-}" ]]; then
@@ -500,9 +511,9 @@ if [[ ${REUSE_DOWNLOADED_DATASET} -eq 0 ]]; then
         --selection-id "${RUNPOD_SELECTION_ID}"
         --selection-sha256 "${RUNPOD_SELECTION_SHA256}"
         --launch-id "${LAUNCH_ID}"
-        --max-api-calls "${STAGE1_MAX_API_CALLS}"
-        --eodhd-qps "${STAGE1_EODHD_QPS}"
-        --taiwan-qps "${STAGE1_TAIWAN_QPS}"
+        --max-api-calls "${RUNPOD_CPU_MAX_API_CALLS}"
+        --eodhd-qps "${RUNPOD_CPU_EODHD_QPS}"
+        --taiwan-qps "${RUNPOD_CPU_TAIWAN_QPS}"
         --max-backoff-seconds "${RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS}"
         --workers "${FIN_TS_CPU_WORKERS}"
         --acquisition-deadline-epoch-seconds "${ACQUISITION_DEADLINE_EPOCH}"

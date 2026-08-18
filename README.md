@@ -187,6 +187,9 @@ Stage 1 / Stage 2 訓練（完全離線）
 - `max_api_calls` 只限制單次 CPU attempt 的 EODHD network attempts（含 retry）；
   TWSE／TPEx 不受 request-count 上限限制，而由預設 1 分鐘的 `--maxBackoff` 決定退出。
   cache hit 不扣額度，未完成時保留進度並由下一個 Pod 續接。
+- `--max-api-calls`、`--eodhd-qps` 與 `--taiwan-qps` 是每次 CPU Pod launch 的
+  acquisition policy，由 `runpod_workflow.sh cpu prepare` 設定；它們不屬於 immutable
+  dataset selection，也不會改變 dataset request identity。
 - 任一 provider 先退出都不會取消其他 provider；只有全部 provider 迴圈退出後，流程才
   發布續傳狀態或固定順序合併 provider-local artifacts。
 - QPS 與 `max_api_calls` 都不是 provider 的每日／每週 quota，也不代表 EODHD
@@ -377,15 +380,13 @@ common stocks 與 ETFs；使用含美國資料的 profile、`--universe all`，�
 | `--stocks` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的美國股票，例如 `"AAPL,MSFT"`；不影響台股 |
 | `--etfs` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的美國 ETF，例如 `"SPY,QQQ"`；不影響台股 |
 | `--symbol-limit` | 正整數 N | **小規模容量／流程驗證用，不是完整美國市場模式。**只適用於含美國資料的 `all` 模式。discovery 後把 ETF 與 stock 分開，各自依 active → delisted、ticker 字母順序取最多 N 檔；若某一類少於 N 就全取。這不是隨機或代表性抽樣。接著確認必要的 `VTI.US` benchmark：已在 N 檔 ETF 內就不重複，否則額外補入，所以 raw universe 最多 `2N+1` 檔。要完整美股與美國 ETF 就不要提供此選項 |
-| `--max-api-calls` | 正整數；預設 `100000` | 專案端 EODHD「單次 acquisition attempt」的 network-attempt safety budget，不是抽樣數、完整資料集上限、Pod 建立條件或帳戶實際每日餘額。只計入 EODHD cache miss 與 retry；TWSE／TPEx requests 會被記錄但不消耗此上限。EODHD 達上限時只退出自己的迴圈，其他 provider 繼續執行；全部 provider 迴圈退出後才進入可續傳的 `waiting_for_budget`。它不把任意 endpoint 的 HTTP request 誤當成固定一個計費 call unit |
-| `--eodhd-qps` | 大於零的數字；預設 `16` | EODHD requests/second pacing；官方上限為每分鐘 1,000 requests，但預設值會向下取整為每秒 16 requests（每分鐘最多 960 requests），保留每分鐘 40 requests（4%）的餘裕。client 會平均分散 requests；此設定不取代 daily call quota，`tw_only` 也不會呼叫 EODHD |
-| `--taiwan-qps` | 大於零的數字；預設 `0.5` | TWSE／TPEx 最大 requests/second，只控制短時間 pacing；`us_only_eodhd` 不會呼叫台灣 provider |
 | `--interactive` | 無值 flag | 明確開啟互動式選單；直接執行 `configure` 而不帶選項時會自動使用此模式 |
 
 互動模式的預設值是 `stage1`、`us_tw_eodhd`、dataset revision `v1`、起始日
-`2005-01-01`、US universe `all`、API budget `100000`、EODHD QPS `16`
-（即每分鐘最多 960 requests）與 Taiwan QPS `0.5`。`--end` 刻意沒有預設值，
-提示時若留白會繼續要求輸入，不會自動採用本機當日。
+`2005-01-01` 與 US universe `all`。`--end` 刻意沒有預設值，提示時若留白會繼續
+要求輸入，不會自動採用本機當日。Provider budget 與 QPS 不在 `configure` 設定；若在
+此命令提供 `--max-api-calls`、`--eodhd-qps` 或 `--taiwan-qps`，會以未知選項拒絕，
+不會建立另一個 selection。
 底層 helper 的 `--project-root` 由 `runpod_workflow.sh` 自動注入，不是使用者
 設定資料範圍的選項，不要自行提供。
 
@@ -408,17 +409,14 @@ bash scripts/runpod_workflow.sh configure \
   --end 2026-07-27 \
   --universe explicit \
   --stocks "AAPL,MSFT" \
-  --etfs "SPY,QQQ" \
-  --max-api-calls 10000 \
-  --eodhd-qps 16 \
-  --taiwan-qps 0.5
+  --etfs "SPY,QQQ"
 ```
 
-`--max-api-calls 10000` 只限制單次 acquisition attempt 的 EODHD network attempts，
-不會把台股或美股截成 10,000 筆資料，也不要求整份資料能在 10,000 次 requests 內完成。
-EODHD 達到上限後會退出自己的迴圈，但平行執行中的 TWSE／TPEx 仍會繼續。三個 provider
-迴圈都退出後，CPU preparation 才保存 cache 與 `waiting_for_budget` 進度並結束；下一個
-Pod 沿用同一 immutable selection 補齊缺少的 responses。
+Provider acquisition policy 會在建立 CPU Pod 時另外設定。`--max-api-calls 10000`
+只限制該次 acquisition attempt 的 EODHD network attempts，不會把台股或美股截成
+10,000 筆資料，也不要求整份資料能在 10,000 次 requests 內完成。EODHD 達到上限後
+會退出自己的迴圈，但平行執行中的 TWSE／TPEx 仍會繼續。三個 provider 迴圈都退出後，
+CPU preparation 才保存 cache 與 `waiting_for_budget` 進度並結束。
 
 供應商額度是另一層限制。EODHD 官方價格頁目前列出 `EOD Historical Data — All
 World` 個人方案月繳 USD 19.99；官方限制文件指出付費方案預設每日 100,000 API
@@ -445,10 +443,11 @@ bash scripts/runpod_workflow.sh configure \
   --universe all
 ```
 
-discovery 後的完整 HTTP request 計畫即使超過預設 `100000`，也只會記錄為資訊，不會
-阻止 Pod 建立或縮小資料範圍。EODHD 每個 CPU attempt 最多送出設定的 network attempts，
+discovery 後的完整 HTTP request 計畫即使超過該次 CPU Pod 的 `--max-api-calls`，
+也只會記錄為資訊，不會阻止 Pod 建立或縮小資料範圍。EODHD 每個 CPU attempt 最多
+送出設定的 network attempts，
 達上限後由下一個 Pod 使用 cache 續傳；可依成本與使用情況調高或調低
-`--max-api-calls`，但它不會繞過 provider quota。
+`cpu prepare --max-api-calls`，但它不會繞過 provider quota。
 
 如果要使用相同的美國 explicit universe、但**完全不下載台股**，必須把 profile
 改成 `us_only_eodhd`：
@@ -461,9 +460,7 @@ bash scripts/runpod_workflow.sh configure \
   --end 2026-07-27 \
   --universe explicit \
   --stocks "AAPL,MSFT" \
-  --etfs "SPY,QQQ" \
-  --max-api-calls 5000 \
-  --eodhd-qps 16
+  --etfs "SPY,QQQ"
 ```
 
 這個 `us_only_eodhd` 範例只包含上述四個美國 ticker 加上自動補入的
@@ -482,9 +479,12 @@ bash scripts/runpod_workflow.sh configure \
 
 腳本會建立 `.runpod/selections/<selection-id>.json` 與
 `.runpod/active-selection.json`。兩者都不含 secret 且被 `.gitignore` 排除。
+目前使用 selection schema 2；舊 schema 1 把 transient acquisition policy 寫入
+selection，因此更新程式碼後必須重新執行 `configure`，不會自動轉換。修改 `--end`
+會按設計建立新的 dataset request namespace；既有 network-volume 檔案不會被刪除。
 profile、日期、universe、symbol limit、資料處理契約或 stage config SHA-256
-任一不同，都會得到不同 identity。QPS/API budget 會記錄在 selection，但不會
-把完全相同的資料語意誤判成不同 dataset request。
+任一不同，都會得到不同 identity。QPS 與 API budget 只記錄在 CPU launch metadata、
+download progress 與 download manifest，不會進入 selection identity。
 
 若 provider 可能修訂歷史資料，且確實要為相同 profile/date/universe 建立新快照，
 請在 `configure` 明確加入新的 `--dataset-revision <label>`；CPU workflow 不會
@@ -532,22 +532,29 @@ artifact 不會上傳。`poetry.lock` 也不會上傳；它會依 approved RunPo
 #### 3. 遠端部署模型與離線資料層
 
 CPU Pod 只能使用 active selection；如果尚未執行 `configure`、config SHA 已改變，
-或 selection JSON 不完整，建立前就會失敗。在本機不帶資源參數執行時會進入
-互動模式，依序詢問 workload 最長執行時間、data cleaning/window construction
-保留時間、TWSE／TPEx 最大單次退避、vCPU 數與 CPU flavor；按 Enter 分別使用 6 小時、
-自動保留、1 分鐘、8 vCPU、`cpu3g`。自動保留是 max runtime 的 25%，最多 2 小時；預設 6 小時會保留 90
-分鐘。最後還必須輸入 `y` 或 `yes` 才會建立可能計費的 Pod，直接按 Enter、輸入
-`n` 或 `no` 都會安全取消：
+或 selection JSON 不完整，建立前就會失敗。在本機不帶任何選項執行時會進入
+互動模式，依序詢問 workload 最長執行時間、這次 Pod 可新增的 EODHD network-attempt
+上限、EODHD QPS、TWSE／TPEx 每個 provider 的 QPS、data cleaning/window construction
+保留時間、TWSE／TPEx 最大單次退避、vCPU 數與 CPU flavor。`--max-api-calls` 沒有
+可直接按 Enter 接受的預設值，必須依帳戶當下剩餘額度明確輸入；其他項目按 Enter 分別
+使用 6 小時、16 QPS、每個台灣 provider 0.5 QPS、自動保留、1 分鐘、8 vCPU 與
+`cpu3g`。自動保留是 max runtime 的 25%，最多 2 小時；預設 6 小時會保留 90 分鐘。
+最後還必須輸入 `y` 或 `yes` 才會建立可能計費的 Pod，直接按 Enter、輸入 `n` 或
+`no` 都會安全取消：
 
 ```bash
 bash scripts/runpod_workflow.sh cpu prepare
 ```
 
-只要提供任一資源參數，就會使用非互動模式，未提供的參數仍採用上述預設值；
-因此自動化腳本可明確提供全部參數，不需要修改 `.env`：
+只要提供任一參數，就會使用非互動模式。此模式必須明確提供 `--max-api-calls`；
+EODHD／Taiwan QPS 與資源選項未提供時才採用上述預設值。因此自動化腳本可明確提供
+全部參數，不需要修改 `.env` 或重新執行 `configure`：
 
 ```bash
 bash scripts/runpod_workflow.sh cpu prepare \
+  --max-api-calls 80000 \
+  --eodhd-qps 16 \
+  --taiwan-qps 0.5 \
   --maxRuntime 10h \
   --prepareReserve 2h \
   --maxBackoff 1m \
@@ -561,6 +568,9 @@ bash scripts/runpod_workflow.sh cpu prepare \
 ```bash
 bash scripts/runpod_workflow.sh cpu prepare \
   --interactive \
+  --max-api-calls 80000 \
+  --eodhd-qps 16 \
+  --taiwan-qps 0.5 \
   --maxRuntime 10h \
   --prepareReserve auto \
   --maxBackoff 1m \
@@ -568,6 +578,10 @@ bash scripts/runpod_workflow.sh cpu prepare \
   --cpuFlavor cpu5g
 ```
 
+`--max-api-calls` 是正整數，只計入本次 CPU Pod 的 EODHD cache miss 與 retry；它不是
+帳戶每日總額度，新的 CPU Pod 也不會自動扣除前一次 Pod 的帳戶使用量。`--eodhd-qps`
+與 `--taiwan-qps` 必須大於零，預設分別為 `16` 與 `0.5`；Taiwan 值是每個 provider
+各自的 limiter，因此 TWSE 與 TPEx 同時執行時是兩個獨立的 0.5 QPS 上限。
 `--maxRuntime`、明確的 `--prepareReserve` 與 `--maxBackoff` 都接受正整數加 `m`、`h` 或 `d`；
 `--prepareReserve auto` 使用上述自動公式，明確值必須短於 max runtime。
 `--maxBackoff` 預設為 `1m`，只控制 TWSE／TPEx：若下一次由指數退避或
@@ -672,7 +686,8 @@ network-attempt count（`--max-api-calls`）為界；TWSE／TPEx 不設 request-
 3. `download-progress.json` 記錄 attempt number、各 provider cache／network counts、
    EODHD limited count，以及每個 provider 的 `complete`、`waiting_for_budget`、
    `waiting_for_provider` 或 `waiting_for_resume` outcome；台灣錯誤另記已等待總秒數、
-   最後等待、下一次 proposed backoff 與最大值。HTTP status、`Retry-After` 與
+   最後等待、下一次 proposed backoff、最大值，以及該次 launch 實際使用的
+   `max-api-calls`／EODHD QPS／Taiwan QPS。HTTP status、`Retry-After` 與
    rate-limit headers 只在供應商有回傳時記錄；資料契約錯誤另記安全的 provider、
    operation、symbol/date/month 與 exception type，不記錄 token 或 response body。
 4. 若任一迴圈仍未完成，dataset lifecycle 依整體 outcome 進入
@@ -680,7 +695,9 @@ network-attempt count（`--max-api-calls`）為界；TWSE／TPEx 不設 request-
    維持不通過，CPU Pod 才自動終止。若三者都完成，則以固定 provider 順序合併分片，
    繼續 data cleaning，不會提早關閉 Pod。
 5. 額度恢復後，**不要重新 `configure`、不要改 `--dataset-revision`、不要刪除
-   cache**。在本機再次建立 CPU Pod，登入後重新啟動同一個 workflow：
+   cache**。在本機再次建立 CPU Pod 時，依新的剩餘額度重新輸入 `--max-api-calls`；
+   QPS 也可依當次 provider 狀態調整，兩者都不會改變 selection。登入後重新啟動同一個
+   workflow：
 
    ```bash
    bash scripts/runpod_workflow.sh cpu prepare
@@ -1272,6 +1289,10 @@ The downloader provides:
   CPU attempt. TWSE/TPEx have no request-count ceiling and instead exit at the
   default one-minute `--maxBackoff` boundary. Cache hits do not consume the
   EODHD counter; incomplete work is saved for another Pod.
+- `--max-api-calls`, `--eodhd-qps`, and `--taiwan-qps` are acquisition policy
+  values for one CPU Pod launch. They are set by `runpod_workflow.sh cpu prepare`,
+  are not part of the immutable dataset selection, and cannot change dataset
+  request identity.
 - One provider exiting never cancels another. Only after every provider loop
   exits does the workflow publish a resume state or deterministically merge
   provider-local artifacts.
@@ -1484,16 +1505,14 @@ All user-facing `configure` options are:
 | `--stocks` | Comma- or space-separated US tickers; repeatable | US stocks in `explicit` mode, such as `"AAPL,MSFT"`; does not affect Taiwan data |
 | `--etfs` | Comma- or space-separated US tickers; repeatable | US ETFs in `explicit` mode, such as `"SPY,QQQ"`; does not affect Taiwan data |
 | `--symbol-limit` | Positive integer N | **A bounded capacity/workflow check, not a complete-US-market mode.** Only valid for a US-containing `all` profile. After discovery, split ETFs and stocks, then keep up to N of each by active → delisted and ticker order; take all when a type has fewer than N. This is neither random nor representative sampling. Then ensure the required `VTI.US` benchmark is present: do not duplicate it if it is among the N ETFs, otherwise add it, so the raw universe is at most `2N+1`. Omit this option for all discovered US stocks and ETFs |
-| `--max-api-calls` | Positive integer; default `100000` | Project-side EODHD network-attempt safety budget for one acquisition—not a sample count, complete-dataset ceiling, Pod-creation rule, or actual remaining daily account quota. Only EODHD cache misses and retries consume it; TWSE/TPEx requests are recorded but unlimited by this counter. At the ceiling, only the EODHD loop exits while other provider loops continue. The workflow enters resumable `waiting_for_budget` only after every provider loop has exited. It does not assume every endpoint request costs exactly one billed call unit |
-| `--eodhd-qps` | Positive number; default `16` | EODHD requests-per-second pacing. The official limit is 1,000 requests per minute, while the default is floored to 16 requests per second (at most 960 per minute), leaving 40 requests per minute (4%) of headroom. The client spaces requests evenly. This does not replace the daily call quota, and `tw_only` never calls EODHD |
-| `--taiwan-qps` | Positive number; default `0.5` | Maximum TWSE/TPEx requests per second. It controls short-term pacing; `us_only_eodhd` never calls a Taiwan provider |
 | `--interactive` | Flag with no value | Explicitly open the interactive prompts; invoking `configure` with no options enables this mode automatically |
 
 Interactive defaults are `stage1`, `us_tw_eodhd`, dataset revision `v1`, start
-date `2005-01-01`, US universe `all`, API budget `100000`, EODHD QPS `16` (at
-most 960 requests per minute), and Taiwan QPS `0.5`. `--end` intentionally has
-no default: leaving its prompt blank asks again instead of selecting the local
-current date. The lower-level helper's
+date `2005-01-01`, and US universe `all`. `--end` intentionally has no default:
+leaving its prompt blank asks again instead of selecting the local current date.
+Provider budgets and QPS are not configured here. Supplying `--max-api-calls`,
+`--eodhd-qps`, or `--taiwan-qps` to this command is rejected as an unknown option
+instead of creating another selection. The lower-level helper's
 `--project-root` is injected by `runpod_workflow.sh`; it is not a user-facing
 dataset-scope option and should not be supplied manually.
 
@@ -1517,18 +1536,15 @@ bash scripts/runpod_workflow.sh configure \
   --end 2026-07-27 \
   --universe explicit \
   --stocks "AAPL,MSFT" \
-  --etfs "SPY,QQQ" \
-  --max-api-calls 10000 \
-  --eodhd-qps 16 \
-  --taiwan-qps 0.5
+  --etfs "SPY,QQQ"
 ```
 
-`--max-api-calls 10000` limits only EODHD network attempts in one acquisition.
+Provider acquisition policy is supplied separately when creating the CPU Pod.
+`--max-api-calls 10000` limits only EODHD network attempts in that acquisition.
 It neither truncates either market to 10,000 rows nor requires the full dataset
 to finish within 10,000 requests. At the ceiling, the EODHD loop exits while the
 parallel TWSE/TPEx loops continue. CPU preparation saves cache and
-`waiting_for_budget` progress only after all three loops exit; another Pod fills
-missing responses under the same immutable selection.
+`waiting_for_budget` progress only after all three loops exit.
 
 Provider quotas are a separate boundary. EODHD's current pricing page lists the
 personal `EOD Historical Data — All World` plan at USD 19.99 per month. Its
@@ -1557,11 +1573,12 @@ bash scripts/runpod_workflow.sh configure \
   --universe all
 ```
 
-Even when the post-discovery complete HTTP request estimate exceeds the default
-`100000`, it remains informational: it neither prevents Pod creation nor shrinks
-the dataset. Each CPU attempt sends at most the configured EODHD network attempts
-and the next Pod resumes from cache. Adjust `--max-api-calls` for cost and usage
-control; it never bypasses provider quotas.
+Even when the post-discovery complete HTTP request estimate exceeds that CPU
+Pod's `--max-api-calls`, it remains informational: it neither prevents Pod
+creation nor shrinks the dataset. Each CPU attempt sends at most the configured
+EODHD network attempts and the next Pod resumes from cache. Adjust
+`cpu prepare --max-api-calls` for cost and usage control; it never bypasses
+provider quotas.
 
 To use the same explicit US universe while downloading **no Taiwan data**, set
 the profile to `us_only_eodhd`:
@@ -1574,9 +1591,7 @@ bash scripts/runpod_workflow.sh configure \
   --end 2026-07-27 \
   --universe explicit \
   --stocks "AAPL,MSFT" \
-  --etfs "SPY,QQQ" \
-  --max-api-calls 5000 \
-  --eodhd-qps 16
+  --etfs "SPY,QQQ"
 ```
 
 This `us_only_eodhd` example contains only those four US tickers plus the
@@ -1595,10 +1610,14 @@ bash scripts/runpod_workflow.sh configure \
 
 The script creates `.runpod/selections/<selection-id>.json` and
 `.runpod/active-selection.json`. They contain no secrets and are excluded by
-`.gitignore`. A different profile, date range, universe, symbol limit, data
+`.gitignore`. Selection schema 2 removes transient acquisition policy. Existing
+schema-1 selections are not migrated automatically, so rerun `configure` after
+updating the code. Changing `--end` intentionally creates a new dataset request
+namespace; existing network-volume files are not deleted. A different profile,
+date range, universe, symbol limit, data
 preparation contract, or stage-config SHA-256 produces a different identity.
-QPS and API budget remain recorded in the selection without misidentifying the
-same dataset semantics as a different dataset request.
+QPS and API budget are recorded only in CPU launch metadata, download progress,
+and the download manifest; they never enter selection identity.
 
 When provider history may have been revised and a new snapshot is intentional
 for the same profile/date/universe, pass a new explicit
@@ -1649,13 +1668,15 @@ selection, rerun CPU preparation as well. Never bypass the GPU gate.
 
 The CPU Pod accepts only the active selection. Pod creation fails before any
 compute is rented when `configure` has not run, the config SHA changed, or the
-selection JSON is incomplete. With no resource options, the local command is
-interactive: it prompts for the maximum workload runtime, the time reserved for
+selection JSON is incomplete. With no options, the local command is interactive:
+it prompts for maximum workload runtime, the maximum additional EODHD network
+attempts for this Pod, EODHD QPS, per-provider TWSE/TPEx QPS, time reserved for
 data cleaning/window construction, maximum TWSE/TPEx retry backoff, vCPU count,
-and CPU flavor. Pressing Enter accepts 6 hours, an automatic reserve, 1 minute,
-8 vCPUs, and `cpu3g`. The automatic
-reserve is 25% of max runtime, capped at 2 hours; the six-hour default reserves
-90 minutes.
+and CPU flavor. `--max-api-calls` has no Enter-to-accept default and must be
+entered explicitly from the account's current remaining quota. Pressing Enter
+accepts 6 hours, 16 EODHD QPS, 0.5 QPS for each Taiwan provider, an automatic
+reserve, 1 minute, 8 vCPUs, and `cpu3g`. The automatic reserve is 25% of max
+runtime, capped at 2 hours; the six-hour default reserves 90 minutes.
 The final prompt requires `y` or `yes` before creating a potentially billable
 Pod; Enter, `n`, or `no` cancels safely:
 
@@ -1663,12 +1684,16 @@ Pod; Enter, `n`, or `no` cancels safely:
 bash scripts/runpod_workflow.sh cpu prepare
 ```
 
-Providing any resource option selects non-interactive mode, while omitted
-options retain their defaults. Automation can therefore provide all values
-explicitly without editing `.env`:
+Providing any option selects non-interactive mode. This mode requires an explicit
+`--max-api-calls`; omitted QPS and resource options retain their defaults.
+Automation can therefore provide all values without editing `.env` or rerunning
+`configure`:
 
 ```bash
 bash scripts/runpod_workflow.sh cpu prepare \
+  --max-api-calls 80000 \
+  --eodhd-qps 16 \
+  --taiwan-qps 0.5 \
   --maxRuntime 10h \
   --prepareReserve 2h \
   --maxBackoff 1m \
@@ -1682,6 +1707,9 @@ user can confirm or replace:
 ```bash
 bash scripts/runpod_workflow.sh cpu prepare \
   --interactive \
+  --max-api-calls 80000 \
+  --eodhd-qps 16 \
+  --taiwan-qps 0.5 \
   --maxRuntime 10h \
   --prepareReserve auto \
   --maxBackoff 1m \
@@ -1689,7 +1717,13 @@ bash scripts/runpod_workflow.sh cpu prepare \
   --cpuFlavor cpu5g
 ```
 
-`--maxRuntime`, an explicit `--prepareReserve`, and `--maxBackoff` accept a
+`--max-api-calls` is a positive integer counting only EODHD cache misses and
+retries in this CPU Pod. It is not the account's total daily quota, and a new
+Pod does not automatically subtract account usage by earlier Pods.
+`--eodhd-qps` and `--taiwan-qps` must be positive, defaulting to `16` and `0.5`.
+The Taiwan value is per provider, so concurrent TWSE and TPEx loops each have an
+independent 0.5-QPS limiter. `--maxRuntime`, an explicit `--prepareReserve`, and
+`--maxBackoff` accept a
 positive integer followed by `m`, `h`, or `d`. `--prepareReserve auto` uses the
 formula above; an explicit reserve must be shorter than max runtime.
 `--maxBackoff` defaults to `1m` and applies only to TWSE/TPEx. A provider loop
@@ -1815,7 +1849,8 @@ to protect cleaning time. The workflow follows this contract:
    counts, the limited EODHD count, and each provider's `complete`,
    `waiting_for_budget`, `waiting_for_provider`, or `waiting_for_resume` outcome.
    Taiwan errors also record cumulative wait, last wait, next proposed backoff,
-   and the maximum. HTTP status, `Retry-After`, and rate-limit headers are stored
+   the maximum, and the launch's effective `max-api-calls`, EODHD QPS, and Taiwan
+   QPS. HTTP status, `Retry-After`, and rate-limit headers are stored
    when supplied. Data-contract errors additionally identify the safe provider,
    operation, symbol/date/month, and exception type. Tokens and response bodies
    are not stored.
@@ -1825,8 +1860,10 @@ to protect cleaning time. The workflow follows this contract:
    loops complete, provider-local parts are merged in a fixed order and cleaning
    continues instead of closing the Pod early.
 5. After quota becomes available, **do not reconfigure, change
-   `--dataset-revision`, or delete the cache**. Create another CPU Pod locally,
-   connect to it, and start the same workflow:
+   `--dataset-revision`, or delete the cache**. When creating the next CPU Pod,
+   enter a new `--max-api-calls` value for the current remaining quota. QPS may
+   also change for that attempt without changing the selection. Then connect to
+   it and start the same workflow:
 
    ```bash
    bash scripts/runpod_workflow.sh cpu prepare
