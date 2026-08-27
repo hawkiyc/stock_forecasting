@@ -372,7 +372,10 @@ class TWSEProvider(_TaiwanMarketProvider):
                     detail_fields, detail_rows = _first_table(detail)
                     free_share_index = _field_index(
                         detail_fields,
-                        {"A.按普通股股東持股比例每千股無償配股"},
+                        {
+                            "A.按普通股股東持股比例每千股無償配股",
+                            "F.按特別股股東持股比例每千股無償配股",
+                        },
                     )
                     if detail_rows and len(detail_rows[0]) > free_share_index:
                         free_shares = _number(

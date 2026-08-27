@@ -918,6 +918,72 @@ def test_twse_historical_action_without_detail_keeps_price_factor_and_records_ga
     assert fetched.metadata["missing_share_multiplier_details"] == 1
 
 
+def test_twse_preferred_share_action_uses_preferred_free_share_field() -> None:
+    class _ActionClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        def get_json(
+            self,
+            endpoint: str,
+            *,
+            params: dict[str, Any],
+        ) -> tuple[Any, RequestRecord]:
+            self.calls.append((endpoint, params))
+            if endpoint.endswith("TWT49UDetail"):
+                return (
+                    {
+                        "stat": "ok",
+                        "fields": [
+                            "股票代號",
+                            "股票名稱",
+                            "(每股配發現金股利)除息",
+                            "(增資配股) 除權",
+                            "F. 按特別股股東持股比例每千股無償配股",
+                            "G. 按特別股股東持股比例每千股有償認股",
+                            "每股認購金額",
+                        ],
+                        "data": [
+                            [
+                                "2847B ",
+                                "眾乙特          ",
+                                "0 元/股",
+                                "",
+                                "0 股",
+                                "178 股",
+                                "10.1 元/股",
+                            ]
+                        ],
+                    },
+                    _request("twse_official"),
+                )
+            return (
+                {
+                    "fields": [
+                        "資料日期",
+                        "股票代號",
+                        "除權息前收盤價",
+                        "除權息參考價",
+                        "權/息",
+                    ],
+                    "data": [["94年02月15日", "2847B", "11.50", "11.32", "權"]],
+                },
+                _request("twse_official"),
+            )
+
+    client = _ActionClient()
+    fetched = TWSEProvider(client).fetch_actions(start="2005-01-01", end="2005-12-31")
+
+    assert len(client.calls) == 2
+    assert client.calls[1][1]["STK_NO"] == "2847B"
+    assert client.calls[1][1]["T1"] == "20050215"
+    assert fetched.frame.loc[0, "symbol"] == "2847B.TW"
+    assert fetched.frame.loc[0, "price_factor"] == pytest.approx(11.32 / 11.50)
+    assert fetched.frame.loc[0, "share_multiplier"] == pytest.approx(1.0)
+    assert fetched.frame.loc[0, "source"] == "twse_twt49u"
+    assert fetched.metadata["missing_share_multiplier_details"] == 0
+
+
 def test_download_cli_renders_fatal_provider_outcomes_without_a_traceback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
