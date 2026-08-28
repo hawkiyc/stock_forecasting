@@ -603,9 +603,9 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
     )
 
     invalid_boundary = copy.deepcopy(validated)
-    invalid_boundary["split_audit"]["splits"]["train"]["label_end_max_at"] = (
-        invalid_boundary["split_audit"]["train_boundary_exclusive"]
-    )
+    crossing_at = invalid_boundary["split_audit"]["train_boundary_exclusive"]
+    invalid_boundary["split_audit"]["splits"]["train"]["label_end_max_at"] = crossing_at
+    invalid_boundary["split_audit"]["maximum_label_end"]["train"] = crossing_at
     with pytest.raises(ValueError, match="train labels cross"):
         validate_dataset_preparation_contract(
             invalid_boundary,
