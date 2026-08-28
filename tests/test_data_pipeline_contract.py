@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ import pytest
 
 from stock_forecasting.baselines import baseline_arrays
 from stock_forecasting.data.adjustments import asof_adjusted_window
+from stock_forecasting.data.benchmarks import resolve_benchmark
 from stock_forecasting.data.dataset import FinancialBatchCollator, FinancialWindowDataset
 from stock_forecasting.data.manifest import (
     artifact_metadata,
@@ -22,7 +24,13 @@ from stock_forecasting.data.manifest import (
     validate_download_manifest,
     validate_training_dataset_manifest,
 )
-from stock_forecasting.data.schema import MarketDataValidationError, normalize_ohlcv_frame
+from stock_forecasting.data.schema import (
+    TRAINING_SECURITY_SCOPE,
+    TRAINING_TARGET_ASSET_TYPES,
+    MarketDataValidationError,
+    normalize_ohlcv_frame,
+)
+from stock_forecasting.data.splits import SPLIT_POLICY, chronological_split
 from stock_forecasting.data.windows import DEFAULT_ALPHA_HORIZONS, build_causal_windows
 from stock_forecasting.training import deterministic_stratified_indices
 
@@ -49,6 +57,153 @@ def test_causal_records_have_paired_historical_inputs_and_future_labels_only(
     assert set(label["alpha_log_returns"]) == {f"{horizon}d" for horizon in DEFAULT_ALPHA_HORIZONS}
     assert label["entry_day_counts_as_holding_day_one"] is True
     assert not ({"text", "facts", "description", "future_benchmark"} & set(record))
+
+
+def test_training_targets_include_common_stock_depositary_receipts_and_equity_etfs(
+    market_frame: pd.DataFrame,
+    window_records: list[dict[str, object]],
+) -> None:
+    assert TRAINING_TARGET_ASSET_TYPES == {"stock", "etf"}
+    assert {str(record["asset_type"]) for record in window_records} == {"stock", "etf"}
+
+    adr = market_frame[market_frame["symbol"] == "AAPL.US"].copy()
+    adr["symbol"] = "BABA.US"
+    adr["source_symbol"] = "BABA"
+    tdr = market_frame[market_frame["symbol"] == "0050.TW"].copy()
+    tdr["symbol"] = "9105.TW"
+    tdr["asset_type"] = "stock"
+    tdr["source_symbol"] = "9105"
+    expanded = pd.concat([market_frame, adr, tdr], ignore_index=True)
+
+    records = build_causal_windows(expanded, window_size=32, stride=20)
+
+    assert {"AAPL.US", "BABA.US", "0050.TW", "9105.TW"} <= {
+        str(record["symbol"]) for record in records
+    }
+    assert {
+        str(record["asset_type"])
+        for record in records
+        if record["symbol"] in {"BABA.US", "9105.TW"}
+    } == {"stock"}
+
+    unsupported = market_frame[market_frame["symbol"].isin({"0050.TW", "TAIEX.TW"})].copy()
+    unsupported.loc[unsupported["symbol"] == "0050.TW", "symbol"] = "2847B.TW"
+    unsupported.loc[unsupported["symbol"] == "2847B.TW", "asset_type"] = "other"
+    audit: dict[str, Any] = {}
+
+    excluded = build_causal_windows(
+        unsupported,
+        window_size=32,
+        stride=20,
+        benchmark_mapping={"2847B.TW": "TAIEX.TW"},
+        audit=audit,
+    )
+
+    assert excluded == []
+    assert audit["excluded_counts_by_reason"]["unsupported_asset_type"] == 1
+
+
+@pytest.mark.parametrize(
+    ("symbol", "market", "benchmark"),
+    (
+        ("TQQQ.US", "US", "VTI.US"),
+        ("SQQQ.US", "US", "VTI.US"),
+        ("00631L.TW", "TWSE", "TAIEX.TW"),
+        ("00632R.TW", "TWSE", "TAIEX.TW"),
+    ),
+)
+def test_leveraged_and_inverse_etfs_cannot_bypass_the_allowlist_with_mapping(
+    symbol: str,
+    market: str,
+    benchmark: str,
+) -> None:
+    decision = resolve_benchmark(
+        symbol=symbol,
+        asset_type="etf",
+        market=market,
+        explicit_mapping={symbol: benchmark},
+    )
+
+    assert decision.eligible is False
+    assert decision.reason == "etf_not_in_audited_unleveraged_equity_allowlist"
+
+
+def test_taiwan_preferred_share_cannot_be_mislabeled_as_stock_to_bypass_scope() -> None:
+    decision = resolve_benchmark(
+        symbol="2847B.TW",
+        asset_type="stock",
+        market="TWSE",
+        explicit_mapping={"2847B.TW": "TAIEX.TW"},
+    )
+
+    assert decision.eligible is False
+    assert decision.reason == "security_not_in_common_stock_or_depositary_receipt_scope"
+
+
+def test_training_dataset_rejects_targets_outside_the_security_scope(
+    window_records: list[dict[str, object]],
+) -> None:
+    invalid = copy.deepcopy(window_records[0])
+    invalid["asset_type"] = "index"
+
+    with pytest.raises(ValueError, match="common stock/ADR/TDR"):
+        FinancialWindowDataset([invalid])
+
+    leveraged = copy.deepcopy(window_records[0])
+    leveraged["symbol"] = "TQQQ.US"
+    leveraged["asset_type"] = "etf"
+    leveraged["metadata"]["market"] = "US"
+    with pytest.raises(ValueError, match="outside the common-stock/ADR/TDR"):
+        FinancialWindowDataset([leveraged])
+
+    preferred = copy.deepcopy(window_records[0])
+    preferred["symbol"] = "2847B.TW"
+    preferred["asset_type"] = "stock"
+    preferred["metadata"]["market"] = "TWSE"
+    with pytest.raises(ValueError, match="outside the common-stock/ADR/TDR"):
+        FinancialWindowDataset([preferred])
+
+
+def test_chronological_split_is_global_and_labels_never_cross_boundaries(
+    market_frame: pd.DataFrame,
+) -> None:
+    windows = build_causal_windows(market_frame, window_size=32, stride=2)
+    audit: dict[str, Any] = {}
+
+    assigned = chronological_split(
+        windows,
+        train_fraction=0.70,
+        validation_fraction=0.15,
+        purge_bars=0,
+        embargo_bars=0,
+        audit=audit,
+    )
+
+    grouped = {
+        split: [record for record in assigned if record["split"] == split]
+        for split in ("train", "validation", "test")
+    }
+    assert max(pd.Timestamp(record["cutoff_at"]) for record in grouped["train"]) < min(
+        pd.Timestamp(record["cutoff_at"]) for record in grouped["validation"]
+    )
+    assert max(
+        pd.Timestamp(record["cutoff_at"]) for record in grouped["validation"]
+    ) < min(pd.Timestamp(record["cutoff_at"]) for record in grouped["test"])
+    train_boundary = pd.Timestamp(audit["train_boundary_exclusive"])
+    validation_boundary = pd.Timestamp(audit["validation_boundary_exclusive"])
+    assert max(
+        pd.Timestamp(value)
+        for record in grouped["train"]
+        for value in record["label"]["end_at"].values()
+    ) < train_boundary
+    assert max(
+        pd.Timestamp(value)
+        for record in grouped["validation"]
+        for value in record["label"]["end_at"].values()
+    ) < validation_boundary
+    assert audit["policy"] == SPLIT_POLICY
+    assert audit["dropped_counts_by_reason"]["label_crosses_train_boundary"] > 0
+    assert audit["dropped_counts_by_reason"]["label_crosses_validation_boundary"] > 0
 
 
 def test_globally_back_adjusted_vendor_scale_cancels_at_each_cutoff(
@@ -298,6 +453,8 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
         "entry_day_counts_as_holding_day_one": True,
         "exit_timing": "regular_session_close_t_plus_h",
         "input_adjustment": "point_in_time_total_return_ohlc_split_adjusted_volume",
+        "training_security_scope": TRAINING_SECURITY_SCOPE,
+        "split_policy": SPLIT_POLICY,
         "benchmark_mapping_sha256": canonical_json_sha256({}),
         "flat_volatility_multiplier": 0.25,
         "max_abs_log_return": 0.5,
@@ -314,13 +471,52 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
         "robust_scales": [0.01] * len(DEFAULT_ALPHA_HORIZONS),
         "prediction_units": "benchmark_relative_log_return",
     }
+    split_audit = {
+        "schema_version": "causal-split-audit-v1",
+        "policy": SPLIT_POLICY,
+        "comparison": "label.end_at < next_split_start",
+        "violations": 0,
+        "train_boundary_exclusive": "2025-01-01T00:00:00+00:00",
+        "validation_boundary_exclusive": "2025-06-01T00:00:00+00:00",
+        "validation_start": "2025-01-20T00:00:00+00:00",
+        "test_start": "2025-06-20T00:00:00+00:00",
+        "label_end_counts": {"train": 3, "validation": 1, "test": 1},
+        "maximum_label_end": {
+            "train": "2024-12-20T00:00:00+00:00",
+            "validation": "2025-05-20T00:00:00+00:00",
+            "test": "2025-07-10T00:00:00+00:00",
+        },
+        "dropped_counts_by_reason": {"purge_or_embargo": 2},
+        "splits": {
+            "train": {
+                "records": 3,
+                "cutoff_start_at": "2020-01-01T00:00:00+00:00",
+                "cutoff_end_at": "2024-12-01T00:00:00+00:00",
+                "label_end_max_at": "2024-12-20T00:00:00+00:00",
+            },
+            "validation": {
+                "records": 1,
+                "cutoff_start_at": "2025-01-20T00:00:00+00:00",
+                "cutoff_end_at": "2025-05-01T00:00:00+00:00",
+                "label_end_max_at": "2025-05-20T00:00:00+00:00",
+            },
+            "test": {
+                "records": 1,
+                "cutoff_start_at": "2025-06-20T00:00:00+00:00",
+                "cutoff_end_at": "2025-06-20T00:00:00+00:00",
+                "label_end_max_at": "2025-07-10T00:00:00+00:00",
+            },
+        },
+    }
     payload = {
         "schema_version": "2.0",
         "kind": "ohlcv-dataset",
         "state": "ready",
+        "training_security_scope": TRAINING_SECURITY_SCOPE,
         "dataset_profile": "tw_only",
         "selected_datasets": ["tpex_official", "twse_official"],
         "split_counts": {"test": 1, "train": 3, "validation": 1},
+        "split_audit": split_audit,
         "preparation_spec": preparation_spec,
         "preparation_spec_sha256": canonical_json_sha256(preparation_spec),
         "label_statistics": label_statistics,
@@ -354,6 +550,26 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
         )
         == preparation_spec
     )
+
+    invalid_boundary = copy.deepcopy(validated)
+    invalid_boundary["split_audit"]["splits"]["train"]["label_end_max_at"] = (
+        invalid_boundary["split_audit"]["train_boundary_exclusive"]
+    )
+    with pytest.raises(ValueError, match="train labels cross"):
+        validate_dataset_preparation_contract(
+            invalid_boundary,
+            input_length=128,
+            alpha_horizons=list(DEFAULT_ALPHA_HORIZONS),
+            benchmark_mapping_path=None,
+            sample_stride=1,
+            effective_embargo_trading_days=14,
+            forecast_horizon=5,
+            diagnostic_horizons=[1, 20],
+            stride=5,
+            flat_volatility_multiplier=0.25,
+            max_abs_log_return=0.5,
+            embargo_trading_days=5,
+        )
 
     with pytest.raises(ValueError, match="window_size"):
         validate_dataset_preparation_contract(
@@ -395,6 +611,7 @@ def test_downloaded_checkpoint_binds_raw_and_request_log_integrity(tmp_path: Pat
             "schema_version": "2.0",
             "kind": "ohlcv-dataset",
             "state": "downloaded",
+            "training_security_scope": TRAINING_SECURITY_SCOPE,
             "dataset_profile": "tw_only",
             "artifacts": {
                 "raw": artifact_metadata(raw, root=tmp_path, row_count=10),
@@ -405,6 +622,14 @@ def test_downloaded_checkpoint_binds_raw_and_request_log_integrity(tmp_path: Pat
 
     validated = validate_download_manifest(manifest, input_path=raw)
     assert validated["state"] == "downloaded"
+
+    obsolete = json.loads(manifest.read_text(encoding="utf-8"))
+    obsolete["training_security_scope"] = "obsolete"
+    atomic_write_json(manifest, obsolete)
+    with pytest.raises(ValueError, match="security scope"):
+        validate_download_manifest(manifest, input_path=raw)
+    obsolete["training_security_scope"] = TRAINING_SECURITY_SCOPE
+    atomic_write_json(manifest, obsolete)
 
     request_log.write_text('{"provider":"tampered"}\n', encoding="utf-8")
     with pytest.raises(ValueError, match="integrity mismatch"):

@@ -3,10 +3,45 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from typing import Any
 
 import pandas as pd
+
+SPLIT_POLICY = "global_chronological_cutoff_with_purge_embargo_and_label_end_guard_v1"
+
+
+def _label_end_at(record: Mapping[str, Any]) -> pd.Timestamp:
+    """Return the latest ground-truth timestamp and reject malformed labels."""
+
+    cutoff = pd.Timestamp(record.get("cutoff_at"))
+    label = record.get("label")
+    if not isinstance(label, Mapping):
+        raise ValueError("Every split candidate must contain a label object")
+    end_at = label.get("end_at")
+    if not isinstance(end_at, Mapping) or not end_at:
+        raise ValueError("Every split candidate label must contain non-empty end_at values")
+    try:
+        end_timestamps = [pd.Timestamp(value) for value in end_at.values()]
+    except (TypeError, ValueError) as error:
+        raise ValueError("Split candidate label end_at contains an invalid timestamp") from error
+    if pd.isna(cutoff) or any(pd.isna(timestamp) for timestamp in end_timestamps):
+        raise ValueError("Split candidate timestamps must not be missing")
+    if any(timestamp <= cutoff for timestamp in end_timestamps):
+        raise ValueError("Every ground-truth label timestamp must be after cutoff_at")
+    return max(end_timestamps)
+
+
+def _split_summary(records: Sequence[dict[str, Any]], split: str) -> dict[str, Any]:
+    selected = [record for record in records if record["split"] == split]
+    cutoffs = [pd.Timestamp(record["cutoff_at"]) for record in selected]
+    label_ends = [_label_end_at(record) for record in selected]
+    return {
+        "records": len(selected),
+        "cutoff_start_at": min(cutoffs).isoformat(),
+        "cutoff_end_at": max(cutoffs).isoformat(),
+        "label_end_max_at": max(label_ends).isoformat(),
+    }
 
 
 def chronological_split(
@@ -16,6 +51,7 @@ def chronological_split(
     validation_fraction: float = 0.15,
     purge_bars: int = 20,
     embargo_bars: int = 5,
+    audit: MutableMapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Assign train/validation/test using global cutoff dates.
 
@@ -59,23 +95,69 @@ def chronological_split(
             "Use more data or smaller purge/embargo values."
         )
 
-    date_to_split: dict[pd.Timestamp, str] = {}
-    for date in cutoff_dates:
-        date_index = observed_date_index[date]
-        if date_index < train_stop:
-            date_to_split[date] = "train"
-        elif validation_start <= date_index < validation_stop:
-            date_to_split[date] = "validation"
-        elif date_index >= test_start:
-            date_to_split[date] = "test"
-
     assigned: list[dict[str, Any]] = []
+    dropped: Counter[str] = Counter()
+    train_boundary_at = cutoff_dates[train_boundary]
+    validation_boundary_at = cutoff_dates[validation_boundary]
     for record in records:
-        split = date_to_split.get(pd.Timestamp(record["cutoff_at"]))
+        cutoff_at = pd.Timestamp(record["cutoff_at"])
+        date_index = observed_date_index[cutoff_at]
+        label_end_at = _label_end_at(record)
+        split: str | None = None
+        if date_index < train_stop:
+            if label_end_at < train_boundary_at:
+                split = "train"
+            else:
+                dropped["label_crosses_train_boundary"] += 1
+        elif validation_start <= date_index < validation_stop:
+            if label_end_at < validation_boundary_at:
+                split = "validation"
+            else:
+                dropped["label_crosses_validation_boundary"] += 1
+        elif date_index >= test_start:
+            split = "test"
+        else:
+            dropped["purge_or_embargo"] += 1
         if split is not None:
             assigned.append({**record, "split": split})
 
     counts = Counter(record["split"] for record in assigned)
     if any(counts[name] == 0 for name in ("train", "validation", "test")):
         raise RuntimeError("Chronological split unexpectedly produced an empty split.")
+    if max(
+        _label_end_at(record) for record in assigned if record["split"] == "train"
+    ) >= train_boundary_at:
+        raise RuntimeError("Train labels cross the global train boundary")
+    if max(
+        _label_end_at(record) for record in assigned if record["split"] == "validation"
+    ) >= validation_boundary_at:
+        raise RuntimeError("Validation labels cross the global validation boundary")
+    if audit is not None:
+        audit.clear()
+        split_summaries = {
+            split: _split_summary(assigned, split)
+            for split in ("train", "validation", "test")
+        }
+        audit.update(
+            {
+                "schema_version": "causal-split-audit-v1",
+                "policy": SPLIT_POLICY,
+                "comparison": "label.end_at < next_split_start",
+                "violations": 0,
+                "train_boundary_exclusive": train_boundary_at.isoformat(),
+                "validation_boundary_exclusive": validation_boundary_at.isoformat(),
+                "validation_start": split_summaries["validation"]["cutoff_start_at"],
+                "test_start": split_summaries["test"]["cutoff_start_at"],
+                "label_end_counts": {
+                    split: split_summaries[split]["records"]
+                    for split in ("train", "validation", "test")
+                },
+                "maximum_label_end": {
+                    split: split_summaries[split]["label_end_max_at"]
+                    for split in ("train", "validation", "test")
+                },
+                "dropped_counts_by_reason": dict(sorted(dropped.items())),
+                "splits": split_summaries,
+            }
+        )
     return assigned

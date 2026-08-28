@@ -12,7 +12,9 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
+from stock_forecasting.data.benchmarks import is_training_target_security
 from stock_forecasting.data.io import read_processed_records
+from stock_forecasting.data.schema import TRAINING_TARGET_ASSET_TYPES
 from stock_forecasting.data.windows import (
     CONTEXT_FIELDS,
     DEFAULT_ALPHA_HORIZONS,
@@ -51,6 +53,37 @@ class FinancialWindowDataset(Dataset[dict[str, Any]]):
             raise ValueError(
                 f"Conditional alpha training requires processed schema "
                 f"{PROCESSED_SCHEMA_VERSION}; found " + ", ".join(invalid_versions)
+            )
+        invalid_asset_types = sorted(
+            {
+                str(record.get("asset_type", "")).strip().lower()
+                for record in self.records
+                if str(record.get("asset_type", "")).strip().lower()
+                not in TRAINING_TARGET_ASSET_TYPES
+            }
+        )
+        if invalid_asset_types:
+            raise ValueError(
+                "Conditional alpha training supports only common stock/ADR/TDR and "
+                "allowlisted unleveraged equity ETF targets; found "
+                + ", ".join(value or "<missing>" for value in invalid_asset_types)
+            )
+        invalid_security_symbols: set[str] = set()
+        for record in self.records:
+            metadata = record.get("metadata")
+            market = metadata.get("market", "") if isinstance(metadata, dict) else ""
+            symbol = str(record.get("symbol", "")).strip().upper()
+            if not is_training_target_security(
+                symbol=symbol,
+                asset_type=str(record.get("asset_type", "")),
+                market=str(market),
+            ):
+                invalid_security_symbols.add(symbol or "<missing>")
+        if invalid_security_symbols:
+            raise ValueError(
+                "Conditional alpha training rejected targets outside the common-stock/ADR/TDR "
+                "and audited unleveraged-equity-ETF scope: "
+                + ", ".join(sorted(invalid_security_symbols))
             )
         self.split = split
         self.series_mode = series_mode

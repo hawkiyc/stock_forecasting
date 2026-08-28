@@ -21,8 +21,8 @@ from stock_forecasting.data.manifest import (
     validate_download_manifest,
 )
 from stock_forecasting.data.quality import assess_ohlcv_quality
-from stock_forecasting.data.schema import read_market_data
-from stock_forecasting.data.splits import chronological_split
+from stock_forecasting.data.schema import TRAINING_SECURITY_SCOPE, read_market_data
+from stock_forecasting.data.splits import SPLIT_POLICY, chronological_split
 from stock_forecasting.data.windows import (
     DEFAULT_ALPHA_HORIZONS,
     PROCESSED_SCHEMA_VERSION,
@@ -133,12 +133,14 @@ def prepare_dataset(
         raise ValueError(
             "No quality-approved windows were created; check history length and source quality"
         )
+    split_audit: dict[str, Any] = {}
     assigned = chronological_split(
         windows,
         train_fraction=args.train_fraction,
         validation_fraction=args.validation_fraction,
         purge_bars=args.purge_bars,
         embargo_bars=args.effective_embargo_bars,
+        audit=split_audit,
     )
     counts = Counter(record["split"] for record in assigned)
     if set(counts) != {"train", "validation", "test"}:
@@ -163,6 +165,8 @@ def prepare_dataset(
         "entry_day_counts_as_holding_day_one": True,
         "exit_timing": "regular_session_close_t_plus_h",
         "input_adjustment": "point_in_time_total_return_ohlc_split_adjusted_volume",
+        "training_security_scope": TRAINING_SECURITY_SCOPE,
+        "split_policy": SPLIT_POLICY,
         "benchmark_mapping_sha256": benchmark_mapping_sha256,
         "target_horizon": args.target_horizon,
         "diagnostic_horizons": args.diagnostic_horizons,
@@ -178,12 +182,13 @@ def prepare_dataset(
         "input_rows": len(frame),
         "candidate_windows_after_quality": len(windows),
         "written_windows": len(assigned),
-        "dropped_for_purge_or_embargo": len(windows) - len(assigned),
+        "dropped_before_split_assignment": len(windows) - len(assigned),
         "split_counts": dict(sorted(counts.items())),
         "symbols": sorted(str(value) for value in frame["symbol"].unique()),
         "preparation_spec": preparation_spec,
         "quality": quality,
         "window_audit": window_audit,
+        "split_audit": split_audit,
         "label_statistics": label_statistics,
         "execution": {
             "parallelism": "thread_pool_by_symbol",
@@ -226,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
         "kind": "ohlcv-dataset",
         "state": "ready",
         "created_at": datetime.now(UTC).isoformat(),
+        "training_security_scope": TRAINING_SECURITY_SCOPE,
         "dataset_profile": download["dataset_profile"],
         "selected_datasets": download["selected_datasets"],
         "providers": download["providers"],
@@ -235,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         "split_counts": split_counts,
         "label_statistics": summary["label_statistics"],
         "window_audit": summary["window_audit"],
+        "split_audit": summary["split_audit"],
         "preparation_spec": preparation_spec,
         "preparation_spec_sha256": canonical_json_sha256(preparation_spec),
         "data_pipeline_digest": _pipeline_digest(),
@@ -249,7 +256,12 @@ def main(argv: list[str] | None = None) -> int:
             "download": download["quality"],
             "processed": summary["quality"],
             "quality_approved_windows": summary["candidate_windows_after_quality"],
-            "purge_or_embargo_dropped_windows": summary["dropped_for_purge_or_embargo"],
+            "split_boundary_dropped_windows": summary[
+                "dropped_before_split_assignment"
+            ],
+            "split_dropped_counts_by_reason": summary["split_audit"][
+                "dropped_counts_by_reason"
+            ],
         },
         "execution": summary["execution"],
         "artifacts": {

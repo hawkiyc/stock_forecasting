@@ -45,7 +45,7 @@ STAGE_RUNTIME = {
 
 # These settings define dataset semantics and must change the dataset request digest.
 PREPARATION_CONTRACT = {
-    "schema_version": 2,
+    "schema_version": 3,
     "processed_schema_version": "3.0",
     "window_size": 128,
     "stride": 5,
@@ -57,8 +57,15 @@ PREPARATION_CONTRACT = {
     "entry_day_counts_as_holding_day_one": True,
     "exit_timing": "regular_session_close_t_plus_h",
     "input_adjustment": "point_in_time_total_return_ohlc_split_adjusted_volume",
+    "training_security_scope": (
+        "common_stock_adr_tdr_and_allowlisted_unleveraged_equity_etf_v1"
+    ),
+    "split_policy": "global_chronological_cutoff_with_purge_embargo_and_label_end_guard_v1",
     "eodhd_split_policy": "per_symbol_full_historical_splits_reconstruct_unadjusted_volume_v2",
-    "us_symbol_limit_policy": "up_to_n_etfs_and_n_stocks_active_then_delisted_ticker_plus_vti",
+    "us_symbol_limit_policy": (
+        "up_to_n_allowlisted_unleveraged_equity_etfs_and_n_stocks_"
+        "active_then_delisted_ticker_plus_vti"
+    ),
     "benchmark_mapping_sha256": (
         "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
     ),
@@ -77,6 +84,7 @@ EXPORT_KEYS = (
     "RUNPOD_SELECTION_ID",
     "RUNPOD_SELECTION_SHA256",
     "RUNPOD_DATASET_REQUEST_SHA256",
+    "RUNPOD_DATASET_REVISION",
     "RUNPOD_SELECTION_FILE",
     "RUNPOD_REMOTE_SELECTION_RELATIVE_PATH",
     "RUNPOD_REMOTE_SELECTION_PATH",
@@ -561,7 +569,8 @@ def _populate_interactive(arguments: argparse.Namespace) -> None:
             arguments.stocks = []
             arguments.etfs = []
             limit = _prompt_text(
-                "Optional per-type US discovery limit: up to N ETFs and N stocks (blank means all)"
+                "Optional per-type US discovery limit: up to N allowlisted unleveraged "
+                "equity ETFs and N stocks (blank means all)"
             )
             arguments.symbol_limit = int(limit) if limit else None
 
@@ -576,6 +585,7 @@ def _selection_exports(selection_path: Path, payload: Dict[str, Any]) -> Dict[st
         "RUNPOD_SELECTION_ID": selection_id,
         "RUNPOD_SELECTION_SHA256": payload["selection_sha256"],
         "RUNPOD_DATASET_REQUEST_SHA256": digest,
+        "RUNPOD_DATASET_REVISION": request["revision"],
         "RUNPOD_SELECTION_FILE": str(selection_path),
         "RUNPOD_REMOTE_SELECTION_RELATIVE_PATH": f"lifecycle/selections/{selection_id}.json",
         "RUNPOD_REMOTE_SELECTION_PATH": f"/runpod-volume/lifecycle/selections/{selection_id}.json",
@@ -707,6 +717,11 @@ def _bind_marker(
         download.get("selected_datasets"), request["selected_datasets"], "download providers"
     )
     _assert_equal(download.get("date_range"), request["date_range"], "download date range")
+    _assert_equal(
+        download.get("training_security_scope"),
+        request["preparation"]["training_security_scope"],
+        "download training security scope",
+    )
     api_policy = download.get("api_policy")
     if not isinstance(api_policy, dict):
         _fail("Download manifest API policy is invalid")
@@ -719,6 +734,11 @@ def _bind_marker(
         api_policy.get("include_delisted"),
         request["universe"]["include_delisted_us"],
         "download delisted-universe policy",
+    )
+    _assert_equal(
+        api_policy.get("cache_revision"),
+        request["revision"],
+        "download provider-cache revision",
     )
     if request["universe"]["mode"] == "explicit":
         symbols = marker.get("symbols", {}).get("values")
@@ -766,6 +786,7 @@ def _verify_environment(
             "RUNPOD_SELECTION_ID",
             "RUNPOD_SELECTION_SHA256",
             "RUNPOD_DATASET_REQUEST_SHA256",
+            "RUNPOD_DATASET_REVISION",
             "RUNPOD_STAGE",
             "RUNPOD_CONFIG",
             "RUNPOD_STAGE_CONFIG_SHA256",

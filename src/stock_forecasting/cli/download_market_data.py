@@ -59,6 +59,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset-request-sha256",
         default=os.environ.get("RUNPOD_DATASET_REQUEST_SHA256"),
     )
+    parser.add_argument(
+        "--cache-revision",
+        default=os.environ.get("RUNPOD_DATASET_REVISION", "v1"),
+        help=(
+            "Provider-cache schema/source revision. The v1 label preserves legacy "
+            "request hashes; later revisions are isolated from older responses."
+        ),
+    )
     parser.add_argument("--selection-id", default=os.environ.get("RUNPOD_SELECTION_ID"))
     parser.add_argument(
         "--selection-sha256",
@@ -69,8 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--symbol-limit",
         type=int,
         help=(
-            "Deterministic bounded US-discovery check: keep up to N ETFs and N "
-            "stocks, then add the required VTI benchmark."
+            "Deterministic bounded US-discovery check: keep up to N audited "
+            "unleveraged equity ETFs and N stocks/ADRs, then add the required "
+            "VTI benchmark."
         ),
     )
     parser.add_argument(
@@ -148,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
         output=args.output,
         manifest_root=manifest_root,
         raw_cache_root=raw_cache_root,
+        cache_revision=args.cache_revision,
         include_delisted=not args.exclude_delisted,
         explicit_us_symbols=tuple(args.symbols),
         explicit_us_etfs=tuple(args.etf_symbols),

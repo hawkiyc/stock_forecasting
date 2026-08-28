@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import uuid
 from collections import Counter, deque
 from collections.abc import Callable, Generator, Iterable, Mapping
@@ -19,7 +20,10 @@ import pandas as pd
 
 from stock_forecasting.config import DatasetProfile
 from stock_forecasting.data.adjustments import apply_cumulative_adjustments
-from stock_forecasting.data.benchmarks import US_BENCHMARK
+from stock_forecasting.data.benchmarks import (
+    US_BENCHMARK,
+    is_allowlisted_unleveraged_equity_etf,
+)
 from stock_forecasting.data.download_progress import DownloadProgress
 from stock_forecasting.data.manifest import (
     DATASET_MANIFEST_SCHEMA_VERSION,
@@ -44,7 +48,11 @@ from stock_forecasting.data.providers import (
     TPExProvider,
     TWSEProvider,
 )
-from stock_forecasting.data.schema import normalize_ohlcv_frame
+from stock_forecasting.data.schema import (
+    TRAINING_SECURITY_SCOPE,
+    TRAINING_TARGET_ASSET_TYPES,
+    normalize_ohlcv_frame,
+)
 
 
 def _ordered_thread_map[InputT, ResultT](
@@ -96,6 +104,7 @@ class IngestionOptions:
     output: Path
     manifest_root: Path
     raw_cache_root: Path
+    cache_revision: str = "v1"
     include_delisted: bool = True
     explicit_us_symbols: tuple[str, ...] = ()
     explicit_us_etfs: tuple[str, ...] = ()
@@ -248,6 +257,8 @@ class _ProviderStats:
     dropped_source_rows: int = 0
     corporate_action_rows: int = 0
     missing_share_multiplier_details: int = 0
+    skipped_unsupported_action_rows: int = 0
+    skipped_unsupported_action_types: Counter[str] = field(default_factory=Counter)
     benchmark_rows: int = 0
     taiwan_trading_dates: int | None = None
     delisted_eod_only_symbols: set[str] = field(default_factory=set)
@@ -445,6 +456,40 @@ def _safe_provider_outcome(error: Exception) -> dict[str, Any]:
     }
 
 
+def _skipped_action_outcome(stats: _ProviderStats) -> dict[str, Any]:
+    if stats.skipped_unsupported_action_rows == 0:
+        return {}
+    return {
+        "skipped_unsupported_action_rows": stats.skipped_unsupported_action_rows,
+        "skipped_unsupported_action_types": dict(
+            sorted(stats.skipped_unsupported_action_types.items())
+        ),
+    }
+
+
+def _skipped_action_quality(
+    stats: Mapping[str, _ProviderStats],
+) -> dict[str, Any]:
+    combined_types: Counter[str] = Counter()
+    by_provider: dict[str, dict[str, Any]] = {}
+    total_rows = 0
+    for provider, provider_stats in sorted(stats.items()):
+        audit = _skipped_action_outcome(provider_stats)
+        if not audit:
+            continue
+        total_rows += provider_stats.skipped_unsupported_action_rows
+        combined_types.update(provider_stats.skipped_unsupported_action_types)
+        by_provider[provider] = {
+            "rows": provider_stats.skipped_unsupported_action_rows,
+            "types": dict(sorted(provider_stats.skipped_unsupported_action_types.items())),
+        }
+    return {
+        "skipped_unsupported_action_rows": total_rows,
+        "skipped_unsupported_action_types": dict(sorted(combined_types.items())),
+        "skipped_unsupported_actions_by_provider": by_provider,
+    }
+
+
 def _aggregate_provider_error(
     outcomes: Mapping[str, _ProviderLoopOutcome],
     stats: Mapping[str, _ProviderStats],
@@ -461,10 +506,12 @@ def _aggregate_provider_error(
                 "recorded_requests": artifacts.request_count,
                 "cache_hits": artifacts.cache_hits,
                 "rows": artifacts.row_count,
+                **_skipped_action_outcome(stats[provider]),
             }
             continue
         payload = _safe_provider_outcome(outcome.error)
         payload["estimated_calls"] = stats[provider].estimated_calls or None
+        payload.update(_skipped_action_outcome(stats[provider]))
         provider_outcomes[provider] = payload
         states.add(str(payload["state"]))
     if not states:
@@ -539,11 +586,71 @@ def _selected_datasets(profile: DatasetProfile) -> list[str]:
     return sorted(values[profile])
 
 
+def _dataset_cache_fallback_roots(
+    raw_cache_root: Path,
+    *,
+    cache_revision: str = "v1",
+) -> tuple[Path, ...]:
+    """Find read-only cache roots with the same provider-cache revision."""
+
+    primary = raw_cache_root.resolve(strict=False)
+    dataset_root = primary.parent
+    datasets_root = dataset_root.parent
+    if datasets_root.name != "datasets" or not datasets_root.is_dir():
+        return ()
+    candidates: list[Path] = []
+    for namespace in sorted(datasets_root.iterdir()):
+        candidate = namespace / "api-cache"
+        declared_revision = "v1"
+        for metadata_path, revision_path in (
+            (namespace / "download-progress.json", ("identity", "cache_revision")),
+            (namespace / "download-manifest.json", ("api_policy", "cache_revision")),
+        ):
+            if not metadata_path.is_file() or metadata_path.is_symlink():
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            container = metadata.get(revision_path[0])
+            if not isinstance(container, dict) or revision_path[1] not in container:
+                # Manifests written before cache revisions belong to legacy v1.
+                continue
+            value = container.get(revision_path[1])
+            declared_revision = value if isinstance(value, str) else ""
+            break
+        if (
+            namespace != dataset_root
+            and namespace.is_dir()
+            and not namespace.is_symlink()
+            and candidate.is_dir()
+            and not candidate.is_symlink()
+            and declared_revision == cache_revision
+        ):
+            candidates.append(candidate)
+    return tuple(candidates)
+
+
 def _explicit_instruments(
     symbols: tuple[str, ...],
     etf_symbols: tuple[str, ...],
 ) -> list[Instrument]:
     etfs = {symbol.upper().removesuffix(".US") for symbol in etf_symbols}
+    unsupported_etfs = sorted(
+        code
+        for code in etfs
+        if not is_allowlisted_unleveraged_equity_etf(
+            symbol=f"{code}.US",
+            market="US",
+        )
+    )
+    if unsupported_etfs:
+        raise ValueError(
+            "Explicit US ETFs must belong to the audited unleveraged equity allowlist: "
+            + ", ".join(unsupported_etfs)
+        )
     instruments: list[Instrument] = []
     requested_symbols = {symbol.upper().removesuffix(".US") for symbol in (*symbols, *etf_symbols)}
     for code in sorted(requested_symbols):
@@ -562,17 +669,52 @@ def _explicit_instruments(
     return instruments
 
 
+def _validate_explicit_instruments(
+    requested: list[Instrument],
+    discovered: list[Instrument],
+) -> list[Instrument]:
+    """Bind explicit symbols to the provider's own stock-versus-ETF typing."""
+
+    by_symbol = {item.canonical_symbol: item for item in discovered}
+    validated: list[Instrument] = []
+    for item in requested:
+        provider_item = by_symbol.get(item.canonical_symbol)
+        if provider_item is None:
+            raise ValueError(
+                f"Explicit US symbol is absent from EODHD discovery: {item.canonical_symbol}"
+            )
+        if provider_item.asset_type != item.asset_type:
+            raise ValueError(
+                "Explicit US symbol type disagrees with EODHD discovery: "
+                f"{item.canonical_symbol} requested={item.asset_type} "
+                f"provider={provider_item.asset_type}"
+            )
+        validated.append(provider_item)
+    return validated
+
+
 def _limit_instruments(
     instruments: list[Instrument],
     limit: int | None,
 ) -> list[Instrument]:
     if limit is not None and limit < 1:
         raise ValueError("symbol_limit must be positive")
-    unsupported_types = sorted({item.asset_type for item in instruments} - {"etf", "stock"})
+    unsupported_types = sorted(
+        {item.asset_type for item in instruments} - TRAINING_TARGET_ASSET_TYPES
+    )
     if unsupported_types:
         raise ValueError(
             f"US symbol limiting supports only ETF and stock instruments: {unsupported_types}"
         )
+    instruments = [
+        item
+        for item in instruments
+        if item.asset_type == "stock"
+        or is_allowlisted_unleveraged_equity_etf(
+            symbol=item.canonical_symbol,
+            market=item.market,
+        )
+    ]
     selected: list[Instrument] = []
     for asset_type in ("etf", "stock"):
         ordered = sorted(
@@ -606,6 +748,7 @@ def _ensure_us_benchmark(instruments: list[Instrument]) -> list[Instrument]:
 
 def _progress_identity(options: IngestionOptions) -> dict[str, Any]:
     identity: dict[str, Any] = {
+        "cache_revision": options.cache_revision,
         "dataset_profile": options.profile,
         "selected_datasets": _selected_datasets(options.profile),
         "date_range": {
@@ -624,7 +767,8 @@ def _progress_identity(options: IngestionOptions) -> dict[str, Any]:
             ),
             "symbol_limit": options.symbol_limit,
             "symbol_limit_policy": (
-                "up_to_n_etfs_and_n_stocks_active_then_delisted_ticker_plus_vti"
+                "up_to_n_allowlisted_unleveraged_equity_etfs_and_n_stocks_"
+                "active_then_delisted_ticker_plus_vti"
             ),
             "include_delisted_us": options.include_delisted,
         },
@@ -668,6 +812,8 @@ def ingest_daily_ohlcv(
         MassiveProvider().discover(include_delisted=options.include_delisted)
     if options.max_api_calls < 1:
         raise ValueError("max_api_calls must be positive")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", options.cache_revision) is None:
+        raise ValueError("cache_revision must be a safe 1-64 character label")
     if not math.isfinite(options.max_backoff_seconds) or options.max_backoff_seconds <= 0.0:
         raise ValueError("max_backoff_seconds must be finite and positive")
     if options.workers < 1:
@@ -700,9 +846,14 @@ def ingest_daily_ohlcv(
         deadline_epoch_seconds=options.acquisition_deadline_epoch_seconds,
         limited_providers={"eodhd"},
     )
+    cache_fallback_roots = _dataset_cache_fallback_roots(
+        options.raw_cache_root,
+        cache_revision=options.cache_revision,
+    )
     progress = DownloadProgress(
         path=options.progress_path or options.manifest_root / "download-progress.json",
         raw_cache_root=options.raw_cache_root,
+        read_cache_roots=cache_fallback_roots,
         identity=_progress_identity(options),
         context=_progress_context(options),
     )
@@ -739,28 +890,32 @@ def ingest_daily_ohlcv(
                 eod_client = CachedJsonClient(
                     provider="eodhd",
                     raw_cache_root=options.raw_cache_root,
+                    read_cache_roots=cache_fallback_roots,
+                    cache_revision=options.cache_revision,
                     max_requests_per_second=options.eodhd_requests_per_second,
                     max_backoff_seconds=options.max_backoff_seconds,
                     request_budget=request_budget,
                 )
                 provider = EODHDProvider(eod_client, api_token=eodhd_api_token)
+                discovered, discovery_requests = _provider_data_call(
+                    provider="eodhd",
+                    operation="discover",
+                    item="US",
+                    function=lambda: provider.discover(
+                        include_delisted=options.include_delisted
+                    ),
+                )
+                log_part.append(discovery_requests)
                 if options.explicit_us_symbols or options.explicit_us_etfs:
-                    instruments = _explicit_instruments(
-                        options.explicit_us_symbols,
-                        options.explicit_us_etfs,
-                    )
-                    discovery_requests: tuple[RequestRecord, ...] = ()
-                else:
-                    discovered, discovery_requests = _provider_data_call(
-                        provider="eodhd",
-                        operation="discover",
-                        item="US",
-                        function=lambda: provider.discover(
-                            include_delisted=options.include_delisted
+                    instruments = _validate_explicit_instruments(
+                        _explicit_instruments(
+                            options.explicit_us_symbols,
+                            options.explicit_us_etfs,
                         ),
+                        discovered,
                     )
+                else:
                     instruments = discovered
-                    log_part.append(discovery_requests)
                 instruments = _ensure_us_benchmark(
                     _limit_instruments(instruments, options.symbol_limit)
                 )
@@ -843,6 +998,8 @@ def ingest_daily_ohlcv(
                     client = CachedJsonClient(
                         provider=provider_name,
                         raw_cache_root=options.raw_cache_root,
+                        read_cache_roots=cache_fallback_roots,
+                        cache_revision=options.cache_revision,
                         max_requests_per_second=options.taiwan_requests_per_second,
                         max_backoff_seconds=options.max_backoff_seconds,
                         headers={
@@ -883,6 +1040,12 @@ def ingest_daily_ohlcv(
                     )
                     provider_stats.missing_share_multiplier_details += int(
                         action_fetch.metadata.get("missing_share_multiplier_details", 0)
+                    )
+                    provider_stats.skipped_unsupported_action_rows += int(
+                        action_fetch.metadata.get("skipped_unsupported_action_rows", 0)
+                    )
+                    provider_stats.skipped_unsupported_action_types.update(
+                        action_fetch.metadata.get("skipped_unsupported_action_types", {})
                     )
 
                     def fetch_taiwan_date(
@@ -1038,6 +1201,7 @@ def ingest_daily_ohlcv(
         for provider, provider_stats in sorted(stats.items())
         if provider_stats.missing_share_multiplier_details > 0
     }
+    skipped_action_quality = _skipped_action_quality(stats)
     benchmark_rows = sum(provider_stats.benchmark_rows for provider_stats in stats.values())
     delisted_eod_only_symbols = set().union(
         *(provider_stats.delisted_eod_only_symbols for provider_stats in stats.values())
@@ -1063,6 +1227,7 @@ def ingest_daily_ohlcv(
         "kind": "ohlcv-dataset",
         "state": "downloaded",
         "created_at": datetime.now(UTC).isoformat(),
+        "training_security_scope": TRAINING_SECURITY_SCOPE,
         "dataset_profile": options.profile,
         "selected_datasets": _selected_datasets(options.profile),
         "providers": sorted(sink.providers),
@@ -1077,6 +1242,7 @@ def ingest_daily_ohlcv(
             "asset_type_counts": dict(sorted(sink.asset_counts.items())),
         },
         "api_policy": {
+            "cache_revision": options.cache_revision,
             "estimated_calls": estimated_calls,
             "estimated_calls_semantics": (
                 "informational_cache_agnostic_plan_with_official_trading_sessions_"
@@ -1109,11 +1275,15 @@ def ingest_daily_ohlcv(
                 "parallel_independent_loops_joined_before_process_exit_and_deterministic_merge"
             ),
             "provider_execution_workers_each": provider_workers,
+            "read_only_cache_fallback_namespaces": len(cache_fallback_roots),
             "taiwan_trading_dates_by_provider": taiwan_trading_date_counts,
             "execution_workers": options.workers,
             "include_delisted": options.include_delisted,
             "symbol_limit": options.symbol_limit,
-            "symbol_limit_semantics": ("up_to_n_etfs_and_n_stocks_then_required_vti_benchmark"),
+            "symbol_limit_semantics": (
+                "up_to_n_allowlisted_unleveraged_equity_etfs_and_n_stocks_"
+                "then_required_vti_benchmark"
+            ),
             "eodhd_split_strategy": (
                 "per_symbol_historical_splits_reconstruct_unadjusted_volume"
                 if options.profile in {"us_only_eodhd", "us_tw_eodhd"}
@@ -1127,6 +1297,7 @@ def ingest_daily_ohlcv(
             "dropped_source_rows": dropped_source_rows,
             "corporate_action_rows": corporate_action_rows,
             "missing_share_multiplier_details_by_provider": (missing_share_multiplier_details),
+            **skipped_action_quality,
             "benchmark_rows": benchmark_rows,
             "delisted_pre_2018_auxiliary_coverage_warning": {
                 "count": len(delisted_eod_only_symbols),
@@ -1151,6 +1322,11 @@ def ingest_daily_ohlcv(
                 "delisted_before_2018": (
                     "eod_available_but_auxiliary_split_coverage_not_guaranteed"
                 ),
+            },
+            "training_security_scope": {
+                "contract": TRAINING_SECURITY_SCOPE,
+                "stock_semantics": "common_stock_including_adr_and_tdr",
+                "etf_semantics": "audited_allowlist_excluding_leveraged_and_inverse_products",
             },
         },
         "artifacts": {

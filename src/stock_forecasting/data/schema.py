@@ -31,6 +31,14 @@ OPTIONAL_COLUMNS = (
 )
 PRICE_COLUMNS = ("open", "high", "low", "close")
 SUPPORTED_ASSET_TYPES = frozenset({"stock", "etf", "future", "option", "index", "other"})
+# ``stock`` is the canonical model-facing umbrella for common shares and
+# depositary receipts. The upstream EODHD common-stock list does not reliably
+# distinguish domestic common shares from ADRs without per-symbol fundamentals,
+# while Taiwan TDR symbols can be identified directly from their exchange code.
+TRAINING_TARGET_ASSET_TYPES = frozenset({"stock", "etf"})
+TRAINING_SECURITY_SCOPE = (
+    "common_stock_adr_tdr_and_allowlisted_unleveraged_equity_etf_v1"
+)
 
 _ALIASES = {
     "date": "timestamp",

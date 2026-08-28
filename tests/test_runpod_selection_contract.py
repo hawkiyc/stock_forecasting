@@ -182,9 +182,15 @@ def test_date_or_universe_changes_dataset_request_identity(tmp_path: Path) -> No
 
 
 def test_eodhd_volume_semantics_are_part_of_the_immutable_dataset_contract() -> None:
-    assert SELECTION.PREPARATION_CONTRACT["schema_version"] == 2
+    assert SELECTION.PREPARATION_CONTRACT["schema_version"] == 3
     assert SELECTION.PREPARATION_CONTRACT["eodhd_split_policy"] == (
         "per_symbol_full_historical_splits_reconstruct_unadjusted_volume_v2"
+    )
+    assert SELECTION.PREPARATION_CONTRACT["training_security_scope"] == (
+        "common_stock_adr_tdr_and_allowlisted_unleveraged_equity_etf_v1"
+    )
+    assert SELECTION.PREPARATION_CONTRACT["split_policy"] == (
+        "global_chronological_cutoff_with_purge_embargo_and_label_end_guard_v1"
     )
 
 
@@ -270,6 +276,8 @@ def test_explicit_revision_creates_a_new_dataset_namespace(tmp_path: Path) -> No
     )
 
     assert first["dataset_request_sha256"] != revised["dataset_request_sha256"]
+    exports = SELECTION._selection_exports(tmp_path / "selection.json", revised)
+    assert exports["RUNPOD_DATASET_REVISION"] == "provider-refresh-20260814"
 
 
 def test_tw_only_rejects_us_symbol_limit(tmp_path: Path) -> None:

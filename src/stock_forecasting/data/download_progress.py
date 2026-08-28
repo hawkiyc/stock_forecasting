@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -35,16 +36,24 @@ def _positive_attempt_number(payload: dict[str, Any] | None) -> int:
     return number + 1
 
 
-def _cache_inventory(raw_cache_root: Path) -> dict[str, Any]:
+def _cache_inventory(raw_cache_roots: Iterable[Path]) -> dict[str, Any]:
     providers: dict[str, dict[str, int]] = {}
     response_count = 0
     size_bytes = 0
-    if raw_cache_root.is_dir():
+    seen_responses: set[tuple[str, str]] = set()
+    roots = tuple(raw_cache_roots)
+    for raw_cache_root in roots:
+        if not raw_cache_root.is_dir() or raw_cache_root.is_symlink():
+            continue
         for response_path in sorted(raw_cache_root.glob("*/*/*.json")):
             if not response_path.is_file() or response_path.is_symlink():
                 continue
             relative = response_path.relative_to(raw_cache_root)
             provider = relative.parts[0]
+            identity = (provider, response_path.stem)
+            if identity in seen_responses:
+                continue
+            seen_responses.add(identity)
             response_size = response_path.stat().st_size
             response_count += 1
             size_bytes += response_size
@@ -58,6 +67,7 @@ def _cache_inventory(raw_cache_root: Path) -> dict[str, Any]:
         "responses": response_count,
         "size_bytes": size_bytes,
         "by_provider": dict(sorted(providers.items())),
+        "read_roots": len(roots),
     }
 
 
@@ -105,6 +115,7 @@ class DownloadProgress:
         *,
         path: Path,
         raw_cache_root: Path,
+        read_cache_roots: Iterable[Path] = (),
         identity: dict[str, Any],
         context: dict[str, Any] | None = None,
     ) -> None:
@@ -112,6 +123,11 @@ class DownloadProgress:
             raise ValueError("Download progress path must not be a symlink")
         self.path = path
         self.raw_cache_root = raw_cache_root
+        self.read_cache_roots = tuple(
+            root
+            for root in dict.fromkeys(Path(value) for value in read_cache_roots)
+            if root != raw_cache_root
+        )
         self.identity = identity
         self.identity_sha256 = canonical_json_sha256(identity)
         self.context = context or {}
@@ -174,7 +190,7 @@ class DownloadProgress:
                 "max_network_requests_semantics": "limited_providers_only",
                 "acquisition_deadline_epoch_seconds": (request_budget.deadline_epoch_seconds),
             },
-            "cache": _cache_inventory(self.raw_cache_root),
+            "cache": _cache_inventory((self.raw_cache_root, *self.read_cache_roots)),
             "resume": {
                 "scope": "successful_raw_json_responses",
                 "automatic_cache_reuse": True,

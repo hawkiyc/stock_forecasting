@@ -19,13 +19,17 @@ from stock_forecasting.data.download_progress import DownloadProgress
 from stock_forecasting.data.ingestion import (
     IngestionOptions,
     _benchmark_trading_dates,
+    _dataset_cache_fallback_roots,
     _ensure_us_benchmark,
     _explicit_instruments,
     _inclusive_end,
     _limit_instruments,
     _progress_context,
     _progress_identity,
+    _ProviderStats,
     _run_parallel_provider_loops,
+    _skipped_action_quality,
+    _validate_explicit_instruments,
 )
 from stock_forecasting.data.providers.base import Instrument, RequestRecord
 from stock_forecasting.data.providers.eodhd import (
@@ -43,7 +47,7 @@ from stock_forecasting.data.providers.http import (
     ProviderRequestError,
 )
 from stock_forecasting.data.providers.massive import MassiveProvider
-from stock_forecasting.data.providers.taiwan import TWSEProvider
+from stock_forecasting.data.providers.taiwan import TPExProvider, TWSEProvider
 
 
 class _FakeSession:
@@ -114,6 +118,113 @@ def test_raw_cache_identity_omits_api_token_and_reuses_response(tmp_path: Path) 
     assert second.cache_hit
     assert "secret" not in first.cache_relative_path
     assert "first-secret" not in next(tmp_path.rglob("*.json")).read_text(encoding="utf-8")
+
+
+def test_new_dataset_namespace_reads_existing_provider_cache_without_copying(
+    tmp_path: Path,
+) -> None:
+    datasets_root = tmp_path / "datasets"
+    old_cache = datasets_root / ("a" * 64) / "api-cache"
+    new_cache = datasets_root / ("b" * 64) / "api-cache"
+    first_session = _FakeSession([{"date": "2026-01-02", "close": 100.0}])
+    CachedJsonClient(
+        provider="eodhd",
+        raw_cache_root=old_cache,
+        max_requests_per_second=10.0,
+        session=first_session,
+        clock=lambda: 1.0,
+        sleeper=lambda _seconds: None,
+    ).get_json(
+        "https://example.invalid/eod/AAPL.US",
+        params={"api_token": "first-secret", "from": "2026-01-01"},
+    )
+    second_session = _FakeSession([{"unexpected": True}])
+    fallback_roots = _dataset_cache_fallback_roots(new_cache)
+
+    payload, record = CachedJsonClient(
+        provider="eodhd",
+        raw_cache_root=new_cache,
+        read_cache_roots=fallback_roots,
+        max_requests_per_second=10.0,
+        session=second_session,
+        clock=lambda: 1.0,
+        sleeper=lambda _seconds: None,
+    ).get_json(
+        "https://example.invalid/eod/AAPL.US",
+        params={"api_token": "rotated-secret", "from": "2026-01-01"},
+    )
+
+    assert fallback_roots == (old_cache,)
+    assert payload == [{"date": "2026-01-02", "close": 100.0}]
+    assert record.cache_hit is True
+    assert second_session.calls == []
+    assert not new_cache.exists()
+
+
+def test_changed_cache_revision_does_not_reuse_legacy_provider_response(
+    tmp_path: Path,
+) -> None:
+    old_cache = tmp_path / "datasets" / ("a" * 64) / "api-cache"
+    new_cache = tmp_path / "datasets" / ("b" * 64) / "api-cache"
+    CachedJsonClient(
+        provider="eodhd",
+        raw_cache_root=old_cache,
+        cache_revision="v1",
+        max_requests_per_second=10.0,
+        session=_FakeSession([{"source": "legacy"}]),
+        clock=lambda: 1.0,
+        sleeper=lambda _seconds: None,
+    ).get_json(
+        "https://example.invalid/eod/AAPL.US",
+        params={"api_token": "first-secret", "from": "2026-01-01"},
+    )
+    revised_session = _FakeSession([{"source": "provider-refresh"}])
+
+    payload, record = CachedJsonClient(
+        provider="eodhd",
+        raw_cache_root=new_cache,
+        read_cache_roots=_dataset_cache_fallback_roots(
+            new_cache,
+            cache_revision="provider-refresh-20260828",
+        ),
+        cache_revision="provider-refresh-20260828",
+        max_requests_per_second=10.0,
+        session=revised_session,
+        clock=lambda: 1.0,
+        sleeper=lambda _seconds: None,
+    ).get_json(
+        "https://example.invalid/eod/AAPL.US",
+        params={"api_token": "rotated-secret", "from": "2026-01-01"},
+    )
+
+    assert payload == [{"source": "provider-refresh"}]
+    assert record.cache_hit is False
+    assert len(revised_session.calls) == 1
+    assert len(list(new_cache.rglob("*.json"))) == 1
+
+
+def test_cache_fallback_roots_include_only_matching_declared_revisions(
+    tmp_path: Path,
+) -> None:
+    datasets_root = tmp_path / "datasets"
+    v1_cache = datasets_root / ("a" * 64) / "api-cache"
+    v2_cache = datasets_root / ("b" * 64) / "api-cache"
+    current_cache = datasets_root / ("c" * 64) / "api-cache"
+    for cache in (v1_cache, v2_cache):
+        cache.mkdir(parents=True)
+    (v2_cache.parent / "download-progress.json").write_text(
+        json.dumps({"identity": {"cache_revision": "v2"}}),
+        encoding="utf-8",
+    )
+
+    assert _dataset_cache_fallback_roots(
+        current_cache,
+        cache_revision="v1",
+    ) == (v1_cache,)
+    assert _dataset_cache_fallback_roots(
+        current_cache,
+        cache_revision="v2",
+    ) == (v2_cache,)
 
 
 def test_shared_network_budget_counts_retries_and_fails_closed(tmp_path: Path) -> None:
@@ -848,7 +959,26 @@ def test_eodhd_historical_splits_parse_new_over_old_ratio() -> None:
     assert "to" not in client.calls[0][1]
 
 
-def test_twse_parser_includes_four_digit_etf_and_stock() -> None:
+@pytest.mark.parametrize(
+    ("provider_value", "expected"),
+    (
+        ("Common Stock", "stock"),
+        ("Stock", "stock"),
+        ("ETF", "etf"),
+        ("Preferred Stock", None),
+        ("Depositary Receipt", "stock"),
+        ("ADR", "stock"),
+        ("Fund", None),
+    ),
+)
+def test_eodhd_asset_type_contract_includes_common_stock_adr_and_etf(
+    provider_value: str,
+    expected: str | None,
+) -> None:
+    assert EODHDProvider._asset_type(provider_value) == expected
+
+
+def test_twse_parser_includes_common_stock_tdr_and_allowlisted_equity_etf() -> None:
     payload = {
         "tables": [
             {
@@ -863,6 +993,12 @@ def test_twse_parser_includes_four_digit_etf_and_stock() -> None:
                 "data": [
                     ["0050", "100", "102", "99", "101", "1,000"],
                     ["2330", "900", "920", "895", "910", "2,000"],
+                    ["9103", "8", "9", "7", "8", "3,000"],
+                    ["9105", "8", "9", "7", "8", "3,000"],
+                    ["9110", "8", "9", "7", "8", "3,000"],
+                    ["9136", "8", "9", "7", "8", "3,000"],
+                    ["00631L", "100", "102", "99", "101", "1,000"],
+                    ["00632R", "100", "102", "99", "101", "1,000"],
                 ],
             }
         ]
@@ -875,8 +1011,14 @@ def test_twse_parser_includes_four_digit_etf_and_stock() -> None:
     by_symbol = fetched.frame.set_index("symbol")
     assert by_symbol.loc["0050.TW", "asset_type"] == "etf"
     assert by_symbol.loc["2330.TW", "asset_type"] == "stock"
+    assert {"9103.TW", "9105.TW", "9110.TW", "9136.TW"} <= set(by_symbol.index)
+    assert set(by_symbol.loc[["9103.TW", "9105.TW", "9110.TW", "9136.TW"], "asset_type"]) == {
+        "stock"
+    }
+    assert not {"00631L.TW", "00632R.TW"} & set(by_symbol.index)
     assert set(by_symbol["provider"]) == {"twse_official"}
     assert by_symbol["is_active"].isna().all()
+    assert fetched.metadata["dropped_rows"] == 2
 
 
 def test_twse_historical_action_without_detail_keeps_price_factor_and_records_gap() -> None:
@@ -918,7 +1060,54 @@ def test_twse_historical_action_without_detail_keeps_price_factor_and_records_ga
     assert fetched.metadata["missing_share_multiplier_details"] == 1
 
 
-def test_twse_preferred_share_action_uses_preferred_free_share_field() -> None:
+def test_twse_tdr_detail_without_the_common_share_field_is_nonfatal() -> None:
+    class _ActionClient:
+        def get_json(
+            self,
+            endpoint: str,
+            *,
+            params: dict[str, Any],
+        ) -> tuple[Any, RequestRecord]:
+            del params
+            if endpoint.endswith("TWT49UDetail"):
+                return (
+                    {
+                        "stat": "ok",
+                        "fields": [
+                            "股票代號",
+                            "F. 按特別股股東持股比例每千股無償配股",
+                        ],
+                        "data": [["9105", "0 股"]],
+                    },
+                    _request("twse_official"),
+                )
+            return (
+                {
+                    "fields": [
+                        "資料日期",
+                        "股票代號",
+                        "除權息前收盤價",
+                        "除權息參考價",
+                        "權/息",
+                    ],
+                    "data": [["94年04月12日", "9105", "53.80", "5.38", "權"]],
+                },
+                _request("twse_official"),
+            )
+
+    fetched = TWSEProvider(_ActionClient()).fetch_actions(
+        start="2005-01-01",
+        end="2005-12-31",
+    )
+
+    assert fetched.frame.loc[0, "symbol"] == "9105.TW"
+    assert fetched.frame.loc[0, "price_factor"] == pytest.approx(0.1)
+    assert fetched.frame.loc[0, "share_multiplier"] == pytest.approx(1.0)
+    assert fetched.frame.loc[0, "source"] == "twse_twt49u_price_only_missing_detail"
+    assert fetched.metadata["missing_share_multiplier_details"] == 1
+
+
+def test_twse_actions_skip_unsupported_symbols_before_detail_requests() -> None:
     class _ActionClient:
         def __init__(self) -> None:
             self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -931,6 +1120,12 @@ def test_twse_preferred_share_action_uses_preferred_free_share_field() -> None:
         ) -> tuple[Any, RequestRecord]:
             self.calls.append((endpoint, params))
             if endpoint.endswith("TWT49UDetail"):
+                free_shares = {
+                    "2330": "50 股",
+                    "9105": "9,000 股",
+                    "910482": "0 股",
+                    "911612": "0 股",
+                }[params["STK_NO"]]
                 return (
                     {
                         "stat": "ok",
@@ -939,19 +1134,15 @@ def test_twse_preferred_share_action_uses_preferred_free_share_field() -> None:
                             "股票名稱",
                             "(每股配發現金股利)除息",
                             "(增資配股) 除權",
-                            "F. 按特別股股東持股比例每千股無償配股",
-                            "G. 按特別股股東持股比例每千股有償認股",
-                            "每股認購金額",
+                            "A. 按普通股股東持股比例每千股無償配股",
                         ],
                         "data": [
                             [
-                                "2847B ",
-                                "眾乙特          ",
+                                f"{params['STK_NO']} ",
+                                "fixture          ",
                                 "0 元/股",
                                 "",
-                                "0 股",
-                                "178 股",
-                                "10.1 元/股",
+                                free_shares,
                             ]
                         ],
                     },
@@ -966,7 +1157,18 @@ def test_twse_preferred_share_action_uses_preferred_free_share_field() -> None:
                         "除權息參考價",
                         "權/息",
                     ],
-                    "data": [["94年02月15日", "2847B", "11.50", "11.32", "權"]],
+                    "data": [
+                        ["94年02月15日", "2330", "100.00", "95.00", "權"],
+                        ["94年02月16日", "0050", "50.00", "49.00", "息"],
+                        ["94年02月17日", "2847B", "11.50", "11.32", "權"],
+                        ["94年02月18日", "2002A", "34.50", "29.21", "權"],
+                        ["94年02月21日", "2352Y", "30.50", "28.99", "權"],
+                        ["94年02月22日", "3037W", "26.00", "24.23", "權"],
+                        ["94年02月23日", "2418U", "31.20", "28.38", "權"],
+                        ["94年02月24日", "911612", "20.00", "19.00", "權"],
+                        ["94年02月25日", "910482", "10.00", "9.00", "權"],
+                        ["94年04月12日", "9105", "53.80", "5.38", "權"],
+                    ],
                 },
                 _request("twse_official"),
             )
@@ -974,14 +1176,101 @@ def test_twse_preferred_share_action_uses_preferred_free_share_field() -> None:
     client = _ActionClient()
     fetched = TWSEProvider(client).fetch_actions(start="2005-01-01", end="2005-12-31")
 
-    assert len(client.calls) == 2
-    assert client.calls[1][1]["STK_NO"] == "2847B"
-    assert client.calls[1][1]["T1"] == "20050215"
-    assert fetched.frame.loc[0, "symbol"] == "2847B.TW"
-    assert fetched.frame.loc[0, "price_factor"] == pytest.approx(11.32 / 11.50)
-    assert fetched.frame.loc[0, "share_multiplier"] == pytest.approx(1.0)
-    assert fetched.frame.loc[0, "source"] == "twse_twt49u"
+    assert len(client.calls) == 5
+    assert [params["STK_NO"] for _, params in client.calls[1:]] == [
+        "2330",
+        "911612",
+        "910482",
+        "9105",
+    ]
+    assert [params["T1"] for _, params in client.calls[1:]] == [
+        "20050215",
+        "20050224",
+        "20050225",
+        "20050412",
+    ]
+    by_symbol = fetched.frame.set_index("symbol")
+    assert set(by_symbol.index) == {
+        "0050.TW",
+        "2330.TW",
+        "9105.TW",
+        "910482.TW",
+        "911612.TW",
+    }
+    assert by_symbol.loc["2330.TW", "price_factor"] == pytest.approx(0.95)
+    assert by_symbol.loc["2330.TW", "share_multiplier"] == pytest.approx(1.05)
+    assert by_symbol.loc["0050.TW", "price_factor"] == pytest.approx(0.98)
+    assert by_symbol.loc["0050.TW", "share_multiplier"] == pytest.approx(1.0)
+    assert by_symbol.loc["9105.TW", "share_multiplier"] == pytest.approx(10.0)
+    assert by_symbol.loc["9105.TW", "price_factor"] == pytest.approx(0.1)
+    assert by_symbol.loc["910482.TW", "share_multiplier"] == pytest.approx(1.0)
+    assert by_symbol.loc["911612.TW", "share_multiplier"] == pytest.approx(1.0)
+    assert set(by_symbol["source"]) == {"twse_twt49u"}
     assert fetched.metadata["missing_share_multiplier_details"] == 0
+    assert fetched.metadata["skipped_unsupported_action_rows"] == 5
+    assert fetched.metadata["skipped_unsupported_action_types"] == {
+        "preferred_stock_code": 2,
+        "rights_certificate_code": 3,
+    }
+
+
+def test_tpex_actions_exclude_non_allowlisted_etfs_from_the_adjustment_frame() -> None:
+    payload = {
+        "fields": [
+            "除權息日期",
+            "代號",
+            "除權息前收盤價",
+            "除權息參考價",
+            "每仟股無償配股",
+        ],
+        "data": [
+            ["115/01/05", "6488", "100", "95", "50"],
+            ["115/01/06", "00679B", "30", "29", "0"],
+        ],
+    }
+
+    fetched = TPExProvider(_StubClient(payload)).fetch_actions(
+        start="2026-01-01",
+        end="2026-02-01",
+    )
+
+    assert fetched.frame["symbol"].tolist() == ["6488.TWO"]
+    assert fetched.metadata["skipped_unsupported_action_rows"] == 1
+    assert fetched.metadata["skipped_unsupported_action_types"] == {
+        "non_allowlisted_etf_code": 1
+    }
+
+
+def test_skipped_unsupported_action_audit_is_manifest_ready() -> None:
+    twse_stats = _ProviderStats(skipped_unsupported_action_rows=5)
+    twse_stats.skipped_unsupported_action_types.update(
+        {
+            "preferred_stock_code": 2,
+            "rights_certificate_code": 3,
+        }
+    )
+
+    assert _skipped_action_quality(
+        {
+            "eodhd": _ProviderStats(),
+            "twse_official": twse_stats,
+        }
+    ) == {
+        "skipped_unsupported_action_rows": 5,
+        "skipped_unsupported_action_types": {
+            "preferred_stock_code": 2,
+            "rights_certificate_code": 3,
+        },
+        "skipped_unsupported_actions_by_provider": {
+            "twse_official": {
+                "rows": 5,
+                "types": {
+                    "preferred_stock_code": 2,
+                    "rights_certificate_code": 3,
+                },
+            }
+        },
+    }
 
 
 def test_download_cli_renders_fatal_provider_outcomes_without_a_traceback(
@@ -1037,6 +1326,19 @@ def test_explicit_etf_only_universe_does_not_require_stock_symbols() -> None:
     assert {item.asset_type for item in instruments} == {"etf"}
 
 
+def test_explicit_leveraged_etf_is_rejected_before_history_requests() -> None:
+    with pytest.raises(ValueError, match="audited unleveraged equity allowlist"):
+        _explicit_instruments((), ("TQQQ.US",))
+
+
+def test_explicit_symbol_type_must_match_eodhd_discovery() -> None:
+    requested = [Instrument("TQQQ.US", "TQQQ.US", "stock", "US", "USD", True)]
+    discovered = [Instrument("TQQQ.US", "TQQQ.US", "etf", "US", "USD", True)]
+
+    with pytest.raises(ValueError, match="type disagrees"):
+        _validate_explicit_instruments(requested, discovered)
+
+
 def test_taiwan_sessions_come_from_official_benchmark_rows() -> None:
     benchmark = pd.DataFrame(
         {"timestamp": pd.to_datetime(["2026-01-02", "2026-01-05", "2026-02-02"], utc=True)}
@@ -1051,9 +1353,10 @@ def test_taiwan_sessions_come_from_official_benchmark_rows() -> None:
 
 def test_symbol_limit_keeps_n_per_asset_type_before_benchmark_insertion() -> None:
     instruments = [
-        Instrument("ZZZ.US", "ZZZ.US", "etf", "US", "USD", True),
-        Instrument("AAA.US", "AAA.US", "etf", "US", "USD", False),
-        Instrument("BBB.US", "BBB.US", "etf", "US", "USD", True),
+        Instrument("VOO.US", "VOO.US", "etf", "US", "USD", True),
+        Instrument("QQQ.US", "QQQ.US", "etf", "US", "USD", False),
+        Instrument("SPY.US", "SPY.US", "etf", "US", "USD", True),
+        Instrument("TQQQ.US", "TQQQ.US", "etf", "US", "USD", True),
         Instrument("MSFT.US", "MSFT.US", "stock", "US", "USD", True),
         Instrument("AAPL.US", "AAPL.US", "stock", "US", "USD", True),
         Instrument("AAA-S.US", "AAA-S.US", "stock", "US", "USD", False),
@@ -1063,14 +1366,14 @@ def test_symbol_limit_keeps_n_per_asset_type_before_benchmark_insertion() -> Non
     with_benchmark = _ensure_us_benchmark(limited)
 
     assert [item.canonical_symbol for item in limited] == [
-        "BBB.US",
-        "ZZZ.US",
+        "SPY.US",
+        "VOO.US",
         "AAPL.US",
         "MSFT.US",
     ]
     assert [item.canonical_symbol for item in with_benchmark] == [
-        "BBB.US",
-        "ZZZ.US",
+        "SPY.US",
+        "VOO.US",
         "AAPL.US",
         "MSFT.US",
         "VTI.US",
@@ -1236,6 +1539,23 @@ def test_launch_acquisition_policy_is_context_not_dataset_identity(tmp_path: Pat
     assert first_policy != second_policy
     assert first_policy["provider_max_backoff_seconds"] == 60.0
     assert second_policy["provider_max_backoff_seconds"] == 30.0
+
+
+def test_cache_revision_is_part_of_resume_identity(tmp_path: Path) -> None:
+    first = IngestionOptions(
+        profile="tw_only",
+        start="2020-01-01",
+        end="2024-01-01",
+        output=tmp_path / "raw.parquet",
+        manifest_root=tmp_path,
+        raw_cache_root=tmp_path / "api-cache",
+        cache_revision="v1",
+    )
+
+    assert _progress_identity(first)["cache_revision"] == "v1"
+    assert _progress_identity(replace(first, cache_revision="v2")) != _progress_identity(
+        first
+    )
 
 
 def test_massive_channel_is_reserved_but_typed() -> None:

@@ -354,6 +354,12 @@ def test_stable_runpod_lifecycle_and_synchronization_boundaries_remain() -> None
     tmux = (ROOT / "scripts/runpod_tmux_launch.sh").read_text(encoding="utf-8")
     validation = (ROOT / "scripts/runpod_validation.sh").read_text(encoding="utf-8")
     guard = (ROOT / "scripts/launch_runpod_guard.sh").read_text(encoding="utf-8")
+    selection_loader = (ROOT / "scripts/lib/runpod_selection.sh").read_text(
+        encoding="utf-8"
+    )
+    pid1_environment = (ROOT / "scripts/runpod_reexec_with_pid1_env.py").read_text(
+        encoding="utf-8"
+    )
 
     for script in (create_gpu, create_cpu):
         assert "RUNPOD_NETWORK_VOLUME_ID" in script
@@ -373,6 +379,10 @@ def test_stable_runpod_lifecycle_and_synchronization_boundaries_remain() -> None
     assert "runpod_self_terminate.sh" in tmux
     assert "launch_runpod_guard.sh" in create_gpu
     assert "launch_runpod_guard.sh" in create_cpu
+    assert '"RUNPOD_DATASET_REVISION":"%s"' in create_gpu
+    assert '"RUNPOD_DATASET_REVISION":"%s"' in create_cpu
+    assert "RUNPOD_DATASET_REVISION" in selection_loader
+    assert '"RUNPOD_DATASET_REVISION"' in pid1_environment
     assert 'caffeinate -is -w "${GUARD_PID}"' in guard
     assert (
         'RUNPOD_VALIDATION_LIFECYCLE_MARKER="${NETWORK_VOLUME_ROOT}'
@@ -425,6 +435,8 @@ def test_cpu_acquisition_budget_is_resumable_and_reserves_preparation_time() -> 
     assert 'for key in ("category", "error_type", "operation", "item", "status_code")' in status
     assert 'ln "${RAW_STAGING}" "${RAW_FINAL}"' in prepare
     assert "fin-ts-verify-download" in prepare
+    assert "obsolete-security-scope" in prepare
+    assert "rebuilding from verified provider cache entries" in prepare
     assert "resumable-dataset-lifecycle" in tmux
     assert "${cpu_resumable_lifecycle_valid} -ne 1" in tmux
     assert "The CPU worker publishes the precise waiting state" in tmux

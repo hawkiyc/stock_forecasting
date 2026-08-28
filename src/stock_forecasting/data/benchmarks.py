@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
+
+from stock_forecasting.data.schema import TRAINING_TARGET_ASSET_TYPES
 
 US_BENCHMARK = "VTI.US"
 TWSE_BENCHMARK = "TAIEX.TW"
 TPEX_BENCHMARK = "TPEX.TWO"
 
-# These are deliberately narrow PoC allowlists. Unknown ETFs must be mapped
-# explicitly rather than silently treating foreign, bond, commodity, inverse,
-# leveraged, or volatility products as domestic long-only equity exposure.
+# These are deliberately narrow audited allowlists. An explicit benchmark map
+# may select a different benchmark for an allowlisted ETF, but it must never
+# turn an unknown bond, commodity, inverse, leveraged, or volatility product
+# into a training target.
 US_DOMESTIC_EQUITY_ETFS = frozenset(
     {
         "DIA.US",
@@ -54,6 +58,44 @@ TWSE_DOMESTIC_EQUITY_ETFS = frozenset(
     }
 )
 TPEX_EXPOSURE_ETFS = frozenset({"006201.TW"})
+_TWSE_COMMON_OR_TDR_SYMBOL = re.compile(r"^(?:[1-9][0-9]{3}|91[0-9]{4})[.]TW$")
+_TPEX_COMMON_STOCK_SYMBOL = re.compile(r"^[1-9][0-9]{3}[.]TWO$")
+
+
+def is_allowlisted_unleveraged_equity_etf(*, symbol: str, market: str) -> bool:
+    """Return whether an ETF belongs to the audited model-target allowlist."""
+
+    canonical_symbol = symbol.strip().upper()
+    canonical_market = _market(market)
+    if canonical_market == "US":
+        return canonical_symbol in US_DOMESTIC_EQUITY_ETFS
+    if canonical_market == "TWSE":
+        return canonical_symbol in (TWSE_DOMESTIC_EQUITY_ETFS | TPEX_EXPOSURE_ETFS)
+    # The current single-benchmark policy has no audited TPEx-listed ETF target.
+    return False
+
+
+def is_training_target_security(*, symbol: str, asset_type: str, market: str) -> bool:
+    """Enforce the common-stock/DR/audited-equity-ETF target boundary."""
+
+    canonical_symbol = symbol.strip().upper()
+    canonical_type = asset_type.strip().lower()
+    canonical_market = _market(market)
+    if canonical_type == "etf":
+        return is_allowlisted_unleveraged_equity_etf(
+            symbol=canonical_symbol,
+            market=canonical_market,
+        )
+    if canonical_type != "stock":
+        return False
+    if canonical_market == "US":
+        # EODHD discovery supplies the common-stock/ADR type boundary.
+        return canonical_symbol.endswith(".US") and len(canonical_symbol) > 3
+    if canonical_market == "TWSE":
+        return _TWSE_COMMON_OR_TDR_SYMBOL.fullmatch(canonical_symbol) is not None
+    if canonical_market == "TPEX":
+        return _TPEX_COMMON_STOCK_SYMBOL.fullmatch(canonical_symbol) is not None
+    return False
 
 
 @dataclass(frozen=True)
@@ -89,50 +131,42 @@ def resolve_benchmark(
     canonical_type = asset_type.strip().lower()
     canonical_market = _market(market)
     mapping = {key.upper(): value.upper() for key, value in (explicit_mapping or {}).items()}
+    if canonical_type == "index":
+        return BenchmarkDecision(None, False, "benchmark_series_not_training_target", "index")
+    if canonical_type not in TRAINING_TARGET_ASSET_TYPES:
+        return BenchmarkDecision(None, False, "unsupported_asset_type", "mvp")
+    if not is_training_target_security(
+        symbol=canonical_symbol,
+        asset_type=canonical_type,
+        market=canonical_market,
+    ):
+        return BenchmarkDecision(
+            None,
+            False,
+            (
+                "etf_not_in_audited_unleveraged_equity_allowlist"
+                if canonical_type == "etf"
+                else "security_not_in_common_stock_or_depositary_receipt_scope"
+            ),
+            "audited_training_security_scope",
+        )
     if canonical_symbol in mapping:
         benchmark = mapping[canonical_symbol]
         if benchmark == canonical_symbol:
             return BenchmarkDecision(None, False, "self_benchmark", "explicit")
         return BenchmarkDecision(benchmark, True, "explicit_mapping", "explicit")
-    if canonical_type == "index":
-        return BenchmarkDecision(None, False, "benchmark_series_not_training_target", "index")
-    if canonical_type not in {"stock", "etf"}:
-        return BenchmarkDecision(None, False, "unsupported_asset_type", "mvp")
 
     if canonical_market == "US":
         benchmark = US_BENCHMARK
         if canonical_symbol == benchmark:
             return BenchmarkDecision(None, False, "self_benchmark", "us_vti")
-        if canonical_type == "etf" and canonical_symbol not in US_DOMESTIC_EQUITY_ETFS:
-            return BenchmarkDecision(
-                None,
-                False,
-                "etf_requires_explicit_economic_exposure_mapping",
-                "us_vti",
-            )
         return BenchmarkDecision(benchmark, True, "us_domestic_equity", "us_vti")
 
     if canonical_market == "TWSE":
         benchmark = TPEX_BENCHMARK if canonical_symbol in TPEX_EXPOSURE_ETFS else TWSE_BENCHMARK
-        if canonical_type == "etf" and canonical_symbol not in (
-            TWSE_DOMESTIC_EQUITY_ETFS | TPEX_EXPOSURE_ETFS
-        ):
-            return BenchmarkDecision(
-                None,
-                False,
-                "etf_requires_explicit_economic_exposure_mapping",
-                "taiwan_economic_exposure",
-            )
         return BenchmarkDecision(benchmark, True, "taiwan_domestic_equity", "taiwan_market")
 
     if canonical_market == "TPEX":
-        if canonical_type == "etf":
-            return BenchmarkDecision(
-                None,
-                False,
-                "tpex_etf_requires_explicit_economic_exposure_mapping",
-                "taiwan_economic_exposure",
-            )
         return BenchmarkDecision(TPEX_BENCHMARK, True, "tpex_common_stock", "taiwan_market")
 
     return BenchmarkDecision(None, False, "unmapped_market", "mvp")

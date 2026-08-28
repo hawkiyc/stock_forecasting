@@ -8,10 +8,13 @@ import math
 import os
 import re
 import uuid
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from stock_forecasting.config import DatasetProfile
+from stock_forecasting.data.schema import TRAINING_SECURITY_SCOPE
+from stock_forecasting.data.splits import SPLIT_POLICY
 
 DATASET_MANIFEST_SCHEMA_VERSION = "2.0"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -172,6 +175,10 @@ def validate_download_manifest(
 
     manifest_path = Path(path).resolve(strict=True)
     payload = load_dataset_manifest(manifest_path, required_state="downloaded")
+    if payload.get("training_security_scope") != TRAINING_SECURITY_SCOPE:
+        raise ValueError(
+            "Download manifest training security scope is missing or obsolete"
+        )
     artifacts = payload.get("artifacts")
     if not isinstance(artifacts, dict) or set(artifacts) != {"raw", "request_log"}:
         raise ValueError("Download manifest must bind raw Parquet and API request log")
@@ -203,6 +210,10 @@ def validate_training_dataset_manifest(
     payload = load_dataset_manifest(manifest_path, required_state="ready")
     if payload.get("dataset_profile") != profile:
         raise ValueError("Dataset manifest profile does not match the experiment config")
+    if payload.get("training_security_scope") != TRAINING_SECURITY_SCOPE:
+        raise ValueError(
+            "Dataset manifest training security scope is missing or obsolete"
+        )
     selected = payload.get("selected_datasets")
     expected_selected = {
         "tw_only": ["tpex_official", "twse_official"],
@@ -292,6 +303,8 @@ def validate_dataset_preparation_contract(
         "entry_day_counts_as_holding_day_one": True,
         "exit_timing": "regular_session_close_t_plus_h",
         "input_adjustment": "point_in_time_total_return_ohlc_split_adjusted_volume",
+        "training_security_scope": TRAINING_SECURITY_SCOPE,
+        "split_policy": SPLIT_POLICY,
         "effective_sample_stride": sample_stride,
         "effective_embargo_bars": effective_embargo_trading_days,
     }
@@ -334,6 +347,81 @@ def validate_dataset_preparation_contract(
             raise ValueError(
                 f"Dataset preparation {key}={actual!r} does not match config value {expected!r}"
             )
+    split_audit = payload.get("split_audit")
+    if (
+        not isinstance(split_audit, dict)
+        or split_audit.get("schema_version") != "causal-split-audit-v1"
+        or split_audit.get("policy") != SPLIT_POLICY
+        or split_audit.get("comparison") != "label.end_at < next_split_start"
+        or split_audit.get("violations") != 0
+    ):
+        raise ValueError("Dataset manifest split_audit policy is invalid")
+    split_summaries = split_audit.get("splits")
+    if not isinstance(split_summaries, dict) or set(split_summaries) != {
+        "train",
+        "validation",
+        "test",
+    }:
+        raise ValueError("Dataset manifest split_audit summaries are invalid")
+
+    def audit_timestamp(value: Any, label: str) -> datetime:
+        if not isinstance(value, str):
+            raise ValueError(f"Dataset manifest {label} timestamp is invalid")
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as error:
+            raise ValueError(f"Dataset manifest {label} timestamp is invalid") from error
+        if parsed.tzinfo is None:
+            raise ValueError(f"Dataset manifest {label} timestamp must include a timezone")
+        return parsed
+
+    train_boundary = audit_timestamp(
+        split_audit.get("train_boundary_exclusive"),
+        "train boundary",
+    )
+    validation_boundary = audit_timestamp(
+        split_audit.get("validation_boundary_exclusive"),
+        "validation boundary",
+    )
+    split_counts = payload.get("split_counts")
+    label_end_counts = split_audit.get("label_end_counts")
+    maximum_label_end = split_audit.get("maximum_label_end")
+    for split, summary in split_summaries.items():
+        if (
+            not isinstance(summary, dict)
+            or not isinstance(split_counts, dict)
+            or summary.get("records") != split_counts.get(split)
+            or not isinstance(label_end_counts, dict)
+            or label_end_counts.get(split) != split_counts.get(split)
+            or not isinstance(maximum_label_end, dict)
+            or maximum_label_end.get(split) != summary.get("label_end_max_at")
+        ):
+            raise ValueError(f"Dataset manifest {split} split audit count is invalid")
+        audit_timestamp(summary.get("cutoff_start_at"), f"{split} cutoff start")
+        audit_timestamp(summary.get("cutoff_end_at"), f"{split} cutoff end")
+        audit_timestamp(summary.get("label_end_max_at"), f"{split} label end")
+    train = split_summaries["train"]
+    validation = split_summaries["validation"]
+    test = split_summaries["test"]
+    if (
+        split_audit.get("validation_start") != validation.get("cutoff_start_at")
+        or split_audit.get("test_start") != test.get("cutoff_start_at")
+    ):
+        raise ValueError("Dataset manifest split start audit is inconsistent")
+    if audit_timestamp(train["label_end_max_at"], "train label end") >= train_boundary:
+        raise ValueError("Dataset manifest train labels cross the split boundary")
+    if (
+        audit_timestamp(validation["label_end_max_at"], "validation label end")
+        >= validation_boundary
+    ):
+        raise ValueError("Dataset manifest validation labels cross the split boundary")
+    if not (
+        audit_timestamp(train["cutoff_end_at"], "train cutoff end")
+        < audit_timestamp(validation["cutoff_start_at"], "validation cutoff start")
+        and audit_timestamp(validation["cutoff_end_at"], "validation cutoff end")
+        < audit_timestamp(test["cutoff_start_at"], "test cutoff start")
+    ):
+        raise ValueError("Dataset manifest split cutoff ranges are not chronological")
     statistics = payload.get("label_statistics")
     if not isinstance(statistics, dict):
         raise ValueError("Dataset manifest has no label_statistics")
@@ -366,6 +454,7 @@ def provenance_summary(path: str | Path) -> dict[str, Any]:
         "manifest_sha256": sha256_file(manifest_path),
         "dataset_profile": payload["dataset_profile"],
         "selected_datasets": payload["selected_datasets"],
+        "training_security_scope": payload.get("training_security_scope"),
         "providers": payload.get("providers", []),
         "markets": payload.get("markets", []),
         "symbols": payload.get("symbols", {}),
@@ -374,6 +463,7 @@ def provenance_summary(path: str | Path) -> dict[str, Any]:
         "preparation_spec": payload.get("preparation_spec", {}),
         "label_statistics": payload.get("label_statistics", {}),
         "window_audit": payload.get("window_audit", {}),
+        "split_audit": payload.get("split_audit", {}),
         "quality": payload.get("quality", {}),
         "artifacts": payload["artifacts"],
     }

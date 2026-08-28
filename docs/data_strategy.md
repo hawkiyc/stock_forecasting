@@ -4,7 +4,8 @@
 
 ### 1. 目標與非目標
 
-PoC 的資料範圍是美國與台灣股票、ETF 日線 OHLCV。任何外部 API 呼叫都只能發生
+PoC 的資料範圍是美國與台灣普通股、ADR／TDR，以及經稽核且可映射的非槓桿
+股票型 ETF 日線 OHLCV。任何外部 API 呼叫都只能發生
 在獨立 CPU preparation 階段；資料必須先落地為 immutable Parquet 與 manifest，
 GPU 訓練、validation 與 inference 才能讀取。訓練迴圈禁止動態下載。
 
@@ -156,12 +157,14 @@ TWSE/TPEx：
 
 ### 7. Benchmark mapping
 
-預設：US → `VTI.US`、TWSE → `TAIEX.TW`、TPEx → `TPEX.TWO`。ETF 使用小型且明確的
-本土股票曝險 allowlist。`benchmark_mapping_path` 是 JSON object：
+預設：US 普通股／ADR → `VTI.US`、TWSE 普通股／TDR → `TAIEX.TW`、TPEx 普通股 →
+`TPEX.TWO`。ETF 使用小型、明確且只含非槓桿股票曝險的 allowlist；槓桿、反向、
+債券、商品、波動率與未稽核 ETF 都不會成為 target。`benchmark_mapping_path` 是
+JSON object，但只能替 allowlist 內的 ETF 選擇另一個 benchmark，不能擴張 universe：
 
 ```json
 {
-  "CUSTOM.US": "VTI.US"
+  "QQQ.US": "SPY.US"
 }
 ```
 
@@ -219,6 +222,8 @@ transition、歷史不足或 benchmark mapping 不明確的樣本會被排除並
 
 先依時間建立 windows，再以 chronological 70% train、15% validation、15% test
 切分，並在邊界套用 purge 20 bars 與 effective embargo 14 bars。sample stride 是 1。
+此外，train 與 validation 中每個樣本的最晚 `label.end_at` 必須嚴格早於下一個
+split boundary；任何跨界 ground truth 都會被排除並記入 split audit。
 RunPod 穩定 shell 仍傳入 legacy `stride=5`、`embargo=5` readiness sentinels；ready
 manifest 同時記錄 effective values，訓練前會雙重驗證。
 
@@ -264,7 +269,8 @@ benchmark calendar gaps、symbol/date coverage、corporate-action 前後連續�
 
 ### 1. Goal and non-goals
 
-The PoC covers daily OHLCV for US and Taiwan stocks and ETFs. External APIs may
+The PoC covers daily OHLCV for US/Taiwan common stocks, ADRs/TDRs, and audited
+benchmark-mappable unleveraged equity ETFs. External APIs may
 be called only during a separate CPU-preparation phase. Data must first become
 immutable Parquet plus manifests; GPU training, validation, and inference then
 read only materialized artifacts. Dynamic acquisition in the training loop is
@@ -420,13 +426,16 @@ close irrelevant to model inputs and labels.
 
 ### 7. Benchmark mapping
 
-Defaults are US → `VTI.US`, TWSE → `TAIEX.TW`, and TPEx → `TPEX.TWO`. ETFs use a
-small explicit domestic-equity allowlist. `benchmark_mapping_path` is a JSON
-object such as:
+Defaults are US common stocks/ADRs → `VTI.US`, TWSE common stocks/TDRs →
+`TAIEX.TW`, and TPEx common stocks → `TPEX.TWO`. ETFs use a small explicit
+allowlist containing only unleveraged equity exposures. Leveraged, inverse,
+bond, commodity, volatility, and unaudited ETFs cannot become targets.
+`benchmark_mapping_path` may choose another benchmark only for an allowlisted
+ETF; it cannot expand the universe. It is a JSON object such as:
 
 ```json
 {
-  "CUSTOM.US": "VTI.US"
+  "QQQ.US": "SPY.US"
 }
 ```
 
@@ -484,7 +493,9 @@ counted in the window audit.
 
 Windows are assigned chronologically to 70% train, 15% validation, and 15% test,
 with 20-bar purge and an effective 14-bar embargo. Effective sample stride is
-one. Stable RunPod shell passes legacy `stride=5` and `embargo=5` readiness
+one. The latest `label.end_at` of every train and validation sample must also be
+strictly earlier than the next split boundary; crossing ground truth is dropped
+and counted in the split audit. Stable RunPod shell passes legacy `stride=5` and `embargo=5` readiness
 sentinels; the manifest separately records effective values and validates both.
 
 Each horizon's loss scale uses train labels only:

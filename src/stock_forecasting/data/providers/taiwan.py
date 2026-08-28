@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from typing import Any, ClassVar
 
 import numpy as np
 import pandas as pd
 
+from stock_forecasting.data.benchmarks import is_allowlisted_unleveraged_equity_etf
 from stock_forecasting.data.schema import normalize_ohlcv_frame
 
 from .base import Instrument, ProviderFetch, RequestRecord
@@ -15,6 +17,10 @@ from .http import CachedJsonClient
 
 _ETF_CODE = re.compile(r"^00[0-9A-Z]{2,6}$")
 _STOCK_CODE = re.compile(r"^[1-9][0-9]{3}$")
+_DEPOSITARY_RECEIPT_CODE = re.compile(r"^91(?:[0-9]{2}|[0-9]{4})$")
+_PREFERRED_STOCK_CODE = re.compile(r"^[1-9][0-9]{3}[A-E]$")
+_RIGHTS_CERTIFICATE_CODE = re.compile(r"^[1-9][0-9]{3}[L-Z]$")
+_SIX_DIGIT_NUMERIC_SECURITY_CODE = re.compile(r"^[0-9]{6}$")
 
 
 def _clean_field(value: Any) -> str:
@@ -183,12 +189,34 @@ def _find_quote_table(
     raise ValueError("Official Taiwan response has no compatible OHLCV quote table")
 
 
-def _asset_type(code: str) -> str | None:
+def _asset_type(code: str, *, market: str) -> str | None:
+    if _DEPOSITARY_RECEIPT_CODE.fullmatch(code):
+        return "stock"
     if _ETF_CODE.fullmatch(code):
-        return "etf"
+        suffix = "TW" if market == "TWSE" else "TWO"
+        return (
+            "etf"
+            if is_allowlisted_unleveraged_equity_etf(
+                symbol=f"{code}.{suffix}",
+                market=market,
+            )
+            else None
+        )
     if _STOCK_CODE.fullmatch(code):
         return "stock"
     return None
+
+
+def _unsupported_action_type(code: str) -> str:
+    if _ETF_CODE.fullmatch(code):
+        return "non_allowlisted_etf_code"
+    if _PREFERRED_STOCK_CODE.fullmatch(code):
+        return "preferred_stock_code"
+    if _RIGHTS_CERTIFICATE_CODE.fullmatch(code):
+        return "rights_certificate_code"
+    if _SIX_DIGIT_NUMERIC_SECURITY_CODE.fullmatch(code):
+        return "six_digit_numeric_security_code"
+    return "unsupported_symbol_code"
 
 
 def _parse_quotes(
@@ -213,7 +241,7 @@ def _parse_quotes(
             dropped += 1
             continue
         code = str(row[indexes["symbol"]]).strip().upper()
-        asset_type = _asset_type(code)
+        asset_type = _asset_type(code, market=market)
         values = {
             field: _number(row[indexes[field]])
             for field in ("open", "high", "low", "close", "volume")
@@ -342,16 +370,22 @@ class TWSEProvider(_TaiwanMarketProvider):
         requests: list[RequestRecord] = [request]
         dropped = 0
         missing_share_multiplier_details = 0
+        skipped_unsupported_action_rows = 0
+        skipped_unsupported_action_types: Counter[str] = Counter()
         for raw in data:
             if len(raw) <= max(indexes.values()):
                 dropped += 1
+                continue
+            symbol_code = str(raw[indexes["symbol"]]).strip().upper()
+            if _asset_type(symbol_code, market=self.market) is None:
+                skipped_unsupported_action_rows += 1
+                skipped_unsupported_action_types[_unsupported_action_type(symbol_code)] += 1
                 continue
             prior_close = _number(raw[indexes["prior_close"]])
             reference_price = _number(raw[indexes["reference_price"]])
             if prior_close is None or reference_price is None or prior_close <= 0.0:
                 dropped += 1
                 continue
-            symbol_code = str(raw[indexes["symbol"]]).strip().upper()
             effective_date = _gregorian_date(raw[indexes["timestamp"]])
             share_multiplier = 1.0
             action_source = "twse_twt49u"
@@ -370,14 +404,18 @@ class TWSEProvider(_TaiwanMarketProvider):
                     action_source = "twse_twt49u_price_only_missing_detail"
                 else:
                     detail_fields, detail_rows = _first_table(detail)
-                    free_share_index = _field_index(
-                        detail_fields,
-                        {
-                            "A.按普通股股東持股比例每千股無償配股",
-                            "F.按特別股股東持股比例每千股無償配股",
-                        },
-                    )
-                    if detail_rows and len(detail_rows[0]) > free_share_index:
+                    try:
+                        free_share_index = _field_index(
+                            detail_fields,
+                            {"A.按普通股股東持股比例每千股無償配股"},
+                        )
+                    except ValueError:
+                        free_share_index = None
+                    if (
+                        free_share_index is not None
+                        and detail_rows
+                        and len(detail_rows[0]) > free_share_index
+                    ):
                         free_shares = _number(
                             re.sub(
                                 r"[^0-9.+-]",
@@ -413,6 +451,10 @@ class TWSEProvider(_TaiwanMarketProvider):
                 "corporate_actions": len(rows),
                 "dropped_rows": dropped,
                 "missing_share_multiplier_details": missing_share_multiplier_details,
+                "skipped_unsupported_action_rows": skipped_unsupported_action_rows,
+                "skipped_unsupported_action_types": dict(
+                    sorted(skipped_unsupported_action_types.items())
+                ),
             },
         )
 
@@ -491,9 +533,16 @@ class TPExProvider(_TaiwanMarketProvider):
         }
         rows: list[dict[str, Any]] = []
         dropped = 0
+        skipped_unsupported_action_rows = 0
+        skipped_unsupported_action_types: Counter[str] = Counter()
         for raw in data:
             if len(raw) <= max(indexes.values()):
                 dropped += 1
+                continue
+            symbol_code = str(raw[indexes["symbol"]]).strip().upper()
+            if _asset_type(symbol_code, market=self.market) is None:
+                skipped_unsupported_action_rows += 1
+                skipped_unsupported_action_types[_unsupported_action_type(symbol_code)] += 1
                 continue
             prior_close = _number(raw[indexes["prior_close"]])
             reference_price = _number(raw[indexes["reference_price"]])
@@ -511,7 +560,6 @@ class TPExProvider(_TaiwanMarketProvider):
             if not np.isfinite(price_factor) or price_factor <= 0.0:
                 dropped += 1
                 continue
-            symbol_code = str(raw[indexes["symbol"]]).strip().upper()
             rows.append(
                 {
                     "timestamp": _gregorian_date(raw[indexes["timestamp"]]),
@@ -524,7 +572,14 @@ class TPExProvider(_TaiwanMarketProvider):
         return ProviderFetch(
             frame=pd.DataFrame(rows),
             requests=(request,),
-            metadata={"corporate_actions": len(rows), "dropped_rows": dropped},
+            metadata={
+                "corporate_actions": len(rows),
+                "dropped_rows": dropped,
+                "skipped_unsupported_action_rows": skipped_unsupported_action_rows,
+                "skipped_unsupported_action_types": dict(
+                    sorted(skipped_unsupported_action_types.items())
+                ),
+            },
         )
 
     def fetch_benchmark_month(self, *, month: str, dataset_profile: str) -> ProviderFetch:

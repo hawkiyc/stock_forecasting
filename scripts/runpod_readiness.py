@@ -735,6 +735,18 @@ def _validate_quant_dataset_payload(
         raise ValueError("Quant target horizon must remain five trading days")
     if sorted(preparation_spec.get("diagnostic_horizons", [])) != [1, 20]:
         raise ValueError("Numerical diagnostic horizons must remain 1 and 20 days")
+    requested_preparation = requested_dataset.get("preparation")
+    if not isinstance(requested_preparation, dict):
+        raise ValueError("Dataset readiness requested preparation contract is invalid")
+    for field in ("training_security_scope", "split_policy"):
+        if preparation_spec.get(field) != requested_preparation.get(field):
+            raise ValueError(
+                f"Dataset readiness {field} disagrees with its requested dataset"
+            )
+    if payload.get("training_security_scope") != preparation_spec.get(
+        "training_security_scope"
+    ):
+        raise ValueError("Dataset readiness training security scope is inconsistent")
     if (
         stage_contract is not None
         and preparation_spec.get("embargo_bars") != stage_contract.embargo_trading_days
@@ -755,6 +767,11 @@ def _validate_quant_dataset_payload(
         or sum(split_counts.values()) != artifacts["processed"]["row_count"]
     ):
         raise ValueError("Dataset readiness split counts are invalid")
+    _validate_causal_split_audit(
+        payload.get("split_audit"),
+        split_counts,
+        "Dataset readiness",
+    )
     repositories = payload.get("model_repositories")
     if (
         not isinstance(repositories, list)
@@ -819,10 +836,13 @@ def _verify_dataset_artifacts(payload, network_volume_root):
         or dataset_payload.get("state") != "ready"
         or dataset_payload.get("dataset_profile") != payload.get("dataset_profile")
         or dataset_payload.get("selected_datasets") != payload.get("selected_datasets")
+        or dataset_payload.get("training_security_scope")
+        != payload.get("training_security_scope")
         or dataset_payload.get("data_pipeline_digest") != payload.get("data_pipeline_digest")
         or dataset_payload.get("preparation_spec_sha256") != payload.get("preparation_spec_sha256")
         or dataset_payload.get("universe_sha256") != payload.get("universe_sha256")
         or dataset_payload.get("split_counts") != payload.get("split_counts")
+        or dataset_payload.get("split_audit") != payload.get("split_audit")
     ):
         raise ValueError("Dataset readiness marker disagrees with dataset-manifest.json")
     dataset_artifacts = dataset_payload.get("artifacts")

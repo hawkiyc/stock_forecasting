@@ -109,7 +109,15 @@ class EODHDProvider:
     @staticmethod
     def _asset_type(value: Any) -> str | None:
         normalized = str(value).strip().lower().replace(" ", "_")
-        if normalized in {"common_stock", "stock"}:
+        # EODHD's exchange-symbol-list groups ADRs into the common-stock
+        # universe. Accept explicit DR labels as the same model-facing stock
+        # umbrella when a response happens to expose them.
+        if normalized in {
+            "adr",
+            "common_stock",
+            "depositary_receipt",
+            "stock",
+        }:
             return "stock"
         if normalized == "etf":
             return "etf"

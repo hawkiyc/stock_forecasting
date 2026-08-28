@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from stock_forecasting.data.manifest import canonical_json_sha256
 from .base import RequestRecord
 
 _SECRET_PARAMETER_NAMES = frozenset({"api_token", "api_key", "token", "password", "secret"})
+_CACHE_REVISION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 class NetworkRequestBudgetExceeded(RuntimeError):
@@ -316,6 +318,8 @@ class CachedJsonClient:
         *,
         provider: str,
         raw_cache_root: str | Path,
+        read_cache_roots: Iterable[str | Path] = (),
+        cache_revision: str = "v1",
         max_requests_per_second: float,
         timeout_seconds: float = 30.0,
         max_attempts: int | None = None,
@@ -329,6 +333,8 @@ class CachedJsonClient:
     ) -> None:
         if max_requests_per_second <= 0.0:
             raise ValueError("max_requests_per_second must be positive")
+        if _CACHE_REVISION_PATTERN.fullmatch(cache_revision) is None:
+            raise ValueError("cache_revision must be a safe 1-64 character label")
         if timeout_seconds <= 0.0:
             raise ValueError("HTTP timeout must be positive")
         if max_attempts is not None and max_attempts < 1:
@@ -339,6 +345,12 @@ class CachedJsonClient:
             raise ValueError("Maximum backoff must be finite and positive when bounded")
         self.provider = provider
         self.raw_cache_root = Path(raw_cache_root)
+        self.cache_revision = cache_revision
+        self.read_cache_roots = tuple(
+            path
+            for path in dict.fromkeys(Path(value) for value in read_cache_roots)
+            if path != self.raw_cache_root
+        )
         self.minimum_interval = 1.0 / max_requests_per_second
         self.timeout_seconds = timeout_seconds
         self.max_attempts = max_attempts
@@ -441,22 +453,33 @@ class CachedJsonClient:
             "endpoint": endpoint,
             "params": public_params,
         }
+        # Preserve the historical v1 key so existing immutable responses remain
+        # reusable. Later provider revisions are isolated by the request digest.
+        if self.cache_revision != "v1":
+            identity["cache_revision"] = self.cache_revision
         return canonical_json_sha256(identity), identity
 
     def _cache_path(self, request_sha256: str) -> Path:
         return self.raw_cache_root / self.provider / request_sha256[:2] / f"{request_sha256}.json"
 
+    def _cached_path(self, request_sha256: str) -> Path | None:
+        relative = Path(self.provider) / request_sha256[:2] / f"{request_sha256}.json"
+        for root in (self.raw_cache_root, *self.read_cache_roots):
+            candidate = root / relative
+            if candidate.is_file() and not candidate.is_symlink():
+                return candidate
+        return None
+
     def _record(
         self,
         *,
         request_sha256: str,
-        cache_path: Path,
         body: bytes,
         cache_hit: bool,
         requested_at: str,
     ) -> RequestRecord:
         response_digest = hashlib.sha256(body).hexdigest()
-        relative = cache_path.relative_to(self.raw_cache_root)
+        relative = Path(self.provider) / request_sha256[:2] / f"{request_sha256}.json"
         return RequestRecord(
             provider=self.provider,
             request_sha256=request_sha256,
@@ -478,17 +501,17 @@ class CachedJsonClient:
             self.request_budget.check_time()
         request_sha256, _identity = self._identity(endpoint=endpoint, params=params)
         cache_path = self._cache_path(request_sha256)
-        if cache_path.is_file():
-            body = cache_path.read_bytes()
+        cached_path = self._cached_path(request_sha256)
+        if cached_path is not None:
+            body = cached_path.read_bytes()
             return (
                 json.loads(body),
                 self._record(
                     request_sha256=request_sha256,
-                    cache_path=cache_path,
                     body=body,
                     cache_hit=True,
                     requested_at=datetime.fromtimestamp(
-                        cache_path.stat().st_mtime, tz=UTC
+                        cached_path.stat().st_mtime, tz=UTC
                     ).isoformat(),
                 ),
             )
@@ -537,7 +560,6 @@ class CachedJsonClient:
                     payload,
                     self._record(
                         request_sha256=request_sha256,
-                        cache_path=cache_path,
                         body=body,
                         cache_hit=False,
                         requested_at=requested_at,

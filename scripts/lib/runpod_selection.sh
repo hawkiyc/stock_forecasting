@@ -18,7 +18,7 @@ runpod_load_active_selection() {
     fi
 
     unset RUNPOD_SELECTION_ID RUNPOD_SELECTION_SHA256 \
-        RUNPOD_DATASET_REQUEST_SHA256 RUNPOD_SELECTION_FILE \
+        RUNPOD_DATASET_REQUEST_SHA256 RUNPOD_DATASET_REVISION RUNPOD_SELECTION_FILE \
         RUNPOD_REMOTE_SELECTION_RELATIVE_PATH RUNPOD_REMOTE_SELECTION_PATH \
         RUNPOD_STAGE RUNPOD_CONFIG RUNPOD_STAGE_CONFIG_SHA256 DATA_ROOT \
         FIN_TS_DATASET_PROFILE STAGE1_US_SYMBOLS STAGE1_US_ETF_SYMBOLS \
@@ -29,6 +29,7 @@ runpod_load_active_selection() {
     while IFS= read -r -d '' key && IFS= read -r -d '' value; do
         case "${key}" in
             RUNPOD_SELECTION_ID|RUNPOD_SELECTION_SHA256|RUNPOD_DATASET_REQUEST_SHA256|\
+            RUNPOD_DATASET_REVISION|\
             RUNPOD_SELECTION_FILE|RUNPOD_REMOTE_SELECTION_RELATIVE_PATH|\
             RUNPOD_REMOTE_SELECTION_PATH|RUNPOD_STAGE|RUNPOD_CONFIG|\
             RUNPOD_STAGE_CONFIG_SHA256|DATA_ROOT|FIN_TS_DATASET_PROFILE|\
@@ -47,7 +48,8 @@ runpod_load_active_selection() {
 
     if [[ -z "${RUNPOD_SELECTION_ID:-}" \
         || -z "${RUNPOD_SELECTION_SHA256:-}" \
-        || -z "${RUNPOD_DATASET_REQUEST_SHA256:-}" ]]; then
+        || -z "${RUNPOD_DATASET_REQUEST_SHA256:-}" \
+        || -z "${RUNPOD_DATASET_REVISION:-}" ]]; then
         echo "No valid active RunPod selection was loaded" >&2
         return 2
     fi

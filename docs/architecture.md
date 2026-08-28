@@ -4,7 +4,8 @@
 
 ### 1. 系統邊界
 
-本版本是單一金融商品的純數值預測模型。它只使用股票與 ETF 的日線 OHLCV，
+本版本是單一金融商品的純數值預測模型。訓練 target 限定為普通股、ADR／TDR，
+以及經稽核且可映射的非槓桿股票型 ETF，並使用其日線 OHLCV。
 不載入 LLM、不生成文字、不重建 fact，也不包含交易規則、技術指標組合、投資組合
 配置或下單功能。傳統技術指標與完整交易策略屬於其他專案；本模型輸出可作為其中
 一項連續、帶不確定性的訊號來源。
@@ -29,13 +30,18 @@ alpha_h = log(G_asset(h)) - log(G_benchmark(h))
 這是 benchmark-relative adjusted execution log return。CAPM abnormal return 只保留
 為未來 diagnostic/ablation 欄位，不是目前的輸入或 loss target。
 
+Train、validation 與 test 依全域交易日期做 70%／15%／15% 時間順序切分。
+除 purge 與 embargo 外，每個 train／validation 樣本的最晚 `label.end_at` 都必須
+嚴格早於下一個 split boundary；跨界樣本會在 manifest audit 中計數並排除。
+
 ### 3. Benchmark policy
 
-- 美國股票與 allowlist 內的美國本土股票 ETF：`VTI.US`。
-- TWSE 股票與 allowlist 內的台灣市場 ETF：`TAIEX.TW`。
+- 美國普通股、ADR 與 allowlist 內的美國股票型 ETF：`VTI.US`。
+- TWSE 普通股、TDR 與 allowlist 內的台灣股票型 ETF：`TAIEX.TW`。
 - TPEx 股票：`TPEX.TWO`。
-- 窄基、槓桿、反向、商品型、債券型或跨國 ETF 預設排除；可透過明確且可稽核的
-  `benchmark_mapping_path` 加入。
+- 槓桿、反向、債券、商品、波動率與未稽核 ETF 一律排除；
+  `benchmark_mapping_path` 只允許替已在 allowlist 的 ETF 改用另一個可稽核
+  benchmark，不能把被排除的 ETF 加入訓練。
 - benchmark index 只作條件輸入與 label construction，不是訓練 target symbol。
 
 未來 benchmark 資料只在離線 label construction 出現。序列化的 `context` 與
@@ -198,8 +204,9 @@ tokens。未來可在這些表示之後加入 point-in-time 文字、財報或�
 
 ### 1. System boundary
 
-This version is a strictly numerical, single-instrument forecasting model. It
-uses daily OHLCV for stocks and ETFs. It does not load an LLM, generate text,
+This version is a strictly numerical, single-instrument forecasting model. Its
+training targets are common stocks, ADRs/TDRs, and audited benchmark-mappable
+unleveraged equity ETFs using daily OHLCV. It does not load an LLM, generate text,
 reconstruct facts, combine technical-analysis rules, allocate a portfolio, or
 place orders. A separate trading system may consume this model as one
 continuous, uncertainty-aware indicator.
@@ -226,13 +233,19 @@ This is benchmark-relative adjusted execution log return. CAPM abnormal return
 is reserved for a future diagnostic/ablation and is not an input or current
 loss target.
 
+Train, validation, and test use global trading dates in chronological
+70%/15%/15% order. Beyond purge and embargo, the latest `label.end_at` of every
+train and validation sample must be strictly earlier than the next split
+boundary. Crossing samples are counted in the manifest audit and excluded.
+
 ### 3. Benchmark policy
 
-- US stocks and allowlisted domestic-equity ETFs: `VTI.US`.
-- TWSE stocks and allowlisted Taiwan-equity ETFs: `TAIEX.TW`.
+- US common stocks, ADRs, and allowlisted equity ETFs: `VTI.US`.
+- TWSE common stocks, TDRs, and allowlisted Taiwan-equity ETFs: `TAIEX.TW`.
 - TPEx stocks: `TPEX.TWO`.
-- Narrow, leveraged, inverse, commodity, bond, or cross-country ETFs fail
-  closed unless an auditable `benchmark_mapping_path` maps them explicitly.
+- Leveraged, inverse, bond, commodity, volatility, and unaudited ETFs fail
+  closed. `benchmark_mapping_path` may change the benchmark only for an ETF
+  already in the allowlist; it cannot add an excluded ETF to training.
 - Benchmark indices are conditioning/label series, never target instruments.
 
 Future benchmark data appears only during offline label construction. Both

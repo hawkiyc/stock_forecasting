@@ -4,7 +4,8 @@
 
 ### 專案定位
 
-本專案以美國與台灣股票、ETF 的日線 OHLCV 資料，微調金融領域預訓練的時序基礎模型。系統只處理數值時序：
+本專案以美國與台灣普通股、ADR／TDR，以及經稽核且可映射的非槓桿股票型 ETF
+日線 OHLCV 資料，微調金融領域預訓練的時序基礎模型。系統只處理數值時序：
 
 - 輸入與輸出都是數值張量，不提供自然語言生成或事實重建功能。
 - 不把外部 API 放進訓練迴圈。
@@ -117,11 +118,12 @@ total-return log return 差，`h ∈ {3,…,14}`。
 
 預設 benchmark policy：
 
-- 美國股票與一般 ETF：`VTI.US`。
-- TWSE 股票：`TAIEX.TW`，其 adjusted anchor 使用官方發行量加權股價報酬指數。
-- TPEx 股票：`TPEX.TWO`，其 adjusted anchor 使用櫃買報酬指數。
-- 無法合理映射的窄基、槓桿、反向、商品型或跨國 ETF 會 fail closed；只有窄幅
-  allowlist 或明確的 `benchmark_mapping_path` 映射才進入訓練。
+- 美國普通股、ADR 與白名單股票型 ETF：`VTI.US`。
+- TWSE 普通股、TDR 與白名單股票型 ETF：`TAIEX.TW`，其 adjusted anchor 使用官方發行量加權股價報酬指數。
+- TPEx 普通股：`TPEX.TWO`，其 adjusted anchor 使用櫃買報酬指數。
+- 只有經稽核白名單內、可映射到既定 benchmark 的非槓桿股票型 ETF 才進入訓練；
+  槓桿、反向、債券、商品、波動率與未稽核 ETF 一律 fail closed。
+  `benchmark_mapping_path` 只能改變白名單 ETF 的 benchmark，不能擴張訓練 universe。
 
 `VTI.US` 是美國商品建立 benchmark-relative label 與 benchmark context 的必要資料
 依賴，不是 `--symbol-limit` 的一般候選商品，也不會成為自己的訓練 target
@@ -177,6 +179,12 @@ processed windows.parquet + dataset-manifest.json
 Stage 1 / Stage 2 訓練（完全離線）
 ```
 
+`train`、`validation`、`test` 依全市場共用的交易日期做 70%／15%／15%
+時間順序切分，不做隨機 row split。Train 與 validation 樣本的最晚
+`label.end_at` 必須嚴格早於下一個 split boundary；20 個交易日 purge 與 14 個
+交易日 effective embargo 之外，程式另有直接的 label-boundary guard，避免未來
+調整 horizon 或間隔參數時讓 ground truth 跨界。
+
 資料下載器具備：
 
 - provider-specific QPS throttle。
@@ -193,6 +201,9 @@ Stage 1 / Stage 2 訓練（完全離線）
   immutable dataset selection，也不會改變 dataset request identity。
 - 任一 provider 先退出都不會取消其他 provider；只有全部 provider 迴圈退出後，流程才
   發布續傳狀態或固定順序合併 provider-local artifacts。
+- Dataset contract 改版或日期改變會建立新的 immutable namespace；新 namespace
+  可唯讀命中其他 dataset namespace 中相同 cache revision 與 request identity 的 raw JSON cache，
+  但新的 Parquet、manifest 與 progress 只會寫入自己的 namespace。
 - QPS 與 `max_api_calls` 都不是 provider 的每日／每週 quota，也不代表 EODHD
   不同 endpoint 的計費 call units。
 - 暫時性 provider 錯誤、429、單次 request budget 或 acquisition time budget
@@ -346,27 +357,29 @@ bash scripts/runpod_workflow.sh configure
 
 `--universe`、`--stocks`、`--etfs` 與 `--symbol-limit` **只控制美國資料
 範圍**，不會篩選台股。`us_tw_eodhd` 永遠由「依 universe 選出的 EODHD
-美國資料」加上「指定日期範圍內 TWSE／TPEx 官方端點回傳的完整台灣市場
-資料」組成。
+美國目標證券」加上「指定日期範圍內 TWSE／TPEx 官方端點回傳、且符合
+普通股／TDR／白名單非槓桿股票型 ETF 契約的台灣資料」組成。
 
 `--data-profile` 可選值如下：
 
 | 值 | 美國資料 | 台灣資料 | 是否需要 `eodhd_api_token` |
 | --- | --- | --- | --- |
-| `tw_only` | 無 | TWSE／TPEx 官方日資料與官方 benchmark；`--universe` 必須為 `all` | 否 |
-| `us_only_eodhd` | 依 `--universe` 選出的 EODHD 美國股票／ETF，並自動補入 `VTI.US` benchmark | 無 | 是 |
-| `us_tw_eodhd` | 依 `--universe` 選出的 EODHD 美國股票／ETF，並自動補入 `VTI.US` benchmark | 與 `tw_only` 相同的完整台灣官方資料 | 是 |
+| `tw_only` | 無 | TWSE／TPEx 普通股、TDR、經稽核且可映射的非槓桿股票型 ETF，以及官方 benchmark；`--universe` 必須為 `all` | 否 |
+| `us_only_eodhd` | 依 `--universe` 選出的 EODHD 普通股（包含 ADR）與經稽核且可映射的非槓桿股票型 ETF，並自動補入 `VTI.US` benchmark | 無 | 是 |
+| `us_tw_eodhd` | 與 `us_only_eodhd` 相同的美國證券範圍 | 與 `tw_only` 相同的台灣目標證券範圍 | 是 |
 
 `--universe` 可選值如下：
 
 | 值 | 意義 | 可搭配的選項 |
 | --- | --- | --- |
-| `all` | 對含美國資料的 profile，透過 EODHD discovery 取得 active 與 delisted 美國商品；對 `tw_only`，表示完整台灣官方資料 | 美國 profile 可選擇搭配 `--symbol-limit`；不得同時提供 `--stocks` 或 `--etfs` |
+| `all` | 對含美國資料的 profile，透過 EODHD discovery 取得 active 與 delisted 普通股／ADR，再套用非槓桿股票型 ETF 白名單；對 `tw_only`，表示完整的台灣目標證券範圍 | 美國 profile 可選擇搭配 `--symbol-limit`；不得同時提供 `--stocks` 或 `--etfs` |
 | `explicit` | **只限制美國資料**；至少要提供一個 `--stocks` 或 `--etfs`。系統仍會自動補入 `VTI.US` | 只能用於 `us_only_eodhd` 或 `us_tw_eodhd`；不得搭配 `--symbol-limit` |
 
-「完整美股與美國 ETF」在此指 EODHD 帳戶可取得且 discovery 回傳的 active／delisted
-common stocks 與 ETFs；使用含美國資料的 profile、`--universe all`，並完全省略
-`--symbol-limit`。它不是保證涵蓋 provider 未回傳或帳戶未授權的商品。
+「完整美國目標證券範圍」在此指 EODHD 帳戶可取得且 discovery 回傳的
+active／delisted common stocks（包含 ADR），以及程式白名單內的非槓桿股票型
+ETF；使用含美國資料的 profile、`--universe all`，並完全省略 `--symbol-limit`。
+槓桿、反向、債券、商品與波動率 ETF 不會成為訓練目標，explicit benchmark
+mapping 也不能繞過此限制。這不保證涵蓋 provider 未回傳或帳戶未授權的商品。
 
 所有使用者可設定的 `configure` 選項如下：
 
@@ -378,9 +391,9 @@ common stocks 與 ETFs；使用含美國資料的 profile、`--universe all`，�
 | `--start` | `YYYY-MM-DD`；預設 `2005-01-01` | 所有選定市場共用的起始日，包含該日；省略時固定使用 `2005-01-01` |
 | `--end` | `YYYY-MM-DD`；無預設值 | 所有選定市場共用的結束邊界，不包含該日；互動與非互動模式都必須由使用者明確提供，避免不知情地改用本機當日 |
 | `--universe` | `all`、`explicit` | 控制美國商品選取方式；對 `tw_only` 只能使用 `all`。非互動模式必填 |
-| `--stocks` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的美國股票，例如 `"AAPL,MSFT"`；不影響台股 |
-| `--etfs` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的美國 ETF，例如 `"SPY,QQQ"`；不影響台股 |
-| `--symbol-limit` | 正整數 N | **小規模容量／流程驗證用，不是完整美國市場模式。**只適用於含美國資料的 `all` 模式。discovery 後把 ETF 與 stock 分開，各自依 active → delisted、ticker 字母順序取最多 N 檔；若某一類少於 N 就全取。這不是隨機或代表性抽樣。接著確認必要的 `VTI.US` benchmark：已在 N 檔 ETF 內就不重複，否則額外補入，所以 raw universe 最多 `2N+1` 檔。要完整美股與美國 ETF 就不要提供此選項 |
+| `--stocks` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的美國普通股／ADR，例如 `"AAPL,BABA"`；會用 EODHD discovery 驗證型別，不影響台股 |
+| `--etfs` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的非槓桿股票型 ETF，例如 `"SPY,QQQ"`；必須在經稽核白名單內，不影響台股 |
+| `--symbol-limit` | 正整數 N | **小規模容量／流程驗證用，不是完整美國市場模式。**只適用於含美國資料的 `all` 模式。discovery 後把白名單內的非槓桿股票型 ETF 與普通股／ADR 分開，各自依 active → delisted、ticker 字母順序取最多 N 檔；若某一類少於 N 就全取。這不是隨機或代表性抽樣。接著確認必要的 `VTI.US` benchmark：已在 N 檔 ETF 內就不重複，否則額外補入，所以 raw universe 最多 `2N+1` 檔。要完整美國目標證券範圍就不要提供此選項 |
 | `--interactive` | 無值 flag | 明確開啟互動式選單；直接執行 `configure` 而不帶選項時會自動使用此模式 |
 
 互動模式的預設值是 `stage1`、`us_tw_eodhd`、dataset revision `v1`、起始日
@@ -396,7 +409,7 @@ common stocks 與 ETFs；使用含美國資料的 profile、`--universe all`，�
 - 美國：`AAPL.US`、`MSFT.US`、`SPY.US`、`QQQ.US`，以及系統自動補入的
   `VTI.US` benchmark。
 - 台灣：不是只有四個美國 ticker，也不是沒有台股；會包含相同日期範圍內
-  TWSE／TPEx 官方端點回傳的完整市場資料與官方 benchmark。
+  TWSE／TPEx 普通股、TDR、白名單內非槓桿股票型 ETF 與官方 benchmark。
 - 日期：兩個市場都從 `2015-01-01` 開始，並在 `2026-07-27` 之前結束；
   `2026-07-27` 本身不包含在資料內。
 
@@ -428,11 +441,11 @@ calls、每分鐘 1,000 HTTP requests，且訂閱方案的每日額度在午夜 
 降低 `--eodhd-qps`。可參考
 [EODHD Pricing](https://eodhd.com/pricing)、
 [EODHD API Limits](https://eodhd.com/financial-apis/api-limits) 與
-[EODHD User API](https://eodhd.com/financial-apis/user-api)。完整美股與美國 ETF 的
+[EODHD User API](https://eodhd.com/financial-apis/user-api)。完整美國目標證券範圍的
 request 計畫可以大於 `--max-api-calls`；專案與供應商額度邊界都由後述的 CPU Pod
 續傳流程跨多次執行處理。
 
-完整 EODHD discovery 範圍加完整台灣市場的設定不提供 `--stocks`、`--etfs` 或
+完整 EODHD／台灣目標證券範圍的設定不提供 `--stocks`、`--etfs` 或
 `--symbol-limit`：
 
 ```bash
@@ -1077,7 +1090,8 @@ Stage 1 只證明腳本與契約可運作，不用來宣稱模型具備 alpha。
 ### Project scope
 
 This project fine-tunes a finance-pretrained time-series foundation model on
-daily OHLCV data for US and Taiwan stocks and ETFs. The system processes only
+daily OHLCV data for US/Taiwan common stocks, ADRs/TDRs, and audited
+benchmark-mappable unleveraged equity ETFs. The system processes only
 numerical time series:
 
 - Inputs and outputs are numerical tensors; no natural-language generation or
@@ -1217,13 +1231,15 @@ returns over identical entry and exit timestamps, for `h ∈ {3,...,14}`.
 
 Default benchmark policy:
 
-- US stocks and ordinary ETFs: `VTI.US`.
-- TWSE stocks: `TAIEX.TW`, whose adjusted anchor uses the official TAIEX total
+- US common stocks, ADRs, and allowlisted equity ETFs: `VTI.US`.
+- TWSE common stocks, TDRs, and allowlisted equity ETFs: `TAIEX.TW`, whose adjusted anchor uses the official TAIEX total
   return index.
-- TPEx stocks: `TPEX.TWO`, whose adjusted anchor uses the official TPEx return
+- TPEx common stocks: `TPEX.TWO`, whose adjusted anchor uses the official TPEx return
   index.
-- Narrow, leveraged, inverse, commodity, or cross-country ETFs fail closed
-  unless covered by the narrow allowlist or an explicit `benchmark_mapping_path`.
+- Only audited allowlisted unleveraged equity ETFs that can map to an approved
+  benchmark enter training. Leveraged, inverse, bond, commodity, volatility,
+  and unaudited ETFs fail closed. `benchmark_mapping_path` may change the
+  benchmark of an allowlisted ETF but cannot expand the training universe.
 
 `VTI.US` is a required data dependency for US benchmark-relative labels and
 benchmark context. It is not an ordinary `--symbol-limit` candidate and cannot
@@ -1286,6 +1302,13 @@ processed windows.parquet + dataset-manifest.json
 Stage 1 / Stage 2 training (fully offline)
 ```
 
+The `train`, `validation`, and `test` partitions use global market-calendar
+boundaries in chronological 70%/15%/15% order rather than random row splits.
+The latest `label.end_at` for every train and validation sample must be strictly
+earlier than the next split boundary. In addition to the 20-trading-day purge
+and 14-trading-day effective embargo, a direct label-boundary guard prevents a
+future horizon or spacing change from moving ground truth across partitions.
+
 The downloader provides:
 
 - Provider-specific QPS throttling.
@@ -1306,6 +1329,10 @@ The downloader provides:
 - One provider exiting never cancels another. Only after every provider loop
   exits does the workflow publish a resume state or deterministically merge
   provider-local artifacts.
+- A dataset-contract or date change creates a new immutable namespace. That
+  namespace may read matching cache revisions and request identities from raw JSON caches in older
+  dataset namespaces, while its Parquet files, manifests, and progress remain
+  confined to the new namespace.
 - Neither QPS nor `max_api_calls` represents a provider's daily/weekly quota or
   EODHD's endpoint-specific billed call units.
 - After a temporary provider failure, HTTP 429, per-attempt request-budget
@@ -1477,30 +1504,32 @@ bash scripts/runpod_workflow.sh configure
 
 `--universe`, `--stocks`, `--etfs`, and `--symbol-limit` control **only the US
 dataset scope**; they never filter Taiwan instruments. `us_tw_eodhd` always
-combines the EODHD US scope selected by `--universe` with the complete Taiwan
-market data returned by the official TWSE and TPEx endpoints over the selected
-date range.
+combines the EODHD US target-security scope selected by `--universe` with the
+TWSE/TPEx data that satisfies the common-stock/TDR/audited-unleveraged-equity-
+ETF contract over the selected date range.
 
 Available `--data-profile` values are:
 
 | Value | US data | Taiwan data | Requires `eodhd_api_token` |
 | --- | --- | --- | --- |
-| `tw_only` | None | Official TWSE/TPEx daily data and official benchmarks; `--universe` must be `all` | No |
-| `us_only_eodhd` | EODHD US stocks/ETFs selected by `--universe`, plus the automatically added `VTI.US` benchmark | None | Yes |
-| `us_tw_eodhd` | EODHD US stocks/ETFs selected by `--universe`, plus the automatically added `VTI.US` benchmark | The same complete official Taiwan scope as `tw_only` | Yes |
+| `tw_only` | None | TWSE/TPEx common stocks, TDRs, audited benchmark-mappable unleveraged equity ETFs, and official benchmarks; `--universe` must be `all` | No |
+| `us_only_eodhd` | EODHD common stocks (including ADRs) and audited benchmark-mappable unleveraged equity ETFs selected by `--universe`, plus the automatically added `VTI.US` benchmark | None | Yes |
+| `us_tw_eodhd` | The same US security scope as `us_only_eodhd` | The same Taiwan target-security scope as `tw_only` | Yes |
 
 Available `--universe` values are:
 
 | Value | Meaning | Compatible options |
 | --- | --- | --- |
-| `all` | For profiles containing US data, use EODHD discovery for active and delisted US instruments. For `tw_only`, use the complete official Taiwan scope | US profiles may optionally use `--symbol-limit`; do not provide `--stocks` or `--etfs` |
+| `all` | For profiles containing US data, use EODHD discovery for active and delisted common stocks/ADRs, then apply the audited unleveraged-equity-ETF allowlist. For `tw_only`, use the complete Taiwan target-security scope | US profiles may optionally use `--symbol-limit`; do not provide `--stocks` or `--etfs` |
 | `explicit` | Restrict **only the US scope** and require at least one `--stocks` or `--etfs` value. The workflow still adds `VTI.US` automatically | Only `us_only_eodhd` and `us_tw_eodhd`; cannot be combined with `--symbol-limit` |
 
-Here, “all US stocks and ETFs” means the active/delisted common stocks and ETFs
-that the EODHD account is entitled to access and that discovery returns. Use a
-US-containing profile with `--universe all` and omit `--symbol-limit` entirely.
-It cannot guarantee instruments that the provider omits or the account cannot
-access.
+Here, the “complete US target-security scope” means active/delisted common
+stocks (including ADRs) returned by EODHD discovery and the unleveraged equity
+ETFs in the audited program allowlist. Use a US-containing profile with
+`--universe all` and omit `--symbol-limit` entirely. Leveraged, inverse, bond,
+commodity, and volatility ETFs cannot become training targets, and an explicit
+benchmark mapping cannot bypass this restriction. The workflow cannot guarantee
+instruments that the provider omits or the account cannot access.
 
 All user-facing `configure` options are:
 
@@ -1512,9 +1541,9 @@ All user-facing `configure` options are:
 | `--start` | `YYYY-MM-DD`; default `2005-01-01` | Inclusive start date shared by every selected market; omission always selects `2005-01-01` |
 | `--end` | `YYYY-MM-DD`; no default | Exclusive end boundary shared by every selected market; both interactive and non-interactive modes require an explicit user value instead of silently selecting the local current date |
 | `--universe` | `all`, `explicit` | Select the US-instrument strategy; `tw_only` accepts only `all`. Required in non-interactive mode |
-| `--stocks` | Comma- or space-separated US tickers; repeatable | US stocks in `explicit` mode, such as `"AAPL,MSFT"`; does not affect Taiwan data |
-| `--etfs` | Comma- or space-separated US tickers; repeatable | US ETFs in `explicit` mode, such as `"SPY,QQQ"`; does not affect Taiwan data |
-| `--symbol-limit` | Positive integer N | **A bounded capacity/workflow check, not a complete-US-market mode.** Only valid for a US-containing `all` profile. After discovery, split ETFs and stocks, then keep up to N of each by active → delisted and ticker order; take all when a type has fewer than N. This is neither random nor representative sampling. Then ensure the required `VTI.US` benchmark is present: do not duplicate it if it is among the N ETFs, otherwise add it, so the raw universe is at most `2N+1`. Omit this option for all discovered US stocks and ETFs |
+| `--stocks` | Comma- or space-separated US tickers; repeatable | US common stocks/ADRs in `explicit` mode, such as `"AAPL,BABA"`; provider type is verified against EODHD discovery and does not affect Taiwan data |
+| `--etfs` | Comma- or space-separated US tickers; repeatable | Unleveraged US equity ETFs in `explicit` mode, such as `"SPY,QQQ"`; each ticker must be in the audited allowlist and does not affect Taiwan data |
+| `--symbol-limit` | Positive integer N | **A bounded capacity/workflow check, not a complete-US-market mode.** Only valid for a US-containing `all` profile. After discovery, split allowlisted unleveraged equity ETFs from common stocks/ADRs, then keep up to N of each by active → delisted and ticker order; take all when a type has fewer than N. This is neither random nor representative sampling. Then ensure the required `VTI.US` benchmark is present: do not duplicate it if it is among the N ETFs, otherwise add it, so the raw universe is at most `2N+1`. Omit this option for the complete US target-security scope |
 | `--interactive` | Flag with no value | Explicitly open the interactive prompts; invoking `configure` with no options enables this mode automatically |
 
 Interactive defaults are `stage1`, `us_tw_eodhd`, dataset revision `v1`, start
@@ -1567,12 +1596,12 @@ pacing to 16 requests per second (960 per minute); lower `--eodhd-qps` further
 if another client uses the same account concurrently. See
 [EODHD Pricing](https://eodhd.com/pricing),
 [EODHD API Limits](https://eodhd.com/financial-apis/api-limits) and the
-[EODHD User API](https://eodhd.com/financial-apis/user-api). A complete US stock
-and ETF request plan may exceed `--max-api-calls`; the resumable CPU workflow
+[EODHD User API](https://eodhd.com/financial-apis/user-api). A complete US
+target-security request plan may exceed `--max-api-calls`; the resumable CPU workflow
 handles both project and provider boundaries across multiple attempts.
 
-For the complete EODHD discovery scope plus the complete Taiwan market, provide
-none of `--stocks`, `--etfs`, or `--symbol-limit`:
+For the complete EODHD and Taiwan target-security scopes, provide none of
+`--stocks`, `--etfs`, or `--symbol-limit`:
 
 ```bash
 bash scripts/runpod_workflow.sh configure \

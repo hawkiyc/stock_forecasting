@@ -63,6 +63,7 @@ STAGE1_US_ETF_SYMBOLS="${STAGE1_US_ETF_SYMBOLS:-}"
 STAGE1_SYMBOL_LIMIT="${STAGE1_SYMBOL_LIMIT:-}"
 STAGE1_DATA_START="${STAGE1_DATA_START:-2005-01-01}"
 STAGE1_DATA_END="${STAGE1_DATA_END:-}"
+RUNPOD_DATASET_REVISION="${RUNPOD_DATASET_REVISION:-v1}"
 RUNPOD_CPU_MAX_API_CALLS="${RUNPOD_CPU_MAX_API_CALLS:-}"
 RUNPOD_CPU_EODHD_QPS="${RUNPOD_CPU_EODHD_QPS:-}"
 RUNPOD_CPU_TAIWAN_QPS="${RUNPOD_CPU_TAIWAN_QPS:-}"
@@ -79,6 +80,7 @@ export RUNPOD_SHUTDOWN_DIR RUNPOD_SHUTDOWN_MARKER
 export NETWORK_VOLUME_ROOT RUNPOD_VOLUME_ROOT="${NETWORK_VOLUME_ROOT}"
 export PROJECT_ROOT DATA_ROOT LOG_ROOT LIFECYCLE_ROOT RUNPOD_ROLE RUNPOD_CONFIG
 export FIN_TS_DATASET_PROFILE
+export RUNPOD_DATASET_REVISION
 export RUNPOD_CPU_MAX_API_CALLS RUNPOD_CPU_EODHD_QPS RUNPOD_CPU_TAIWAN_QPS
 # The image may export cache paths under ephemeral /workspace; never inherit them.
 export HF_HOME="${NETWORK_VOLUME_ROOT}/cache/huggingface"
@@ -98,6 +100,10 @@ if [[ ! "${RUNPOD_SELECTION_ID:-}" =~ ^selection-[0-9a-f]{16}$ \
     || ! "${RUNPOD_SELECTION_SHA256:-}" =~ ^[0-9a-f]{64}$ \
     || ! "${RUNPOD_DATASET_REQUEST_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
     echo "CPU preparation requires a valid immutable training selection" >&2
+    exit 2
+fi
+if [[ ! "${RUNPOD_DATASET_REVISION}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+    echo "RUNPOD_DATASET_REVISION must be a safe 1-64 character label" >&2
     exit 2
 fi
 if [[ -z "${RUNPOD_REMOTE_SELECTION_PATH}" ]]; then
@@ -432,6 +438,16 @@ RUNPOD_ROLE=cpu-prep RUNPOD_CONFIG="${RUNPOD_CONFIG}" \
     bash "${SCRIPT_DIR}/prefetch_hf_models.sh" --smoke-time-series-backbone
 
 if [[ ${REUSE_READY_DATASET} -eq 1 ]]; then
+    if ! "${POETRY_BIN}" run fin-ts-verify-download \
+        --manifest "${DOWNLOAD_MANIFEST_FINAL}" \
+        --raw "${RAW_FINAL}"; then
+        quarantine_known_files obsolete-security-scope "${FINAL_DATA_FILES[@]}"
+        REUSE_READY_DATASET=0
+        REUSE_DOWNLOADED_DATASET=0
+        printf 'The immutable dataset uses an obsolete acquisition security scope; rebuilding from verified provider cache entries.\n' >&2
+    fi
+fi
+if [[ ${REUSE_READY_DATASET} -eq 1 ]]; then
     "${RUNPOD_PYTHON_BIN}" "${SCRIPT_DIR}/runpod_readiness.py" check-code \
         --marker "${CODE_MARKER}" \
         --project-root "${PROJECT_ROOT}"
@@ -506,6 +522,7 @@ if [[ ${REUSE_DOWNLOADED_DATASET} -eq 0 ]]; then
         --output "${RAW_STAGING}"
         --manifest-root "${DATA_STAGING_ROOT}"
         --raw-cache-root "${API_CACHE_ROOT}"
+        --cache-revision "${RUNPOD_DATASET_REVISION}"
         --progress-path "${DOWNLOAD_PROGRESS}"
         --dataset-request-sha256 "${RUNPOD_DATASET_REQUEST_SHA256}"
         --selection-id "${RUNPOD_SELECTION_ID}"
