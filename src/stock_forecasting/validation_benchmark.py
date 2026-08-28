@@ -55,8 +55,8 @@ from stock_forecasting.wandb_status import update_wandb_status
 LEARNED_BASELINES = ("gbdt", "gru", "dlinear", "patchtst")
 FULL_MODEL_NAME = "kronos_full"
 ALL_VALIDATION_MODELS = (*RULE_BASELINE_NAMES, *LEARNED_BASELINES, FULL_MODEL_NAME)
-EVALUATION_CONTRACT_VERSION = "4.0"
-VALIDATION_BENCHMARK_SCHEMA_VERSION = "4.0"
+EVALUATION_CONTRACT_VERSION = "5.0"
+VALIDATION_BENCHMARK_SCHEMA_VERSION = "5.0"
 MODEL_DEFINITIONS = {
     "always_buy": "Constant positive-alpha distribution calibrated only on train labels.",
     "zero_return": "Constant zero-alpha distribution calibrated only on train labels.",
@@ -150,7 +150,7 @@ def build_evaluation_contract(
             "run_id": run_id,
             "training_resume_contract_sha256": training_resume_contract_sha256,
             "dataset_artifacts": dataset_artifacts,
-            "model_architecture_sha256": config.model.architecture_digest(),
+            "model_architecture_sha256": config.model_architecture_digest(),
             "config": config.as_dict(),
             "models": list(models),
             "seeds": list(seeds),
@@ -320,10 +320,15 @@ def select_training_records(
     records: list[dict[str, Any]],
     fraction: float,
     max_samples: int | None,
+    alpha_horizons: list[int],
 ) -> list[dict[str, Any]]:
     """Use the exact deterministic market/asset stratification used by training."""
 
-    dataset = FinancialWindowDataset(records, split=None)
+    dataset = FinancialWindowDataset(
+        records,
+        split=None,
+        alpha_horizons=alpha_horizons,
+    )
     indices = deterministic_stratified_indices(
         dataset,
         fraction=fraction,
@@ -466,7 +471,8 @@ class ValidationBenchmark:
                 "causality": "All inputs end at cutoff_at; forward labels are never features.",
                 "model_selection": (
                     "Validation primary_5d/selection_score compatibility path; "
-                    "the value aggregates normalized pinball over horizons 3 through 14."
+                    "the value aggregates normalized pinball over horizons "
+                    f"{self.config.data.h_start} through {self.config.data.max_horizon}."
                 ),
                 "training_subset": "Matches the trainer's exact deterministic stratification.",
                 "test_policy": "The test split is counted but never evaluated.",
@@ -479,7 +485,7 @@ class ValidationBenchmark:
             "checkpoint": str(self.checkpoint),
             "dataset_profile": self.config.data.dataset_profile,
             "selected_datasets": self.config.data.selected_datasets,
-            "model_architecture_sha256": self.config.model.architecture_digest(),
+            "model_architecture_sha256": self.config.model_architecture_digest(),
             "config": self.config.as_dict(),
             "requested_models": self.models,
             "seeds": self.seeds,
@@ -630,6 +636,7 @@ class ValidationBenchmark:
                 split_records["train"],
                 self.config.data.train_fraction,
                 self.config.data.max_samples,
+                self.config.data.alpha_horizons,
             )
             self.payload["sample_counts"] = {
                 split: len(values) for split, values in split_records.items()

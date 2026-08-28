@@ -15,7 +15,10 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from stock_forecasting.data.windows import DEFAULT_ALPHA_HORIZONS
+from stock_forecasting.data.horizons import (
+    DEFAULT_ALPHA_HORIZONS,
+    validate_alpha_horizons,
+)
 from stock_forecasting.metrics import cross_sectional_metrics, multi_horizon_alpha_metrics
 
 ALPHA_QUANTILES = (0.1, 0.5, 0.9)
@@ -55,7 +58,7 @@ class BaselineArrays:
     dates: list[str]
     symbols: list[str]
     asset_types: list[str]
-    horizons: tuple[int, ...] = DEFAULT_ALPHA_HORIZONS
+    horizons: tuple[int, ...]
 
 
 def _safe_log_return(values: NDArray[np.float64], periods: int) -> float:
@@ -143,6 +146,8 @@ def baseline_arrays(records: list[dict[str, Any]]) -> BaselineArrays:
     dates: list[str] = []
     symbols: list[str] = []
     asset_types: list[str] = []
+    first_label = records[0].get("label", {})
+    horizons = validate_alpha_horizons(first_label.get("horizons", ()))
     for record in records:
         asset_summary = _numeric_summary(record["context"])
         benchmark_summary = _numeric_summary(record["benchmark_context"])
@@ -159,14 +164,14 @@ def baseline_arrays(records: list[dict[str, Any]]) -> BaselineArrays:
         if asset_sequence.shape != benchmark_sequence.shape:
             raise ValueError("Asset and benchmark windows must have the same shape")
         label = record.get("label", {})
-        if tuple(label.get("horizons", ())) != DEFAULT_ALPHA_HORIZONS:
-            raise ValueError("Baseline record horizons do not match days 3 through 14")
+        if tuple(label.get("horizons", ())) != horizons:
+            raise ValueError("Baseline records do not share one alpha horizon contract")
         alpha_values = label.get("alpha_log_returns")
         if not isinstance(alpha_values, dict):
             raise ValueError("Baseline record has no alpha_log_returns")
         features.append(feature_row)
         sequences.append(np.stack([asset_sequence, benchmark_sequence]))
-        targets.append([float(alpha_values[f"{horizon}d"]) for horizon in DEFAULT_ALPHA_HORIZONS])
+        targets.append([float(alpha_values[f"{horizon}d"]) for horizon in horizons])
         dates.append(str(record["cutoff_at"]))
         symbols.append(str(record["symbol"]))
         asset_types.append(str(record["asset_type"]))
@@ -186,6 +191,7 @@ def baseline_arrays(records: list[dict[str, Any]]) -> BaselineArrays:
         dates=dates,
         symbols=symbols,
         asset_types=asset_types,
+        horizons=horizons,
     )
 
 
@@ -401,15 +407,21 @@ def _ordered_quantiles(raw: Tensor) -> Tensor:
 
 
 class CausalGRUBaseline(nn.Module):
-    def __init__(self, hidden_dim: int = 64) -> None:
+    def __init__(
+        self,
+        hidden_dim: int = 64,
+        *,
+        horizons: tuple[int, ...] = DEFAULT_ALPHA_HORIZONS,
+    ) -> None:
         super().__init__()
+        self.horizons = validate_alpha_horizons(horizons)
         self.robust_scales: tuple[float, ...] | None = None
         self.encoder = nn.GRU(input_size=5, hidden_size=hidden_dim, batch_first=True)
         self.head = nn.Sequential(
             nn.LayerNorm(hidden_dim * 3),
             nn.Linear(hidden_dim * 3, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, len(DEFAULT_ALPHA_HORIZONS) * 3),
+            nn.Linear(hidden_dim, len(self.horizons) * 3),
         )
 
     def forward(self, sequences: Tensor) -> Tensor:
@@ -419,16 +431,22 @@ class CausalGRUBaseline(nn.Module):
         _output, hidden = self.encoder(sequences.reshape(batch * instruments, steps, fields))
         encoded = hidden[-1].reshape(batch, instruments, -1)
         fused = torch.cat([encoded[:, 0], encoded[:, 1], encoded[:, 0] - encoded[:, 1]], dim=-1)
-        raw = self.head(fused).reshape(batch, len(DEFAULT_ALPHA_HORIZONS), 3)
+        raw = self.head(fused).reshape(batch, len(self.horizons), 3)
         return _ordered_quantiles(raw)
 
 
 class DLinearBaseline(nn.Module):
-    def __init__(self, context_length: int) -> None:
+    def __init__(
+        self,
+        context_length: int,
+        *,
+        horizons: tuple[int, ...] = DEFAULT_ALPHA_HORIZONS,
+    ) -> None:
         super().__init__()
         self.context_length = context_length
+        self.horizons = validate_alpha_horizons(horizons)
         self.trend = nn.AvgPool1d(kernel_size=25, stride=1, padding=12)
-        self.linear = nn.Linear(context_length * 4, len(DEFAULT_ALPHA_HORIZONS) * 3)
+        self.linear = nn.Linear(context_length * 4, len(self.horizons) * 3)
 
     def forward(self, sequences: Tensor) -> Tensor:
         relative_close = sequences[:, 0, :, 3] - sequences[:, 1, :, 3]
@@ -441,7 +459,7 @@ class DLinearBaseline(nn.Module):
             [trend_close, seasonal_close, trend_volume, seasonal_volume],
             dim=-1,
         )
-        raw = self.linear(features).reshape(-1, len(DEFAULT_ALPHA_HORIZONS), 3)
+        raw = self.linear(features).reshape(-1, len(self.horizons), 3)
         return _ordered_quantiles(raw)
 
 
@@ -452,8 +470,10 @@ class PatchTSTBaseline(nn.Module):
         patch_length: int = 16,
         stride: int = 8,
         hidden_dim: int = 64,
+        horizons: tuple[int, ...] = DEFAULT_ALPHA_HORIZONS,
     ) -> None:
         super().__init__()
+        self.horizons = validate_alpha_horizons(horizons)
         self.patch = nn.Conv1d(10, hidden_dim, kernel_size=patch_length, stride=stride)
         layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
@@ -464,14 +484,14 @@ class PatchTSTBaseline(nn.Module):
             norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=2)
-        self.head = nn.Linear(hidden_dim, len(DEFAULT_ALPHA_HORIZONS) * 3)
+        self.head = nn.Linear(hidden_dim, len(self.horizons) * 3)
 
     def forward(self, sequences: Tensor) -> Tensor:
         batch, instruments, steps, fields = sequences.shape
         values = sequences.permute(0, 1, 3, 2).reshape(batch, instruments * fields, steps)
         patches = self.patch(values).transpose(1, 2)
         encoded = self.encoder(patches).mean(dim=1)
-        raw = self.head(encoded).reshape(batch, len(DEFAULT_ALPHA_HORIZONS), 3)
+        raw = self.head(encoded).reshape(batch, len(self.horizons), 3)
         return _ordered_quantiles(raw)
 
 
@@ -582,7 +602,7 @@ def fit_causal_gru(
     learning_rate: float = 1e-3,
 ) -> tuple[CausalGRUBaseline, dict[str, Any]]:
     _seed_baseline(seed)
-    model = CausalGRUBaseline()
+    model = CausalGRUBaseline(horizons=train.horizons)
     trained, metrics = _fit_neural(
         model,
         train,
@@ -621,7 +641,10 @@ def fit_dlinear(
     learning_rate: float = 1e-3,
 ) -> tuple[DLinearBaseline, dict[str, Any]]:
     _seed_baseline(seed)
-    model = DLinearBaseline(context_length=train.sequences.shape[2])
+    model = DLinearBaseline(
+        context_length=train.sequences.shape[2],
+        horizons=train.horizons,
+    )
     trained, metrics = _fit_neural(
         model,
         train,
@@ -646,7 +669,7 @@ def fit_patchtst(
     learning_rate: float = 1e-3,
 ) -> tuple[PatchTSTBaseline, dict[str, Any]]:
     _seed_baseline(seed)
-    model = PatchTSTBaseline()
+    model = PatchTSTBaseline(horizons=train.horizons)
     trained, metrics = _fit_neural(
         model,
         train,

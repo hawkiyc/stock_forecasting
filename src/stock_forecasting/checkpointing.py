@@ -498,7 +498,7 @@ def _stage_checkpoint(
         "epoch": epoch,
         "batch_index": batch_index,
         "training_stage": config.training.stage,
-        "model_architecture_sha256": config.model.architecture_digest(),
+        "model_architecture_sha256": config.model_architecture_digest(),
         "metrics": metrics or {},
         "created_at": datetime.now(UTC).isoformat(),
         "time_series_model_id": config.model.time_series_model_id,
@@ -1290,7 +1290,7 @@ def _validate_loaded_model_contract(
 ) -> None:
     """Reject evaluation or inference under a different model or training stage."""
 
-    expected_architecture = config.model.architecture_digest()
+    expected_architecture = config.model_architecture_digest()
     expected_resume_contract = training_resume_contract_digest(config)
     if trainer_state.get("model_output_schema_version") != MODEL_OUTPUT_SCHEMA_VERSION:
         raise ValueError("Checkpoint predates the conditional alpha output contract")
@@ -1317,7 +1317,7 @@ def _validate_loaded_model_contract(
         raise ValueError("Checkpoint Kronos source revision differs from the selected config")
     stored_config = ExperimentConfig.from_yaml(checkpoint_dir / "resolved-config.yaml")
     if (
-        stored_config.model.architecture_digest() != expected_architecture
+        stored_config.model_architecture_digest() != expected_architecture
         or stored_config.training.stage != config.training.stage
     ):
         raise ValueError("Checkpoint resolved config differs from its selected model contract")

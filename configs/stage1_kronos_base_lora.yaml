@@ -7,7 +7,7 @@ data:
   manifest_path: ${DATA_ROOT:-/runpod-volume/data}/dataset-manifest.json
   dataset_profile: ${FIN_TS_DATASET_PROFILE:-us_tw_eodhd}
   input_length: 128
-  alpha_horizons: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+  h_start: ${FIN_TS_H_START:-3}
   benchmark_mapping_path: null
   forecast_horizon: 5
   diagnostic_horizons: [1, 20]

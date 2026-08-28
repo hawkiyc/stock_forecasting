@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from stock_forecasting.data.adjustments import robust_horizon_scales
+from stock_forecasting.data.horizons import DEFAULT_H_START, alpha_horizons_from_start
 from stock_forecasting.data.io import write_processed_records
 from stock_forecasting.data.manifest import (
     DATASET_MANIFEST_SCHEMA_VERSION,
@@ -23,11 +24,7 @@ from stock_forecasting.data.manifest import (
 from stock_forecasting.data.quality import assess_ohlcv_quality
 from stock_forecasting.data.schema import TRAINING_SECURITY_SCOPE, read_market_data
 from stock_forecasting.data.splits import SPLIT_POLICY, chronological_split
-from stock_forecasting.data.windows import (
-    DEFAULT_ALPHA_HORIZONS,
-    PROCESSED_SCHEMA_VERSION,
-    build_causal_windows,
-)
+from stock_forecasting.data.windows import PROCESSED_SCHEMA_VERSION, build_causal_windows
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,12 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--window-size", type=int, default=128)
     parser.add_argument("--stride", type=int, default=5, help="RunPod compatibility sentinel.")
     parser.add_argument("--sample-stride", type=int, default=1)
-    parser.add_argument(
-        "--alpha-horizons",
-        type=int,
-        nargs="+",
-        default=list(DEFAULT_ALPHA_HORIZONS),
-    )
+    parser.add_argument("--h-start", type=int, choices=(1, 2, 3), default=DEFAULT_H_START)
     parser.add_argument("--target-horizon", type=int, default=5)
     parser.add_argument("--diagnostic-horizons", type=int, nargs="+", default=[1, 20])
     parser.add_argument("--flat-volatility-multiplier", type=float, default=0.25)
@@ -80,6 +72,7 @@ def _pipeline_digest() -> str:
         package_root / "data" / "schema.py",
         package_root / "data" / "adjustments.py",
         package_root / "data" / "benchmarks.py",
+        package_root / "data" / "horizons.py",
         package_root / "data" / "quality.py",
         package_root / "data" / "windows.py",
         package_root / "data" / "splits.py",
@@ -109,6 +102,7 @@ def _load_benchmark_mapping(path: Path | None) -> tuple[dict[str, str], str]:
 def prepare_dataset(
     args: argparse.Namespace,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    alpha_horizons = list(alpha_horizons_from_start(args.h_start))
     frame = read_market_data(args.input)
     quality = assess_ohlcv_quality(
         frame,
@@ -120,7 +114,7 @@ def prepare_dataset(
         frame,
         window_size=args.window_size,
         stride=args.sample_stride,
-        alpha_horizons=args.alpha_horizons,
+        h_start=args.h_start,
         benchmark_mapping=benchmark_mapping,
         target_horizon=args.target_horizon,
         diagnostic_horizons=args.diagnostic_horizons,
@@ -145,10 +139,10 @@ def prepare_dataset(
     counts = Counter(record["split"] for record in assigned)
     if set(counts) != {"train", "validation", "test"}:
         raise ValueError("Purged split did not produce non-empty train/validation/test partitions")
-    scales = robust_horizon_scales(assigned, args.alpha_horizons)
+    scales = robust_horizon_scales(assigned, alpha_horizons)
     label_statistics = {
         "source_split": "train",
-        "horizons": list(args.alpha_horizons),
+        "horizons": alpha_horizons,
         "robust_scale_method": "max(iqr,mad_x_1.4826,1e-4)",
         "robust_scales": scales,
         "prediction_units": "benchmark_relative_log_return",
@@ -158,7 +152,9 @@ def prepare_dataset(
         "window_size": args.window_size,
         "stride": args.stride,
         "effective_sample_stride": args.sample_stride,
-        "alpha_horizons": list(args.alpha_horizons),
+        "h_start": args.h_start,
+        "max_horizon": alpha_horizons[-1],
+        "alpha_horizons": alpha_horizons,
         "label_kind": "benchmark_relative_adjusted_log_return",
         "signal_timing": "after_close_t",
         "entry_timing": "regular_session_open_t_plus_1",

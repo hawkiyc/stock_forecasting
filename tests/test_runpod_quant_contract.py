@@ -431,6 +431,11 @@ def test_cpu_acquisition_budget_is_resumable_and_reserves_preparation_time() -> 
     assert "RUNPOD_CPU_PREPARE_RESERVE_SECONDS" in prepare
     assert "ACQUISITION_DEADLINE_EPOCH" in prepare
     assert "RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS" in prepare
+    assert '--h-start "${FIN_TS_H_START}"' in prepare
+    download_arguments = prepare.split("DOWNLOAD_ARGUMENTS=(", maxsplit=1)[1].split(
+        ")", maxsplit=1
+    )[0]
+    assert "FIN_TS_H_START" not in download_arguments
     assert 'error.get("provider_outcomes")' in status
     assert 'for key in ("category", "error_type", "operation", "item", "status_code")' in status
     assert 'ln "${RAW_STAGING}" "${RAW_FINAL}"' in prepare
@@ -817,7 +822,7 @@ def test_eodhd_secret_is_cpu_only() -> None:
 def test_stage_configs_have_identical_architecture_digest() -> None:
     stage1 = ExperimentConfig.from_yaml(ROOT / "configs/stage1_kronos_base_lora.yaml")
     stage2 = ExperimentConfig.from_yaml(ROOT / "configs/stage2_kronos_base_lora.yaml")
-    assert stage1.model.architecture_digest() == stage2.model.architecture_digest()
+    assert stage1.model_architecture_digest() == stage2.model_architecture_digest()
 
 
 def test_runpod_setup_and_stage_configs_pin_the_same_kronos_revision() -> None:

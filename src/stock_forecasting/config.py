@@ -12,6 +12,12 @@ from typing import Any, Literal, cast
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from stock_forecasting.data.horizons import (
+    DEFAULT_H_START,
+    MAX_ALPHA_HORIZON,
+    alpha_horizons_from_start,
+)
+
 _ENV_DEFAULT_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-([^}]*)}")
 DatasetProfile = Literal[
     "tw_only",
@@ -49,7 +55,7 @@ class DataConfig(StrictModel):
     manifest_path: Path | None = None
     dataset_profile: DatasetProfile = "tw_only"
     input_length: int = Field(default=128, ge=32, le=512)
-    alpha_horizons: list[int] = Field(default_factory=lambda: list(range(3, 15)))
+    h_start: int = Field(default=DEFAULT_H_START, ge=1, le=3)
     benchmark_mapping_path: Path | None = None
     # These two fields are retained only because the stable RunPod readiness
     # scripts validate them. They do not define the new model target.
@@ -70,10 +76,15 @@ class DataConfig(StrictModel):
     max_samples: int | None = Field(default=None, ge=1)
     require_ready_manifest: bool = True
 
+    @field_validator("h_start", mode="before")
+    @classmethod
+    def reject_boolean_h_start(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("h_start must be 1, 2, or 3")
+        return value
+
     @model_validator(mode="after")
     def validate_horizons(self) -> DataConfig:
-        if self.alpha_horizons != list(range(3, 15)):
-            raise ValueError("alpha_horizons are fixed at trading days 3 through 14")
         if self.forecast_horizon != 5:
             raise ValueError("RunPod readiness compatibility requires forecast_horizon=5")
         if self.diagnostic_horizons != [1, 20]:
@@ -83,6 +94,18 @@ class DataConfig(StrictModel):
         if self.sample_stride != 1:
             raise ValueError("Conditional alpha windows require sample_stride=1")
         return self
+
+    @property
+    def alpha_horizons(self) -> list[int]:
+        """Return the configured contiguous holding-day forecast horizons."""
+
+        return list(alpha_horizons_from_start(self.h_start))
+
+    @property
+    def max_horizon(self) -> int:
+        """Return the fixed maximum holding-day forecast horizon."""
+
+        return MAX_ALPHA_HORIZON
 
     @property
     def selected_datasets(self) -> list[str]:
@@ -363,6 +386,22 @@ class ExperimentConfig(StrictModel):
 
     def as_dict(self) -> dict[str, Any]:
         return cast(dict[str, Any], json.loads(self.model_dump_json()))
+
+    def model_architecture_digest(self) -> str:
+        """Hash model parameters together with the variable output horizon contract."""
+
+        payload = {
+            "model_sha256": self.model.architecture_digest(),
+            "alpha_horizons": self.data.alpha_horizons,
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def save_resolved(self, path: str | Path) -> None:
         target = Path(path)

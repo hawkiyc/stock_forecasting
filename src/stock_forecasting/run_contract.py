@@ -13,11 +13,12 @@ from stock_forecasting.models import MODEL_OUTPUT_SCHEMA_VERSION
 from stock_forecasting.run_paths import validate_run_id, validate_training_resume_path
 
 CHECKPOINT_ARTIFACT_SCHEMA_VERSION = "3.0"
-TRAINING_RESUME_CONTRACT_VERSION = "4.0"
+TRAINING_RESUME_CONTRACT_VERSION = "5.0"
 TRAINING_IMPLEMENTATION_PATHS = (
     "checkpointing.py",
     "config.py",
     "data/dataset.py",
+    "data/horizons.py",
     "data/io.py",
     "data/manifest.py",
     "factory.py",
@@ -94,7 +95,7 @@ def training_resume_contract(config: ExperimentConfig) -> dict[str, Any]:
         "model_output_schema_version": MODEL_OUTPUT_SCHEMA_VERSION,
         "data": payload["data"],
         "model": payload["model"],
-        "model_architecture_sha256": config.model.architecture_digest(),
+        "model_architecture_sha256": config.model_architecture_digest(),
         "training": training,
         "training_implementation": training_implementation_contract(),
         "dataset_artifacts": _dataset_resume_contract(config),

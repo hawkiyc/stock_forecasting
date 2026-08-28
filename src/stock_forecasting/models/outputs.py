@@ -8,7 +8,7 @@ from typing import Any
 
 from torch import Tensor
 
-MODEL_OUTPUT_SCHEMA_VERSION = "4.0"
+MODEL_OUTPUT_SCHEMA_VERSION = "5.0"
 
 
 class OutputMapping(Mapping[str, Any]):

@@ -91,8 +91,18 @@ def test_forecast_payload_is_multi_horizon_continuous_and_classifier_free() -> N
         signal_threshold=0.01,
     )
 
-    assert set(payload) == {"units", "signal_threshold", "by_horizon"}
+    assert set(payload) == {
+        "units",
+        "h_start",
+        "max_horizon",
+        "horizons",
+        "signal_threshold",
+        "by_horizon",
+    }
     assert payload["units"] == "benchmark_relative_adjusted_log_return"
+    assert payload["h_start"] == 3
+    assert payload["max_horizon"] == 14
+    assert payload["horizons"] == list(DEFAULT_ALPHA_HORIZONS)
     assert payload["signal_threshold"] == pytest.approx(0.01)
     assert list(payload["by_horizon"]) == [
         f"{horizon}d" for horizon in DEFAULT_ALPHA_HORIZONS

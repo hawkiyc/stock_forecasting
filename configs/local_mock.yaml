@@ -7,7 +7,7 @@ data:
   manifest_path: data/dataset-manifest.json
   dataset_profile: tw_only
   input_length: 128
-  alpha_horizons: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+  h_start: 3
   benchmark_mapping_path: null
   forecast_horizon: 5
   diagnostic_horizons: [1, 20]

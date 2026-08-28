@@ -29,6 +29,7 @@ _PERSISTENT_ENVIRONMENT_KEYS = frozenset(
         "PIP_CACHE_DIR",
         "KRONOS_ROOT",
         "MODEL_CACHE_MANIFEST",
+        "FIN_TS_H_START",
     }
 )
 _ISOLATED_ENVIRONMENT_PREFIXES = ("RUNPOD_", "WANDB_", "HF_", "AWS_")
@@ -91,7 +92,7 @@ def market_frame() -> pd.DataFrame:
 
 @pytest.fixture
 def window_records(market_frame: pd.DataFrame) -> list[dict[str, object]]:
-    """Return processed schema 3.0 records with non-empty purged splits."""
+    """Return processed schema 4.0 records with non-empty purged splits."""
 
     windows = build_causal_windows(
         market_frame,

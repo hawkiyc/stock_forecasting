@@ -59,11 +59,58 @@ def test_causal_records_have_paired_historical_inputs_and_future_labels_only(
     assert not ({"text", "facts", "description", "future_benchmark"} & set(record))
 
 
+@pytest.mark.parametrize("h_start", [1, 2, 3])
+def test_h_start_builds_contiguous_labels_through_fixed_day_14(
+    market_frame: pd.DataFrame,
+    h_start: int,
+) -> None:
+    records = build_causal_windows(
+        market_frame,
+        window_size=32,
+        stride=20,
+        h_start=h_start,
+    )
+    label = records[0]["label"]
+    assert isinstance(label, dict)
+
+    expected = list(range(h_start, 15))
+    assert label["horizons"] == expected
+    assert list(label["alpha_log_returns"]) == [f"{horizon}d" for horizon in expected]
+    assert list(label["end_at"])[-1] == "14d"
+
+
+def test_earlier_h_start_preserves_existing_day_3_through_14_labels(
+    market_frame: pd.DataFrame,
+) -> None:
+    first_day = build_causal_windows(
+        market_frame,
+        window_size=32,
+        stride=20,
+        h_start=1,
+    )
+    third_day = build_causal_windows(
+        market_frame,
+        window_size=32,
+        stride=20,
+        h_start=3,
+    )
+
+    assert [record["sample_id"] for record in first_day] == [
+        record["sample_id"] for record in third_day
+    ]
+    for first_record, third_record in zip(first_day, third_day, strict=True):
+        assert first_record["context"] == third_record["context"]
+        assert first_record["benchmark_context"] == third_record["benchmark_context"]
+        first_labels = first_record["label"]["alpha_log_returns"]
+        third_labels = third_record["label"]["alpha_log_returns"]
+        assert {key: first_labels[key] for key in third_labels} == third_labels
+
+
 def test_training_targets_include_common_stock_depositary_receipts_and_equity_etfs(
     market_frame: pd.DataFrame,
     window_records: list[dict[str, object]],
 ) -> None:
-    assert TRAINING_TARGET_ASSET_TYPES == {"stock", "etf"}
+    assert {"stock", "etf"} == TRAINING_TARGET_ASSET_TYPES
     assert {str(record["asset_type"]) for record in window_records} == {"stock", "etf"}
 
     adr = market_frame[market_frame["symbol"] == "AAPL.US"].copy()
@@ -440,8 +487,10 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
     processed.write_bytes(b"immutable processed parquet fixture")
     manifest = tmp_path / "dataset-manifest.json"
     preparation_spec = {
-        "processed_schema_version": "3.0",
+        "processed_schema_version": "4.0",
         "window_size": 128,
+        "h_start": 3,
+        "max_horizon": 14,
         "target_horizon": 5,
         "diagnostic_horizons": [1, 20],
         "stride": 5,
@@ -537,6 +586,8 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
         validate_dataset_preparation_contract(
             validated,
             input_length=128,
+            h_start=3,
+            max_horizon=14,
             alpha_horizons=list(DEFAULT_ALPHA_HORIZONS),
             benchmark_mapping_path=None,
             sample_stride=1,
@@ -559,6 +610,8 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
         validate_dataset_preparation_contract(
             invalid_boundary,
             input_length=128,
+            h_start=3,
+            max_horizon=14,
             alpha_horizons=list(DEFAULT_ALPHA_HORIZONS),
             benchmark_mapping_path=None,
             sample_stride=1,
@@ -575,6 +628,8 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
         validate_dataset_preparation_contract(
             validated,
             input_length=64,
+            h_start=3,
+            max_horizon=14,
             alpha_horizons=list(DEFAULT_ALPHA_HORIZONS),
             benchmark_mapping_path=None,
             sample_stride=1,

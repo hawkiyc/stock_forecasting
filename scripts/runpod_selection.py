@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple, Union
 
-SELECTION_SCHEMA_VERSION = 2
+SELECTION_SCHEMA_VERSION = 3
 DATASET_REQUEST_SCHEMA_VERSION = 1
 ACTIVE_POINTER_SCHEMA_VERSION = 1
 SELECTION_ID_PATTERN = re.compile(r"selection-[0-9a-f]{16}")
@@ -44,13 +44,12 @@ STAGE_RUNTIME = {
 }
 
 # These settings define dataset semantics and must change the dataset request digest.
-PREPARATION_CONTRACT = {
-    "schema_version": 3,
-    "processed_schema_version": "3.0",
+_BASE_PREPARATION_CONTRACT = {
+    "schema_version": 4,
+    "processed_schema_version": "4.0",
     "window_size": 128,
     "stride": 5,
     "effective_sample_stride": 1,
-    "alpha_horizons": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
     "label_kind": "benchmark_relative_adjusted_log_return",
     "signal_timing": "after_close_t",
     "entry_timing": "regular_session_open_t_plus_1",
@@ -80,6 +79,20 @@ PREPARATION_CONTRACT = {
     "effective_embargo_bars": 14,
 }
 
+
+def _preparation_contract(h_start: int) -> Dict[str, Any]:
+    if isinstance(h_start, bool) or not isinstance(h_start, int) or h_start not in (1, 2, 3):
+        _fail("h_start must be 1, 2, or 3")
+    return {
+        **_BASE_PREPARATION_CONTRACT,
+        "h_start": h_start,
+        "max_horizon": 14,
+        "alpha_horizons": list(range(h_start, 15)),
+    }
+
+
+PREPARATION_CONTRACT = _preparation_contract(3)
+
 EXPORT_KEYS = (
     "RUNPOD_SELECTION_ID",
     "RUNPOD_SELECTION_SHA256",
@@ -93,6 +106,7 @@ EXPORT_KEYS = (
     "RUNPOD_STAGE_CONFIG_SHA256",
     "DATA_ROOT",
     "FIN_TS_DATASET_PROFILE",
+    "FIN_TS_H_START",
     "STAGE1_US_SYMBOLS",
     "STAGE1_US_ETF_SYMBOLS",
     "STAGE1_SYMBOL_LIMIT",
@@ -412,7 +426,11 @@ def _validate_selection(
     elif stocks or etfs:
         _fail("US symbol lists require universe mode explicit")
 
-    if request.get("preparation") != PREPARATION_CONTRACT:
+    preparation = request.get("preparation")
+    if not isinstance(preparation, dict):
+        _fail("Dataset preparation contract is invalid")
+    h_start = preparation.get("h_start")
+    if request.get("preparation") != _preparation_contract(h_start):
         _fail("Dataset preparation contract is unsupported")
     if _payload_sha256(_dataset_request_core(request)) != dataset_request_sha256:
         _fail("Dataset request digest is inconsistent")
@@ -478,7 +496,7 @@ def _build_selection(arguments: argparse.Namespace, project_root: Path) -> Dict[
             "symbol_limit": symbol_limit,
             "include_delisted_us": True,
         },
-        "preparation": PREPARATION_CONTRACT,
+        "preparation": _preparation_contract(arguments.h_start),
     }
     payload = {  # type: Dict[str, Any]
         "schema_version": SELECTION_SCHEMA_VERSION,
@@ -554,6 +572,9 @@ def _populate_interactive(arguments: argparse.Namespace) -> None:
     arguments.dataset_revision = _prompt_text("Dataset revision label", "v1")
     arguments.start = _prompt_text("Dataset start date (inclusive)", "2005-01-01")
     arguments.end = _prompt_required_text("Dataset end date (exclusive)")
+    arguments.h_start = int(
+        _prompt_choice("First holding-day forecast horizon", ("1", "2", "3"), "3")
+    )
     if arguments.data_profile == "tw_only":
         arguments.universe = "all"
         arguments.stocks = []
@@ -594,6 +615,7 @@ def _selection_exports(selection_path: Path, payload: Dict[str, Any]) -> Dict[st
         "RUNPOD_STAGE_CONFIG_SHA256": payload["stage"]["config_sha256"],
         "DATA_ROOT": f"/runpod-volume/datasets/{digest}",
         "FIN_TS_DATASET_PROFILE": request["profile"],
+        "FIN_TS_H_START": str(request["preparation"]["h_start"]),
         "STAGE1_US_SYMBOLS": " ".join(universe["us_stocks"]),
         "STAGE1_US_ETF_SYMBOLS": " ".join(universe["us_etfs"]),
         "STAGE1_SYMBOL_LIMIT": (
@@ -791,6 +813,7 @@ def _verify_environment(
             "RUNPOD_CONFIG",
             "RUNPOD_STAGE_CONFIG_SHA256",
             "FIN_TS_DATASET_PROFILE",
+            "FIN_TS_H_START",
             "STAGE1_US_SYMBOLS",
             "STAGE1_US_ETF_SYMBOLS",
             "STAGE1_SYMBOL_LIMIT",
@@ -827,6 +850,7 @@ def command_create(arguments: argparse.Namespace) -> int:
             request["date_range"]["end_exclusive"],
         )
     )
+    print(f"First forecast horizon: {request['preparation']['h_start']}d")
     print(f"Dataset request SHA-256: {payload['dataset_request_sha256']}")
     print(f"Selection file: {path}")
     return 0
@@ -938,6 +962,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Inclusive market-data start date (default: 2005-01-01).",
     )
     create.add_argument("--end", help="Exclusive market-data end date (YYYY-MM-DD).")
+    create.add_argument(
+        "--h-start",
+        type=int,
+        choices=(1, 2, 3),
+        default=3,
+        help="First cumulative holding-day alpha horizon; maximum remains day 14.",
+    )
     create.add_argument("--universe", choices=("all", "explicit"))
     create.add_argument(
         "--stocks",

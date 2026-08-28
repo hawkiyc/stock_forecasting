@@ -68,7 +68,7 @@ def run_preflight(
             "training_fraction": str(config.data.train_fraction),
             "dataset_profile": config.data.dataset_profile,
             "selected_datasets": ",".join(config.data.selected_datasets),
-            "model_architecture_sha256": config.model.architecture_digest(),
+            "model_architecture_sha256": config.model_architecture_digest(),
         }
     )
 
@@ -99,6 +99,8 @@ def run_preflight(
                     preparation_spec = validate_dataset_preparation_contract(
                         manifest,
                         input_length=config.data.input_length,
+                        h_start=config.data.h_start,
+                        max_horizon=config.data.max_horizon,
                         alpha_horizons=config.data.alpha_horizons,
                         benchmark_mapping_path=config.data.benchmark_mapping_path,
                         sample_stride=config.data.sample_stride,

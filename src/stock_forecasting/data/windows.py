@@ -17,11 +17,17 @@ from stock_forecasting.data.adjustments import (
     execution_total_return,
 )
 from stock_forecasting.data.benchmarks import resolve_benchmark
+from stock_forecasting.data.horizons import (
+    DEFAULT_ALPHA_HORIZONS as DEFAULT_ALPHA_HORIZONS,
+)
+from stock_forecasting.data.horizons import (
+    DEFAULT_H_START,
+    alpha_horizons_from_start,
+)
 from stock_forecasting.data.schema import normalize_ohlcv_frame
 
 CONTEXT_FIELDS = ("open", "high", "low", "close", "volume")
-DEFAULT_ALPHA_HORIZONS = tuple(range(3, 15))
-PROCESSED_SCHEMA_VERSION = "3.0"
+PROCESSED_SCHEMA_VERSION = "4.0"
 _PROVENANCE_FIELDS = (
     "provider",
     "market",
@@ -58,13 +64,6 @@ def _record_metadata(symbol_frame: pd.DataFrame) -> dict[str, Any]:
     return metadata
 
 
-def _validate_horizons(horizons: Iterable[int]) -> tuple[int, ...]:
-    ordered = tuple(int(horizon) for horizon in horizons)
-    if ordered != DEFAULT_ALPHA_HORIZONS:
-        raise ValueError("alpha_horizons are fixed at trading days 3 through 14")
-    return ordered
-
-
 def _aligned_rows(frame: pd.DataFrame, timestamps: pd.Series) -> pd.DataFrame | None:
     indexed = frame.set_index("timestamp", drop=False)
     requested = pd.DatetimeIndex(timestamps)
@@ -91,7 +90,7 @@ def build_causal_windows(
     *,
     window_size: int = 128,
     stride: int = 1,
-    alpha_horizons: Iterable[int] = DEFAULT_ALPHA_HORIZONS,
+    h_start: int = DEFAULT_H_START,
     benchmark_mapping: Mapping[str, str] | None = None,
     max_abs_log_return: float = 0.5,
     audit: MutableMapping[str, Any] | None = None,
@@ -122,7 +121,7 @@ def build_causal_windows(
         raise ValueError("flat_volatility_multiplier must be non-negative")
     if workers < 1:
         raise ValueError("workers must be positive")
-    horizons = _validate_horizons(alpha_horizons)
+    horizons = alpha_horizons_from_start(h_start)
     maximum_horizon = max(horizons)
 
     normalized = ensure_adjustment_columns(normalize_ohlcv_frame(frame))

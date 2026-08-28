@@ -9,7 +9,8 @@
 
 - 輸入與輸出都是數值張量，不提供自然語言生成或事實重建功能。
 - 不把外部 API 放進訓練迴圈。
-- 只輸出 3–14 個持有交易日的連續 alpha 條件分布。
+- 只輸出從可設定的 `h_start`（1、2 或 3）到固定第 14 個持有交易日的連續
+  alpha 條件分布。
 - 提供可供下游系統重用的數值 encoder 介面。
 
 這是研究與能力驗證用的 PoC，不是投資建議、交易系統或可保證獲利的模型。
@@ -18,15 +19,16 @@
 
 `MultiHorizonAlphaHead` 的唯一預測輸出是：
 
-- `alpha_quantiles`: `[batch, 12, 3]`。
-- 第二維依序是持有 3、4、…、14 個交易日。
+- `alpha_quantiles`: `[batch, 15-h_start, 3]`。
+- 第二維依序是持有 `h_start`、`h_start+1`、…、14 個交易日；`h_start`
+  只能是 1、2 或 3，預設為 3。
 - 第三維固定為 q10、q50、q90。
 - 單位是商品相對其 benchmark 的 adjusted execution log return。
 
 模型沒有 `forecast_logits`、分類 head、分類 loss 或方向機率。推論時可由每個
 horizon 的 q10/q50/q90，使用固定閾值後處理成 `strong_bearish`、`bearish`、
 `neutral`、`bullish`、`strong_bullish`；這些訊號不是額外訓練目標，也不會增加
-loss 權重。Checkpoint 必須符合 `model_output_schema_version=4.0`；不相容的
+loss 權重。Checkpoint 必須符合 `model_output_schema_version=5.0`；不相容的
 output schema 會被拒絕載入。
 
 ### 模型架構
@@ -42,7 +44,7 @@ Adjusted benchmark OHLCV through close t ─┘              │
                                            gated benchmark cross-attention
                                                          │
                                                          ▼
-                                     3–14d alpha q10/q50/q90 [B,12,3]
+                         h_start–14d alpha q10/q50/q90 [B,15-h_start,3]
 ```
 
 生產設定使用 `NeoQuasar/Kronos-base` 與
@@ -114,7 +116,7 @@ EODHD 是 PoC 資料，不應被描述成交易所級真實行情。跨 provider
 每筆樣本在交易日 `t` 收盤後產生訊號；下一個共同交易日的 regular-session raw
 open 進場，該日算第 1 個持有交易日，持有 `h` 日時在第 `h` 個共同交易日的
 raw close 出場。label 是商品與 benchmark 在完全相同 entry/exit timestamps 的
-total-return log return 差，`h ∈ {3,…,14}`。
+total-return log return 差，`h ∈ {h_start,…,14}`，其中 `h_start ∈ {1,2,3}`。
 
 預設 benchmark policy：
 
@@ -293,7 +295,9 @@ symbol limit 或處理契約變動時會使用新的根目錄，不需要手動�
 - `configs/stage1_kronos_base_lora.yaml`
 - `configs/stage2_kronos_base_lora.yaml`
 
-兩份設定的 `model.architecture_digest()` 必須一致。Stage 1 的 15% 是確定性、分層且精確的 train subset，不會縮小 validation/test，也不能用「前 15% 資料」取代。
+兩份設定的 `config.model_architecture_digest()` 必須一致；此 digest 同時綁定模型參數與
+`h_start`／輸出 horizon 契約。Stage 1 的 15% 是確定性、分層且精確的 train subset，
+不會縮小 validation/test，也不能用「前 15% 資料」取代。
 
 ### RunPod 完整操作手冊
 
@@ -390,6 +394,7 @@ mapping 也不能繞過此限制。這不保證涵蓋 provider 未回傳或帳�
 | `--dataset-revision` | 1～64 字元；英數開頭，之後可用英數、`.`、`_`、`-`；預設 `v1` | provider 修訂歷史資料時，用新 label 強制建立新的 immutable dataset namespace |
 | `--start` | `YYYY-MM-DD`；預設 `2005-01-01` | 所有選定市場共用的起始日，包含該日；省略時固定使用 `2005-01-01` |
 | `--end` | `YYYY-MM-DD`；無預設值 | 所有選定市場共用的結束邊界，不包含該日；互動與非互動模式都必須由使用者明確提供，避免不知情地改用本機當日 |
+| `--h-start` | `1`、`2`、`3`；預設 `3` | 在 `t` 收盤後同時預測從第幾個持有交易日起至第 14 日的累積 alpha；仍於 `t+1` raw open 評估進場。此值屬於 processed dataset 與模型輸出契約 |
 | `--universe` | `all`、`explicit` | 控制美國商品選取方式；對 `tw_only` 只能使用 `all`。非互動模式必填 |
 | `--stocks` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的美國普通股／ADR，例如 `"AAPL,BABA"`；會用 EODHD discovery 驗證型別，不影響台股 |
 | `--etfs` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的非槓桿股票型 ETF，例如 `"SPY,QQQ"`；必須在經稽核白名單內，不影響台股 |
@@ -397,7 +402,7 @@ mapping 也不能繞過此限制。這不保證涵蓋 provider 未回傳或帳�
 | `--interactive` | 無值 flag | 明確開啟互動式選單；直接執行 `configure` 而不帶選項時會自動使用此模式 |
 
 互動模式的預設值是 `stage1`、`us_tw_eodhd`、dataset revision `v1`、起始日
-`2005-01-01` 與 US universe `all`。`--end` 刻意沒有預設值，提示時若留白會繼續
+`2005-01-01`、`h_start=3` 與 US universe `all`。`--end` 刻意沒有預設值，提示時若留白會繼續
 要求輸入，不會自動採用本機當日。Provider acquisition policy 不在 `configure` 設定；
 若在此命令提供 `--max-api-calls`、`--eodhd-qps`、`--taiwan-qps` 或 `--maxBackoff`，
 會以未知選項拒絕，不會建立另一個 selection。
@@ -421,6 +426,7 @@ bash scripts/runpod_workflow.sh configure \
   --data-profile us_tw_eodhd \
   --start 2015-01-01 \
   --end 2026-07-27 \
+  --h-start 3 \
   --universe explicit \
   --stocks "AAPL,MSFT" \
   --etfs "SPY,QQQ"
@@ -493,12 +499,19 @@ bash scripts/runpod_workflow.sh configure \
 
 腳本會建立 `.runpod/selections/<selection-id>.json` 與
 `.runpod/active-selection.json`。兩者都不含 secret 且被 `.gitignore` 排除。
-目前使用 selection schema 2；舊 schema 1 把 transient acquisition policy 寫入
-selection，因此更新程式碼後必須重新執行 `configure`，不會自動轉換。修改 `--end`
+目前使用 selection schema 3；舊 schema 不含完整 `h_start` 處理契約，因此更新程式碼後
+必須重新執行 `configure`，不會自動轉換。修改 `--end`
 會按設計建立新的 dataset request namespace；既有 network-volume 檔案不會被刪除。
 profile、日期、universe、symbol limit、資料處理契約或 stage config SHA-256
 任一不同，都會得到不同 identity。QPS、API budget 與最大退避只記錄在 CPU launch
 metadata、download progress 與 download manifest，不會進入 selection identity。
+
+只修改 `h_start` 會產生新的 dataset request SHA，並重新建立 processed windows、labels、
+train-only robust scales 與 split audit；它不會改變日期、symbol、provider request 或
+`cache_revision`。CPU acquisition 會以唯讀方式掃描其他 dataset namespace 中相同
+`cache_revision=v1` 的 `api-cache`，所以既有相同 URL／參數 response 會記為 cache hit，
+不會再次送出網路 API call。只有舊快取原本缺少、失敗，或 request 參數本身改變的資料
+才需要呼叫 provider。
 
 若 provider 可能修訂歷史資料，且確實要為相同 profile/date/universe 建立新快照，
 請在 `configure` 明確加入新的 `--dataset-revision <label>`；CPU workflow 不會
@@ -772,7 +785,7 @@ bash scripts/runpod_workflow.sh readiness --gpu
 Stage 2 使用相同 dataset request 時會得到相同 data namespace，但以 100%
 train split 重新從相同 pretrained base 開始，不接續 Stage 1 checkpoint。
 必須重新執行 `configure --stage stage2` 並明確提供與原 CPU dataset 相同的
-profile/date/universe；stage/config identity 不同時，舊 Stage 1 marker 會被 GPU
+profile/date/universe/dataset revision/`h_start`；stage/config identity 不同時，舊 Stage 1 marker 會被 GPU
 gate 拒絕。範例：
 
 ```bash
@@ -781,6 +794,7 @@ bash scripts/runpod_workflow.sh configure \
   --data-profile tw_only \
   --start 2015-01-01 \
   --end 2026-07-27 \
+  --h-start 3 \
   --universe all
 bash scripts/runpod_workflow.sh sync --apply
 bash scripts/runpod_workflow.sh cpu prepare
@@ -792,7 +806,8 @@ Stage 2 的 CPU Pod 建立完成後，腳本會提示在 SSH 內執行
 
 CPU workflow 完成後，在本機再次執行
 `bash scripts/runpod_workflow.sh readiness --gpu`。若只把 stage 改成 Stage 2，
-但 profile/date/universe 與先前不同，dataset request SHA 也會不同，不會錯用舊
+但 profile/date/universe/dataset revision/`h_start` 與先前不同，dataset request SHA
+也會不同，不會錯用舊
 Parquet。
 
 #### 4. 建立 GPU Pod 並訓練
@@ -1053,7 +1068,8 @@ PoC 最低驗收條件：
 2. Stage 2 與 Stage 1 architecture digest 相同，且由相同 pretrained base 重新開始。
 3. 所有 run 都可追溯到 immutable Parquet、dataset profile、provider、symbols、日期範圍與 split counts。
 4. CPU marker 與 active training selection 必須在 stage、config SHA、profile、日期、requested universe 與 dataset request SHA 完全一致；例如 CPU `tw_only` 對 GPU `us_tw_eodhd` 必須在 Pod 建立前 fail closed。
-5. `alpha_quantiles` 固定為 `[B,12,3]`，且沒有 classifier、文字或 fact 輸出。
+5. `alpha_quantiles` 固定為 `[B,15-h_start,3]`，`h_start ∈ {1,2,3}`、最大 horizon
+   固定為 14，且沒有 classifier、文字或 fact 輸出。
 6. 模型 input、時序切分與正規化不使用未來資訊；未來 benchmark 只存在於離線 label construction。
 7. 模型至少與 zero-return、momentum、technical、GBDT 與 neural baselines 在同一 validation/test protocol 下比較。
 8. 不只報告單一 aggregate loss；同時報告各 horizon 的 normalized pinball、median correlation、方向一致率、區間 coverage/width 與依市場、asset type、年份的切片。
@@ -1097,7 +1113,8 @@ numerical time series:
 - Inputs and outputs are numerical tensors; no natural-language generation or
   fact-reconstruction interface is provided.
 - The training loop never calls an external market-data API.
-- It predicts continuous conditional alpha distributions for holding days 3–14.
+- It predicts continuous conditional alpha distributions from configurable
+  `h_start` (1, 2, or 3) through the fixed 14th holding day.
 - It exposes reusable numerical encoder representations for downstream systems.
 
 This is a research and capability-validation PoC. It is not investment advice,
@@ -1107,8 +1124,9 @@ a production trading system, or a claim of guaranteed profitability.
 
 The only prediction emitted by `MultiHorizonAlphaHead` is:
 
-- `alpha_quantiles`: `[batch, 12, 3]`.
-- Dimension two contains holding periods 3, 4, ..., 14 trading days.
+- `alpha_quantiles`: `[batch, 15-h_start, 3]`.
+- Dimension two contains holding periods `h_start`, `h_start+1`, ..., 14;
+  `h_start` is restricted to 1, 2, or 3 and defaults to 3.
 - Dimension three is fixed to q10, q50, and q90.
 - Units are adjusted execution log return relative to the instrument's benchmark.
 
@@ -1116,7 +1134,7 @@ There is no `forecast_logits`, classification head, classification loss, or
 direction probability. Inference may post-process each horizon's q10/q50/q90
 with a fixed threshold into `strong_bearish`, `bearish`, `neutral`, `bullish`,
 or `strong_bullish`. These signals are not extra training targets and introduce
-no loss weights. Checkpoints must use `model_output_schema_version=4.0`;
+no loss weights. Checkpoints must use `model_output_schema_version=5.0`;
 incompatible output schemas fail closed.
 
 ### Architecture
@@ -1132,7 +1150,7 @@ Adjusted benchmark OHLCV through close t ─┘              │
                                            gated benchmark cross-attention
                                                          │
                                                          ▼
-                                     3–14d alpha q10/q50/q90 [B,12,3]
+                         h_start–14d alpha q10/q50/q90 [B,15-h_start,3]
 ```
 
 Production configs use `NeoQuasar/Kronos-base` and
@@ -1227,7 +1245,8 @@ Each sample emits a signal after trading-day `t` closes. Entry occurs at the
 next shared trading day's raw regular-session open, which counts as holding day
 one. A horizon `h` exits at the raw close of the `h`th shared trading day. The
 label is the difference between instrument and benchmark total-return log
-returns over identical entry and exit timestamps, for `h ∈ {3,...,14}`.
+returns over identical entry and exit timestamps, for
+`h ∈ {h_start,...,14}` and `h_start ∈ {1,2,3}`.
 
 Default benchmark policy:
 
@@ -1434,7 +1453,8 @@ Configs:
 - `configs/stage1_kronos_base_lora.yaml`
 - `configs/stage2_kronos_base_lora.yaml`
 
-The two configs must have identical `model.architecture_digest()` values. Stage
+The two configs must have identical `config.model_architecture_digest()` values;
+this digest binds model parameters and the `h_start`/output-horizon contract. Stage
 1 uses an exact, deterministic, stratified 15% train subset. It does not shrink
 validation/test and must not be approximated by taking the first 15% of data.
 
@@ -1540,6 +1560,7 @@ All user-facing `configure` options are:
 | `--dataset-revision` | 1-64 characters; start with an alphanumeric character, followed by alphanumerics, `.`, `_`, or `-`; default `v1` | Use a new label to force a new immutable dataset namespace after a provider revises historical data |
 | `--start` | `YYYY-MM-DD`; default `2005-01-01` | Inclusive start date shared by every selected market; omission always selects `2005-01-01` |
 | `--end` | `YYYY-MM-DD`; no default | Exclusive end boundary shared by every selected market; both interactive and non-interactive modes require an explicit user value instead of silently selecting the local current date |
+| `--h-start` | `1`, `2`, or `3`; default `3` | First cumulative holding-day alpha horizon predicted after the close at `t`, through the fixed day 14; entry is still evaluated at the raw open of `t+1`. This is part of the processed-dataset and model-output contract |
 | `--universe` | `all`, `explicit` | Select the US-instrument strategy; `tw_only` accepts only `all`. Required in non-interactive mode |
 | `--stocks` | Comma- or space-separated US tickers; repeatable | US common stocks/ADRs in `explicit` mode, such as `"AAPL,BABA"`; provider type is verified against EODHD discovery and does not affect Taiwan data |
 | `--etfs` | Comma- or space-separated US tickers; repeatable | Unleveraged US equity ETFs in `explicit` mode, such as `"SPY,QQQ"`; each ticker must be in the audited allowlist and does not affect Taiwan data |
@@ -1547,7 +1568,7 @@ All user-facing `configure` options are:
 | `--interactive` | Flag with no value | Explicitly open the interactive prompts; invoking `configure` with no options enables this mode automatically |
 
 Interactive defaults are `stage1`, `us_tw_eodhd`, dataset revision `v1`, start
-date `2005-01-01`, and US universe `all`. `--end` intentionally has no default:
+date `2005-01-01`, `h_start=3`, and US universe `all`. `--end` intentionally has no default:
 leaving its prompt blank asks again instead of selecting the local current date.
 Provider acquisition policy is not configured here. Supplying `--max-api-calls`,
 `--eodhd-qps`, `--taiwan-qps`, or `--maxBackoff` to this command is rejected as
@@ -1573,6 +1594,7 @@ bash scripts/runpod_workflow.sh configure \
   --data-profile us_tw_eodhd \
   --start 2015-01-01 \
   --end 2026-07-27 \
+  --h-start 3 \
   --universe explicit \
   --stocks "AAPL,MSFT" \
   --etfs "SPY,QQQ"
@@ -1649,14 +1671,22 @@ bash scripts/runpod_workflow.sh configure \
 
 The script creates `.runpod/selections/<selection-id>.json` and
 `.runpod/active-selection.json`. They contain no secrets and are excluded by
-`.gitignore`. Selection schema 2 removes transient acquisition policy. Existing
-schema-1 selections are not migrated automatically, so rerun `configure` after
-updating the code. Changing `--end` intentionally creates a new dataset request
+`.gitignore`. Selection schema 3 binds the complete `h_start` preparation
+contract. Older selections are not migrated automatically, so rerun `configure`
+after updating the code. Changing `--end` intentionally creates a new dataset request
 namespace; existing network-volume files are not deleted. A different profile,
 date range, universe, symbol limit, data
 preparation contract, or stage-config SHA-256 produces a different identity.
 QPS, API budget, and maximum backoff are recorded only in CPU launch metadata,
 download progress, and the download manifest; they never enter selection identity.
+
+Changing only `h_start` creates a new dataset request SHA and rebuilds processed
+windows, labels, train-only robust scales, and split audit. It does not change
+dates, symbols, provider requests, or `cache_revision`. CPU acquisition scans
+other dataset namespaces with the same `cache_revision=v1` as read-only cache
+fallbacks, so an existing response with the same URL and parameters is recorded
+as a cache hit and sends no network API call. Only responses that were missing or
+failed previously, or whose request parameters changed, require provider access.
 
 When provider history may have been revised and a new snapshot is intentional
 for the same profile/date/universe, pass a new explicit
@@ -1971,7 +2001,8 @@ bash scripts/runpod_workflow.sh readiness --gpu
 Stage 2 uses the same data namespace when its dataset request is identical, but
 trains on 100% of the train split from the same pretrained base. It does not
 continue from a Stage 1 checkpoint. Run `configure --stage stage2` again and
-explicitly supply the same profile/date/universe as the intended CPU dataset.
+explicitly supply the same profile/date/universe/dataset revision/`h_start` as
+the intended CPU dataset.
 The GPU gate rejects an old Stage 1 marker when the stage/config identity has
 changed. For example:
 
@@ -1981,6 +2012,7 @@ bash scripts/runpod_workflow.sh configure \
   --data-profile tw_only \
   --start 2015-01-01 \
   --end 2026-07-27 \
+  --h-start 3 \
   --universe all
 bash scripts/runpod_workflow.sh sync --apply
 bash scripts/runpod_workflow.sh cpu prepare
@@ -2284,8 +2316,9 @@ Minimum PoC acceptance:
 4. The CPU marker and active training selection match exactly on stage, config
    SHA, profile, dates, requested universe, and dataset request SHA. For example,
    CPU `tw_only` versus GPU `us_tw_eodhd` fails closed before Pod creation.
-5. `alpha_quantiles` remains fixed at `[B,12,3]`, with no classifier, text, or
-   fact output.
+5. `alpha_quantiles` remains fixed at `[B,15-h_start,3]`, with
+   `h_start in {1,2,3}`, a fixed maximum horizon of 14, and no classifier, text,
+   or fact output.
 6. Model inputs, time splits, and normalization use no future information;
    future benchmark values exist only in offline label construction.
 7. The model is compared with zero-return, momentum, technical, GBDT, and neural

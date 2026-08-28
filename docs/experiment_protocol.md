@@ -6,7 +6,8 @@
 
 主要問題：在嚴格 point-in-time、next-open execution 與 chronological evaluation
 下，以金融 K-line 預訓練的 Kronos-base 經 LoRA 微調後，能否比簡單規則、傳統 ML
-與小型 causal DL baseline 更準確地預測個別股票／ETF 未來 3–14 個持有交易日、
+與小型 causal DL baseline 更準確地預測個別股票／ETF 從可設定的第 1、2 或 3 個
+持有交易日起至固定第 14 日、
 相對市場 benchmark 的 alpha 條件分布？
 
 本協定不把 validation Sharpe 或單次回測視為「可交易 alpha」的充分證據，也不把模型
@@ -20,7 +21,7 @@ model input 或 quant head。
 - 美國與台灣股票、ETF；期貨與選擇權不在本 PoC。
 - 收盤 `t` 後產生訊號，下一共同交易日 raw open 進場。
 - 進場日算第 1 個持有交易日。
-- horizons 固定為 3–14 日。
+- `h_start` 可設定為 1、2 或 3；horizons 是 `h_start` 到固定第 14 日。
 - label 固定為 benchmark-relative adjusted execution log return。
 - CAPM abnormal return 只作未來 diagnostic/ablation。
 - 連續 quantile 預測是唯一訓練 target；方向訊號只作後處理。
@@ -28,7 +29,7 @@ model input 或 quant head。
 ### 3. 模型假說
 
 主假說：共享金融預訓練 encoder 加上歷史 benchmark 的動態 gated conditioning，能在
-同一資料與切分下，降低所有 3–14 日 horizon 的 normalized pinball loss，且改善
+同一資料與切分下，降低所有 `h_start`–14 日 horizon 的 normalized pinball loss，且改善
 median correlation 或 calibration，而不是只在單一五日方向分類上看似提升。
 
 必要反證條件：若 zero-return、past-only momentum、GBDT、GRU、DLinear 或 PatchTST
@@ -44,6 +45,7 @@ median correlation 或 calibration，而不是只在單一五日方向分類上�
 - provider、market、symbol、asset type 與 date range
 - benchmark mapping SHA-256
 - window/preparation spec 與 data-pipeline digest
+- `h_start`、固定 `max_horizon=14` 與完整 horizon 序列
 - train-only robust scales
 - chronological split counts 與 window exclusion audit
 
@@ -88,7 +90,8 @@ asset return、CAPM diagnostic 與任何 future label 都不得出現在 input t
 | 接續 Stage 1 checkpoint | 否 | 否 |
 
 Stage 1 不是「最早 15% 時間」，也不是縮短 validation/test。兩個 config 的
-`model.architecture_digest()` 必須相同；Stage 2 重新從相同 pretrained revision
+`config.model_architecture_digest()` 必須相同；此 digest 包含 `h_start`／輸出維度，
+Stage 2 重新從相同 pretrained revision
 開始，以免把 Stage 1 script smoke 當成額外訓練資料。
 
 ### 7. Objective
@@ -98,7 +101,7 @@ Stage 1 不是「最早 15% 時間」，也不是縮短 validation/test。兩個
 
 ```text
 scale_h = max(IQR_h, 1.4826 * MAD_h, 1e-4)
-selection_score = mean_h(normalized_pinball_h), h=3,...,14
+selection_score = mean_h(normalized_pinball_h), h=h_start,...,14
 ```
 
 為保留既有 RunPod checkpoint monitor 路徑，aggregate score 同時寫在
@@ -125,7 +128,7 @@ subset 與 validation split：
 
 - all-horizon mean normalized pinball，lower is better。
 
-每個 3–14 日 horizon 另報告：
+每個 `h_start`–14 日 horizon 另報告：
 
 - raw pinball 與 normalized pinball
 - q50 MAE 與 normalized MAE
@@ -159,7 +162,7 @@ transaction-cost 假設必須明列；單一 Sharpe 不可解讀為已證明可�
 3. 綁定 run ID、dataset artifacts、model architecture、Kronos source/model/tokenizer
    revisions 與 bounded training-source digest。
 4. 通過 artifact SHA-256/size 與 strict trainable-key restore。
-5. 使用 `model_output_schema_version=4.0`；舊 checkpoint fail closed。
+5. 使用 `model_output_schema_version=5.0`；舊 checkpoint fail closed。
 
 報告成功狀態必須以 terminal lifecycle、run manifest、best-checkpoint pointer、trainer
 state 與 raw validation JSON 交叉確認，不能只看 W&B chart 或 README。
@@ -171,7 +174,8 @@ Stage 1：
 - train subset 精確為完整 train split 的 15%。
 - 完成 remote ruff/pytest、forward/backward、validation-ranked checkpoint save/reload、
   inference schema smoke 與自動 lifecycle termination。
-- 輸出 `[B,12,3]` ordered alpha quantiles；沒有 LLM/fact/classifier。
+- 輸出 `[B,15-h_start,3]` ordered alpha quantiles，`h_start ∈ {1,2,3}`；
+  沒有 LLM/fact/classifier。
 
 Stage 2：
 
@@ -214,7 +218,7 @@ runtime 證據。
 
 Under strict point-in-time inputs, next-open execution, and chronological
 evaluation, can a finance-K-line-pretrained Kronos-base with LoRA predict the
-3–14 holding-day benchmark-relative alpha distribution of an individual stock
+`h_start`-through-14 holding-day benchmark-relative alpha distribution of an individual stock
 or ETF more accurately than simple rules, traditional ML, and compact causal DL
 baselines?
 
@@ -229,7 +233,7 @@ incremental model value; they do not enter production inputs or the alpha head.
 - US and Taiwan stocks/ETFs; no futures or options in this PoC.
 - Signal after close `t`; entry at the next shared trading day's raw open.
 - Entry day counts as holding day one.
-- Horizons fixed to days 3–14.
+- `h_start` is configurable as 1, 2, or 3; horizons run through fixed day 14.
 - Label fixed to benchmark-relative adjusted execution log return.
 - CAPM abnormal return reserved for a diagnostic/ablation.
 - Continuous quantiles are the sole training target; direction is post-processing.
@@ -249,7 +253,8 @@ be claimed.
 
 Every run binds dataset profile and selected sources, raw/processed hashes and
 sizes, providers/markets/symbols/types/dates, benchmark-mapping hash, preparation
-and pipeline digests, train-only robust scales, split counts, and exclusion
+and pipeline digests, `h_start`, fixed `max_horizon=14`, the full horizon sequence,
+train-only robust scales, split counts, and exclusion
 audit. Formal comparisons cannot mix profiles, universes, dataset versions, or
 benchmark mappings. EODHD versus official Taiwan source differences must be
 disclosed.
@@ -298,7 +303,7 @@ train-only per-horizon normalization:
 
 ```text
 scale_h = max(IQR_h, 1.4826 * MAD_h, 1e-4)
-selection_score = mean_h(normalized_pinball_h), h=3,...,14
+selection_score = mean_h(normalized_pinball_h), h=h_start,...,14
 ```
 
 The aggregate is also exposed at `primary_5d/selection_score` to preserve the
@@ -346,7 +351,7 @@ dataset version.
 An acceptable checkpoint is validation-selected, stores the trainable union,
 optimizer/scheduler/RNG/resolved config, binds run/data/model/source revisions,
 passes artifact and strict-key verification, and declares
-`model_output_schema_version=4.0`. Old checkpoints fail closed. Confirm success
+`model_output_schema_version=5.0`. Old checkpoints fail closed. Confirm success
 using terminal lifecycle, run manifest, best pointer, trainer state, and raw
 validation JSON—not a W&B chart or README alone.
 
@@ -354,8 +359,8 @@ validation JSON—not a W&B chart or README alone.
 
 Stage 1 uses exactly 15% of train, passes remote ruff/pytest, forward/backward,
 validation-ranked save/reload, inference-schema smoke, and lifecycle
-termination. It outputs ordered `[B,12,3]` alpha quantiles with no LLM, facts, or
-classifier.
+termination. It outputs ordered `[B,15-h_start,3]` alpha quantiles for
+`h_start in {1,2,3}`, with no LLM, facts, or classifier.
 
 Stage 2 uses the same architecture and pretrained revisions with 100% train,
 evaluates all baselines under one protocol, persists per-horizon/aggregate/

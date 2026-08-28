@@ -37,6 +37,7 @@ def _arguments(**overrides: object) -> argparse.Namespace:
         "dataset_revision": "v1",
         "start": "2020-01-01",
         "end": "2024-01-01",
+        "h_start": 3,
         "universe": "all",
         "stocks": [],
         "etfs": [],
@@ -181,8 +182,25 @@ def test_date_or_universe_changes_dataset_request_identity(tmp_path: Path) -> No
     assert baseline["dataset_request_sha256"] != explicit_universe["dataset_request_sha256"]
 
 
+def test_h_start_changes_processed_dataset_identity_but_not_provider_cache_revision(
+    tmp_path: Path,
+) -> None:
+    project_root = _project_root(tmp_path)
+    first_day = SELECTION._build_selection(_arguments(h_start=1), project_root)
+    third_day = SELECTION._build_selection(_arguments(h_start=3), project_root)
+
+    assert first_day["dataset_request_sha256"] != third_day["dataset_request_sha256"]
+    assert first_day["dataset_request"]["revision"] == "v1"
+    assert third_day["dataset_request"]["revision"] == "v1"
+    assert first_day["dataset_request"]["preparation"]["alpha_horizons"] == list(
+        range(1, 15)
+    )
+    exports = SELECTION._selection_exports(tmp_path / "selection.json", first_day)
+    assert exports["FIN_TS_H_START"] == "1"
+
+
 def test_eodhd_volume_semantics_are_part_of_the_immutable_dataset_contract() -> None:
-    assert SELECTION.PREPARATION_CONTRACT["schema_version"] == 3
+    assert SELECTION.PREPARATION_CONTRACT["schema_version"] == 4
     assert SELECTION.PREPARATION_CONTRACT["eodhd_split_policy"] == (
         "per_symbol_full_historical_splits_reconstruct_unadjusted_volume_v2"
     )
@@ -217,7 +235,7 @@ def test_provider_acquisition_values_cannot_change_selection_identity(tmp_path: 
         == with_transient_values["dataset_request_sha256"]
     )
     assert baseline["selection_sha256"] == with_transient_values["selection_sha256"]
-    assert baseline["schema_version"] == SELECTION.SELECTION_SCHEMA_VERSION == 2
+    assert baseline["schema_version"] == SELECTION.SELECTION_SCHEMA_VERSION == 3
     assert baseline["dataset_request"]["schema_version"] == 1
     assert "acquisition_policy" not in baseline
     exports = SELECTION._selection_exports(tmp_path / "selection.json", baseline)
@@ -256,6 +274,7 @@ def test_selection_defaults_only_cover_dataset_semantics(tmp_path: Path) -> None
 
     assert arguments.start == "2005-01-01"
     assert arguments.end is None
+    assert arguments.h_start == 3
     for name in ("max_api_calls", "eodhd_qps", "taiwan_qps", "max_backoff_seconds"):
         assert not hasattr(arguments, name)
 

@@ -25,6 +25,7 @@ _PIPELINE_PATHS = (
     "src/stock_forecasting/cli/prepare_data.py",
     "src/stock_forecasting/data/adjustments.py",
     "src/stock_forecasting/data/benchmarks.py",
+    "src/stock_forecasting/data/horizons.py",
     "src/stock_forecasting/data/schema.py",
     "src/stock_forecasting/data/quality.py",
     "src/stock_forecasting/data/windows.py",
@@ -212,6 +213,8 @@ def build_readiness_manifest(
     validate_dataset_preparation_contract(
         dataset,
         input_length=config.data.input_length,
+        h_start=config.data.h_start,
+        max_horizon=config.data.max_horizon,
         alpha_horizons=config.data.alpha_horizons,
         benchmark_mapping_path=config.data.benchmark_mapping_path,
         sample_stride=config.data.sample_stride,

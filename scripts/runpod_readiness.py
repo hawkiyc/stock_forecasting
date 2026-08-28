@@ -735,10 +735,23 @@ def _validate_quant_dataset_payload(
         raise ValueError("Quant target horizon must remain five trading days")
     if sorted(preparation_spec.get("diagnostic_horizons", [])) != [1, 20]:
         raise ValueError("Numerical diagnostic horizons must remain 1 and 20 days")
+    h_start = preparation_spec.get("h_start")
+    if isinstance(h_start, bool) or h_start not in (1, 2, 3):
+        raise ValueError("Quant h_start must be 1, 2, or 3")
+    if preparation_spec.get("max_horizon") != 14:
+        raise ValueError("Quant maximum alpha horizon must remain 14 trading days")
+    if preparation_spec.get("alpha_horizons") != list(range(h_start, 15)):
+        raise ValueError("Quant alpha horizons must be contiguous from h_start through day 14")
     requested_preparation = requested_dataset.get("preparation")
     if not isinstance(requested_preparation, dict):
         raise ValueError("Dataset readiness requested preparation contract is invalid")
-    for field in ("training_security_scope", "split_policy"):
+    for field in (
+        "h_start",
+        "max_horizon",
+        "alpha_horizons",
+        "training_security_scope",
+        "split_policy",
+    ):
         if preparation_spec.get(field) != requested_preparation.get(field):
             raise ValueError(
                 f"Dataset readiness {field} disagrees with its requested dataset"

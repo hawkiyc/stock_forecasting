@@ -251,6 +251,9 @@ def _forecast_payload(
         }
     return {
         "units": "benchmark_relative_adjusted_log_return",
+        "h_start": horizons[0],
+        "max_horizon": horizons[-1],
+        "horizons": horizons,
         "signal_threshold": signal_threshold,
         "by_horizon": by_horizon,
     }

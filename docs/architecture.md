@@ -18,7 +18,8 @@
 2. 訊號在 `t` 收盤後產生。
 3. 下一個共同交易日 `t+1` 的 raw regular-session open 進場。
 4. 進場日算第 1 個持有交易日。
-5. horizon `h` 在第 `h` 個共同交易日的 raw close 出場，`h=3,...,14`。
+5. horizon `h` 在第 `h` 個共同交易日的 raw close 出場，
+   `h=h_start,...,14`，且 `h_start ∈ {1,2,3}`。
 
 令商品與 benchmark 在同一 entry/exit timestamp 的 total-return gross factors 分別為
 `G_asset(h)` 與 `G_benchmark(h)`，訓練 label 是：
@@ -87,7 +88,7 @@ benchmark adjusted OHLCV through close t ─┘       (frozen base + LoRA)
                                                          │
                                MultiHorizonAlphaHead
                                                          │
-                              alpha_quantiles [B,12,3]
+                        alpha_quantiles [B,15-h_start,3]
 ```
 
 資產與 benchmark 共用同一個 Kronos encoder 與 resampler 權重。這能避免兩條分支
@@ -115,10 +116,11 @@ benchmark_timestamps:        int [B,T,5]
 唯一預測輸出：
 
 ```text
-alpha_quantiles: float [B,12,3]
+alpha_quantiles: float [B,15-h_start,3]
 ```
 
-其中 horizons 固定為 `[3,4,...,14]`，quantiles 固定為 `[0.1,0.5,0.9]`，並由
+其中 `h_start` 只能是 1、2 或 3，horizons 是連續的
+`[h_start,h_start+1,...,14]`；quantiles 固定為 `[0.1,0.5,0.9]`，並由
 參數化方式保證 `q10 <= q50 <= q90`。輸出同時暴露以下數值表示，供稽核與未來
 多模態銜接：
 
@@ -165,9 +167,11 @@ loss = mean(pinball(alpha_h / scale_h))
 | multi-horizon alpha head | trainable |
 
 `adapter.safetensors` 僅保存上述可訓練參數。trainer state 必須包含
-`model_output_schema_version=4.0`、architecture digest、dataset/training contract、
+`model_output_schema_version=5.0`、包含 `h_start` 的 architecture digest、
+dataset/training contract、
 固定的 Kronos source/model/tokenizer revisions 與 artifact hashes。舊版 LLM/fact/
-三分類 checkpoint 缺少 schema 4.0 或 trainable-key union，必須 fail closed。
+三分類或固定 3–14 horizon checkpoint 缺少 schema 5.0 或正確 trainable-key union，
+必須 fail closed。
 
 checkpoint artifact 外層 schema 仍保留既有 RunPod lifecycle 所需版本；這只是部署
 相容層，不代表舊模型輸出仍存在。
@@ -220,7 +224,7 @@ For each decision date `t`:
 3. Entry is the next shared trading day's raw regular-session open.
 4. The entry day counts as holding day one.
 5. Horizon `h` exits at the raw close of the `h`th shared trading day, for
-   `h=3,...,14`.
+   `h=h_start,...,14` and `h_start in {1,2,3}`.
 
 If the instrument and benchmark total-return gross factors over the identical
 entry/exit timestamps are `G_asset(h)` and `G_benchmark(h)`, then:
@@ -295,7 +299,7 @@ benchmark adjusted OHLCV through close t ─┘       (frozen base + LoRA)
                                                          │
                                MultiHorizonAlphaHead
                                                          │
-                              alpha_quantiles [B,12,3]
+                        alpha_quantiles [B,15-h_start,3]
 ```
 
 Both streams share Kronos and resampler weights. The conditioner uses asset
@@ -322,10 +326,11 @@ benchmark_timestamps:        int [B,T,5]
 The sole prediction is:
 
 ```text
-alpha_quantiles: float [B,12,3]
+alpha_quantiles: float [B,15-h_start,3]
 ```
 
-Horizons are fixed to `[3,4,...,14]`; quantiles are fixed to `[0.1,0.5,0.9]`.
+`h_start` is restricted to 1, 2, or 3, and horizons are the contiguous sequence
+`[h_start,h_start+1,...,14]`; quantiles are fixed to `[0.1,0.5,0.9]`.
 The parameterization guarantees `q10 <= q50 <= q90`. The output also exposes
 asset/benchmark hidden states, both latent streams, conditioned latent tokens,
 and the conditioning gate for auditability and future multimodal integration.
@@ -365,7 +370,8 @@ checkpoint selection.
 | multi-horizon alpha head | trainable |
 
 `adapter.safetensors` stores only the trainable union. Trainer state binds
-`model_output_schema_version=4.0`, architecture, dataset/training contracts,
+`model_output_schema_version=5.0`, the `h_start`-aware architecture digest,
+dataset/training contracts,
 pinned source/model/tokenizer revisions, and artifact hashes. Old LLM/fact/
 three-class checkpoints fail closed. The outer checkpoint artifact version
 retains the stable RunPod lifecycle compatibility layer; it does not imply that

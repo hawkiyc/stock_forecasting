@@ -140,7 +140,7 @@ def evaluate_checkpoint(
         "device": str(device),
         "checkpoint": _checkpoint_summary(resolved_checkpoint, checkpoint_state),
         "data_provenance": provenance_summary(config.data.resolved_manifest_path),
-        "model_architecture_sha256": config.model.architecture_digest(),
+        "model_architecture_sha256": config.model_architecture_digest(),
         "metrics": metrics,
     }
 

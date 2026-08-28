@@ -56,8 +56,10 @@ def test_prefetch_binds_every_repository_to_its_exact_revision(tmp_path: Path) -
     assert all(call["local_files_only"] is True for call in calls)
 
 
-def test_quant_model_preserves_head_and_reusable_encoder_shapes() -> None:
+@pytest.mark.parametrize("h_start", [1, 2, 3])
+def test_quant_model_preserves_head_and_reusable_encoder_shapes(h_start: int) -> None:
     config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    config.data.h_start = h_start
     bundle = build_model_bundle(config, torch.device("cpu"))
     asset_series = torch.rand(2, config.data.input_length, 5)
     benchmark_series = torch.rand(2, config.data.input_length, 5)
@@ -87,7 +89,7 @@ def test_quant_model_preserves_head_and_reusable_encoder_shapes() -> None:
         "conditioned_latent_tokens",
         "conditioning_gate",
     }
-    assert output.alpha_quantiles.shape == (2, 12, 3)
+    assert output.alpha_quantiles.shape == (2, 15 - h_start, 3)
     assert output.asset_last_hidden_state.shape == (2, config.data.input_length, 64)
     assert output.benchmark_last_hidden_state.shape == (2, config.data.input_length, 64)
     assert output.asset_attention_mask.shape == (2, config.data.input_length)
@@ -148,7 +150,7 @@ def test_loaded_checkpoint_must_match_model_ids_architecture_and_stage(
     state = {
         "model_output_schema_version": MODEL_OUTPUT_SCHEMA_VERSION,
         "training_resume_contract_sha256": training_resume_contract_digest(config),
-        "model_architecture_sha256": config.model.architecture_digest(),
+        "model_architecture_sha256": config.model_architecture_digest(),
         "training_stage": config.training.stage,
         "time_series_model_id": config.model.time_series_model_id,
         "time_series_tokenizer_id": config.model.time_series_tokenizer_id,

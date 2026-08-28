@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from stock_forecasting.config import DatasetProfile
+from stock_forecasting.data.horizons import MAX_ALPHA_HORIZON, alpha_horizons_from_start
 from stock_forecasting.data.schema import TRAINING_SECURITY_SCOPE
 from stock_forecasting.data.splits import SPLIT_POLICY
 
@@ -261,6 +262,8 @@ def validate_dataset_preparation_contract(
     payload: dict[str, Any],
     *,
     input_length: int,
+    h_start: int,
+    max_horizon: int,
     alpha_horizons: list[int],
     benchmark_mapping_path: str | Path | None,
     sample_stride: int,
@@ -274,6 +277,12 @@ def validate_dataset_preparation_contract(
 ) -> dict[str, Any]:
     """Bind model-facing window semantics to the ready dataset manifest."""
 
+    expected_horizons = list(alpha_horizons_from_start(h_start))
+    if max_horizon != MAX_ALPHA_HORIZON or alpha_horizons != expected_horizons:
+        raise ValueError(
+            "Configured alpha horizons must be contiguous from h_start through day 14"
+        )
+
     preparation_spec = payload.get("preparation_spec")
     if not isinstance(preparation_spec, dict):
         raise ValueError("Dataset manifest has no preparation_spec")
@@ -283,6 +292,8 @@ def validate_dataset_preparation_contract(
 
     expected_integers = {
         "window_size": input_length,
+        "h_start": h_start,
+        "max_horizon": max_horizon,
         "target_horizon": forecast_horizon,
         "stride": stride,
         "purge_bars": 20,
@@ -295,7 +306,7 @@ def validate_dataset_preparation_contract(
                 f"does not match config value {expected!r}"
             )
     expected_exact = {
-        "processed_schema_version": "3.0",
+        "processed_schema_version": "4.0",
         "alpha_horizons": alpha_horizons,
         "label_kind": "benchmark_relative_adjusted_log_return",
         "signal_timing": "after_close_t",

@@ -58,6 +58,7 @@ PREPARATION_FINAL_FILES=(
     "${DATASET_MANIFEST_FINAL}"
 )
 FIN_TS_DATASET_PROFILE="${FIN_TS_DATASET_PROFILE:-us_tw_eodhd}"
+FIN_TS_H_START="${FIN_TS_H_START:-}"
 STAGE1_US_SYMBOLS="${STAGE1_US_SYMBOLS:-}"
 STAGE1_US_ETF_SYMBOLS="${STAGE1_US_ETF_SYMBOLS:-}"
 STAGE1_SYMBOL_LIMIT="${STAGE1_SYMBOL_LIMIT:-}"
@@ -79,7 +80,7 @@ RUNPOD_SHUTDOWN_MARKER="${RUNPOD_SHUTDOWN_DIR}/shutdown.json"
 export RUNPOD_SHUTDOWN_DIR RUNPOD_SHUTDOWN_MARKER
 export NETWORK_VOLUME_ROOT RUNPOD_VOLUME_ROOT="${NETWORK_VOLUME_ROOT}"
 export PROJECT_ROOT DATA_ROOT LOG_ROOT LIFECYCLE_ROOT RUNPOD_ROLE RUNPOD_CONFIG
-export FIN_TS_DATASET_PROFILE
+export FIN_TS_DATASET_PROFILE FIN_TS_H_START
 export RUNPOD_DATASET_REVISION
 export RUNPOD_CPU_MAX_API_CALLS RUNPOD_CPU_EODHD_QPS RUNPOD_CPU_TAIWAN_QPS
 # The image may export cache paths under ephemeral /workspace; never inherit them.
@@ -112,6 +113,10 @@ if [[ -z "${RUNPOD_REMOTE_SELECTION_PATH}" ]]; then
 fi
 if [[ ! "${FIN_TS_DATASET_PROFILE}" =~ ^(tw_only|us_only_eodhd|us_tw_eodhd|us_tw_massive)$ ]]; then
     echo "FIN_TS_DATASET_PROFILE is unsupported" >&2
+    exit 2
+fi
+if [[ ! "${FIN_TS_H_START}" =~ ^[1-3]$ ]]; then
+    echo "FIN_TS_H_START must be 1, 2, or 3" >&2
     exit 2
 fi
 if [[ "${FIN_TS_DATASET_PROFILE}" == "us_tw_massive" ]]; then
@@ -589,7 +594,7 @@ write_lifecycle_state preparing
     --window-size 128 \
     --stride 5 \
     --sample-stride 1 \
-    --alpha-horizons 3 4 5 6 7 8 9 10 11 12 13 14 \
+    --h-start "${FIN_TS_H_START}" \
     --target-horizon 5 \
     --diagnostic-horizons 1 20 \
     --flat-volatility-multiplier 0.25 \

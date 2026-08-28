@@ -38,7 +38,7 @@ def test_stage_configs_share_one_model_architecture_and_start_fresh() -> None:
     assert stage2.training.stage == "stage2"
     assert stage2.data.train_fraction == pytest.approx(1.0)
     assert stage1.model == stage2.model
-    assert stage1.model.architecture_digest() == stage2.model.architecture_digest()
+    assert stage1.model_architecture_digest() == stage2.model_architecture_digest()
     assert stage1.training.resume_checkpoint is None
     assert stage2.training.resume_checkpoint is None
     assert training_resume_contract_digest(stage1) != training_resume_contract_digest(stage2)
@@ -74,19 +74,53 @@ def test_quant_output_dimensions_are_fixed() -> None:
         ExperimentConfig.model_validate(payload)
 
 
-def test_alpha_horizons_and_runpod_compatibility_sentinels_are_fixed() -> None:
+@pytest.mark.parametrize(
+    ("h_start", "expected_horizons"),
+    [
+        (1, list(range(1, 15))),
+        (2, list(range(2, 15))),
+        (3, list(range(3, 15))),
+    ],
+)
+def test_h_start_derives_contiguous_horizons_and_keeps_runpod_sentinels(
+    h_start: int,
+    expected_horizons: list[int],
+) -> None:
     path = ROOT / "configs/local_mock.yaml"
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    payload["data"]["alpha_horizons"] = [5]
+    payload["data"]["h_start"] = h_start
 
-    with pytest.raises(ValidationError, match="trading days 3 through 14"):
-        ExperimentConfig.model_validate(payload)
-
-    config = ExperimentConfig.from_yaml(path)
+    config = ExperimentConfig.model_validate(payload)
+    assert config.data.h_start == h_start
+    assert config.data.alpha_horizons == expected_horizons
+    assert config.data.max_horizon == 14
     assert config.data.stride == 5
     assert config.data.embargo_trading_days == 5
     assert config.data.sample_stride == 1
     assert config.data.effective_embargo_trading_days == 14
+
+
+@pytest.mark.parametrize("h_start", [0, 4, True])
+def test_h_start_rejects_values_outside_one_through_three(h_start: int | bool) -> None:
+    path = ROOT / "configs/local_mock.yaml"
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload["data"]["h_start"] = h_start
+
+    with pytest.raises(ValidationError):
+        ExperimentConfig.model_validate(payload)
+
+
+def test_h_start_changes_model_and_training_contract_identity() -> None:
+    first_day = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    third_day = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    first_day.data.h_start = 1
+
+    assert first_day.model == third_day.model
+    assert first_day.model.architecture_digest() == third_day.model.architecture_digest()
+    assert first_day.model_architecture_digest() != third_day.model_architecture_digest()
+    assert training_resume_contract_digest(first_day) != training_resume_contract_digest(
+        third_day
+    )
 
 
 def test_stage_fraction_contract_fails_closed() -> None:
@@ -150,8 +184,8 @@ def test_training_resume_contract_binds_bounded_implementation_sources() -> None
     implementation = training_implementation_contract()
     contract = training_resume_contract(config)
 
-    assert contract["schema_version"] == TRAINING_RESUME_CONTRACT_VERSION == "4.0"
-    assert contract["model_output_schema_version"] == MODEL_OUTPUT_SCHEMA_VERSION == "4.0"
+    assert contract["schema_version"] == TRAINING_RESUME_CONTRACT_VERSION == "5.0"
+    assert contract["model_output_schema_version"] == MODEL_OUTPUT_SCHEMA_VERSION == "5.0"
     assert contract["training_implementation"] == implementation
     assert set(implementation["files"]) == set(TRAINING_IMPLEMENTATION_PATHS)
     assert len(implementation["sha256"]) == 64

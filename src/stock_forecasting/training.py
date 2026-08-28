@@ -136,9 +136,21 @@ def build_dataloaders(
 ) -> tuple[DataLoader[Any], DataLoader[Any], DataLoader[Any]]:
     dataset_path = resolve_processed_dataset(config.data.processed_path)
     records = read_processed_records(dataset_path)
-    train_source = FinancialWindowDataset(records, split="train")
-    validation_dataset = FinancialWindowDataset(records, split="validation")
-    test_dataset = FinancialWindowDataset(records, split="test")
+    train_source = FinancialWindowDataset(
+        records,
+        split="train",
+        alpha_horizons=config.data.alpha_horizons,
+    )
+    validation_dataset = FinancialWindowDataset(
+        records,
+        split="validation",
+        alpha_horizons=config.data.alpha_horizons,
+    )
+    test_dataset = FinancialWindowDataset(
+        records,
+        split="test",
+        alpha_horizons=config.data.alpha_horizons,
+    )
     indices = deterministic_stratified_indices(
         train_source,
         fraction=config.data.train_fraction,
@@ -529,7 +541,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
             )
             if state.get("training_stage") != config.training.stage:
                 raise ValueError("Resume checkpoint belongs to a different training stage")
-            if state.get("model_architecture_sha256") != config.model.architecture_digest():
+            if state.get("model_architecture_sha256") != config.model_architecture_digest():
                 raise ValueError("Resume checkpoint model architecture digest differs")
             global_step = int(state["global_step"])
             last_checkpoint_step = global_step
@@ -684,7 +696,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
         if best_checkpoint is None:
             raise RuntimeError("Training completed without a validation-ranked checkpoint")
 
-        architecture_digest = config.model.architecture_digest()
+        architecture_digest = config.model_architecture_digest()
         tracking.update_summary(
             {
                 "training_stage": config.training.stage,

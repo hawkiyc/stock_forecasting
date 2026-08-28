@@ -12,6 +12,7 @@ ALLOWED_NAMES = frozenset(
         "DATA_ROOT",
         "EODHD_API_TOKEN",
         "FIN_TS_DATASET_PROFILE",
+        "FIN_TS_H_START",
         "HF_TOKEN",
         "LOG_ROOT",
         "MAX_RUNTIME_SECONDS",

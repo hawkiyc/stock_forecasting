@@ -204,13 +204,20 @@ artifact。secret-like key 不得寫入 manifest。
 RunPod CPU wrapper 發布到固定 `DATA_ROOT`。要建立另一資料版本，應使用新的版本化
 `DATA_ROOT` 或新的 network volume；不要刪除或覆寫既有 immutable artifacts。
 
+`h_start` 是 processed label 契約，因此修改它會得到新的 dataset request SHA 與
+`DATA_ROOT`，並重算 windows、labels、robust scales 與 split audit。它不會傳給
+provider downloader，也不會改變 `cache_revision`。新 namespace 會唯讀掃描其他
+namespace 中相同 revision 的 API cache；相同 URL／參數的 response 是 cache hit，
+不消耗新的 network API call。只有缺少、先前失敗或 request 參數已改變的資料需要下載。
+
 ### 9. Processed record contract
 
-每筆 schema `3.0` record 包含：
+每筆 schema `4.0` record 包含：
 
 - `context`：商品截至 `cutoff_at` 的 point-in-time adjusted OHLCV。
 - `benchmark_context`：同日期、同長度的 benchmark adjusted OHLCV。
-- `label.alpha_log_returns`：3–14 日 benchmark-relative execution log returns。
+- `label.alpha_log_returns`：從 `h_start`（1、2 或 3）到固定第 14 日的
+  benchmark-relative execution log returns。
 - `label.asset_total_returns` 與 `benchmark_total_returns`：只供 audit，不進 input。
 - `diagnostics.capm_abnormal_return=null`：預留 diagnostic，不是 target。
 - provider、market、benchmark policy、dataset profile 等 metadata。
@@ -479,10 +486,19 @@ The CPU wrapper publishes fixed `DATA_ROOT` paths. Create a versioned
 `DATA_ROOT` or separate network volume for a new dataset; do not delete or
 overwrite existing immutable artifacts.
 
+`h_start` is part of the processed-label contract, so changing it creates a new
+dataset request SHA and `DATA_ROOT`, then rebuilds windows, labels, robust scales,
+and split audit. It is never passed to the provider downloader and does not alter
+`cache_revision`. The new namespace scans same-revision API caches in other
+namespaces read-only; an identical URL/parameter response is a cache hit and
+consumes no new network API call. Only missing, previously failed, or
+parameter-changed requests require downloading.
+
 ### 9. Processed record contract
 
-Each schema `3.0` record contains the instrument and aligned benchmark contexts
-through `cutoff_at`, 3–14 day benchmark-relative alpha labels, auditable asset/
+Each schema `4.0` record contains the instrument and aligned benchmark contexts
+through `cutoff_at`, benchmark-relative alpha labels from `h_start` (1, 2, or 3)
+through fixed day 14, auditable asset/
 benchmark returns outside the input, a reserved null CAPM diagnostic, and
 provider/market/benchmark/profile metadata. Future entry/exit values are never
 serialized into either context. Missing benchmark dates, extreme adjusted

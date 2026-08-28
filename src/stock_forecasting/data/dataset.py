@@ -13,11 +13,14 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
 from stock_forecasting.data.benchmarks import is_training_target_security
+from stock_forecasting.data.horizons import (
+    DEFAULT_ALPHA_HORIZONS,
+    validate_alpha_horizons,
+)
 from stock_forecasting.data.io import read_processed_records
 from stock_forecasting.data.schema import TRAINING_TARGET_ASSET_TYPES
 from stock_forecasting.data.windows import (
     CONTEXT_FIELDS,
-    DEFAULT_ALPHA_HORIZONS,
     PROCESSED_SCHEMA_VERSION,
 )
 
@@ -33,6 +36,7 @@ class FinancialWindowDataset(Dataset[dict[str, Any]]):
         *,
         split: Literal["train", "validation", "test"] | None = None,
         series_mode: Literal["raw", "relative"] = "raw",
+        alpha_horizons: Sequence[int] = DEFAULT_ALPHA_HORIZONS,
     ) -> None:
         if series_mode not in {"raw", "relative"}:
             raise ValueError("series_mode must be 'raw' or 'relative'")
@@ -87,7 +91,7 @@ class FinancialWindowDataset(Dataset[dict[str, Any]]):
             )
         self.split = split
         self.series_mode = series_mode
-        self.horizons = DEFAULT_ALPHA_HORIZONS
+        self.horizons = validate_alpha_horizons(alpha_horizons)
 
     def __len__(self) -> int:
         return len(self.records)

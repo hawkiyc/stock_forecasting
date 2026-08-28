@@ -10,7 +10,10 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from stock_forecasting.data.windows import DEFAULT_ALPHA_HORIZONS
+from stock_forecasting.data.horizons import (
+    DEFAULT_ALPHA_HORIZONS,
+    validate_alpha_horizons,
+)
 
 
 class GatedBenchmarkConditioner(nn.Module):
@@ -82,10 +85,8 @@ class MultiHorizonAlphaHead(nn.Module):
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        ordered_horizons = tuple(int(value) for value in horizons)
+        ordered_horizons = validate_alpha_horizons(horizons)
         ordered_quantiles = tuple(float(value) for value in quantiles)
-        if ordered_horizons != DEFAULT_ALPHA_HORIZONS:
-            raise ValueError("MultiHorizonAlphaHead requires horizons 3 through 14")
         if ordered_quantiles != (0.1, 0.5, 0.9):
             raise ValueError("MultiHorizonAlphaHead requires quantiles (0.1, 0.5, 0.9)")
         if input_dim <= 0:
