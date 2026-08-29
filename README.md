@@ -403,11 +403,14 @@ volume 已部署完成，不要重新執行 `credentials` 或 `volume deploy`；
 - 上傳 [`cloudflare/tpex-proxy/src/index.mjs`](cloudflare/tpex-proxy/src/index.mjs)，
   並將執行位置提示設為 `gcp:asia-east1`。
 - 只允許 `GET`、共享 token、固定 TPEx origin、四個專案使用中的 path，以及各
-  path 的固定 query schema；它不是通用或開放式 proxy。
+  path 的固定 query schema；TPEx 若回傳 redirect，最多跟隨三次且每一跳都必須維持
+  相同 HTTPS origin，跨 origin、缺少 Location 或無限 redirect 都會拒絕。它不是通用
+  或開放式 proxy。
 - 啟用該 script 的 `workers.dev` URL，把同一個 relay token 寫入新建的 RunPod
   Secret；Cloudflare API token 不會進入 Pod。
-- 直接以 `exDailyQ` 執行 smoke test。只有 Worker 實際取得含官方資料表的 JSON
-  才視為部署成功。
+- 直接以 `exDailyQ` 執行 smoke test。驗證器會在首次 `workers.dev` 路由尚未傳播時
+  進行有限次指數退避重試，並以 HTTP status 與安全的 Worker error code 回報失敗；
+  只有 Worker 實際取得含官方資料表的 JSON 才視為部署成功。
 
 此 Worker 不使用 KV、Durable Objects、資料庫或其他付費 binding；TPEx 每個 cache
 miss 對應一次 Worker request 與一次 upstream subrequest。實際是否落在免費額度內
@@ -1679,12 +1682,16 @@ network-volume and S3 settings. If the volume is already deployed, do not rerun
 - It uploads [`cloudflare/tpex-proxy/src/index.mjs`](cloudflare/tpex-proxy/src/index.mjs)
   with a `gcp:asia-east1` placement hint.
 - It accepts only `GET`, the shared token, the fixed TPEx origin, the four paths
-  used by this project, and each path's fixed query schema. It is not a general
-  or open proxy.
+  used by this project, and each path's fixed query schema. If TPEx redirects a
+  request, the Worker follows at most three hops and every hop must remain on
+  the same HTTPS origin; cross-origin, missing-Location, and looping redirects
+  are rejected. It is not a general or open proxy.
 - It enables the script's `workers.dev` URL and stores the same relay token in
   a newly created RunPod Secret. The Cloudflare API token never enters a Pod.
-- It runs an `exDailyQ` smoke test. Deployment passes only when the Worker
-  actually returns official JSON containing a data table.
+- It runs an `exDailyQ` smoke test. The verifier performs bounded exponential
+  backoff while a new `workers.dev` route propagates and reports failures using
+  the HTTP status plus a safe Worker error code. Deployment passes only when
+  the Worker actually returns official JSON containing a data table.
 
 The Worker uses no KV, Durable Objects, database, or other paid binding. Each
 TPEx cache miss consumes one Worker request and one upstream subrequest.

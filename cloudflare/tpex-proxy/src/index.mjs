@@ -1,5 +1,6 @@
 const UPSTREAM_ORIGIN = "https://www.tpex.org.tw";
-const PROXY_VERSION = "1";
+const PROXY_VERSION = "2";
+const MAX_UPSTREAM_REDIRECTS = 3;
 
 const ROUTES = Object.freeze({
   "/www/zh-tw/afterTrading/dailyQuotes": Object.freeze({
@@ -120,6 +121,65 @@ function validatedUpstreamUrl(requestUrl) {
   return upstream;
 }
 
+function validatedRedirectUrl(currentUrl, location) {
+  if (typeof location !== "string" || location.length === 0) {
+    return null;
+  }
+
+  let redirected;
+  try {
+    redirected = new URL(location, currentUrl);
+  } catch (_error) {
+    return null;
+  }
+  if (
+    redirected.origin !== UPSTREAM_ORIGIN ||
+    redirected.username !== "" ||
+    redirected.password !== "" ||
+    redirected.hash !== ""
+  ) {
+    return null;
+  }
+  return redirected;
+}
+
+async function fetchUpstream(initialUrl, fetchImpl) {
+  let currentUrl = initialUrl;
+  for (let redirectCount = 0; redirectCount <= MAX_UPSTREAM_REDIRECTS; redirectCount += 1) {
+    let response;
+    try {
+      response = await fetchImpl(currentUrl, {
+        method: "GET",
+        headers: {
+          Accept: "application/json,text/plain,*/*",
+          "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+          Referer: "https://www.tpex.org.tw/",
+          "User-Agent":
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/140.0 Safari/537.36",
+        },
+        redirect: "manual",
+      });
+    } catch (_error) {
+      return { error: "tpex_upstream_unreachable" };
+    }
+
+    if (response.status < 300 || response.status >= 400) {
+      return { response };
+    }
+    if (redirectCount === MAX_UPSTREAM_REDIRECTS) {
+      return { error: "tpex_upstream_redirect_limit_exceeded" };
+    }
+
+    const redirected = validatedRedirectUrl(currentUrl, response.headers.get("Location"));
+    if (redirected === null) {
+      return { error: "tpex_upstream_redirect_rejected" };
+    }
+    currentUrl = redirected;
+  }
+  return { error: "tpex_upstream_redirect_limit_exceeded" };
+}
+
 export async function handleRequest(request, env, fetchImpl = fetch) {
   if (request.method !== "GET") {
     return jsonError(405, "method_not_allowed");
@@ -133,27 +193,11 @@ export async function handleRequest(request, env, fetchImpl = fetch) {
     return jsonError(400, "unsupported_tpex_request");
   }
 
-  let upstreamResponse;
-  try {
-    upstreamResponse = await fetchImpl(upstreamUrl, {
-      method: "GET",
-      headers: {
-        Accept: "application/json,text/plain,*/*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-        Referer: "https://www.tpex.org.tw/",
-        "User-Agent":
-          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
-          "(KHTML, like Gecko) Chrome/140.0 Safari/537.36",
-      },
-      redirect: "manual",
-    });
-  } catch (_error) {
-    return jsonError(502, "tpex_upstream_unreachable");
+  const upstreamResult = await fetchUpstream(upstreamUrl, fetchImpl);
+  if (upstreamResult.error !== undefined) {
+    return jsonError(502, upstreamResult.error);
   }
-
-  if (upstreamResponse.status >= 300 && upstreamResponse.status < 400) {
-    return jsonError(502, "tpex_upstream_redirect_rejected");
-  }
+  const upstreamResponse = upstreamResult.response;
 
   const responseHeaders = new Headers({
     "Cache-Control": "no-store",

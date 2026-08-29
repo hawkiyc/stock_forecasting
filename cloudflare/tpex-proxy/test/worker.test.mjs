@@ -35,6 +35,66 @@ test("forwards only the fixed TPEx origin and approved query", async () => {
   assert.equal(response.headers.get("Cache-Control"), "no-store");
 });
 
+test("follows a bounded same-origin TPEx redirect", async () => {
+  const fetchedUrls = [];
+  const response = await handleRequest(
+    request(),
+    { TPEX_PROXY_SHARED_SECRET: TOKEN },
+    async (url, options) => {
+      fetchedUrls.push(url.toString());
+      assert.equal(options.redirect, "manual");
+      if (fetchedUrls.length === 1) {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: url.toString() },
+        });
+      }
+      return new Response(JSON.stringify({ tables: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(fetchedUrls.length, 2);
+  assert.equal(fetchedUrls[1], fetchedUrls[0]);
+});
+
+test("rejects cross-origin and unbounded TPEx redirects", async () => {
+  const crossOriginResponse = await handleRequest(
+    request(),
+    { TPEX_PROXY_SHARED_SECRET: TOKEN },
+    async () =>
+      new Response(null, {
+        status: 302,
+        headers: { Location: "https://example.com/not-tpex" },
+      }),
+  );
+  assert.equal(crossOriginResponse.status, 502);
+  assert.deepEqual(await crossOriginResponse.json(), {
+    error: "tpex_upstream_redirect_rejected",
+  });
+
+  let redirectCalls = 0;
+  const loopingResponse = await handleRequest(
+    request(),
+    { TPEX_PROXY_SHARED_SECRET: TOKEN },
+    async (url) => {
+      redirectCalls += 1;
+      return new Response(null, {
+        status: 302,
+        headers: { Location: url.toString() },
+      });
+    },
+  );
+  assert.equal(loopingResponse.status, 502);
+  assert.deepEqual(await loopingResponse.json(), {
+    error: "tpex_upstream_redirect_limit_exceeded",
+  });
+  assert.equal(redirectCalls, 4);
+});
+
 test("rejects missing authentication without reaching TPEx", async () => {
   let fetched = false;
   const response = await handleRequest(

@@ -837,6 +837,9 @@ def test_tpex_cloudflare_worker_is_closed_and_cpu_only() -> None:
     reexec = (ROOT / "scripts/runpod_reexec_with_pid1_env.py").read_text(
         encoding="utf-8"
     )
+    verifier = (ROOT / "scripts/verify_tpex_cloudflare_proxy.sh").read_text(
+        encoding="utf-8"
+    )
     http_client = (
         ROOT / "src/stock_forecasting/data/providers/http.py"
     ).read_text(encoding="utf-8")
@@ -852,6 +855,9 @@ def test_tpex_cloudflare_worker_is_closed_and_cpu_only() -> None:
     assert 'request.method !== "GET"' in worker
     assert 'request.headers.get("X-TPEX-Proxy-Token")' in worker
     assert 'redirect: "manual"' in worker
+    assert "MAX_UPSTREAM_REDIRECTS = 3" in worker
+    assert 'redirected.origin !== UPSTREAM_ORIGIN' in worker
+    assert 'error: "tpex_upstream_redirect_limit_exceeded"' in worker
     assert '"region": "gcp:asia-east1"' in config
     assert '"required": ["TPEX_PROXY_SHARED_SECRET"]' in config
     for action in ("configure", "deploy", "verify"):
@@ -863,6 +869,10 @@ def test_tpex_cloudflare_worker_is_closed_and_cpu_only() -> None:
     assert 'imported.pop("TPEX_PROXY_TOKEN", None)' in reexec
     assert "request_sha256, _identity = self._identity(endpoint=endpoint" in http_client
     assert "request_endpoint = self.transport.request_url(endpoint)" in http_client
+    assert "VERIFY_MAX_ATTEMPTS=8" in verifier
+    assert "__FIN_TS_HTTP_STATUS__" in verifier
+    assert "JSONDecodeError" in verifier
+    assert "retrying in %ss" in verifier
 
 
 def test_stage_configs_have_identical_architecture_digest() -> None:
