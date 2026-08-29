@@ -348,6 +348,31 @@ RunPod 機房若被 TPEx data endpoint 以 HTTP 403 拒絕，台灣市場 profil
 權限的 API token（API 文件將同一能力稱為 `Workers Scripts Write`），取得 32 字元
 account ID，再執行：
 
+在 **Manage account → Account API tokens → Create a token** 畫面採用下列最小權限
+設定。不要選擇畫面中的 **Edit Cloudflare Workers** 範本；該範本會加入本專案不需要
+的 Workers Routes、KV、R2、Tail 與其他 read 權限。改選 **Start from scratch**：
+
+| 欄位 | 設定 |
+| --- | --- |
+| Token name | 使用可辨識用途的名稱，例如 `stock-forecasting-tpex-relay-deployer`。 |
+| Permission policies | 只保留一列：**Account → Workers Scripts → Edit**。不需另外加入 Read。 |
+| Account resources | 只包含目前部署 Worker 的 Cloudflare account，不要選所有 accounts。若 Account API token 畫面未顯示此選項，代表 token 已由目前 account 擁有並限制於該 account。 |
+| Token expiration | 建議選 **90 days**；需要較少輪替時可選 **1 year**，不建議 `No expiration`。 |
+| Client IP address filtering | 家用網路、動態 IP、VPN 或會移動使用時留白。只有已知固定 public egress IP 時才設定 Allow，單一 IPv4 使用 `/32`、單一 IPv6 使用 `/128`。 |
+
+不要加入 **Read all resources**、**Write all resources**、**Edit zone DNS**、Workers
+Routes、Workers KV Storage、Workers R2 Storage、Workers Tail 或 Account Settings。
+`Workers Scripts Edit` 已涵蓋部署器需要的 subdomain 查詢／建立、Worker module 上傳與
+`workers.dev` 啟用操作。API token 只在本機執行 `tpex-proxy deploy` 時使用；90 天或
+1 年後到期不會關閉已部署的 Worker，也不會中斷 Pod 透過 relay 抓取 TPEx，只會讓
+下一次重新部署前必須輪替 token。
+
+按 **Continue to summary** 後，確認摘要只有目前 account 的 **Workers Scripts
+Edit**，再建立 token。token secret 只顯示一次；不要貼進 README、終端指令列、聊天
+或截圖，直接在下一個 `configure` 指令的隱藏輸入提示貼上。32 字元 account ID 不是
+token secret，可從 Cloudflare account URL 或 dashboard Overview 取得；不要把個人
+account ID 寫入專案文件。
+
 ```bash
 bash scripts/runpod_workflow.sh tpex-proxy configure
 bash scripts/runpod_workflow.sh tpex-proxy deploy
@@ -395,6 +420,11 @@ cache key 或 dataset request identity。切換到 Worker 後，既有成功的 
 與 EODHD JSON cache 會照常續用，只對缺少的 TPEx response 經 Worker 發出請求。
 相關官方文件：
 
+- [Cloudflare API token 建立流程](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/)
+- [Cloudflare Account API tokens](https://developers.cloudflare.com/fundamentals/api/get-started/account-owned-tokens/)
+- [Cloudflare API token 範本權限](https://developers.cloudflare.com/fundamentals/api/reference/template/)
+- [Cloudflare API token 權限表](https://developers.cloudflare.com/fundamentals/api/reference/permissions/)
+- [Cloudflare token expiration 與 IP 限制](https://developers.cloudflare.com/fundamentals/api/how-to/restrict-tokens/)
 - [Cloudflare Workers API](https://developers.cloudflare.com/api/resources/workers/)
 - [Cloudflare Worker placement](https://developers.cloudflare.com/workers/configuration/placement/)
 - [Cloudflare Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
@@ -1576,6 +1606,37 @@ Cloudflare API token with only **Workers Scripts Edit** permission (the API
 documentation calls the same capability `Workers Scripts Write`), obtain the
 32-character account ID, and run:
 
+Use the following least-privilege settings on **Manage account → Account API
+tokens → Create a token**. Do not select the **Edit Cloudflare Workers**
+template shown on that page; it adds Workers Routes, KV, R2, Tail, and other
+read permissions that this project does not use. Select **Start from scratch**
+instead:
+
+| Field | Setting |
+| --- | --- |
+| Token name | Use a descriptive purpose, such as `stock-forecasting-tpex-relay-deployer`. |
+| Permission policies | Keep exactly one row: **Account → Workers Scripts → Edit**. A separate Read permission is not required. |
+| Account resources | Include only the Cloudflare account that will own the Worker, not all accounts. If this selector is absent for an Account API token, the token is already owned by and scoped to the current account. |
+| Token expiration | **90 days** is recommended; use **1 year** when less frequent rotation is necessary. Avoid `No expiration`. |
+| Client IP address filtering | Leave this blank for residential networks, dynamic addresses, VPNs, or mobile use. Restrict it only for a known fixed public egress address, using `/32` for one IPv4 address or `/128` for one IPv6 address. |
+
+Do not add **Read all resources**, **Write all resources**, **Edit zone DNS**,
+Workers Routes, Workers KV Storage, Workers R2 Storage, Workers Tail, or Account
+Settings. `Workers Scripts Edit` already covers the subdomain lookup/creation,
+Worker-module upload, and `workers.dev` activation operations used by the
+deployer. The API token is used only by the local `tpex-proxy deploy` control
+command. Its expiration does not disable an already deployed Worker or
+interrupt a Pod using the relay; it only requires token rotation before a
+future deployment.
+
+On **Continue to summary**, verify that the summary contains only **Workers
+Scripts Edit** for the current account, then create the token. The token secret
+is displayed only once. Do not paste it into the README, a shell command line,
+chat, or a screenshot; paste it directly into the hidden prompt from the next
+`configure` command. The 32-character account ID is not the token secret and
+can be found in the Cloudflare account URL or dashboard Overview. Do not put a
+personal account ID in project documentation.
+
 ```bash
 bash scripts/runpod_workflow.sh tpex-proxy configure
 bash scripts/runpod_workflow.sh tpex-proxy deploy
@@ -1629,6 +1690,11 @@ After switching transports, all successful TWSE, TPEx, and EODHD JSON cache
 entries remain reusable; only missing TPEx responses pass through the Worker.
 Official references:
 
+- [Create a Cloudflare API token](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/)
+- [Cloudflare Account API tokens](https://developers.cloudflare.com/fundamentals/api/get-started/account-owned-tokens/)
+- [Cloudflare API token template permissions](https://developers.cloudflare.com/fundamentals/api/reference/template/)
+- [Cloudflare API token permission groups](https://developers.cloudflare.com/fundamentals/api/reference/permissions/)
+- [Cloudflare token expiration and IP restrictions](https://developers.cloudflare.com/fundamentals/api/how-to/restrict-tokens/)
 - [Cloudflare Workers API](https://developers.cloudflare.com/api/resources/workers/)
 - [Cloudflare Worker placement](https://developers.cloudflare.com/workers/configuration/placement/)
 - [Cloudflare Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
