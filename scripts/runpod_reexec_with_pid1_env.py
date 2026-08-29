@@ -51,6 +51,8 @@ ALLOWED_NAMES = frozenset(
         "STAGE1_SYMBOL_LIMIT",
         "STAGE1_US_ETF_SYMBOLS",
         "STAGE1_US_SYMBOLS",
+        "TPEX_PROXY_TOKEN",
+        "TPEX_PROXY_URL",
         "VALIDATION_CHECKPOINT",
         "VALIDATION_DISABLE_WANDB",
         "VALIDATION_RECOMPUTE_FULL_MODEL",
@@ -106,7 +108,9 @@ FORBIDDEN_NAMES = frozenset(
         "RUNPOD_S3_SECRET_ACCESS_KEY",
     }
 )
-ROLE_SECRET_NAMES = frozenset({"EODHD_API_TOKEN", "HF_TOKEN", "WANDB_API_KEY"})
+ROLE_SECRET_NAMES = frozenset(
+    {"EODHD_API_TOKEN", "HF_TOKEN", "TPEX_PROXY_TOKEN", "WANDB_API_KEY"}
+)
 
 
 def read_allowlisted_environment(path):
@@ -151,6 +155,8 @@ def main() -> int:
     elif role in {"gpu-train", "gpu-validation"}:
         imported.pop("EODHD_API_TOKEN", None)
         imported.pop("HF_TOKEN", None)
+        imported.pop("TPEX_PROXY_TOKEN", None)
+        imported.pop("TPEX_PROXY_URL", None)
     else:
         raise ValueError(f"Unsupported RUNPOD_ROLE in PID 1 environment: {role}")
     environment.update(imported)

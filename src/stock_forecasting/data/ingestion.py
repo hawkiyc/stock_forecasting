@@ -46,6 +46,7 @@ from stock_forecasting.data.providers import (
     ProviderRequestError,
     RequestRecord,
     TPExProvider,
+    TpexWorkerTransport,
     TWSEProvider,
 )
 from stock_forecasting.data.schema import (
@@ -121,6 +122,7 @@ class IngestionOptions:
     workers: int = 1
     acquisition_deadline_epoch_seconds: float | None = None
     preparation_reserve_seconds: int | None = None
+    tpex_proxy_url: str | None = None
 
 
 class _ParquetSink:
@@ -787,6 +789,9 @@ def _progress_context(options: IngestionOptions) -> dict[str, Any]:
             "taiwan_requests_per_second_per_provider": options.taiwan_requests_per_second,
             "provider_max_backoff_seconds": options.max_backoff_seconds,
             "provider_max_backoff_scope": ["eodhd", "tpex_official", "twse_official"],
+            "tpex_transport": (
+                "cloudflare_worker_v1" if options.tpex_proxy_url else "direct"
+            ),
         }
     }
     optional = {
@@ -805,6 +810,7 @@ def ingest_daily_ohlcv(
     options: IngestionOptions,
     *,
     eodhd_api_token: str | None = None,
+    tpex_proxy_token: str | None = None,
 ) -> dict[str, Any]:
     """Fetch providers only here; training and evaluation never call this function."""
 
@@ -820,6 +826,8 @@ def ingest_daily_ohlcv(
         raise ValueError("workers must be positive")
     if options.preparation_reserve_seconds is not None and options.preparation_reserve_seconds < 1:
         raise ValueError("preparation_reserve_seconds must be positive")
+    if bool(options.tpex_proxy_url) != bool(tpex_proxy_token):
+        raise ValueError("TPEX_PROXY_URL and TPEX_PROXY_TOKEN must be configured together")
     has_explicit_us_universe = bool(options.explicit_us_symbols or options.explicit_us_etfs)
     if options.profile == "tw_only" and (
         has_explicit_us_universe or options.symbol_limit is not None
@@ -995,6 +1003,16 @@ def ingest_daily_ohlcv(
 
                 def run_taiwan(sink_part: _ParquetSink, log_part: _RequestLog) -> None:
                     provider_stats = stats[provider_name]
+                    tpex_transport = (
+                        TpexWorkerTransport(
+                            origin=options.tpex_proxy_url,
+                            token=tpex_proxy_token,
+                        )
+                        if provider_name == "tpex_official"
+                        and options.tpex_proxy_url is not None
+                        and tpex_proxy_token is not None
+                        else None
+                    )
                     client = CachedJsonClient(
                         provider=provider_name,
                         raw_cache_root=options.raw_cache_root,
@@ -1017,6 +1035,7 @@ def ingest_daily_ohlcv(
                             ),
                         },
                         retryable_status_codes={403, 408, 425, 429},
+                        transport=tpex_transport,
                         request_budget=request_budget,
                     )
                     provider = provider_class(client)
@@ -1268,6 +1287,9 @@ def ingest_daily_ohlcv(
             "eodhd_official_default_requests_per_minute": (EODHD_DEFAULT_REQUESTS_PER_MINUTE),
             "taiwan_requests_per_second": options.taiwan_requests_per_second,
             "taiwan_requests_per_second_scope": "per_provider",
+            "tpex_transport": (
+                "cloudflare_worker_v1" if options.tpex_proxy_url else "direct"
+            ),
             "provider_max_backoff_seconds": options.max_backoff_seconds,
             "provider_max_backoff_scope": ["eodhd", "tpex_official", "twse_official"],
             "taiwan_request_count_ceiling": None,

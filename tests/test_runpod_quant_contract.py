@@ -819,6 +819,52 @@ def test_eodhd_secret_is_cpu_only() -> None:
     assert 'imported.pop("EODHD_API_TOKEN", None)' in reexec
 
 
+def test_tpex_cloudflare_worker_is_closed_and_cpu_only() -> None:
+    worker = (
+        ROOT / "cloudflare/tpex-proxy/src/index.mjs"
+    ).read_text(encoding="utf-8")
+    config = (
+        ROOT / "cloudflare/tpex-proxy/wrangler.jsonc"
+    ).read_text(encoding="utf-8")
+    workflow = (ROOT / "scripts/runpod_workflow.sh").read_text(encoding="utf-8")
+    sync = (ROOT / "scripts/sync_project_to_runpod_volume.sh").read_text(
+        encoding="utf-8"
+    )
+    create_cpu = (ROOT / "scripts/create_runpod_cpu_pod.sh").read_text(
+        encoding="utf-8"
+    )
+    create_gpu = (ROOT / "scripts/create_runpod_pod.sh").read_text(encoding="utf-8")
+    reexec = (ROOT / "scripts/runpod_reexec_with_pid1_env.py").read_text(
+        encoding="utf-8"
+    )
+    http_client = (
+        ROOT / "src/stock_forecasting/data/providers/http.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'const UPSTREAM_ORIGIN = "https://www.tpex.org.tw"' in worker
+    for path in (
+        "/www/zh-tw/afterTrading/dailyQuotes",
+        "/www/zh-tw/bulletin/exDailyQ",
+        "/www/zh-tw/indexInfo/ROE",
+        "/www/zh-tw/indexInfo/inx",
+    ):
+        assert path in worker
+    assert 'request.method !== "GET"' in worker
+    assert 'request.headers.get("X-TPEX-Proxy-Token")' in worker
+    assert 'redirect: "manual"' in worker
+    assert '"region": "gcp:asia-east1"' in config
+    assert '"required": ["TPEX_PROXY_SHARED_SECRET"]' in config
+    for action in ("configure", "deploy", "verify"):
+        assert action in workflow
+    assert "cloudflare/tpex-proxy/src/index.mjs" in sync
+    assert "cloudflare/tpex-proxy/wrangler.jsonc" in sync
+    assert '"TPEX_PROXY_TOKEN":"%s"' in create_cpu
+    assert "TPEX_PROXY_TOKEN" not in create_gpu
+    assert 'imported.pop("TPEX_PROXY_TOKEN", None)' in reexec
+    assert "request_sha256, _identity = self._identity(endpoint=endpoint" in http_client
+    assert "request_endpoint = self.transport.request_url(endpoint)" in http_client
+
+
 def test_stage_configs_have_identical_architecture_digest() -> None:
     stage1 = ExperimentConfig.from_yaml(ROOT / "configs/stage1_kronos_base_lora.yaml")
     stage2 = ExperimentConfig.from_yaml(ROOT / "configs/stage2_kronos_base_lora.yaml")

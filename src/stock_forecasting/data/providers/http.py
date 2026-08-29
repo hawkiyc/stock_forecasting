@@ -9,10 +9,12 @@ import re
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 
@@ -22,6 +24,73 @@ from .base import RequestRecord
 
 _SECRET_PARAMETER_NAMES = frozenset({"api_token", "api_key", "token", "password", "secret"})
 _CACHE_REVISION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_WORKERS_DEV_HOST_PATTERN = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\."
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev"
+)
+_TPEX_UPSTREAM_HOST = "www.tpex.org.tw"
+_TPEX_PROXY_PATHS = frozenset(
+    {
+        "/www/zh-tw/afterTrading/dailyQuotes",
+        "/www/zh-tw/bulletin/exDailyQ",
+        "/www/zh-tw/indexInfo/ROE",
+        "/www/zh-tw/indexInfo/inx",
+    }
+)
+
+
+@dataclass(frozen=True)
+class TpexWorkerTransport:
+    """Rewrite approved TPEx requests without changing their cache identity."""
+
+    origin: str
+    token: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        parsed = urlsplit(self.origin)
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError("TPEx Worker origin has an invalid port") from error
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+            or _WORKERS_DEV_HOST_PATTERN.fullmatch(parsed.hostname) is None
+        ):
+            raise ValueError("TPEx Worker origin must be a root workers.dev HTTPS origin")
+        if not 32 <= len(self.token) <= 512 or any(
+            character in self.token for character in ("\r", "\n", "\0")
+        ):
+            raise ValueError("TPEx Worker token has an invalid format")
+        object.__setattr__(self, "origin", f"https://{parsed.hostname}")
+
+    def request_url(self, endpoint: str) -> str:
+        parsed = urlsplit(endpoint)
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError("TPEx endpoint has an invalid port") from error
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != _TPEX_UPSTREAM_HOST
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+            or parsed.path not in _TPEX_PROXY_PATHS
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("TPEx Worker transport rejected an unsupported upstream endpoint")
+        return f"{self.origin}{parsed.path}"
+
+    def request_headers(self) -> dict[str, str]:
+        return {"X-TPEX-Proxy-Token": self.token}
 
 
 class NetworkRequestBudgetExceeded(RuntimeError):
@@ -326,6 +395,7 @@ class CachedJsonClient:
         max_backoff_seconds: float | None = None,
         headers: Mapping[str, str] | None = None,
         retryable_status_codes: frozenset[int] | set[int] | None = None,
+        transport: TpexWorkerTransport | None = None,
         session: requests.Session | None = None,
         request_budget: NetworkRequestBudget | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -369,6 +439,7 @@ class CachedJsonClient:
             for status_code in self.retryable_status_codes
         ):
             raise ValueError("Retryable HTTP status codes must be integers from 400 to 599")
+        self.transport = transport
         self.session = session
         self.request_budget = request_budget
         self.clock = clock
@@ -420,21 +491,26 @@ class CachedJsonClient:
 
     def _send(self, endpoint: str, params: Mapping[str, Any]) -> requests.Response:
         session = self._session()
+        request_endpoint = endpoint
+        request_headers = dict(self.headers)
+        if self.transport is not None:
+            request_endpoint = self.transport.request_url(endpoint)
+            request_headers.update(self.transport.request_headers())
         if self.session is None:
             return session.get(
-                endpoint,
+                request_endpoint,
                 params=dict(params),
                 timeout=self.timeout_seconds,
-                headers=self.headers,
+                headers=request_headers,
             )
         # Injected sessions are primarily deterministic test doubles and are not
         # assumed to be thread-safe.
         with self._provided_session_lock:
             return session.get(
-                endpoint,
+                request_endpoint,
                 params=dict(params),
                 timeout=self.timeout_seconds,
-                headers=self.headers,
+                headers=request_headers,
             )
 
     def _identity(

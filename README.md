@@ -330,12 +330,76 @@ Python 3 只供無第三方相依的 manifest/JSON control helper 使用，不�
    - `eodhd_api_token`：只有 `us_only_eodhd` 或 `us_tw_eodhd` profile
      需要；`tw_only` 不需要。
 
+包含台灣市場的 profile 另需 TPEx Cloudflare Worker。Worker 部署腳本會為每次
+部署建立唯一名稱的 `tpex_proxy_token_<timestamp>_<nonce>` RunPod Secret，並把
+secret 名稱寫回本機 `.env`；不要手動建立固定名稱的 TPEx secret。
+
 不要複製、開啟或手動修改 `.env`。以隱藏輸入方式建立 credential-only
 `.env`；腳本會原子寫入並固定權限為 `600`：
 
 ```bash
 bash scripts/runpod_workflow.sh credentials
 ```
+
+##### TPEx Cloudflare Worker
+
+RunPod 機房若被 TPEx data endpoint 以 HTTP 403 拒絕，台灣市場 profile 必須先
+部署受限的 Cloudflare Worker。先在 Cloudflare 建立只有 **Workers Scripts Edit**
+權限的 API token（API 文件將同一能力稱為 `Workers Scripts Write`），取得 32 字元
+account ID，再執行：
+
+```bash
+bash scripts/runpod_workflow.sh tpex-proxy configure
+bash scripts/runpod_workflow.sh tpex-proxy deploy
+```
+
+`configure` 以隱藏輸入保存 Cloudflare token，並在首次設定時自動產生共享 relay
+token。若 Cloudflare 帳號尚未設定 `workers.dev` subdomain，請在互動提示輸入一個
+全域唯一名稱；既有帳號可留白，部署器會向 Cloudflare 查詢。`deploy` 透過官方
+Workers API 完成以下受控步驟：
+
+`deploy` 會使用本機 `.env` 內既有的 `RUNPOD_API_KEY` 呼叫官方 GraphQL
+`secretCreate`。`secretCreate` 是 API mutation 名稱，不是建立 RunPod API key 時可
+單獨勾選的權限。你不需要為此預先重建金鑰；若目前金鑰無效、只有讀取權限，或
+無法在所屬 account/team 建立 Secret，`deploy` 會停止，而且不會把新的 Worker
+metadata 啟用到本機 `.env`。
+
+`configure` 會合併更新 `.env`，保留既有的 RunPod network volume 與 S3 設定。若
+volume 已部署完成，不要重新執行 `credentials` 或 `volume deploy`；`deploy` 成功後
+直接跳到「驗證 S3 並上傳程式碼」執行 `sync --dry-run` 與 `sync --apply`。
+
+- 上傳 [`cloudflare/tpex-proxy/src/index.mjs`](cloudflare/tpex-proxy/src/index.mjs)，
+  並將執行位置提示設為 `gcp:asia-east1`。
+- 只允許 `GET`、共享 token、固定 TPEx origin、四個專案使用中的 path，以及各
+  path 的固定 query schema；它不是通用或開放式 proxy。
+- 啟用該 script 的 `workers.dev` URL，把同一個 relay token 寫入新建的 RunPod
+  Secret；Cloudflare API token 不會進入 Pod。
+- 直接以 `exDailyQ` 執行 smoke test。只有 Worker 實際取得含官方資料表的 JSON
+  才視為部署成功。
+
+此 Worker 不使用 KV、Durable Objects、資料庫或其他付費 binding；TPEx 每個 cache
+miss 對應一次 Worker request 與一次 upstream subrequest。實際是否落在免費額度內
+仍以 Cloudflare 帳號方案與當下官方 limits 為準。
+
+Cloudflare placement hint 會讓 Worker 靠近指定 region，但不保證特定的固定出口
+IP，也不能保證 TPEx 永遠接受該出口。因此 smoke test 才是建立 CPU Pod 前的實際
+通過條件；可隨時重新驗證：
+
+```bash
+bash scripts/runpod_workflow.sh tpex-proxy verify
+```
+
+TPEx client 仍使用原始 `https://www.tpex.org.tw` endpoint 與 public query params
+計算 request SHA-256；Worker URL、relay token 與 transport 模式都不會進入 raw
+cache key 或 dataset request identity。切換到 Worker 後，既有成功的 TWSE、TPEx
+與 EODHD JSON cache 會照常續用，只對缺少的 TPEx response 經 Worker 發出請求。
+相關官方文件：
+
+- [Cloudflare Workers API](https://developers.cloudflare.com/api/resources/workers/)
+- [Cloudflare Worker placement](https://developers.cloudflare.com/workers/configuration/placement/)
+- [Cloudflare Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
+- [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
+- [RunPod GraphQL `secretCreate`](https://docs.runpod.io/sdks/graphql/manage-pod-templates)
 
 接著由腳本建立 network volume。成功回傳的 volume ID、datacenter、S3 region
 與 endpoint 會自動寫回同一個 `.env`，不需要複製 ID：
@@ -523,11 +587,12 @@ train-only robust scales 與 split audit；它不會改變日期、symbol、prov
 bash scripts/runpod_workflow.sh selection show
 ```
 
-`.env` 現在只保存本機 RunPod/S3 credentials 與腳本回填的 volume metadata；
+`.env` 只保存本機 RunPod/S3/Cloudflare deployment credentials，以及腳本回填的
+volume 與 TPEx Worker metadata；
 stage、資料範圍、runtime 與 config 不從 `.env` 讀取。不要 `source .env`，也不要
 把 API key、token 或 secret value 寫進 README、config、shell script 或提交
-紀錄。Pod 只會收到 RunPod Secret reference，不會收到本機 account-level
-RunPod/S3 credential。
+紀錄。Pod 只會收到 RunPod Secret reference 與非敏感 Worker URL，不會收到本機
+account-level RunPod/S3/Cloudflare credential。
 
 #### 2. 驗證 S3 並上傳程式碼
 
@@ -1491,12 +1556,84 @@ API key. Then create these fixed-name RunPod Secrets:
    - `eodhd_api_token`: required only by the `us_only_eodhd` and
      `us_tw_eodhd` profiles; it is not required by `tw_only`.
 
+Profiles containing Taiwan data also require the TPEx Cloudflare Worker. Each
+Worker deployment creates a uniquely named
+`tpex_proxy_token_<timestamp>_<nonce>` RunPod Secret and records that secret
+name in the local `.env`; do not create a fixed-name TPEx secret manually.
+
 Do not copy, open, or manually edit `.env`. Create the credential-only file
 through hidden input; the script writes it atomically with mode `600`:
 
 ```bash
 bash scripts/runpod_workflow.sh credentials
 ```
+
+##### TPEx Cloudflare Worker
+
+When a RunPod datacenter receives HTTP 403 from TPEx data endpoints, deploy the
+restricted Cloudflare Worker before using a Taiwan-market profile. Create a
+Cloudflare API token with only **Workers Scripts Edit** permission (the API
+documentation calls the same capability `Workers Scripts Write`), obtain the
+32-character account ID, and run:
+
+```bash
+bash scripts/runpod_workflow.sh tpex-proxy configure
+bash scripts/runpod_workflow.sh tpex-proxy deploy
+```
+
+`configure` stores the Cloudflare token through hidden input and generates the
+shared relay token on first setup. If the Cloudflare account has no
+`workers.dev` subdomain, enter a globally unique name at the prompt; leave it
+blank for an existing account and the deployer queries Cloudflare. `deploy`
+enforces these boundaries through the official Workers API:
+
+`deploy` uses the existing `RUNPOD_API_KEY` in the local `.env` to call the
+official GraphQL `secretCreate` mutation. `secretCreate` is an API operation,
+not a separately selectable permission when creating a RunPod API key. There
+is no need to replace the key in advance. If the current key is invalid,
+read-only, or cannot create a Secret in its account/team scope, `deploy` stops
+without activating the new Worker metadata in the local `.env`.
+
+`configure` merges its updates into `.env` and preserves the existing RunPod
+network-volume and S3 settings. If the volume is already deployed, do not rerun
+`credentials` or `volume deploy`; after `deploy` succeeds, proceed directly to
+"Verify S3 and upload source code" and run `sync --dry-run` and `sync --apply`.
+
+- It uploads [`cloudflare/tpex-proxy/src/index.mjs`](cloudflare/tpex-proxy/src/index.mjs)
+  with a `gcp:asia-east1` placement hint.
+- It accepts only `GET`, the shared token, the fixed TPEx origin, the four paths
+  used by this project, and each path's fixed query schema. It is not a general
+  or open proxy.
+- It enables the script's `workers.dev` URL and stores the same relay token in
+  a newly created RunPod Secret. The Cloudflare API token never enters a Pod.
+- It runs an `exDailyQ` smoke test. Deployment passes only when the Worker
+  actually returns official JSON containing a data table.
+
+The Worker uses no KV, Durable Objects, database, or other paid binding. Each
+TPEx cache miss consumes one Worker request and one upstream subrequest.
+Whether usage remains inside the free allowance is governed by the account's
+Cloudflare plan and the current official limits.
+
+A Cloudflare placement hint moves execution near the requested region, but it
+does not guarantee a fixed egress IP or permanent acceptance by TPEx. The smoke
+test is therefore the live gate before CPU Pod creation. Re-run it at any time:
+
+```bash
+bash scripts/runpod_workflow.sh tpex-proxy verify
+```
+
+The TPEx client still hashes the original `https://www.tpex.org.tw` endpoint
+and public query parameters for request identity. The Worker URL, relay token,
+and transport mode do not enter raw-cache keys or dataset-request identity.
+After switching transports, all successful TWSE, TPEx, and EODHD JSON cache
+entries remain reusable; only missing TPEx responses pass through the Worker.
+Official references:
+
+- [Cloudflare Workers API](https://developers.cloudflare.com/api/resources/workers/)
+- [Cloudflare Worker placement](https://developers.cloudflare.com/workers/configuration/placement/)
+- [Cloudflare Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
+- [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
+- [RunPod GraphQL `secretCreate`](https://docs.runpod.io/sdks/graphql/manage-pod-templates)
 
 Create the network volume through the script. The returned volume ID,
 datacenter, S3 region, and endpoint are written back to the same `.env`
@@ -1699,11 +1836,13 @@ Inspect the active selection without opening JSON:
 bash scripts/runpod_workflow.sh selection show
 ```
 
-`.env` now stores only local RunPod/S3 credentials and volume metadata written
-by the scripts. Stage, data range, runtime, and config are never read from
+`.env` stores only local RunPod/S3/Cloudflare deployment credentials plus
+volume and TPEx Worker metadata written by the scripts. Stage, data range,
+runtime, and config are never read from
 `.env`. Do not `source .env`, and never put API keys, tokens, or secret values
 in the README, configs, shell scripts, or commit history. Pods receive RunPod
-Secret references, not local account-level RunPod or S3 credentials.
+Secret references and a non-secret Worker URL, not local account-level RunPod,
+S3, or Cloudflare credentials.
 
 #### 2. Verify S3 and upload source code
 

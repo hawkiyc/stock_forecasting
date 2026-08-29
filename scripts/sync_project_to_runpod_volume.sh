@@ -90,6 +90,12 @@ append_manifest_file() {
 for root_file in README.md pyproject.toml; do
     append_manifest_file "${root_file}"
 done
+for worker_file in \
+    cloudflare/tpex-proxy/src/index.mjs \
+    cloudflare/tpex-proxy/test/worker.test.mjs \
+    cloudflare/tpex-proxy/wrangler.jsonc; do
+    append_manifest_file "${worker_file}"
+done
 
 while IFS= read -r absolute_path; do
     append_manifest_file "${absolute_path#${LOCAL_PROJECT_ROOT}/}"
@@ -153,7 +159,7 @@ while IFS= read -r env_line || [[ -n "${env_line}" ]]; do
     esac
     env_key="${env_assignment%%=*}"
     case "${env_key}" in
-        RUNPOD_EODHD_SECRET_NAME|RUNPOD_HF_SECRET_NAME|RUNPOD_WANDB_SECRET_NAME)
+        RUNPOD_EODHD_SECRET_NAME|RUNPOD_HF_SECRET_NAME|RUNPOD_TPEX_PROXY_SECRET_NAME|RUNPOD_WANDB_SECRET_NAME)
             # Secret identifiers are safe metadata; their values are never credentials.
             continue
             ;;

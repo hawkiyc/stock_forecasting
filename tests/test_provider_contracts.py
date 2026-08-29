@@ -45,6 +45,7 @@ from stock_forecasting.data.providers.http import (
     NetworkRequestBudgetExceeded,
     ProviderAcquisitionError,
     ProviderRequestError,
+    TpexWorkerTransport,
 )
 from stock_forecasting.data.providers.massive import MassiveProvider
 from stock_forecasting.data.providers.taiwan import TPExProvider, TWSEProvider
@@ -118,6 +119,62 @@ def test_raw_cache_identity_omits_api_token_and_reuses_response(tmp_path: Path) 
     assert second.cache_hit
     assert "secret" not in first.cache_relative_path
     assert "first-secret" not in next(tmp_path.rglob("*.json")).read_text(encoding="utf-8")
+
+
+def test_tpex_worker_transport_preserves_upstream_cache_identity(tmp_path: Path) -> None:
+    token = "fixture-token-that-is-longer-than-thirty-two-characters"
+    session = _FakeSession({"tables": []})
+    transport = TpexWorkerTransport(
+        origin="https://stock-forecasting-tpex-proxy.example.workers.dev/",
+        token=token,
+    )
+    client = CachedJsonClient(
+        provider="tpex_official",
+        raw_cache_root=tmp_path,
+        max_requests_per_second=10.0,
+        transport=transport,
+        session=session,
+        clock=lambda: 1.0,
+        sleeper=lambda _seconds: None,
+    )
+    endpoint = "https://www.tpex.org.tw/www/zh-tw/bulletin/exDailyQ"
+    params = {
+        "startDate": "2026/01/01",
+        "endDate": "2026/01/31",
+        "response": "json",
+    }
+
+    _payload, record = client.get_json(endpoint, params=params)
+    expected_digest, identity = client._identity(endpoint=endpoint, params=params)
+
+    assert record.request_sha256 == expected_digest
+    assert identity["endpoint"] == endpoint
+    serialized_identity = json.dumps(identity, sort_keys=True)
+    assert token not in serialized_identity
+    assert "workers.dev" not in serialized_identity
+    assert session.calls[0]["endpoint"] == (
+        "https://stock-forecasting-tpex-proxy.example.workers.dev"
+        "/www/zh-tw/bulletin/exDailyQ"
+    )
+    assert session.calls[0]["headers"]["X-TPEX-Proxy-Token"] == token
+    assert token not in repr(transport)
+
+
+def test_tpex_worker_transport_rejects_open_proxy_inputs() -> None:
+    transport = TpexWorkerTransport(
+        origin="https://stock-forecasting-tpex-proxy.example.workers.dev",
+        token="fixture-token-that-is-longer-than-thirty-two-characters",
+    )
+
+    with pytest.raises(ValueError, match="unsupported upstream"):
+        transport.request_url("https://example.com/www/zh-tw/bulletin/exDailyQ")
+    with pytest.raises(ValueError, match="unsupported upstream"):
+        transport.request_url("https://www.tpex.org.tw/arbitrary")
+    with pytest.raises(ValueError, match="workers.dev"):
+        TpexWorkerTransport(
+            origin="https://example.com",
+            token="fixture-token-that-is-longer-than-thirty-two-characters",
+        )
 
 
 def test_new_dataset_namespace_reads_existing_provider_cache_without_copying(
@@ -1531,6 +1588,7 @@ def test_launch_acquisition_policy_is_context_not_dataset_identity(tmp_path: Pat
         eodhd_requests_per_second=8.0,
         taiwan_requests_per_second=0.25,
         max_backoff_seconds=30.0,
+        tpex_proxy_url="https://stock-forecasting-tpex-proxy.example.workers.dev",
     )
 
     assert _progress_identity(first) == _progress_identity(second)
@@ -1539,6 +1597,8 @@ def test_launch_acquisition_policy_is_context_not_dataset_identity(tmp_path: Pat
     assert first_policy != second_policy
     assert first_policy["provider_max_backoff_seconds"] == 60.0
     assert second_policy["provider_max_backoff_seconds"] == 30.0
+    assert first_policy["tpex_transport"] == "direct"
+    assert second_policy["tpex_transport"] == "cloudflare_worker_v1"
 
 
 def test_cache_revision_is_part_of_resume_identity(tmp_path: Path) -> None:

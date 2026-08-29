@@ -137,9 +137,25 @@ runpod_load_create_env() {
     set +x
     runpod_validate_project_env_file "${project_root}"
     for key in \
-        RUNPOD_NETWORK_VOLUME_ID RUNPOD_DATACENTER_ID; do
+        RUNPOD_NETWORK_VOLUME_ID RUNPOD_DATACENTER_ID \
+        TPEX_PROXY_URL RUNPOD_TPEX_PROXY_SECRET_NAME; do
         runpod_load_project_env_key "${project_root}" "${key}" optional
     done
+    export RUNPOD_ENV_FILE="$(runpod_project_env_file "${project_root}")"
+}
+
+runpod_load_tpex_proxy_deploy_env() {
+    local project_root="$1"
+    local key=""
+
+    set +x
+    runpod_validate_project_env_file "${project_root}"
+    for key in \
+        CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID TPEX_PROXY_SHARED_SECRET \
+        RUNPOD_API_KEY; do
+        runpod_load_project_env_key "${project_root}" "${key}" required
+    done
+    runpod_load_project_env_key "${project_root}" CLOUDFLARE_WORKERS_SUBDOMAIN optional
     export RUNPOD_ENV_FILE="$(runpod_project_env_file "${project_root}")"
 }
 

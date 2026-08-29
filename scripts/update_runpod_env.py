@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Atomically manage the small, credential-only RunPod dotenv file."""
+"""Atomically manage the local control-plane credential and metadata dotenv."""
 
 import argparse
 import os
@@ -13,18 +13,26 @@ from pathlib import Path
 from typing import Dict, List, NoReturn, Optional, Set
 
 ALLOWED_KEYS = {
+    "CLOUDFLARE_ACCOUNT_ID",
+    "CLOUDFLARE_API_TOKEN",
+    "CLOUDFLARE_WORKERS_SUBDOMAIN",
     "RUNPOD_API_KEY",
     "RUNPOD_NETWORK_VOLUME_ID",
+    "RUNPOD_TPEX_PROXY_SECRET_NAME",
     "RUNPOD_DATACENTER_ID",
     "RUNPOD_S3_ACCESS_KEY_ID",
     "RUNPOD_S3_SECRET_ACCESS_KEY",
     "RUNPOD_S3_REGION",
     "RUNPOD_S3_ENDPOINT",
+    "TPEX_PROXY_SHARED_SECRET",
+    "TPEX_PROXY_URL",
 }
 SECRET_KEYS = {
+    "CLOUDFLARE_API_TOKEN",
     "RUNPOD_API_KEY",
     "RUNPOD_S3_ACCESS_KEY_ID",
     "RUNPOD_S3_SECRET_ACCESS_KEY",
+    "TPEX_PROXY_SHARED_SECRET",
 }
 ASSIGNMENT_PATTERN = re.compile(r"^(?:export[ \t]+)?([A-Z][A-Z0-9_]*)=(.*)$")
 
@@ -100,6 +108,17 @@ def _validate_value(key: str, value: str) -> str:
     elif key == "RUNPOD_NETWORK_VOLUME_ID":
         if value and re.fullmatch(r"[A-Za-z0-9_-]+", value) is None:
             _fail("RUNPOD_NETWORK_VOLUME_ID contains unsupported characters")
+    elif key == "CLOUDFLARE_ACCOUNT_ID":
+        if value and re.fullmatch(r"[0-9a-fA-F]{32}", value) is None:
+            _fail("CLOUDFLARE_ACCOUNT_ID must contain 32 hexadecimal characters")
+    elif key == "CLOUDFLARE_WORKERS_SUBDOMAIN":
+        if value and re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value
+        ) is None:
+            _fail("CLOUDFLARE_WORKERS_SUBDOMAIN has an invalid format")
+    elif key == "RUNPOD_TPEX_PROXY_SECRET_NAME":
+        if value and re.fullmatch(r"[A-Za-z0-9_-]+", value) is None:
+            _fail("RUNPOD_TPEX_PROXY_SECRET_NAME contains unsupported characters")
     elif key in {"RUNPOD_DATACENTER_ID", "RUNPOD_S3_REGION"}:
         if re.fullmatch(r"[A-Z0-9]+(?:-[A-Z0-9]+)+", value) is None:
             _fail(f"{key} has an invalid format")
@@ -111,6 +130,13 @@ def _validate_value(key: str, value: str) -> str:
             r"[a-z0-9]+(?:-[a-z0-9]+)+", region
         ) is None:
             _fail("RUNPOD_S3_ENDPOINT is not an approved RunPod endpoint")
+    elif key == "TPEX_PROXY_URL":
+        if value and re.fullmatch(
+            r"https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+            r"\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev/?",
+            value,
+        ) is None:
+            _fail("TPEX_PROXY_URL must be an approved workers.dev HTTPS origin")
     return value
 
 
@@ -191,7 +217,7 @@ def command_apply(arguments: argparse.Namespace) -> int:
     rendered = _render_template(template_text, merged)
     if current_text == rendered and env_path.exists():
         os.chmod(env_path, 0o600)
-        print(f"RunPod dotenv is already current: {env_path}")
+        print(f"Control-plane dotenv is already current: {env_path}")
         return 0
 
     backup_path: Optional[Path] = None
@@ -201,7 +227,7 @@ def command_apply(arguments: argparse.Namespace) -> int:
         shutil.copy2(env_path, backup_path)
         os.chmod(backup_path, 0o600)
     _atomic_write(env_path, rendered)
-    print(f"Updated credential-only RunPod dotenv: {env_path}")
+    print(f"Updated control-plane dotenv: {env_path}")
     if backup_path is not None:
         print(f"Previous dotenv backup: {backup_path}")
     return 0
@@ -225,7 +251,7 @@ def main() -> int:
     try:
         return int(arguments.handler(arguments))
     except (DotenvError, OSError, ValueError) as error:
-        print(f"RunPod dotenv update failed: {error}", file=sys.stderr)
+        print(f"Control-plane dotenv update failed: {error}", file=sys.stderr)
         return 2
 
 

@@ -15,6 +15,7 @@ from .http import (
     NetworkRequestBudgetExceeded,
     ProviderAcquisitionError,
     ProviderRequestError,
+    TpexWorkerTransport,
 )
 from .massive import MassiveProvider
 from .taiwan import TPExProvider, TWSEProvider
@@ -37,5 +38,6 @@ __all__ = [
     "ProviderRequestError",
     "RequestRecord",
     "TPExProvider",
+    "TpexWorkerTransport",
     "TWSEProvider",
 ]

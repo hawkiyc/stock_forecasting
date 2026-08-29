@@ -174,11 +174,13 @@ def main(argv: list[str] | None = None) -> int:
         workers=args.workers,
         acquisition_deadline_epoch_seconds=(args.acquisition_deadline_epoch_seconds),
         preparation_reserve_seconds=args.preparation_reserve_seconds,
+        tpex_proxy_url=os.environ.get("TPEX_PROXY_URL") or None,
     )
     try:
         payload = ingest_daily_ohlcv(
             options,
             eodhd_api_token=os.environ.get("EODHD_API_TOKEN"),
+            tpex_proxy_token=os.environ.get("TPEX_PROXY_TOKEN"),
         )
     except ProviderAcquisitionError as error:
         exit_code = TEMPORARY_PROVIDER_EXIT_CODE if error.retryable else 1

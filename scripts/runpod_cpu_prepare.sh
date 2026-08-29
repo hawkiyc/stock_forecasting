@@ -69,6 +69,8 @@ RUNPOD_CPU_MAX_API_CALLS="${RUNPOD_CPU_MAX_API_CALLS:-}"
 RUNPOD_CPU_EODHD_QPS="${RUNPOD_CPU_EODHD_QPS:-}"
 RUNPOD_CPU_TAIWAN_QPS="${RUNPOD_CPU_TAIWAN_QPS:-}"
 RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS="${RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS:-60}"
+TPEX_PROXY_URL="${TPEX_PROXY_URL:-}"
+TPEX_PROXY_TOKEN="${TPEX_PROXY_TOKEN:-}"
 RUNPOD_CPU_MAX_RUNTIME_SECONDS="${RUNPOD_CPU_MAX_RUNTIME_SECONDS:-21600}"
 RUNPOD_CPU_PREPARE_RESERVE_SECONDS="${RUNPOD_CPU_PREPARE_RESERVE_SECONDS:-}"
 RUNPOD_PYTEST_WORKERS="${RUNPOD_PYTEST_WORKERS:-auto}"
@@ -83,6 +85,7 @@ export PROJECT_ROOT DATA_ROOT LOG_ROOT LIFECYCLE_ROOT RUNPOD_ROLE RUNPOD_CONFIG
 export FIN_TS_DATASET_PROFILE FIN_TS_H_START
 export RUNPOD_DATASET_REVISION
 export RUNPOD_CPU_MAX_API_CALLS RUNPOD_CPU_EODHD_QPS RUNPOD_CPU_TAIWAN_QPS
+export TPEX_PROXY_URL TPEX_PROXY_TOKEN
 # The image may export cache paths under ephemeral /workspace; never inherit them.
 export HF_HOME="${NETWORK_VOLUME_ROOT}/cache/huggingface"
 export TRANSFORMERS_CACHE="${HF_HOME}/hub"
@@ -127,6 +130,18 @@ if [[ "${FIN_TS_DATASET_PROFILE}" == *eodhd* \
     && ( -z "${EODHD_API_TOKEN:-}" || "${EODHD_API_TOKEN}" == *'{{ RUNPOD_SECRET_'* ) ]]; then
     echo "EODHD_API_TOKEN RunPod Secret is missing or was not resolved" >&2
     exit 2
+fi
+if [[ "${FIN_TS_DATASET_PROFILE}" == "tw_only" \
+    || "${FIN_TS_DATASET_PROFILE}" == "us_tw_eodhd" \
+    || "${FIN_TS_DATASET_PROFILE}" == "us_tw_massive" ]]; then
+    if [[ -z "${TPEX_PROXY_TOKEN}" || "${TPEX_PROXY_TOKEN}" == *'{{ RUNPOD_SECRET_'* ]]; then
+        echo "TPEX_PROXY_TOKEN RunPod Secret is missing or was not resolved" >&2
+        exit 2
+    fi
+    if [[ ! "${TPEX_PROXY_URL}" =~ ^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev/?$ ]]; then
+        echo "TPEX_PROXY_URL is missing or is not an approved workers.dev origin" >&2
+        exit 2
+    fi
 fi
 if [[ ! "${RUNPOD_PYTEST_WORKERS}" =~ ^(auto|0|[1-9][0-9]*)$ ]]; then
     echo "RUNPOD_PYTEST_WORKERS must be auto, 0, or a positive integer" >&2

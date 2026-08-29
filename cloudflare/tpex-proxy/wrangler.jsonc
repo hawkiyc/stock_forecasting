@@ -1,0 +1,13 @@
+{
+  "name": "stock-forecasting-tpex-proxy",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-08-28",
+  "placement": {
+    "region": "gcp:asia-east1"
+  },
+  "secrets": {
+    "required": ["TPEX_PROXY_SHARED_SECRET"]
+  },
+  "workers_dev": true,
+  "preview_urls": false
+}
