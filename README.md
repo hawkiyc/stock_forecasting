@@ -352,11 +352,17 @@ account ID，再執行：
 設定。不要選擇畫面中的 **Edit Cloudflare Workers** 範本；該範本會加入本專案不需要
 的 Workers Routes、KV、R2、Tail 與其他 read 權限。改選 **Start from scratch**：
 
+Cloudflare 新版 Account API token 編輯器不再把 `Account` 顯示為可逐層展開的選單。
+進入 **Edit policy** 後，將最上方的 policy scope 保持為 **Entire Account**，在
+**Search for permission groups...** 輸入 `Workers Scripts`；也可以展開
+**Developer Platform** 後尋找同名權限。最後只對 **Workers Scripts** 選擇
+**Edit**。`Developer Platform` 只是介面分類，不是另一項權限。
+
 | 欄位 | 設定 |
 | --- | --- |
 | Token name | 使用可辨識用途的名稱，例如 `stock-forecasting-tpex-relay-deployer`。 |
-| Permission policies | 只保留一列：**Account → Workers Scripts → Edit**。不需另外加入 Read。 |
-| Account resources | 只包含目前部署 Worker 的 Cloudflare account，不要選所有 accounts。若 Account API token 畫面未顯示此選項，代表 token 已由目前 account 擁有並限制於該 account。 |
+| Policy scope | 保持 **Entire Account**。這是目前 account-owned token 的 account scope，不是授權目前使用者名下的所有 Cloudflare accounts。Workers Scripts 權限無法再縮限至單一 script。 |
+| Permission policies | 搜尋 `Workers Scripts`，或展開 **Developer Platform**；只對 **Workers Scripts** 選擇 **Edit**，不要另外選 Read。介面應只顯示一項已選 permission group。 |
 | Token expiration | 建議選 **90 days**；需要較少輪替時可選 **1 year**，不建議 `No expiration`。 |
 | Client IP address filtering | 家用網路、動態 IP、VPN 或會移動使用時留白。只有已知固定 public egress IP 時才設定 Allow，單一 IPv4 使用 `/32`、單一 IPv6 使用 `/128`。 |
 
@@ -368,7 +374,8 @@ Routes、Workers KV Storage、Workers R2 Storage、Workers Tail 或 Account Sett
 下一次重新部署前必須輪替 token。
 
 按 **Continue to summary** 後，確認摘要只有目前 account 的 **Workers Scripts
-Edit**，再建立 token。token secret 只顯示一次；不要貼進 README、終端指令列、聊天
+Edit**，沒有其他 permission group，再建立 token。Cloudflare 官方權限表將它列為
+account-scoped 的 Worker script 寫入權限。token secret 只顯示一次；不要貼進 README、終端指令列、聊天
 或截圖，直接在下一個 `configure` 指令的隱藏輸入提示貼上。32 字元 account ID 不是
 token secret，可從 Cloudflare account URL 或 dashboard Overview 取得；不要把個人
 account ID 寫入專案文件。
@@ -1612,11 +1619,18 @@ template shown on that page; it adds Workers Routes, KV, R2, Tail, and other
 read permissions that this project does not use. Select **Start from scratch**
 instead:
 
+The current Account API token editor no longer presents `Account` as a nested
+menu. In **Edit policy**, leave the top policy scope set to **Entire Account**,
+then enter `Workers Scripts` in **Search for permission groups...**.
+Alternatively, expand **Developer Platform** and find the same permission.
+Select only **Edit** for **Workers Scripts**. `Developer Platform` is a UI
+category, not an additional permission.
+
 | Field | Setting |
 | --- | --- |
 | Token name | Use a descriptive purpose, such as `stock-forecasting-tpex-relay-deployer`. |
-| Permission policies | Keep exactly one row: **Account → Workers Scripts → Edit**. A separate Read permission is not required. |
-| Account resources | Include only the Cloudflare account that will own the Worker, not all accounts. If this selector is absent for an Account API token, the token is already owned by and scoped to the current account. |
+| Policy scope | Keep **Entire Account**. This is the account scope of the current account-owned token; it does not grant access to every Cloudflare account owned by the current user. Workers Scripts cannot be narrowed to a single script. |
+| Permission policies | Search for `Workers Scripts`, or expand **Developer Platform**; select only **Edit** for **Workers Scripts** and do not add Read. The UI should show only one selected permission group. |
 | Token expiration | **90 days** is recommended; use **1 year** when less frequent rotation is necessary. Avoid `No expiration`. |
 | Client IP address filtering | Leave this blank for residential networks, dynamic addresses, VPNs, or mobile use. Restrict it only for a known fixed public egress address, using `/32` for one IPv4 address or `/128` for one IPv6 address. |
 
@@ -1630,12 +1644,14 @@ interrupt a Pod using the relay; it only requires token rotation before a
 future deployment.
 
 On **Continue to summary**, verify that the summary contains only **Workers
-Scripts Edit** for the current account, then create the token. The token secret
-is displayed only once. Do not paste it into the README, a shell command line,
-chat, or a screenshot; paste it directly into the hidden prompt from the next
-`configure` command. The 32-character account ID is not the token secret and
-can be found in the Cloudflare account URL or dashboard Overview. Do not put a
-personal account ID in project documentation.
+Scripts Edit** for the current account and no other permission group, then
+create the token. Cloudflare's permission reference defines it as the
+account-scoped permission that grants write access to Worker scripts. The token
+secret is displayed only once. Do not paste it into the README, a shell command
+line, chat, or a screenshot; paste it directly into the hidden prompt from the
+next `configure` command. The 32-character account ID is not the token secret
+and can be found in the Cloudflare account URL or dashboard Overview. Do not
+put a personal account ID in project documentation.
 
 ```bash
 bash scripts/runpod_workflow.sh tpex-proxy configure
