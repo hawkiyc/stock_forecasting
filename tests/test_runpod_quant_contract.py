@@ -919,6 +919,11 @@ def test_tpex_cloud_run_relay_is_closed_cpu_only_and_warmed_before_download() ->
     assert "tpex-relay|tpex-proxy" in workflow
     assert "cloudrun/tpex-relay/src/relay.mjs" in sync
     assert "cloudrun/tpex-relay/src/server.mjs" in sync
+    assert (
+        "GCP_TPEX_RELAY_SECRET|RUNPOD_EODHD_SECRET_NAME|RUNPOD_HF_SECRET_NAME|"
+        "RUNPOD_TPEX_PROXY_SECRET_NAME|RUNPOD_WANDB_SECRET_NAME" in sync
+    )
+    assert '*API_KEY|*TOKEN|*SECRET*|*PASSWORD*' in sync
     assert '"TPEX_PROXY_TOKEN":"%s"' in create_cpu
     assert "workers.dev" not in create_cpu
     assert "run.app" in create_cpu

@@ -160,8 +160,8 @@ while IFS= read -r env_line || [[ -n "${env_line}" ]]; do
     esac
     env_key="${env_assignment%%=*}"
     case "${env_key}" in
-        RUNPOD_EODHD_SECRET_NAME|RUNPOD_HF_SECRET_NAME|RUNPOD_TPEX_PROXY_SECRET_NAME|RUNPOD_WANDB_SECRET_NAME)
-            # Secret identifiers are safe metadata; their values are never credentials.
+        GCP_TPEX_RELAY_SECRET|RUNPOD_EODHD_SECRET_NAME|RUNPOD_HF_SECRET_NAME|RUNPOD_TPEX_PROXY_SECRET_NAME|RUNPOD_WANDB_SECRET_NAME)
+            # Secret resource identifiers are safe metadata; their values are never credentials.
             continue
             ;;
         *API_KEY|*TOKEN|*SECRET*|*PASSWORD*|RUNPOD_S3_ACCESS_KEY_ID)
