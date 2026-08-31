@@ -39,7 +39,7 @@ __all__ = [
     "ProviderRequestError",
     "RequestRecord",
     "TPExProvider",
+    "TWSEProvider",
     "TpexRelayTransport",
     "TpexWorkerTransport",
-    "TWSEProvider",
 ]

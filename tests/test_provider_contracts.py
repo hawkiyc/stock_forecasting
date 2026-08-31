@@ -170,7 +170,7 @@ def test_tpex_relay_transport_rejects_open_proxy_inputs() -> None:
         transport.request_url("https://example.com/www/zh-tw/bulletin/exDailyQ")
     with pytest.raises(ValueError, match="unsupported upstream"):
         transport.request_url("https://www.tpex.org.tw/arbitrary")
-    with pytest.raises(ValueError, match="run.app"):
+    with pytest.raises(ValueError, match=r"run\.app"):
         TpexRelayTransport(
             origin="https://example.com",
             token="fixture-token-that-is-longer-than-thirty-two-characters",

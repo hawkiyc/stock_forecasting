@@ -152,21 +152,20 @@ def _validate_value(key: str, value: str) -> str:
             r"[a-z0-9]+(?:-[a-z0-9]+)+", region
         ) is None:
             _fail("RUNPOD_S3_ENDPOINT is not an approved RunPod endpoint")
-    elif key == "TPEX_PROXY_URL":
-        if value and re.fullmatch(
-            r"https://(?:"
-            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-            r"\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev"
-            r"|"
-            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-            r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.run\.app"
-            r")/?",
-            value,
-        ) is None:
-            _fail(
-                "TPEX_PROXY_URL must be an approved run.app origin or a preserved "
-                "legacy workers.dev origin"
-            )
+    elif key == "TPEX_PROXY_URL" and value and not re.fullmatch(
+        r"https://(?:"
+        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        r"\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev"
+        r"|"
+        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.run\.app"
+        r")/?",
+        value,
+    ):
+        _fail(
+            "TPEX_PROXY_URL must be an approved run.app origin or a preserved "
+            "legacy workers.dev origin"
+        )
     return value
 
 
