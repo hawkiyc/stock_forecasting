@@ -30,6 +30,12 @@ from stock_forecasting.data.manifest import (
     artifact_metadata,
     atomic_write_json,
 )
+from stock_forecasting.data.provider_checkpoint import (
+    ProviderCheckpoint,
+    load_provider_checkpoint,
+    publish_provider_checkpoint,
+    quarantine_provider_checkpoint,
+)
 from stock_forecasting.data.providers import (
     EODHD_DEFAULT_DAILY_API_CALL_LIMIT,
     EODHD_DEFAULT_REQUESTS_PER_MINUTE,
@@ -54,6 +60,8 @@ from stock_forecasting.data.schema import (
     TRAINING_TARGET_ASSET_TYPES,
     normalize_ohlcv_frame,
 )
+
+PROVIDER_MATERIALIZATION_REVISION = "provider-materialization-v1"
 
 
 def _ordered_thread_map[InputT, ResultT](
@@ -123,6 +131,7 @@ class IngestionOptions:
     acquisition_deadline_epoch_seconds: float | None = None
     preparation_reserve_seconds: int | None = None
     tpex_proxy_url: str | None = None
+    provider_checkpoint_root: Path | None = None
 
 
 class _ParquetSink:
@@ -274,10 +283,14 @@ class _ProviderArtifacts:
     row_count: int
     request_count: int
     cache_hits: int
+    checkpoint_identity_sha256: str | None = None
+    checkpoint_reused: bool = False
 
     def cleanup(self) -> None:
-        """Remove only launch-local provider fragments after merge or pause."""
+        """Remove only launch-local provider fragments after publication."""
 
+        if self.checkpoint_identity_sha256 is not None:
+            return
         self.parquet_path.unlink(missing_ok=True)
         self.request_log_path.unlink(missing_ok=True)
 
@@ -287,6 +300,176 @@ class _ProviderLoopOutcome:
     provider: str
     result: Any | None = None
     error: Exception | None = None
+
+
+def _nonnegative_stat(payload: Mapping[str, Any], key: str) -> int:
+    value = payload.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"Provider checkpoint has an invalid {key} statistic")
+    return value
+
+
+def _provider_stats_payload(stats: _ProviderStats) -> dict[str, Any]:
+    return {
+        "benchmark_rows": stats.benchmark_rows,
+        "corporate_action_rows": stats.corporate_action_rows,
+        "delisted_eod_only_symbols": sorted(stats.delisted_eod_only_symbols),
+        "dropped_source_rows": stats.dropped_source_rows,
+        "empty_series": stats.empty_series,
+        "estimated_calls": stats.estimated_calls,
+        "missing_share_multiplier_details": stats.missing_share_multiplier_details,
+        "skipped_unsupported_action_rows": stats.skipped_unsupported_action_rows,
+        "skipped_unsupported_action_types": dict(
+            sorted(stats.skipped_unsupported_action_types.items())
+        ),
+        "taiwan_trading_dates": stats.taiwan_trading_dates,
+    }
+
+
+def _provider_stats_from_payload(payload: Any) -> _ProviderStats:
+    required_keys = {
+        "benchmark_rows",
+        "corporate_action_rows",
+        "delisted_eod_only_symbols",
+        "dropped_source_rows",
+        "empty_series",
+        "estimated_calls",
+        "missing_share_multiplier_details",
+        "skipped_unsupported_action_rows",
+        "skipped_unsupported_action_types",
+        "taiwan_trading_dates",
+    }
+    if not isinstance(payload, dict) or set(payload) != required_keys:
+        raise ValueError("Provider checkpoint statistics are invalid")
+    delisted_symbols = payload["delisted_eod_only_symbols"]
+    if (
+        not isinstance(delisted_symbols, list)
+        or any(not isinstance(value, str) or not value for value in delisted_symbols)
+        or delisted_symbols != sorted(set(delisted_symbols))
+    ):
+        raise ValueError("Provider checkpoint delisted-symbol statistics are invalid")
+    skipped_types = payload["skipped_unsupported_action_types"]
+    if not isinstance(skipped_types, dict) or any(
+        not isinstance(key, str)
+        or not key
+        or not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        for key, value in skipped_types.items()
+    ):
+        raise ValueError("Provider checkpoint skipped-action statistics are invalid")
+    taiwan_trading_dates = payload["taiwan_trading_dates"]
+    if taiwan_trading_dates is not None and (
+        not isinstance(taiwan_trading_dates, int)
+        or isinstance(taiwan_trading_dates, bool)
+        or taiwan_trading_dates < 0
+    ):
+        raise ValueError("Provider checkpoint Taiwan session statistic is invalid")
+    return _ProviderStats(
+        estimated_calls=_nonnegative_stat(payload, "estimated_calls"),
+        empty_series=_nonnegative_stat(payload, "empty_series"),
+        dropped_source_rows=_nonnegative_stat(payload, "dropped_source_rows"),
+        corporate_action_rows=_nonnegative_stat(payload, "corporate_action_rows"),
+        missing_share_multiplier_details=_nonnegative_stat(
+            payload,
+            "missing_share_multiplier_details",
+        ),
+        skipped_unsupported_action_rows=_nonnegative_stat(
+            payload,
+            "skipped_unsupported_action_rows",
+        ),
+        skipped_unsupported_action_types=Counter(skipped_types),
+        benchmark_rows=_nonnegative_stat(payload, "benchmark_rows"),
+        taiwan_trading_dates=taiwan_trading_dates,
+        delisted_eod_only_symbols=set(delisted_symbols),
+    )
+
+
+def _artifacts_from_provider_checkpoint(
+    checkpoint: ProviderCheckpoint,
+    *,
+    reused: bool,
+) -> tuple[_ProviderArtifacts, _ProviderStats]:
+    metadata = checkpoint.metadata
+    if set(metadata) != {"cache_hits", "provider_stats"}:
+        raise ValueError("Provider checkpoint metadata is invalid")
+    cache_hits = metadata["cache_hits"]
+    if (
+        not isinstance(cache_hits, int)
+        or isinstance(cache_hits, bool)
+        or not 0 <= cache_hits <= checkpoint.request_count
+    ):
+        raise ValueError("Provider checkpoint cache-hit count is invalid")
+    stats = _provider_stats_from_payload(metadata["provider_stats"])
+    return (
+        _ProviderArtifacts(
+            provider=checkpoint.provider,
+            parquet_path=checkpoint.parquet_path,
+            request_log_path=checkpoint.request_log_path,
+            row_count=checkpoint.row_count,
+            request_count=checkpoint.request_count,
+            cache_hits=cache_hits,
+            checkpoint_identity_sha256=checkpoint.identity_sha256,
+            checkpoint_reused=reused,
+        ),
+        stats,
+    )
+
+
+def _checkpointed_provider_runner(
+    *,
+    provider: str,
+    runner: Callable[[], _ProviderArtifacts],
+    checkpoint_root: Path,
+    checkpoint_identity: dict[str, Any],
+    stats: dict[str, _ProviderStats],
+) -> Callable[[], _ProviderArtifacts]:
+    try:
+        checkpoint = load_provider_checkpoint(
+            checkpoint_root,
+            provider=provider,
+            identity=checkpoint_identity,
+        )
+        if checkpoint is not None:
+            artifacts, restored_stats = _artifacts_from_provider_checkpoint(
+                checkpoint,
+                reused=True,
+            )
+            stats[provider] = restored_stats
+            return lambda: artifacts
+    except ValueError:
+        quarantine_provider_checkpoint(
+            checkpoint_root,
+            provider=provider,
+            identity=checkpoint_identity,
+        )
+
+    def run_and_publish() -> _ProviderArtifacts:
+        local_artifacts = runner()
+        try:
+            published = publish_provider_checkpoint(
+                checkpoint_root,
+                provider=provider,
+                identity=checkpoint_identity,
+                parquet_path=local_artifacts.parquet_path,
+                request_log_path=local_artifacts.request_log_path,
+                row_count=local_artifacts.row_count,
+                request_count=local_artifacts.request_count,
+                metadata={
+                    "cache_hits": local_artifacts.cache_hits,
+                    "provider_stats": _provider_stats_payload(stats[provider]),
+                },
+            )
+            artifacts, restored_stats = _artifacts_from_provider_checkpoint(
+                published,
+                reused=False,
+            )
+            stats[provider] = restored_stats
+            return artifacts
+        finally:
+            local_artifacts.cleanup()
+
+    return run_and_publish
 
 
 class _ProviderDataContractError(RuntimeError):
@@ -508,6 +691,10 @@ def _aggregate_provider_error(
                 "recorded_requests": artifacts.request_count,
                 "cache_hits": artifacts.cache_hits,
                 "rows": artifacts.row_count,
+                "materialization_checkpoint": {
+                    "identity_sha256": artifacts.checkpoint_identity_sha256,
+                    "reused": artifacts.checkpoint_reused,
+                },
                 **_skipped_action_outcome(stats[provider]),
             }
             continue
@@ -780,6 +967,21 @@ def _progress_identity(options: IngestionOptions) -> dict[str, Any]:
     return identity
 
 
+def _provider_checkpoint_identity(
+    options: IngestionOptions,
+    *,
+    provider: str,
+) -> dict[str, Any]:
+    """Bind reusable provider materialization to content-affecting inputs only."""
+
+    return {
+        "materialization_revision": PROVIDER_MATERIALIZATION_REVISION,
+        "provider": provider,
+        "training_security_scope": TRAINING_SECURITY_SCOPE,
+        "dataset_request": _progress_identity(options),
+    }
+
+
 def _progress_context(options: IngestionOptions) -> dict[str, Any]:
     context: dict[str, Any] = {
         "acquisition_policy": {
@@ -858,6 +1060,13 @@ def ingest_daily_ohlcv(
         options.raw_cache_root,
         cache_revision=options.cache_revision,
     )
+    provider_checkpoint_root = (
+        options.provider_checkpoint_root
+        if options.provider_checkpoint_root is not None
+        else options.raw_cache_root.parent / "provider-checkpoints"
+    )
+    if provider_checkpoint_root.exists() and provider_checkpoint_root.is_symlink():
+        raise ValueError("Provider checkpoint root must not be a symlink")
     progress = DownloadProgress(
         path=options.progress_path or options.manifest_root / "download-progress.json",
         raw_cache_root=options.raw_cache_root,
@@ -1164,6 +1373,19 @@ def ingest_daily_ohlcv(
             for provider_class in (TWSEProvider, TPExProvider):
                 runners[provider_class.name] = make_taiwan_runner(provider_class)
 
+        runners = {
+            provider: _checkpointed_provider_runner(
+                provider=provider,
+                runner=runner,
+                checkpoint_root=provider_checkpoint_root,
+                checkpoint_identity=_provider_checkpoint_identity(
+                    options,
+                    provider=provider,
+                ),
+                stats=stats,
+            )
+            for provider, runner in sorted(runners.items())
+        }
         outcomes = _run_parallel_provider_loops(runners)
         aggregate_error = _aggregate_provider_error(outcomes, stats)
         if aggregate_error is not None:
@@ -1230,6 +1452,20 @@ def ingest_daily_ohlcv(
         for provider, provider_stats in sorted(stats.items())
         if provider_stats.taiwan_trading_dates is not None
     }
+    provider_materialization_checkpoints: dict[str, dict[str, Any]] = {}
+    for provider, outcome in sorted(outcomes.items()):
+        artifacts = outcome.result
+        if (
+            not isinstance(artifacts, _ProviderArtifacts)
+            or artifacts.checkpoint_identity_sha256 is None
+        ):
+            raise RuntimeError(
+                f"Provider completed without a durable materialization checkpoint: {provider}"
+            )
+        provider_materialization_checkpoints[provider] = {
+            "identity_sha256": artifacts.checkpoint_identity_sha256,
+            "reused": artifacts.checkpoint_reused,
+        }
 
     raw_artifact = artifact_metadata(
         options.output,
@@ -1278,6 +1514,9 @@ def ingest_daily_ohlcv(
             "provider_billing_quota_accounting": "external_to_max_api_calls",
             "recorded_requests": request_log.count,
             "network_requests": request_budget.network_requests,
+            "network_requests_semantics": (
+                "current_acquisition_attempt_only_excludes_reused_provider_checkpoints"
+            ),
             "eodhd_limited_network_requests": request_budget.limited_network_requests,
             "network_requests_by_provider": request_budget.provider_counts,
             "cache_hits": request_log.cache_hits,
@@ -1294,9 +1533,17 @@ def ingest_daily_ohlcv(
             "provider_max_backoff_scope": ["eodhd", "tpex_official", "twse_official"],
             "taiwan_request_count_ceiling": None,
             "provider_execution": (
-                "parallel_independent_loops_joined_before_process_exit_and_deterministic_merge"
+                "parallel_independent_loops_joined_before_process_exit_with_"
+                "durable_provider_checkpoints_and_deterministic_merge"
             ),
             "provider_execution_workers_each": provider_workers,
+            "provider_materialization_revision": PROVIDER_MATERIALIZATION_REVISION,
+            "provider_materialization_checkpoint_scope": (
+                "per_dataset_request_and_provider_fail_closed_integrity_checked"
+            ),
+            "provider_materialization_checkpoints": (
+                provider_materialization_checkpoints
+            ),
             "read_only_cache_fallback_namespaces": len(cache_fallback_roots),
             "taiwan_trading_dates_by_provider": taiwan_trading_date_counts,
             "execution_workers": options.workers,

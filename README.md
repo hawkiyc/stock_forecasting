@@ -201,16 +201,19 @@ Stage 1 / Stage 2 訓練（完全離線）
 - `--max-api-calls`、`--eodhd-qps`、`--taiwan-qps` 與 `--maxBackoff` 是每次 CPU Pod
   launch 的 acquisition policy，由 `runpod_workflow.sh cpu prepare` 設定；它們不屬於
   immutable dataset selection，也不會改變 dataset request identity。
-- 任一 provider 先退出都不會取消其他 provider；只有全部 provider 迴圈退出後，流程才
-  發布續傳狀態或固定順序合併 provider-local artifacts。
+- 任一 provider 先退出都不會取消其他 provider；每個成功完成的 provider 會先以
+  dataset request、training security scope 與 materialization revision 綁定的
+  SHA-256 checkpoint 原子發布。只有全部 provider 迴圈退出後，流程才發布續傳狀態
+  或依固定順序合併已驗證的 provider checkpoints。
 - Dataset contract 改版或日期改變會建立新的 immutable namespace；新 namespace
   可唯讀命中其他 dataset namespace 中相同 cache revision 與 request identity 的 raw JSON cache，
   但新的 Parquet、manifest 與 progress 只會寫入自己的 namespace。
 - QPS 與 `max_api_calls` 都不是 provider 的每日／每週 quota，也不代表 EODHD
   不同 endpoint 的計費 call units。
 - 暫時性 provider 錯誤、429、單次 request budget 或 acquisition time budget
-  耗盡時，保留成功的 raw responses、寫入 `download-progress.json`，並允許下一個
-  CPU Pod 只補未快取的 requests。
+  耗盡時，保留成功的 raw responses 與已完成的 provider materialization checkpoints、
+  寫入 `download-progress.json`，並允許下一個 CPU Pod 直接重用已完成 provider，
+  只對未完成 provider 補未快取的 requests 並重新 materialize。
 - CPU workflow 預設保留 max runtime 的 25% 給 canonical data cleaning 與 causal
   window construction（最多 2 小時，亦可用 `--prepareReserve` 明確設定）；下載完成的 raw Parquet、request log
   與 download manifest 會先發布成 durable `downloaded` checkpoint。後續 Pod 可完全
@@ -791,14 +794,16 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    這個有效核心數。每個 provider 有自己的 QPS limiter。`--max-api-calls` 只限制 EODHD，
    TWSE／TPEx 沒有專案端 request-count ceiling；三個 provider 都由同一個
    `--maxBackoff` 值控制各自的退避邊界。
-   任一 provider 先退出都不會取消另外兩個；主流程 join 全部迴圈後才合併 provider-local
-   Parquet/request-log 分片或發布續傳狀態。完整 request 估算只作資訊；workflow 自動保留 max runtime 的 25%（最多 2 小時；預設 6 小時即
+   任一 provider 先退出都不會取消另外兩個；完成的 provider 會先原子發布 durable
+   Parquet/request-log checkpoint。主流程 join 全部迴圈後才合併已驗證的 checkpoints
+   或發布續傳狀態。完整 request 估算只作資訊；workflow 自動保留 max runtime 的 25%（最多 2 小時；預設 6 小時即
    90 分鐘）給 data cleaning/window construction，也可用 `--prepareReserve` 調整。
 4. 建立並驗證下列 persistent artifacts：
    | 遠端路徑                                                                  | 內容                                              |
    | ------------------------------------------------------------------------- | ------------------------------------------------- |
    | `/runpod-volume/datasets/<dataset-request-sha256>/api-cache/`            | provider raw response cache                       |
    | `/runpod-volume/datasets/<dataset-request-sha256>/download-progress.json` | 續傳 attempt、cache 數量與 provider／budget／runtime 等待狀態 |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/provider-checkpoints/` | 可驗證並跨 CPU Pod 重用的 provider materialization checkpoints |
    | `/runpod-volume/datasets/<dataset-request-sha256>/raw/market.parquet`    | durable `downloaded` checkpoint 的 canonical daily OHLCV |
    | `/runpod-volume/datasets/<dataset-request-sha256>/processed/windows.parquet` | 因果訓練視窗                                  |
    | `/runpod-volume/datasets/<dataset-request-sha256>/download-manifest.json` | 實際 provider、profile、symbols 與下載 provenance |
@@ -842,7 +847,8 @@ request-count 上限。共同 acquisition deadline 仍可讓任何迴圈進入
 `waiting_for_resume`，以保留 data cleaning 時間。流程遵守下列契約：
 
 1. 已成功取得的每個 raw JSON response 仍保留在該 dataset request 專屬的
-   `api-cache/`，不發布不完整 Parquet 或 `state=ready` marker。
+   `api-cache/`。完整的單一 provider 可原子發布至 `provider-checkpoints/`，但不完整的
+   provider staging Parquet 與 aggregate `state=ready` marker 都不會發布。
 2. EODHD 先達 `--max-api-calls` 或先超過最大退避時，都只退出 EODHD 迴圈，
    TWSE／TPEx 繼續；任一台灣 provider 先超過最大退避時，也不會停止 EODHD 或另一個
    台灣 provider。最大退避越界會開啟該 provider client 的共享 circuit breaker；
@@ -856,10 +862,13 @@ request-count 上限。共同 acquisition deadline 仍可讓任何迴圈進入
    `max-api-calls`／EODHD QPS／Taiwan QPS。HTTP status、`Retry-After` 與
    rate-limit headers 只在供應商有回傳時記錄；資料契約錯誤另記安全的 provider、
    operation、symbol/date/month 與 exception type，不記錄 token 或 response body。
+   `complete` outcome 另記 materialization checkpoint identity，以及該 checkpoint
+   是本次新發布或直接重用。
 4. 若任一迴圈仍未完成，dataset lifecycle 依整體 outcome 進入
    `waiting_for_budget`、`waiting_for_provider` 或 `waiting_for_resume`，GPU readiness
-   維持不通過，CPU Pod 才自動終止。若三者都完成，則以固定 provider 順序合併分片，
-   繼續 data cleaning，不會提早關閉 Pod。
+   維持不通過，CPU Pod 才自動終止；已完成 provider 的 durable checkpoints 仍會保留。
+   若三者都完成，則以固定 provider 順序合併通過驗證的 checkpoints，繼續 data
+   cleaning，不會提早關閉 Pod。
 5. 額度恢復後，**不要重新 `configure`、不要改 `--dataset-revision`、不要刪除
    cache**。在本機再次建立 CPU Pod 時，依新的剩餘額度重新輸入 `--max-api-calls`；
    QPS 也可依當次 provider 狀態調整，兩者都不會改變 selection。登入後重新啟動同一個
@@ -872,8 +881,9 @@ request-count 上限。共同 acquisition deadline 仍可讓任何迴圈進入
    bash scripts/runpod_tmux_launch.sh cpu-prepare
    ```
 
-6. 新 attempt 會用相同 dataset request identity 重新播放已快取 responses，只對缺少
-   的 request 呼叫 provider；Parquet 會由完整 response 集合重新建立。只有全部資料、
+6. 新 attempt 會先驗證並重用具有相同 dataset request identity、training security
+   scope 與 materialization revision 的 provider checkpoints。只有未完成的 provider
+   才重新播放已快取 responses 並對缺少的 request 呼叫 provider。只有全部資料、
    manifest 與 selection gate 都通過後，lifecycle 才會變成 `ready`。`all` 模式的
    discovery response 也屬於同一份 immutable cache，因此跨日續傳不會重新取得一份
    已漂移的商品清單。
@@ -890,8 +900,10 @@ price factor，share multiplier 使用 identity `1.0`，並在
 attempt、已快取 response 數、此次 network request 數、可用的完整 request 估算與
 安全的 provider error 摘要，不需要手動開啟 JSON。
 
-這是 request-level 續傳，不是 HTTP response 的 byte-range 續傳。每個成功完成的 API
-request 都是續傳單位。若 `download-progress.json` 的 identity 與目前 dataset request
+這同時提供 request-level 與 provider-materialization-level 續傳，不是 HTTP response
+的 byte-range 續傳。每個成功完成的 API request 是 raw-cache 續傳單位；每個通過 hash
+與 identity 驗證的完整 provider checkpoint 是 materialization 續傳單位。若
+`download-progress.json` 的 identity 與目前 dataset request
 不同，流程會 fail closed，避免混用不同 profile、日期或 universe。過小的
 `--max-api-calls` 會產生可續傳的 `waiting_for_budget`，不是失敗，也不要求重新
 `configure`；可用相同 selection 直接建立下一個 CPU Pod。401／403 或其他非暫時性
@@ -1476,9 +1488,11 @@ The downloader provides:
   acquisition policy values for one CPU Pod launch. They are set by
   `runpod_workflow.sh cpu prepare`, are not part of the immutable dataset
   selection, and cannot change dataset request identity.
-- One provider exiting never cancels another. Only after every provider loop
-  exits does the workflow publish a resume state or deterministically merge
-  provider-local artifacts.
+- One provider exiting never cancels another. Each completed provider first
+  atomically publishes a SHA-256 checkpoint bound to the dataset request,
+  training security scope, and materialization revision. Only after every
+  provider loop exits does the workflow publish a resume state or merge the
+  validated provider checkpoints in deterministic order.
 - A dataset-contract or date change creates a new immutable namespace. That
   namespace may read matching cache revisions and request identities from raw JSON caches in older
   dataset namespaces, while its Parquet files, manifests, and progress remain
@@ -1486,9 +1500,10 @@ The downloader provides:
 - Neither QPS nor `max_api_calls` represents a provider's daily/weekly quota or
   EODHD's endpoint-specific billed call units.
 - After a temporary provider failure, HTTP 429, per-attempt request-budget
-  exhaustion, or acquisition-time exhaustion, successful raw responses remain
-  cached, `download-progress.json` is updated, and a later CPU Pod requests only
-  missing cache entries.
+  exhaustion, or acquisition-time exhaustion, successful raw responses and
+  completed provider-materialization checkpoints remain durable.
+  `download-progress.json` is updated, and a later CPU Pod reuses completed
+  providers while only incomplete providers replay cache and request misses.
 - The CPU workflow reserves 25% of max runtime for canonical cleaning and causal
   window construction by default, capped at 2 hours and explicitly configurable
   through `--prepareReserve`. Once
@@ -2141,8 +2156,9 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    `--max-api-calls` limits only EODHD; TWSE/TPEx have no project-side request
    counter ceiling. All three providers use the same `--maxBackoff` value for
    their independent retry boundary. One provider exiting never
-   cancels the other two. The process joins all loops before deterministically
-   merging provider-local Parquet/request-log parts or publishing a resume state. The
+   cancels the other two. A completed provider first atomically publishes its
+   durable Parquet/request-log checkpoint. The process joins all loops before
+   merging validated checkpoints or publishing a resume state. The
    complete-plan estimate is informational. The workflow automatically reserves
    25% of max runtime for cleaning/window construction (90 minutes for the
    default six-hour runtime and capped at 2 hours), configurable with
@@ -2152,6 +2168,7 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    | ---------------------------------------------------------------------------------- | ----------------------------------------------------------- |
    | `/runpod-volume/datasets/<dataset-request-sha256>/api-cache/`                     | Provider raw-response cache                                 |
    | `/runpod-volume/datasets/<dataset-request-sha256>/download-progress.json`          | Resume attempt, cache counts, and provider/budget/runtime wait state |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/provider-checkpoints/`          | Validated provider-materialization checkpoints reusable across CPU Pods |
    | `/runpod-volume/datasets/<dataset-request-sha256>/raw/market.parquet`             | Canonical daily OHLCV in the durable `downloaded` checkpoint |
    | `/runpod-volume/datasets/<dataset-request-sha256>/processed/windows.parquet`      | Causal training windows                                     |
    | `/runpod-volume/datasets/<dataset-request-sha256>/download-manifest.json`         | Actual providers, profile, symbols, and download provenance |
@@ -2203,7 +2220,9 @@ still place any loop in `waiting_for_resume` to protect cleaning time. The
 workflow follows this contract:
 
 1. Every successful raw JSON response remains in the dataset request's
-   `api-cache/`. No incomplete Parquet or `state=ready` marker is published.
+   `api-cache/`. A complete provider may atomically publish under
+   `provider-checkpoints/`, but incomplete provider staging Parquet and the
+   aggregate `state=ready` marker are never published.
 2. If EODHD reaches `--max-api-calls` or its backoff boundary first, only its
    loop exits; TWSE/TPEx continue. A Taiwan provider crossing its backoff boundary
    likewise does not stop EODHD or the other Taiwan provider. Crossing the
@@ -2219,12 +2238,13 @@ workflow follows this contract:
    and Taiwan QPS. HTTP status, `Retry-After`, and rate-limit headers are stored
    when supplied. Data-contract errors additionally identify the safe provider,
    operation, symbol/date/month, and exception type. Tokens and response bodies
-   are not stored.
+   are not stored. A `complete` outcome also records its materialization
+   checkpoint identity and whether that checkpoint was published or reused.
 4. If any loop is incomplete, the aggregate lifecycle becomes
    `waiting_for_budget`, `waiting_for_provider`, or `waiting_for_resume`; GPU
-   readiness stays blocked, and only then does the CPU Pod terminate. If all
-   loops complete, provider-local parts are merged in a fixed order and cleaning
-   continues instead of closing the Pod early.
+   readiness stays blocked, while durable checkpoints from completed providers
+   remain available. If all loops complete, validated provider checkpoints are
+   merged in a fixed order and cleaning continues instead of closing the Pod early.
 5. After quota becomes available, **do not reconfigure, change
    `--dataset-revision`, or delete the cache**. When creating the next CPU Pod,
    enter a new `--max-api-calls` value for the current remaining quota. QPS may
@@ -2238,9 +2258,10 @@ workflow follows this contract:
    bash scripts/runpod_tmux_launch.sh cpu-prepare
    ```
 
-6. The new attempt replays cached responses under the same dataset request
-   identity and calls the provider only for missing requests. It rebuilds
-   Parquet from the complete response set. The lifecycle becomes `ready` only
+6. The new attempt first validates and reuses provider checkpoints with the same
+   dataset request identity, training security scope, and materialization
+   revision. It replays cached responses only for incomplete providers and calls
+   them only for missing requests. The lifecycle becomes `ready` only
    after all data, manifests, and selection gates pass. The `all`-mode discovery
    response is part of the same immutable cache, so a cross-day resume does not
    replace it with a drifted instrument list.
@@ -2260,8 +2281,10 @@ response count, network requests in that attempt, the full request estimate when
 available, and a safe provider-error summary below the dataset lifecycle, so no
 JSON file needs to be opened manually.
 
-This is request-level resume, not byte-range resume within one HTTP response.
-Each successfully completed API request is the resume unit. A progress identity
+This provides both request-level and provider-materialization-level resume, not
+byte-range resume within one HTTP response. Each successfully completed API
+request is a raw-cache resume unit; each complete provider checkpoint that
+passes hash and identity validation is a materialization resume unit. A progress identity
 that differs from the current profile, dates, universe, or dataset request
 fails closed. An undersized `--max-api-calls` produces resumable
 `waiting_for_budget`, not failure; create another CPU Pod with the same selection.

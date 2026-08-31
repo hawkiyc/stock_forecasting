@@ -43,14 +43,19 @@ def _gregorian_date(value: Any) -> str:
 
     text = str(value).strip().replace("年", "/").replace("月", "/").replace("日", "")
     compact = re.sub(r"[^0-9]", "", text)
-    if len(compact) == 7:
-        return f"{int(compact[:3]) + 1911:04d}-{compact[3:5]}-{compact[5:7]}"
-    if len(compact) == 8:
-        return f"{compact[:4]}-{compact[4:6]}-{compact[6:8]}"
     parts = [part for part in re.split(r"[^0-9]+", text) if part]
     if len(parts) == 3:
         year = int(parts[0]) + (1911 if len(parts[0]) <= 3 else 0)
         return f"{year:04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+    if len(compact) == 6:
+        roc_year = int(compact[:2])
+        if roc_year < 1:
+            raise ValueError(f"Unsupported Taiwan date value: {value!r}")
+        return f"{roc_year + 1911:04d}-{compact[2:4]}-{compact[4:6]}"
+    if len(compact) == 7:
+        return f"{int(compact[:3]) + 1911:04d}-{compact[3:5]}-{compact[5:7]}"
+    if len(compact) == 8:
+        return f"{compact[:4]}-{compact[4:6]}-{compact[6:8]}"
     raise ValueError(f"Unsupported Taiwan date value: {value!r}")
 
 

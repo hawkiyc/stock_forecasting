@@ -40,6 +40,7 @@ DOWNLOAD_MANIFEST_FINAL="${DATA_ROOT}/download-manifest.json"
 DATASET_MANIFEST_FINAL="${DATA_ROOT}/dataset-manifest.json"
 REQUEST_LOG_FINAL="${DATA_ROOT}/manifests/api-request-log.jsonl"
 API_CACHE_ROOT="${DATA_ROOT}/api-cache"
+PROVIDER_CHECKPOINT_ROOT="${DATA_ROOT}/provider-checkpoints"
 DOWNLOAD_PROGRESS="${DATA_ROOT}/download-progress.json"
 FINAL_DATA_FILES=(
     "${RAW_FINAL}"
@@ -542,6 +543,7 @@ if [[ ${REUSE_DOWNLOADED_DATASET} -eq 0 ]]; then
         --output "${RAW_STAGING}"
         --manifest-root "${DATA_STAGING_ROOT}"
         --raw-cache-root "${API_CACHE_ROOT}"
+        --provider-checkpoint-root "${PROVIDER_CHECKPOINT_ROOT}"
         --cache-revision "${RUNPOD_DATASET_REVISION}"
         --progress-path "${DOWNLOAD_PROGRESS}"
         --dataset-request-sha256 "${RUNPOD_DATASET_REQUEST_SHA256}"
@@ -583,8 +585,9 @@ allowed = {"waiting_for_provider", "waiting_for_budget", "waiting_for_resume"}
 if state not in allowed:
     raise SystemExit("Download progress has no supported resumable state")
 print(state)' "${DOWNLOAD_PROGRESS}")"
-        printf 'Acquisition paused in state %s. Cached responses are saved at %s; rerun the same cpu prepare workflow.\n' \
-            "${PREP_RESUMABLE_STATE}" "${API_CACHE_ROOT}" >&2
+        printf 'Acquisition paused in state %s. Cached responses at %s and completed provider checkpoints at %s are preserved; rerun the same cpu prepare workflow.\n' \
+            "${PREP_RESUMABLE_STATE}" "${API_CACHE_ROOT}" \
+            "${PROVIDER_CHECKPOINT_ROOT}" >&2
         exit 75
     fi
     if [[ ${DOWNLOAD_EXIT_CODE} -ne 0 ]]; then

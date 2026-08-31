@@ -133,14 +133,24 @@ if isinstance(outcomes, dict):
                 if isinstance(outcome.get("last_error"), dict)
                 else {}
             )
-            error_fields = []
+            detail_fields = []
+            checkpoint = (
+                outcome.get("materialization_checkpoint")
+                if isinstance(outcome.get("materialization_checkpoint"), dict)
+                else {}
+            )
+            if checkpoint.get("identity_sha256"):
+                detail_fields.append(
+                    "checkpoint="
+                    + ("reused" if checkpoint.get("reused") is True else "published")
+                )
             for key in ("category", "error_type", "operation", "item", "status_code"):
                 value = provider_error.get(key)
                 if value is not None:
-                    error_fields.append(key + "=" + str(value))
+                    detail_fields.append(key + "=" + str(value))
             rendered = provider + ":" + provider_state
-            if error_fields:
-                rendered += "(" + ",".join(error_fields) + ")"
+            if detail_fields:
+                rendered += "(" + ",".join(detail_fields) + ")"
             provider_states.append(rendered)
     if provider_states:
         fields.append("providers=" + ",".join(provider_states))

@@ -51,6 +51,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-root", type=Path)
     parser.add_argument("--raw-cache-root", type=Path)
     parser.add_argument(
+        "--provider-checkpoint-root",
+        type=Path,
+        help=(
+            "Persistent integrity-checked provider Parquet checkpoints; defaults "
+            "to a provider-checkpoints sibling of the raw API cache."
+        ),
+    )
+    parser.add_argument(
         "--progress-path",
         type=Path,
         help="Persistent progress JSON used to resume the same dataset request.",
@@ -157,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
         output=args.output,
         manifest_root=manifest_root,
         raw_cache_root=raw_cache_root,
+        provider_checkpoint_root=args.provider_checkpoint_root,
         cache_revision=args.cache_revision,
         include_delisted=not args.exclude_delisted,
         explicit_us_symbols=tuple(args.symbols),

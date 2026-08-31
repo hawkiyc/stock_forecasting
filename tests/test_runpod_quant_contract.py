@@ -428,6 +428,7 @@ def test_cpu_acquisition_budget_is_resumable_and_reserves_preparation_time() -> 
     assert "parallel_independent_loops_joined_before_process_exit" in ingestion
     assert '"waiting_for_budget"' in progress
     assert '"waiting_for_resume"' in progress
+    assert '"automatic_provider_checkpoint_reuse": True' in progress
     assert "RUNPOD_CPU_PREPARE_RESERVE_SECONDS" in prepare
     assert "ACQUISITION_DEADLINE_EPOCH" in prepare
     assert "RUNPOD_PROVIDER_MAX_BACKOFF_SECONDS" in prepare
@@ -436,7 +437,11 @@ def test_cpu_acquisition_budget_is_resumable_and_reserves_preparation_time() -> 
         ")", maxsplit=1
     )[0]
     assert "FIN_TS_H_START" not in download_arguments
+    assert '--provider-checkpoint-root "${PROVIDER_CHECKPOINT_ROOT}"' in download_arguments
+    assert 'PROVIDER_CHECKPOINT_ROOT="${DATA_ROOT}/provider-checkpoints"' in prepare
     assert 'error.get("provider_outcomes")' in status
+    assert 'outcome.get("materialization_checkpoint")' in status
+    assert '"checkpoint="' in status
     assert 'for key in ("category", "error_type", "operation", "item", "status_code")' in status
     assert 'ln "${RAW_STAGING}" "${RAW_FINAL}"' in prepare
     assert "fin-ts-verify-download" in prepare

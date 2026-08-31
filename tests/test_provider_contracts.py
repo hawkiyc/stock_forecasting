@@ -48,7 +48,11 @@ from stock_forecasting.data.providers.http import (
     TpexRelayTransport,
 )
 from stock_forecasting.data.providers.massive import MassiveProvider
-from stock_forecasting.data.providers.taiwan import TPExProvider, TWSEProvider
+from stock_forecasting.data.providers.taiwan import (
+    TPExProvider,
+    TWSEProvider,
+    _gregorian_date,
+)
 
 
 class _FakeSession:
@@ -940,6 +944,74 @@ def test_eodhd_future_split_reconstruction_cancels_at_the_sample_cutoff() -> Non
 
 def test_eodhd_end_boundary_is_converted_from_exclusive_to_inclusive() -> None:
     assert _inclusive_end("2026-04-30") == "2026-04-29"
+
+
+@pytest.mark.parametrize(
+    ("provider_value", "expected"),
+    (
+        ("950203", "2006-02-03"),
+        ("95/02/03", "2006-02-03"),
+        ("2006/2/3", "2006-02-03"),
+        ("1150220", "2026-02-20"),
+        ("20260220", "2026-02-20"),
+    ),
+)
+def test_taiwan_date_parser_supports_compact_legacy_roc_dates(
+    provider_value: str,
+    expected: str,
+) -> None:
+    assert _gregorian_date(provider_value) == expected
+
+
+def test_tpex_benchmark_parses_real_six_digit_roc_return_dates() -> None:
+    class _BenchmarkClient:
+        def get_json(
+            self,
+            endpoint: str,
+            *,
+            params: dict[str, Any],
+        ) -> tuple[Any, RequestRecord]:
+            assert params == {"date": "2006/02/01", "response": "json"}
+            if endpoint.endswith("/inx"):
+                payload = {
+                    "date": "20060201",
+                    "tables": [
+                        {
+                            "fields": ["日期", "開市", "最高", "最低", "收市", "漲/跌"],
+                            "data": [
+                                ["2006/02/03", "132.00", "132.25", "130.87", "131.94", "1.48"]
+                            ],
+                        }
+                    ],
+                    "stat": "ok",
+                }
+            else:
+                assert endpoint.endswith("/ROE")
+                payload = {
+                    "date": "20060201",
+                    "tables": [
+                        {
+                            "fields": [
+                                "日期",
+                                "櫃買指數",
+                                "櫃買報酬指數(基期:94/12/30)",
+                            ],
+                            "data": [["950203", "131.94", "131.94"]],
+                        }
+                    ],
+                    "stat": "ok",
+                }
+            return payload, _request("tpex_official")
+
+    fetched = TPExProvider(_BenchmarkClient()).fetch_benchmark_month(
+        month="2006-02",
+        dataset_profile="tw_only",
+    )
+
+    assert fetched.frame["timestamp"].dt.strftime("%Y-%m-%d").tolist() == [
+        "2006-02-03"
+    ]
+    assert fetched.frame.loc[0, "adjusted_close"] == pytest.approx(131.94)
 
 
 def test_delisted_instrument_rows_keep_discovery_time_status() -> None:

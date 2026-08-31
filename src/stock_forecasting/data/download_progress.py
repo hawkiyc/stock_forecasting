@@ -192,8 +192,11 @@ class DownloadProgress:
             },
             "cache": _cache_inventory((self.raw_cache_root, *self.read_cache_roots)),
             "resume": {
-                "scope": "successful_raw_json_responses",
+                "scope": (
+                    "successful_raw_json_responses_and_completed_provider_materializations"
+                ),
                 "automatic_cache_reuse": True,
+                "automatic_provider_checkpoint_reuse": True,
                 "next_action": "rerun_the_same_dataset_request",
                 "workflow_command": "bash scripts/runpod_workflow.sh cpu prepare",
             },
