@@ -16,6 +16,10 @@ ALLOWED_KEYS = {
     "CLOUDFLARE_ACCOUNT_ID",
     "CLOUDFLARE_API_TOKEN",
     "CLOUDFLARE_WORKERS_SUBDOMAIN",
+    "GCP_CLOUD_RUN_REGION",
+    "GCP_PROJECT_ID",
+    "GCP_TPEX_RELAY_SECRET",
+    "GCP_TPEX_RELAY_SERVICE",
     "RUNPOD_API_KEY",
     "RUNPOD_NETWORK_VOLUME_ID",
     "RUNPOD_TPEX_PROXY_SECRET_NAME",
@@ -116,6 +120,24 @@ def _validate_value(key: str, value: str) -> str:
             r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value
         ) is None:
             _fail("CLOUDFLARE_WORKERS_SUBDOMAIN has an invalid format")
+    elif key == "GCP_PROJECT_ID":
+        if value and re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", value) is None:
+            _fail("GCP_PROJECT_ID has an invalid format")
+    elif key == "GCP_CLOUD_RUN_REGION":
+        if value != "asia-east1":
+            _fail("GCP_CLOUD_RUN_REGION must be asia-east1")
+    elif key == "GCP_TPEX_RELAY_SERVICE":
+        if value and (
+            len(value) > 49
+            or re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", value) is None
+        ):
+            _fail("GCP_TPEX_RELAY_SERVICE has an invalid Cloud Run service name")
+    elif key == "GCP_TPEX_RELAY_SECRET":
+        if value and (
+            len(value) > 255
+            or re.fullmatch(r"[A-Za-z0-9_-]+", value) is None
+        ):
+            _fail("GCP_TPEX_RELAY_SECRET has an invalid Secret Manager name")
     elif key == "RUNPOD_TPEX_PROXY_SECRET_NAME":
         if value and re.fullmatch(r"[A-Za-z0-9_-]+", value) is None:
             _fail("RUNPOD_TPEX_PROXY_SECRET_NAME contains unsupported characters")
@@ -132,11 +154,19 @@ def _validate_value(key: str, value: str) -> str:
             _fail("RUNPOD_S3_ENDPOINT is not an approved RunPod endpoint")
     elif key == "TPEX_PROXY_URL":
         if value and re.fullmatch(
-            r"https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-            r"\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev/?",
+            r"https://(?:"
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+            r"\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev"
+            r"|"
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+            r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.run\.app"
+            r")/?",
             value,
         ) is None:
-            _fail("TPEX_PROXY_URL must be an approved workers.dev HTTPS origin")
+            _fail(
+                "TPEX_PROXY_URL must be an approved run.app origin or a preserved "
+                "legacy workers.dev origin"
+            )
     return value
 
 

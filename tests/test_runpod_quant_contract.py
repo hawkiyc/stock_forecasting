@@ -819,12 +819,15 @@ def test_eodhd_secret_is_cpu_only() -> None:
     assert 'imported.pop("EODHD_API_TOKEN", None)' in reexec
 
 
-def test_tpex_cloudflare_worker_is_closed_and_cpu_only() -> None:
-    worker = (
-        ROOT / "cloudflare/tpex-proxy/src/index.mjs"
-    ).read_text(encoding="utf-8")
-    config = (
-        ROOT / "cloudflare/tpex-proxy/wrangler.jsonc"
+def test_tpex_cloud_run_relay_is_closed_cpu_only_and_warmed_before_download() -> None:
+    relay = (ROOT / "cloudrun/tpex-relay/src/relay.mjs").read_text(encoding="utf-8")
+    server = (ROOT / "cloudrun/tpex-relay/src/server.mjs").read_text(encoding="utf-8")
+    package = (ROOT / "cloudrun/tpex-relay/package.json").read_text(encoding="utf-8")
+    deploy_script = (ROOT / "scripts/deploy_tpex_cloud_run_relay.sh").read_text(
+        encoding="utf-8"
+    )
+    secret_creator = (
+        ROOT / "scripts/create_runpod_tpex_proxy_secret.py"
     ).read_text(encoding="utf-8")
     workflow = (ROOT / "scripts/runpod_workflow.sh").read_text(encoding="utf-8")
     sync = (ROOT / "scripts/sync_project_to_runpod_volume.sh").read_text(
@@ -837,42 +840,105 @@ def test_tpex_cloudflare_worker_is_closed_and_cpu_only() -> None:
     reexec = (ROOT / "scripts/runpod_reexec_with_pid1_env.py").read_text(
         encoding="utf-8"
     )
-    verifier = (ROOT / "scripts/verify_tpex_cloudflare_proxy.sh").read_text(
+    verifier = (ROOT / "scripts/verify_tpex_cloud_run_relay.sh").read_text(
         encoding="utf-8"
     )
+    warmup = (ROOT / "scripts/warm_tpex_cloud_run_relay.sh").read_text(
+        encoding="utf-8"
+    )
+    cpu_prepare = (ROOT / "scripts/runpod_cpu_prepare.sh").read_text(encoding="utf-8")
+    dotenv_helper = (ROOT / "scripts/update_runpod_env.py").read_text(encoding="utf-8")
     http_client = (
         ROOT / "src/stock_forecasting/data/providers/http.py"
     ).read_text(encoding="utf-8")
 
-    assert 'const UPSTREAM_ORIGIN = "https://www.tpex.org.tw"' in worker
+    assert 'const UPSTREAM_ORIGIN = "https://www.tpex.org.tw"' in relay
     for path in (
         "/www/zh-tw/afterTrading/dailyQuotes",
         "/www/zh-tw/bulletin/exDailyQ",
         "/www/zh-tw/indexInfo/ROE",
         "/www/zh-tw/indexInfo/inx",
     ):
-        assert path in worker
-    assert 'request.method !== "GET"' in worker
-    assert 'request.headers.get("X-TPEX-Proxy-Token")' in worker
-    assert 'redirect: "manual"' in worker
-    assert "MAX_UPSTREAM_REDIRECTS = 3" in worker
-    assert 'redirected.origin !== UPSTREAM_ORIGIN' in worker
-    assert 'error: "tpex_upstream_redirect_limit_exceeded"' in worker
-    assert '"region": "gcp:asia-east1"' in config
-    assert '"required": ["TPEX_PROXY_SHARED_SECRET"]' in config
-    for action in ("configure", "deploy", "verify"):
+        assert path in relay
+        assert path in verifier
+    assert 'request.method !== "GET"' in relay
+    assert 'AUTHENTICATION_HEADER = "X-TPEX-Relay-Token"' in relay
+    assert 'requestUrl.pathname === "/_internal/warmup"' in relay
+    assert "timeoutSignalFactory" in relay
+    assert "UPSTREAM_TIMEOUT_MS = 30_000" in relay
+    assert "MAX_UPSTREAM_BODY_BYTES = 16 * 1024 * 1024" in relay
+    assert 'redirect: "manual"' in relay
+    assert 'cache: "no-store"' in relay
+    assert "MAX_UPSTREAM_REDIRECTS = 3" in relay
+    assert 'redirected.origin !== UPSTREAM_ORIGIN' in relay
+    assert 'error: "tpex_upstream_redirect_limit_exceeded"' in relay
+    assert 'error: "tpex_upstream_redirect_loop"' in relay
+    assert "visitedStates.has(redirectedState)" in relay
+    assert 'const RELAY_VERSION = "1"' in relay
+    assert 'typeof headers.getSetCookie === "function"' in relay
+    assert 'headers.set("Cookie"' in relay
+    assert "MAX_UPSTREAM_REDIRECT_COOKIES = 8" in relay
+    assert '"X-TPEX-Relay-Region"' in relay
+    assert '"X-TPEX-Upstream-Redirect-Cookies"' in relay
+    assert 'process.env.TPEX_PROXY_SHARED_SECRET' in server
+    assert '"node": "22.x.x"' in package
+    assert '"gcp-build": "node --test test/*.test.mjs"' in package
+    for boundary in (
+        '--region="${GCP_CLOUD_RUN_REGION}"',
+        "--execution-environment=gen2",
+        "--allow-unauthenticated",
+        "--cpu=1",
+        "--memory=512Mi",
+        "--concurrency=1",
+        "--min=0",
+        "--max=1",
+        "--timeout=60s",
+        "--cpu-throttling",
+        "--cpu-boost",
+    ):
+        assert boundary in deploy_script
+    assert 'GCP_CLOUD_RUN_REGION}" != "asia-east1"' in deploy_script
+    assert "roles/run.builder" in deploy_script
+    assert "roles/secretmanager.secretAccessor" in deploy_script
+    assert 'secret_version}" =~ ^[1-9][0-9]*$' in deploy_script
+    assert '--set-secrets="TPEX_PROXY_SHARED_SECRET=' in deploy_script
+    assert "Cloud Run service deployment completed" in deploy_script
+    assert "did not create/update the RunPod TPEx Secret" in deploy_script
+    preflight_index = deploy_script.index("--check-access")
+    relay_deploy_index = deploy_script.index('gcloud run deploy "${GCP_TPEX_RELAY_SERVICE}"')
+    secret_create_index = deploy_script.rindex("create_runpod_tpex_proxy_secret.py")
+    assert preflight_index < relay_deploy_index < secret_create_index
+    assert 'query="query { myself { id } }"' in secret_creator
+    assert 'RUNPOD_GRAPHQL_USER_AGENT = "stock-forecasting-runpod-control/0.1"' in (
+        secret_creator
+    )
+    assert '"User-Agent": RUNPOD_GRAPHQL_USER_AGENT' in secret_creator
+    assert '"error_code", "error_name", "error_category", "detail"' in secret_creator
+    for action in ("configure", "deploy", "verify", "status"):
         assert action in workflow
-    assert "cloudflare/tpex-proxy/src/index.mjs" in sync
-    assert "cloudflare/tpex-proxy/wrangler.jsonc" in sync
+    assert "tpex-relay|tpex-proxy" in workflow
+    assert "cloudrun/tpex-relay/src/relay.mjs" in sync
+    assert "cloudrun/tpex-relay/src/server.mjs" in sync
     assert '"TPEX_PROXY_TOKEN":"%s"' in create_cpu
+    assert "workers.dev" not in create_cpu
+    assert "run.app" in create_cpu
+    assert "legacy workers.dev origin" in dotenv_helper
+    assert 'GCP_CLOUD_RUN_REGION must be asia-east1' in dotenv_helper
     assert "TPEX_PROXY_TOKEN" not in create_gpu
     assert 'imported.pop("TPEX_PROXY_TOKEN", None)' in reexec
     assert "request_sha256, _identity = self._identity(endpoint=endpoint" in http_client
     assert "request_endpoint = self.transport.request_url(endpoint)" in http_client
+    assert 'return {"X-TPEX-Relay-Token": self.token}' in http_client
     assert "VERIFY_MAX_ATTEMPTS=8" in verifier
     assert "__FIN_TS_HTTP_STATUS__" in verifier
-    assert "JSONDecodeError" in verifier
+    assert "__FIN_TS_RELAY_REGION__" in verifier
+    assert "__FIN_TS_UPSTREAM_REDIRECT_COOKIES__" in verifier
     assert "retrying in %ss" in verifier
+    assert '"${TPEX_PROXY_URL%/}/_internal/warmup"' in warmup
+    assert "no TPEx upstream request was sent" in warmup
+    warmup_index = cpu_prepare.index('warm_tpex_cloud_run_relay.sh"')
+    download_index = cpu_prepare.index('run fin-ts-download "${DOWNLOAD_ARGUMENTS[@]}"')
+    assert warmup_index < download_index
 
 
 def test_stage_configs_have_identical_architecture_digest() -> None:

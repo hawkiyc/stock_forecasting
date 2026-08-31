@@ -46,7 +46,7 @@ from stock_forecasting.data.providers import (
     ProviderRequestError,
     RequestRecord,
     TPExProvider,
-    TpexWorkerTransport,
+    TpexRelayTransport,
     TWSEProvider,
 )
 from stock_forecasting.data.schema import (
@@ -790,7 +790,7 @@ def _progress_context(options: IngestionOptions) -> dict[str, Any]:
             "provider_max_backoff_seconds": options.max_backoff_seconds,
             "provider_max_backoff_scope": ["eodhd", "tpex_official", "twse_official"],
             "tpex_transport": (
-                "cloudflare_worker_v1" if options.tpex_proxy_url else "direct"
+                "cloud_run_relay_v1" if options.tpex_proxy_url else "direct"
             ),
         }
     }
@@ -1004,7 +1004,7 @@ def ingest_daily_ohlcv(
                 def run_taiwan(sink_part: _ParquetSink, log_part: _RequestLog) -> None:
                     provider_stats = stats[provider_name]
                     tpex_transport = (
-                        TpexWorkerTransport(
+                        TpexRelayTransport(
                             origin=options.tpex_proxy_url,
                             token=tpex_proxy_token,
                         )
@@ -1288,7 +1288,7 @@ def ingest_daily_ohlcv(
             "taiwan_requests_per_second": options.taiwan_requests_per_second,
             "taiwan_requests_per_second_scope": "per_provider",
             "tpex_transport": (
-                "cloudflare_worker_v1" if options.tpex_proxy_url else "direct"
+                "cloud_run_relay_v1" if options.tpex_proxy_url else "direct"
             ),
             "provider_max_backoff_seconds": options.max_backoff_seconds,
             "provider_max_backoff_scope": ["eodhd", "tpex_official", "twse_official"],

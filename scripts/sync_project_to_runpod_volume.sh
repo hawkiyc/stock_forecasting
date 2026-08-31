@@ -90,11 +90,12 @@ append_manifest_file() {
 for root_file in README.md pyproject.toml; do
     append_manifest_file "${root_file}"
 done
-for worker_file in \
-    cloudflare/tpex-proxy/src/index.mjs \
-    cloudflare/tpex-proxy/test/worker.test.mjs \
-    cloudflare/tpex-proxy/wrangler.jsonc; do
-    append_manifest_file "${worker_file}"
+for relay_file in \
+    cloudrun/tpex-relay/package.json \
+    cloudrun/tpex-relay/src/relay.mjs \
+    cloudrun/tpex-relay/src/server.mjs \
+    cloudrun/tpex-relay/test/relay.test.mjs; do
+    append_manifest_file "${relay_file}"
 done
 
 while IFS= read -r absolute_path; do

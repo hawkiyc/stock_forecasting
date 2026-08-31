@@ -138,8 +138,8 @@ if [[ "${FIN_TS_DATASET_PROFILE}" == "tw_only" \
         echo "TPEX_PROXY_TOKEN RunPod Secret is missing or was not resolved" >&2
         exit 2
     fi
-    if [[ ! "${TPEX_PROXY_URL}" =~ ^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev/?$ ]]; then
-        echo "TPEX_PROXY_URL is missing or is not an approved workers.dev origin" >&2
+    if [[ ! "${TPEX_PROXY_URL}" =~ ^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*\.run\.app/?$ ]]; then
+        echo "TPEX_PROXY_URL is missing or is not an approved run.app origin" >&2
         exit 2
     fi
 fi
@@ -564,6 +564,11 @@ if [[ ${REUSE_DOWNLOADED_DATASET} -eq 0 ]]; then
     fi
     if [[ -n "${STAGE1_SYMBOL_LIMIT}" ]]; then
         DOWNLOAD_ARGUMENTS+=(--symbol-limit "${STAGE1_SYMBOL_LIMIT}")
+    fi
+    if [[ "${FIN_TS_DATASET_PROFILE}" == "tw_only" \
+        || "${FIN_TS_DATASET_PROFILE}" == "us_tw_eodhd" \
+        || "${FIN_TS_DATASET_PROFILE}" == "us_tw_massive" ]]; then
+        bash "${SCRIPT_DIR}/warm_tpex_cloud_run_relay.sh"
     fi
     set +e
     "${POETRY_BIN}" run fin-ts-download "${DOWNLOAD_ARGUMENTS[@]}"

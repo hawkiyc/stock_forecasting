@@ -170,11 +170,11 @@ if [[ "${RUNPOD_STAGE}" == "stage1" \
     || "${FIN_TS_DATASET_PROFILE}" == "us_tw_eodhd" \
     || "${FIN_TS_DATASET_PROFILE}" == "us_tw_massive" ) ]]; then
     if [[ ! "${RUNPOD_TPEX_PROXY_SECRET_NAME}" =~ ^[A-Za-z0-9_-]+$ ]]; then
-        echo "RunPod TPEx proxy secret name is missing or invalid; deploy the TPEx Worker first" >&2
+        echo "RunPod TPEx relay secret name is missing or invalid; deploy the Cloud Run relay first" >&2
         exit 2
     fi
-    if [[ ! "${TPEX_PROXY_URL}" =~ ^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev/?$ ]]; then
-        echo "TPEX_PROXY_URL is missing or is not an approved workers.dev origin" >&2
+    if [[ ! "${TPEX_PROXY_URL}" =~ ^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*\.run\.app/?$ ]]; then
+        echo "TPEX_PROXY_URL is missing or is not an approved run.app origin" >&2
         exit 2
     fi
 fi

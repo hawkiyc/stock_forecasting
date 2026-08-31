@@ -144,19 +144,23 @@ runpod_load_create_env() {
     export RUNPOD_ENV_FILE="$(runpod_project_env_file "${project_root}")"
 }
 
-runpod_load_tpex_proxy_deploy_env() {
+runpod_load_tpex_relay_deploy_env() {
     local project_root="$1"
     local key=""
 
     set +x
     runpod_validate_project_env_file "${project_root}"
     for key in \
-        CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID TPEX_PROXY_SHARED_SECRET \
-        RUNPOD_API_KEY; do
+        GCP_PROJECT_ID GCP_CLOUD_RUN_REGION GCP_TPEX_RELAY_SERVICE \
+        GCP_TPEX_RELAY_SECRET TPEX_PROXY_SHARED_SECRET RUNPOD_API_KEY; do
         runpod_load_project_env_key "${project_root}" "${key}" required
     done
-    runpod_load_project_env_key "${project_root}" CLOUDFLARE_WORKERS_SUBDOMAIN optional
     export RUNPOD_ENV_FILE="$(runpod_project_env_file "${project_root}")"
+}
+
+runpod_load_tpex_proxy_deploy_env() {
+    # Preserve the former function name for local script compatibility.
+    runpod_load_tpex_relay_deploy_env "$1"
 }
 
 runpod_load_s3_env() {

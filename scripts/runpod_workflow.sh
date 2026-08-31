@@ -12,9 +12,10 @@ usage() {
     cat >&2 <<'EOF'
 Usage:
   bash scripts/runpod_workflow.sh credentials
-  bash scripts/runpod_workflow.sh tpex-proxy configure
-  bash scripts/runpod_workflow.sh tpex-proxy deploy
-  bash scripts/runpod_workflow.sh tpex-proxy verify
+  bash scripts/runpod_workflow.sh tpex-relay configure
+  bash scripts/runpod_workflow.sh tpex-relay deploy
+  bash scripts/runpod_workflow.sh tpex-relay verify
+  bash scripts/runpod_workflow.sh tpex-relay status
   bash scripts/runpod_workflow.sh volume deploy [OPTIONS]
   bash scripts/runpod_workflow.sh configure [SELECTION OPTIONS]
   bash scripts/runpod_workflow.sh selection show
@@ -47,19 +48,23 @@ case "${COMMAND}" in
         [[ $# -eq 0 ]] || { usage; exit 2; }
         exec bash "${SCRIPT_DIR}/configure_runpod_credentials.sh"
         ;;
-    tpex-proxy)
+    tpex-relay|tpex-proxy)
         case "${1:-}" in
             configure)
                 [[ $# -eq 1 ]] || { usage; exit 2; }
-                exec bash "${SCRIPT_DIR}/configure_tpex_cloudflare_proxy.sh"
+                exec bash "${SCRIPT_DIR}/configure_tpex_cloud_run_relay.sh"
                 ;;
             deploy)
                 [[ $# -eq 1 ]] || { usage; exit 2; }
-                exec bash "${SCRIPT_DIR}/deploy_tpex_cloudflare_proxy.sh"
+                exec bash "${SCRIPT_DIR}/deploy_tpex_cloud_run_relay.sh"
                 ;;
             verify)
                 [[ $# -eq 1 ]] || { usage; exit 2; }
-                exec bash "${SCRIPT_DIR}/verify_tpex_cloudflare_proxy.sh"
+                exec bash "${SCRIPT_DIR}/verify_tpex_cloud_run_relay.sh"
+                ;;
+            status)
+                [[ $# -eq 1 ]] || { usage; exit 2; }
+                exec bash "${SCRIPT_DIR}/show_tpex_cloud_run_relay_status.sh"
                 ;;
             *)
                 usage

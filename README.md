@@ -330,8 +330,9 @@ Python 3 只供無第三方相依的 manifest/JSON control helper 使用，不�
    - `eodhd_api_token`：只有 `us_only_eodhd` 或 `us_tw_eodhd` profile
      需要；`tw_only` 不需要。
 
-包含台灣市場的 profile 另需 TPEx Cloudflare Worker。Worker 部署腳本會為每次
-部署建立唯一名稱的 `tpex_proxy_token_<timestamp>_<nonce>` RunPod Secret，並把
+包含台灣市場的 profile 另需位於 GCP `asia-east1`（台灣）的 TPEx Cloud Run relay。
+relay 部署腳本會為每次通過驗證的部署建立唯一名稱的
+`tpex_relay_token_<timestamp>_<nonce>` RunPod Secret，並把
 secret 名稱寫回本機 `.env`；不要手動建立固定名稱的 TPEx secret。
 
 不要複製、開啟或手動修改 `.env`。以隱藏輸入方式建立 credential-only
@@ -341,104 +342,128 @@ secret 名稱寫回本機 `.env`；不要手動建立固定名稱的 TPEx secret
 bash scripts/runpod_workflow.sh credentials
 ```
 
-##### TPEx Cloudflare Worker
+##### TPEx Cloud Run relay
 
-RunPod 機房若被 TPEx data endpoint 以 HTTP 403 拒絕，台灣市場 profile 必須先
-部署受限的 Cloudflare Worker。先在 Cloudflare 建立只有 **Workers Scripts Edit**
-權限的 API token（API 文件將同一能力稱為 `Workers Scripts Write`），取得 32 字元
-account ID，再執行：
-
-在 **Manage account → Account API tokens → Create a token** 畫面採用下列最小權限
-設定。不要選擇畫面中的 **Edit Cloudflare Workers** 範本；該範本會加入本專案不需要
-的 Workers Routes、KV、R2、Tail 與其他 read 權限。改選 **Start from scratch**：
-
-Cloudflare 新版 Account API token 編輯器不再把 `Account` 顯示為可逐層展開的選單。
-進入 **Edit policy** 後，將最上方的 policy scope 保持為 **Entire Account**，在
-**Search for permission groups...** 輸入 `Workers Scripts`；也可以展開
-**Developer Platform** 後尋找同名權限。最後只對 **Workers Scripts** 選擇
-**Edit**。`Developer Platform` 只是介面分類，不是另一項權限。
-
-| 欄位 | 設定 |
-| --- | --- |
-| Token name | 使用可辨識用途的名稱，例如 `stock-forecasting-tpex-relay-deployer`。 |
-| Policy scope | 保持 **Entire Account**。這是目前 account-owned token 的 account scope，不是授權目前使用者名下的所有 Cloudflare accounts。Workers Scripts 權限無法再縮限至單一 script。 |
-| Permission policies | 搜尋 `Workers Scripts`，或展開 **Developer Platform**；只對 **Workers Scripts** 選擇 **Edit**，不要另外選 Read。介面應只顯示一項已選 permission group。 |
-| Token expiration | 建議選 **90 days**；需要較少輪替時可選 **1 year**，不建議 `No expiration`。 |
-| Client IP address filtering | 家用網路、動態 IP、VPN 或會移動使用時留白。只有已知固定 public egress IP 時才設定 Allow，單一 IPv4 使用 `/32`、單一 IPv6 使用 `/128`。 |
-
-不要加入 **Read all resources**、**Write all resources**、**Edit zone DNS**、Workers
-Routes、Workers KV Storage、Workers R2 Storage、Workers Tail 或 Account Settings。
-`Workers Scripts Edit` 已涵蓋部署器需要的 subdomain 查詢／建立、Worker module 上傳與
-`workers.dev` 啟用操作。API token 只在本機執行 `tpex-proxy deploy` 時使用；90 天或
-1 年後到期不會關閉已部署的 Worker，也不會中斷 Pod 透過 relay 抓取 TPEx，只會讓
-下一次重新部署前必須輪替 token。
-
-按 **Continue to summary** 後，確認摘要只有目前 account 的 **Workers Scripts
-Edit**，沒有其他 permission group，再建立 token。Cloudflare 官方權限表將它列為
-account-scoped 的 Worker script 寫入權限。token secret 只顯示一次；不要貼進 README、終端指令列、聊天
-或截圖，直接在下一個 `configure` 指令的隱藏輸入提示貼上。32 字元 account ID 不是
-token secret，可從 Cloudflare account URL 或 dashboard Overview 取得；不要把個人
-account ID 寫入專案文件。
+RunPod 機房若被 TPEx data endpoint 以 HTTP 403 拒絕，台灣市場 profile 必須先部署
+受限的 Cloud Run relay。建立已啟用 billing 的獨立 GCP project，安裝 Google Cloud
+CLI，登入要用來部署的帳號；不需要建立 Cloudflare token、GCP API token、自訂
+subdomain、Pub/Sub topic 或 relay 儲存空間：
 
 ```bash
-bash scripts/runpod_workflow.sh tpex-proxy configure
-bash scripts/runpod_workflow.sh tpex-proxy deploy
+gcloud auth login
 ```
 
-`configure` 以隱藏輸入保存 Cloudflare token，並在首次設定時自動產生共享 relay
-token。若 Cloudflare 帳號尚未設定 `workers.dev` subdomain，請在互動提示輸入一個
-全域唯一名稱；既有帳號可留白，部署器會向 Cloudflare 查詢。`deploy` 透過官方
-Workers API 完成以下受控步驟：
+部署腳本會啟用 Cloud Run、Cloud Build、Artifact Registry、Secret Manager 與 IAM
+API，建立專用 runtime service account，為 source build 使用的 Compute Engine default
+service account 加入 `roles/run.builder`，建立／更新單一 Secret Manager secret，並
+設定 unauthenticated network ingress。執行部署的 GCP principal 因此必須具備這些
+管理動作所需權限。在個人持有、只用於此 relay 的新 project，首次設定可使用 Project
+Owner；多人或正式環境應改用等價的最小權限組合。Google 對 source deployment
+列出的基礎角色為 `roles/run.sourceDeveloper`、
+`roles/serviceusage.serviceUsageConsumer`、runtime identity 上的
+`roles/iam.serviceAccountUser`，而此腳本額外需要啟用 API、建立 service account、
+管理 Secret／Secret IAM、設定 Cloud Run public invoker 與授予 build role 的權限。
+腳本不會嘗試把這些管理角色授予目前登入者。
+
+`--allow-unauthenticated` 只表示 RunPod 能連到 managed `run.app` HTTPS endpoint；
+應用層仍要求長度受限的共享 token。若組織政策禁止 unauthenticated Cloud Run，
+部署會 fail closed，不能把 relay 改成沒有應用層驗證的公開 proxy。
+
+```bash
+bash scripts/runpod_workflow.sh tpex-relay configure
+bash scripts/runpod_workflow.sh tpex-relay deploy
+```
+
+`configure` 只把 GCP project ID、固定區域 `asia-east1`、service／Secret 名稱與首次
+自動產生的共享 relay token 合併寫入本機 `.env`；`gcloud` 登入 credential 留在本機
+Google Cloud CLI credential store，不會寫進 `.env`、source 或 Pod。Cloud Run 會
+自動提供 `run.app` subdomain，互動流程不會要求自訂 domain。
+
+`configure` 會保留既有 RunPod network volume、S3、RunPod API key、已啟用的 relay
+URL，以及遷移前的 Cloudflare 欄位。Cloudflare 欄位不再被新 workflow 使用；在
+Cloud Run live verification 與後續 CPU Pod 實際成功前，腳本也不會刪除舊 Worker
+或撤銷舊 token。若 volume 已部署完成，不要重跑 `credentials` 或 `volume deploy`。
 
 `deploy` 會使用本機 `.env` 內既有的 `RUNPOD_API_KEY` 呼叫官方 GraphQL
 `secretCreate`。`secretCreate` 是 API mutation 名稱，不是建立 RunPod API key 時可
-單獨勾選的權限。你不需要為此預先重建金鑰；若目前金鑰無效、只有讀取權限，或
-無法在所屬 account/team 建立 Secret，`deploy` 會停止，而且不會把新的 Worker
-metadata 啟用到本機 `.env`。
+單獨勾選的權限。`deploy` 會在任何 GCP 寫入前先執行只讀的 `myself { id }` GraphQL
+preflight，不會在檢查階段建立資源。RunPod 的 Cloudflare WAF 會以 Error 1010 拒絕
+Python `urllib` 預設的瀏覽器簽章，因此控制程式固定傳送明確的專案 API-client
+`User-Agent`；不要把這種 403 直接判定成 API key 權限不足。若 gateway 仍拒絕，
+腳本會保留 `error_code`、`error_name`、`error_category` 與安全的 `detail`，同時遮蔽
+API key 與 relay token。API key 只保存在本機 `.env`，不會隨 source sync 上傳；
+preflight 或 Secret 建立失敗時，`deploy` 會停止，也不會把新的 relay metadata
+啟用到本機 `.env`。
 
-`configure` 會合併更新 `.env`，保留既有的 RunPod network volume 與 S3 設定。若
-volume 已部署完成，不要重新執行 `credentials` 或 `volume deploy`；`deploy` 成功後
-直接跳到「驗證 S3 並上傳程式碼」執行 `sync --dry-run` 與 `sync --apply`。
+GraphQL preflight 通過後，部署器才會建立 GCP 資源。共享 token 以 Secret Manager
+的數字 version 掛入特定 Cloud Run revision，不使用會漂移的 `latest`。新 revision
+產生前，Node.js Buildpack 會透過 `gcp-build` 強制執行 relay 單元測試；測試或 build
+失敗就不會部署 revision。新 revision 上線後，部署器先驗證 authenticated warmup，
+再實際驗證 `dailyQuotes`、`exDailyQ`、
+`ROE` 與 `inx` 四個精確路徑；官方 route probe 之間固定間隔 2 秒。全部取得含官方
+資料表的 JSON 後，才建立新的 RunPod
+Secret 並原子更新本機 `TPEX_PROXY_URL` 與 secret reference。若 live verification 或
+RunPod Secret 建立失敗，Cloud Run revision 可能已存在，但該輪仍屬未完成，本機仍
+保留先前 URL／Secret reference。修正原因後重跑 `tpex-relay deploy` 即可。
 
-- 上傳 [`cloudflare/tpex-proxy/src/index.mjs`](cloudflare/tpex-proxy/src/index.mjs)，
-  並將執行位置提示設為 `gcp:asia-east1`。
+- 以 source deployment 上傳 [`cloudrun/tpex-relay`](cloudrun/tpex-relay)，固定使用
+  GCP `asia-east1`（台灣）、Node.js 22、1 vCPU、512 MiB、60 秒 request timeout、
+  request-based CPU throttling 與 startup CPU boost。
+- 設定 service-level `min instances=0`、`max instances=1`、container
+  concurrency `1`。沒有 request 時可 scale to zero；單一 instance／單一 request
+  防止 Cloud Run autoscaling 放大既有 `--taiwan-qps`。relay 不再另設一個與 CLI
+  衝突的 QPS limiter。
 - 只允許 `GET`、共享 token、固定 TPEx origin、四個專案使用中的 path，以及各
   path 的固定 query schema；TPEx 若回傳 redirect，最多跟隨三次且每一跳都必須維持
-  相同 HTTPS origin，跨 origin、缺少 Location 或無限 redirect 都會拒絕。它不是通用
-  或開放式 proxy。
-- 啟用該 script 的 `workers.dev` URL，把同一個 relay token 寫入新建的 RunPod
-  Secret；Cloudflare API token 不會進入 Pod。
-- 直接以 `exDailyQ` 執行 smoke test。驗證器會在首次 `workers.dev` 路由尚未傳播時
-  進行有限次指數退避重試，並以 HTTP status 與安全的 Worker error code 回報失敗；
-  只有 Worker 實際取得含官方資料表的 JSON 才視為部署成功。
+  相同 HTTPS origin。每次 upstream request 的總 timeout 為 30 秒、response body
+  上限為 16 MiB；relay 不進行 provider retry。重新導向回應若設定工作階段 Cookie，
+  只會在驗證同源後承接到下一跳，且 Cookie 數量與 header bytes 都有硬上限；Cookie
+  不會回傳給呼叫端。
+  跨 origin、缺少 Location 或 Cookie 超限會立即拒絕；相同 URL 與 Cookie 狀態再次
+  出現時，會判定為沒有進展的 redirect loop。它不是通用或開放式 proxy。
+- 成功的 2xx response 必須可解析為 JSON object，但 relay 回傳原始 bytes，不重排或
+  改寫 TPEx payload。非 2xx response 保留 status 與有上限的 body，讓既有 provider
+  指數退避決定何時退出；relay 自身不會形成無限 retry loop。
 
-此 Worker 不使用 KV、Durable Objects、資料庫或其他付費 binding；TPEx 每個 cache
-miss 對應一次 Worker request 與一次 upstream subrequest。實際是否落在免費額度內
-仍以 Cloudflare 帳號方案與當下官方 limits 為準。
+這個 MVP 不使用 Pub/Sub、資料庫、Cloud Storage 或固定出口 IP。Cloud Run 使用預設
+動態 egress；`asia-east1` 是台灣 region，但 region 本身不是 TPEx 永遠接受該 IP 的
+保證，所以四路 live verification 才是建立 CPU Pod 前的必要 gate。若日後仍出現
+依 egress IP 而變的 403，再評估 Serverless VPC Access ＋ Cloud NAT 固定 IP；若所有
+GCP 台灣出口都被拒絕，才改用台灣本地 VPS relay。
 
-Cloudflare placement hint 會讓 Worker 靠近指定 region，但不保證特定的固定出口
-IP，也不能保證 TPEx 永遠接受該出口。因此 smoke test 才是建立 CPU Pod 前的實際
-通過條件；可隨時重新驗證：
+`min instances=0` 配合 request-based billing 時，不會為閒置 Cloud Run instance
+支付運算費；但 request、source build、Artifact Registry image 儲存、Secret Manager
+與網路流量仍各自依 GCP 定價與免費額度計費，不能把整體服務視為保證免費。可隨時
+查看 control-plane 狀態或重新執行完整 live verification：
 
 ```bash
-bash scripts/runpod_workflow.sh tpex-proxy verify
+bash scripts/runpod_workflow.sh tpex-relay status
+bash scripts/runpod_workflow.sh tpex-relay verify
 ```
 
 TPEx client 仍使用原始 `https://www.tpex.org.tw` endpoint 與 public query params
-計算 request SHA-256；Worker URL、relay token 與 transport 模式都不會進入 raw
-cache key 或 dataset request identity。切換到 Worker 後，既有成功的 TWSE、TPEx
-與 EODHD JSON cache 會照常續用，只對缺少的 TPEx response 經 Worker 發出請求。
+計算 request SHA-256；Cloud Run URL、relay token 與 transport 模式都不會進入 raw
+cache key 或 dataset request identity。切換 relay 後，既有成功的 TWSE、TPEx 與
+EODHD JSON cache 會照常續用，只對缺少的 TPEx response 經 relay 發出請求。CPU
+workflow 只在確定需要 provider acquisition 時，緊接 `fin-ts-download` 前呼叫已驗證的
+`/_internal/warmup`；該 request 不會呼叫 TPEx。它不放在 tmux 啟動開頭，避免完整
+pytest 與 Hugging Face prefetch 期間 relay 又 scale to zero。若完整 raw checkpoint
+已可重用，連 warmup 都不會執行。
+
+舊的 `tpex-proxy configure|deploy|verify|status` workflow 名稱暫時保留為相容 alias，
+但實際呼叫的已是 Cloud Run 腳本；新操作請使用 `tpex-relay`。
 相關官方文件：
 
-- [Cloudflare API token 建立流程](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/)
-- [Cloudflare Account API tokens](https://developers.cloudflare.com/fundamentals/api/get-started/account-owned-tokens/)
-- [Cloudflare API token 範本權限](https://developers.cloudflare.com/fundamentals/api/reference/template/)
-- [Cloudflare API token 權限表](https://developers.cloudflare.com/fundamentals/api/reference/permissions/)
-- [Cloudflare token expiration 與 IP 限制](https://developers.cloudflare.com/fundamentals/api/how-to/restrict-tokens/)
-- [Cloudflare Workers API](https://developers.cloudflare.com/api/resources/workers/)
-- [Cloudflare Worker placement](https://developers.cloudflare.com/workers/configuration/placement/)
-- [Cloudflare Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
-- [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
+- [安裝 Google Cloud CLI](https://cloud.google.com/sdk/docs/install)
+- [Cloud Run 區域](https://docs.cloud.google.com/run/docs/locations)
+- [從 source 部署 Cloud Run](https://docs.cloud.google.com/run/docs/deploying-source-code)
+- [Node.js Buildpack 與 `gcp-build`](https://docs.cloud.google.com/docs/buildpacks/nodejs)
+- [Cloud Run IAM 角色](https://docs.cloud.google.com/run/docs/reference/iam/roles)
+- [Cloud Run autoscaling](https://docs.cloud.google.com/run/docs/about-instance-autoscaling)
+- [Cloud Run minimum instances 與 billing](https://docs.cloud.google.com/run/docs/configuring/min-instances)
+- [Cloud Run Secret Manager 整合](https://docs.cloud.google.com/run/docs/configuring/services/secrets)
+- [Cloud Run 定價](https://cloud.google.com/run/pricing)
+- [RunPod GraphQL 設定與認證](https://docs.runpod.io/sdks/graphql/configurations)
 - [RunPod GraphQL `secretCreate`](https://docs.runpod.io/sdks/graphql/manage-pod-templates)
 
 接著由腳本建立 network volume。成功回傳的 volume ID、datacenter、S3 region
@@ -627,12 +652,13 @@ train-only robust scales 與 split audit；它不會改變日期、symbol、prov
 bash scripts/runpod_workflow.sh selection show
 ```
 
-`.env` 只保存本機 RunPod/S3/Cloudflare deployment credentials，以及腳本回填的
-volume 與 TPEx Worker metadata；
+`.env` 只保存本機 RunPod/S3 credential、GCP relay metadata、relay shared token，
+以及腳本回填的 volume、RunPod Secret reference 與 TPEx Cloud Run URL；
 stage、資料範圍、runtime 與 config 不從 `.env` 讀取。不要 `source .env`，也不要
 把 API key、token 或 secret value 寫進 README、config、shell script 或提交
-紀錄。Pod 只會收到 RunPod Secret reference 與非敏感 Worker URL，不會收到本機
-account-level RunPod/S3/Cloudflare credential。
+紀錄。`gcloud` credential 只留在本機 Google Cloud CLI credential store。Pod 只會
+收到 RunPod Secret reference 解析出的 relay token 與非敏感 `run.app` URL，不會收到
+本機 account-level RunPod/S3 或 GCP deployment credential。
 
 #### 2. 驗證 S3 並上傳程式碼
 
@@ -1596,9 +1622,9 @@ API key. Then create these fixed-name RunPod Secrets:
    - `eodhd_api_token`: required only by the `us_only_eodhd` and
      `us_tw_eodhd` profiles; it is not required by `tw_only`.
 
-Profiles containing Taiwan data also require the TPEx Cloudflare Worker. Each
-Worker deployment creates a uniquely named
-`tpex_proxy_token_<timestamp>_<nonce>` RunPod Secret and records that secret
+Profiles containing Taiwan data also require a TPEx Cloud Run relay in GCP
+`asia-east1` (Taiwan). Each verified relay deployment creates a uniquely named
+`tpex_relay_token_<timestamp>_<nonce>` RunPod Secret and records that secret
 name in the local `.env`; do not create a fixed-name TPEx secret manually.
 
 Do not copy, open, or manually edit `.env`. Create the credential-only file
@@ -1608,120 +1634,152 @@ through hidden input; the script writes it atomically with mode `600`:
 bash scripts/runpod_workflow.sh credentials
 ```
 
-##### TPEx Cloudflare Worker
+##### TPEx Cloud Run relay
 
 When a RunPod datacenter receives HTTP 403 from TPEx data endpoints, deploy the
-restricted Cloudflare Worker before using a Taiwan-market profile. Create a
-Cloudflare API token with only **Workers Scripts Edit** permission (the API
-documentation calls the same capability `Workers Scripts Write`), obtain the
-32-character account ID, and run:
-
-Use the following least-privilege settings on **Manage account → Account API
-tokens → Create a token**. Do not select the **Edit Cloudflare Workers**
-template shown on that page; it adds Workers Routes, KV, R2, Tail, and other
-read permissions that this project does not use. Select **Start from scratch**
-instead:
-
-The current Account API token editor no longer presents `Account` as a nested
-menu. In **Edit policy**, leave the top policy scope set to **Entire Account**,
-then enter `Workers Scripts` in **Search for permission groups...**.
-Alternatively, expand **Developer Platform** and find the same permission.
-Select only **Edit** for **Workers Scripts**. `Developer Platform` is a UI
-category, not an additional permission.
-
-| Field | Setting |
-| --- | --- |
-| Token name | Use a descriptive purpose, such as `stock-forecasting-tpex-relay-deployer`. |
-| Policy scope | Keep **Entire Account**. This is the account scope of the current account-owned token; it does not grant access to every Cloudflare account owned by the current user. Workers Scripts cannot be narrowed to a single script. |
-| Permission policies | Search for `Workers Scripts`, or expand **Developer Platform**; select only **Edit** for **Workers Scripts** and do not add Read. The UI should show only one selected permission group. |
-| Token expiration | **90 days** is recommended; use **1 year** when less frequent rotation is necessary. Avoid `No expiration`. |
-| Client IP address filtering | Leave this blank for residential networks, dynamic addresses, VPNs, or mobile use. Restrict it only for a known fixed public egress address, using `/32` for one IPv4 address or `/128` for one IPv6 address. |
-
-Do not add **Read all resources**, **Write all resources**, **Edit zone DNS**,
-Workers Routes, Workers KV Storage, Workers R2 Storage, Workers Tail, or Account
-Settings. `Workers Scripts Edit` already covers the subdomain lookup/creation,
-Worker-module upload, and `workers.dev` activation operations used by the
-deployer. The API token is used only by the local `tpex-proxy deploy` control
-command. Its expiration does not disable an already deployed Worker or
-interrupt a Pod using the relay; it only requires token rotation before a
-future deployment.
-
-On **Continue to summary**, verify that the summary contains only **Workers
-Scripts Edit** for the current account and no other permission group, then
-create the token. Cloudflare's permission reference defines it as the
-account-scoped permission that grants write access to Worker scripts. The token
-secret is displayed only once. Do not paste it into the README, a shell command
-line, chat, or a screenshot; paste it directly into the hidden prompt from the
-next `configure` command. The 32-character account ID is not the token secret
-and can be found in the Cloudflare account URL or dashboard Overview. Do not
-put a personal account ID in project documentation.
+restricted Cloud Run relay before using a Taiwan-market profile. Create a
+dedicated GCP project with billing enabled, install the Google Cloud CLI, and
+authenticate the deployment account. No Cloudflare token, GCP API token,
+custom subdomain, Pub/Sub topic, or relay storage is required:
 
 ```bash
-bash scripts/runpod_workflow.sh tpex-proxy configure
-bash scripts/runpod_workflow.sh tpex-proxy deploy
+gcloud auth login
 ```
 
-`configure` stores the Cloudflare token through hidden input and generates the
-shared relay token on first setup. If the Cloudflare account has no
-`workers.dev` subdomain, enter a globally unique name at the prompt; leave it
-blank for an existing account and the deployer queries Cloudflare. `deploy`
-enforces these boundaries through the official Workers API:
+The deployer enables the Cloud Run, Cloud Build, Artifact Registry, Secret
+Manager, and IAM APIs; creates a dedicated runtime service account; grants
+`roles/run.builder` to the Compute Engine default account used for the source
+build; creates or updates one Secret Manager secret; and configures
+unauthenticated network ingress. The GCP principal running it must therefore
+be authorized for those administrative mutations. Project Owner is acceptable
+for first-time setup in a new personal project dedicated to this relay; a
+shared or production project should use an equivalent least-privilege set.
+Google lists `roles/run.sourceDeveloper`,
+`roles/serviceusage.serviceUsageConsumer`, and
+`roles/iam.serviceAccountUser` on the runtime identity as the base source
+deployment roles. This script additionally needs permission to enable APIs,
+create service accounts, manage the secret and its IAM policy, set the public
+Cloud Run invoker policy, and grant the builder role. It does not grant these
+administrative roles to the logged-in principal.
+
+`--allow-unauthenticated` only makes the managed `run.app` HTTPS endpoint
+reachable from RunPod. The application still requires a length-bounded shared
+token. An organization policy that blocks unauthenticated Cloud Run causes a
+fail-closed deployment; never replace application authentication with an open
+general-purpose proxy.
+
+```bash
+bash scripts/runpod_workflow.sh tpex-relay configure
+bash scripts/runpod_workflow.sh tpex-relay deploy
+```
+
+`configure` merges the GCP project ID, fixed `asia-east1` region, service and
+secret names, and an automatically generated shared relay token into local
+`.env`. The `gcloud` login stays in the local Google Cloud CLI credential store
+and never enters `.env`, source, or a Pod. Cloud Run provides a managed
+`run.app` hostname; there is no custom-domain prompt.
+
+The update preserves all existing RunPod volume, S3, API-key, and activated
+relay values, as well as legacy Cloudflare fields during migration. The new
+workflow does not use those Cloudflare values or delete the old Worker/token.
+Keep the old deployment until Cloud Run passes live verification and a CPU Pod
+has succeeded. Do not rerun `credentials` or `volume deploy` when the volume
+already exists.
 
 `deploy` uses the existing `RUNPOD_API_KEY` in the local `.env` to call the
 official GraphQL `secretCreate` mutation. `secretCreate` is an API operation,
-not a separately selectable permission when creating a RunPod API key. There
-is no need to replace the key in advance. If the current key is invalid,
-read-only, or cannot create a Secret in its account/team scope, `deploy` stops
-without activating the new Worker metadata in the local `.env`.
+not a separately selectable permission when creating a RunPod API key. Before
+performing any GCP write, `deploy` runs the read-only `myself { id }` GraphQL
+preflight and creates no resource during that check. RunPod's Cloudflare WAF
+rejects Python `urllib`'s default browser signature with Error 1010, so the
+control script sends an explicit project API-client `User-Agent`; do not infer
+that this particular 403 means the API key lacks permission. If the gateway
+still rejects a request, the script preserves `error_code`, `error_name`,
+`error_category`, and a safe `detail` while redacting the API key and relay
+token. The API key remains in the local `.env` and is excluded from source
+synchronization. If the preflight or Secret creation fails, `deploy` stops
+without activating new relay metadata in the local `.env`.
 
-`configure` merges its updates into `.env` and preserves the existing RunPod
-network-volume and S3 settings. If the volume is already deployed, do not rerun
-`credentials` or `volume deploy`; after `deploy` succeeds, proceed directly to
-"Verify S3 and upload source code" and run `sync --dry-run` and `sync --apply`.
+Only after the GraphQL preflight does the deployer mutate GCP. The shared token
+is mounted from a numbered Secret Manager version into one Cloud Run revision;
+it never uses a drifting `latest` reference. Before a revision is produced, the
+Node.js buildpack must pass the relay unit tests through `gcp-build`; a failed
+test or build cannot deploy a revision. After the revision is live, the deployer
+verifies authenticated warmup and then all four exact routes:
+`dailyQuotes`, `exDailyQ`, `ROE`, and `inx`, with two seconds between official
+route probes. Only official table-shaped JSON from every route allows it to
+create a new RunPod Secret and atomically activate
+`TPEX_PROXY_URL` plus the secret reference in local `.env`. A live-verification
+or RunPod Secret failure can leave the new Cloud Run revision deployed, but the
+workflow remains incomplete and the previous local URL/reference stays active.
+Fix the reported cause and rerun `tpex-relay deploy`.
 
-- It uploads [`cloudflare/tpex-proxy/src/index.mjs`](cloudflare/tpex-proxy/src/index.mjs)
-  with a `gcp:asia-east1` placement hint.
+- Source deployment uploads [`cloudrun/tpex-relay`](cloudrun/tpex-relay) with
+  GCP `asia-east1` (Taiwan), Node.js 22, 1 vCPU, 512 MiB, a 60-second request
+  timeout, request-based CPU throttling, and startup CPU boost.
+- Service-level minimum instances is `0`, maximum instances is `1`, and
+  container concurrency is `1`. It scales to zero while idle and cannot
+  multiply the existing `--taiwan-qps` through autoscaling. The relay does not
+  add a second fixed QPS limiter that could conflict with the CPU CLI setting.
 - It accepts only `GET`, the shared token, the fixed TPEx origin, the four paths
-  used by this project, and each path's fixed query schema. If TPEx redirects a
-  request, the Worker follows at most three hops and every hop must remain on
-  the same HTTPS origin; cross-origin, missing-Location, and looping redirects
-  are rejected. It is not a general or open proxy.
-- It enables the script's `workers.dev` URL and stores the same relay token in
-  a newly created RunPod Secret. The Cloudflare API token never enters a Pod.
-- It runs an `exDailyQ` smoke test. The verifier performs bounded exponential
-  backoff while a new `workers.dev` route propagates and reports failures using
-  the HTTP status plus a safe Worker error code. Deployment passes only when
-  the Worker actually returns official JSON containing a data table.
+  used by this project, and each path's exact query schema. One upstream request
+  has a 30-second total timeout and a 16 MiB response limit. Redirects are
+  limited to three same-origin hops; bounded session cookies can be carried to
+  the next same-origin hop but are never returned to the caller. Cross-origin,
+  missing-Location, cookie-limit, and no-progress loops fail closed. The relay
+  never performs provider retry and is not a general or open proxy.
+- A successful 2xx response must parse as a JSON object, while the relay returns
+  the original bytes rather than rewriting the official payload. A bounded
+  non-2xx response retains its status and body so the existing provider-level
+  exponential backoff decides when to stop.
 
-The Worker uses no KV, Durable Objects, database, or other paid binding. Each
-TPEx cache miss consumes one Worker request and one upstream subrequest.
-Whether usage remains inside the free allowance is governed by the account's
-Cloudflare plan and the current official limits.
+This MVP uses no Pub/Sub, database, Cloud Storage, or static outbound address.
+Cloud Run uses dynamic default egress. Although `asia-east1` is a Taiwan
+region, region selection does not guarantee that TPEx will accept every egress
+address, so four-route live verification is the deployment gate. If 403 later
+varies by egress address, evaluate Serverless VPC Access plus Cloud NAT for a
+static address. Move to a Taiwan domestic VPS only if TPEx rejects all tested
+GCP Taiwan egress.
 
-A Cloudflare placement hint moves execution near the requested region, but it
-does not guarantee a fixed egress IP or permanent acceptance by TPEx. The smoke
-test is therefore the live gate before CPU Pod creation. Re-run it at any time:
+With request-based billing and minimum instances `0`, idle Cloud Run instances
+do not incur compute charges. Requests, source builds, Artifact Registry image
+storage, Secret Manager, and network traffic are still governed by their own
+GCP pricing and free allowances; the service is not guaranteed to be entirely
+free. Inspect control-plane state or rerun complete live verification at any
+time:
 
 ```bash
-bash scripts/runpod_workflow.sh tpex-proxy verify
+bash scripts/runpod_workflow.sh tpex-relay status
+bash scripts/runpod_workflow.sh tpex-relay verify
 ```
 
 The TPEx client still hashes the original `https://www.tpex.org.tw` endpoint
-and public query parameters for request identity. The Worker URL, relay token,
+and public query parameters for request identity. The Cloud Run URL, relay token,
 and transport mode do not enter raw-cache keys or dataset-request identity.
 After switching transports, all successful TWSE, TPEx, and EODHD JSON cache
-entries remain reusable; only missing TPEx responses pass through the Worker.
+entries remain reusable; only missing TPEx responses pass through the relay.
+The CPU workflow calls authenticated `/_internal/warmup` immediately before
+`fin-ts-download`, and only when provider acquisition is actually required.
+Warmup never contacts TPEx. It is intentionally not placed at tmux startup,
+because the complete pytest suite and Hugging Face prefetch could let the relay
+scale back to zero before acquisition. Reusing a complete raw checkpoint skips
+even the warmup request.
+
+The old `tpex-proxy configure|deploy|verify|status` workflow name remains as a
+compatibility alias, but it dispatches to the Cloud Run scripts. Use
+`tpex-relay` for new operations.
 Official references:
 
-- [Create a Cloudflare API token](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/)
-- [Cloudflare Account API tokens](https://developers.cloudflare.com/fundamentals/api/get-started/account-owned-tokens/)
-- [Cloudflare API token template permissions](https://developers.cloudflare.com/fundamentals/api/reference/template/)
-- [Cloudflare API token permission groups](https://developers.cloudflare.com/fundamentals/api/reference/permissions/)
-- [Cloudflare token expiration and IP restrictions](https://developers.cloudflare.com/fundamentals/api/how-to/restrict-tokens/)
-- [Cloudflare Workers API](https://developers.cloudflare.com/api/resources/workers/)
-- [Cloudflare Worker placement](https://developers.cloudflare.com/workers/configuration/placement/)
-- [Cloudflare Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
-- [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
+- [Install the Google Cloud CLI](https://cloud.google.com/sdk/docs/install)
+- [Cloud Run locations](https://docs.cloud.google.com/run/docs/locations)
+- [Deploy Cloud Run from source](https://docs.cloud.google.com/run/docs/deploying-source-code)
+- [Node.js buildpack and `gcp-build`](https://docs.cloud.google.com/docs/buildpacks/nodejs)
+- [Cloud Run IAM roles](https://docs.cloud.google.com/run/docs/reference/iam/roles)
+- [Cloud Run autoscaling](https://docs.cloud.google.com/run/docs/about-instance-autoscaling)
+- [Cloud Run minimum instances and billing](https://docs.cloud.google.com/run/docs/configuring/min-instances)
+- [Cloud Run Secret Manager integration](https://docs.cloud.google.com/run/docs/configuring/services/secrets)
+- [Cloud Run pricing](https://cloud.google.com/run/pricing)
+- [RunPod GraphQL configuration and authentication](https://docs.runpod.io/sdks/graphql/configurations)
 - [RunPod GraphQL `secretCreate`](https://docs.runpod.io/sdks/graphql/manage-pod-templates)
 
 Create the network volume through the script. The returned volume ID,
@@ -1925,13 +1983,15 @@ Inspect the active selection without opening JSON:
 bash scripts/runpod_workflow.sh selection show
 ```
 
-`.env` stores only local RunPod/S3/Cloudflare deployment credentials plus
-volume and TPEx Worker metadata written by the scripts. Stage, data range,
+`.env` stores only local RunPod/S3 credentials, GCP relay metadata, the relay
+shared token, and script-managed volume, RunPod Secret reference, and TPEx
+Cloud Run URL values. Stage, data range,
 runtime, and config are never read from
 `.env`. Do not `source .env`, and never put API keys, tokens, or secret values
 in the README, configs, shell scripts, or commit history. Pods receive RunPod
-Secret references and a non-secret Worker URL, not local account-level RunPod,
-S3, or Cloudflare credentials.
+Secret-resolved relay tokens and a non-secret `run.app` URL. The local `gcloud`
+credential stays in the Google Cloud CLI credential store; account-level
+RunPod, S3, and GCP deployment credentials never enter a Pod.
 
 #### 2. Verify S3 and upload source code
 
