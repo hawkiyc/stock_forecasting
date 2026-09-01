@@ -1150,6 +1150,61 @@ def test_twse_parser_includes_common_stock_tdr_and_allowlisted_equity_etf() -> N
     assert fetched.metadata["dropped_rows"] == 2
 
 
+def test_tpex_drops_zero_price_rows_without_rejecting_the_daily_payload() -> None:
+    payload = {
+        "date": "20070424",
+        "stat": "ok",
+        "tables": [
+            {
+                "fields": [
+                    "代號",
+                    "名稱",
+                    "收盤",
+                    "漲跌",
+                    "開盤",
+                    "最高",
+                    "最低",
+                    "均價",
+                    "成交股數",
+                ],
+                "data": [
+                    [
+                        "4113",
+                        "聯上",
+                        "0.00",
+                        "---",
+                        "0.00",
+                        "0.00",
+                        "0.00",
+                        "0.00",
+                        "200",
+                    ],
+                    [
+                        "6121",
+                        "新普",
+                        "100.00",
+                        "+1.00",
+                        "99.00",
+                        "101.00",
+                        "98.00",
+                        "99.50",
+                        "0",
+                    ],
+                ],
+            }
+        ],
+    }
+
+    fetched = TPExProvider(_StubClient(payload)).fetch_date(
+        date="2007-04-24",
+        dataset_profile="tw_only",
+    )
+
+    assert list(fetched.frame["symbol"]) == ["6121.TWO"]
+    assert fetched.frame.loc[0, "volume"] == 0.0
+    assert fetched.metadata["dropped_rows"] == 1
+
+
 def test_twse_historical_action_without_detail_keeps_price_factor_and_records_gap() -> None:
     class _ActionClient:
         def __init__(self) -> None:

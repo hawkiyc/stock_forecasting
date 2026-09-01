@@ -247,11 +247,17 @@ def _parse_quotes(
             continue
         code = str(row[indexes["symbol"]]).strip().upper()
         asset_type = _asset_type(code, market=market)
-        values = {
+        prices = {
             field: _number(row[indexes[field]])
-            for field in ("open", "high", "low", "close", "volume")
+            for field in ("open", "high", "low", "close")
         }
-        if asset_type is None or any(value is None for value in values.values()):
+        volume = _number(row[indexes["volume"]])
+        if (
+            asset_type is None
+            or volume is None
+            or volume < 0.0
+            or any(value is None or value <= 0.0 for value in prices.values())
+        ):
             dropped += 1
             continue
         rows.append(
@@ -259,7 +265,8 @@ def _parse_quotes(
                 "timestamp": date,
                 "symbol": f"{code}.{suffix}",
                 "asset_type": asset_type,
-                **values,
+                **prices,
+                "volume": volume,
                 "provider": provider,
                 "market": market,
                 "currency": "TWD",
