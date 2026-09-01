@@ -7,7 +7,6 @@ import json
 import re
 from pathlib import Path, PurePosixPath
 
-
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
