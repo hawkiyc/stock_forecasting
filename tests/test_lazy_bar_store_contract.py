@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from itertools import islice
 from pathlib import Path
 
@@ -113,13 +114,9 @@ def test_bar_store_persists_bars_once_and_builds_labels_lazily(
         "asset_total_returns",
         "benchmark_total_returns",
     ):
-        assert lazy_record["label"][label_key] == pytest.approx(
-            legacy_record["label"][label_key]
-        )
+        assert lazy_record["label"][label_key] == pytest.approx(legacy_record["label"][label_key])
     for context_name in ("context", "benchmark_context"):
-        assert lazy_record[context_name]["timestamp"] == legacy_record[context_name][
-            "timestamp"
-        ]
+        assert lazy_record[context_name]["timestamp"] == legacy_record[context_name]["timestamp"]
         for field in CONTEXT_FIELDS:
             assert lazy_record[context_name][field] == pytest.approx(
                 legacy_record[context_name][field]
@@ -155,10 +152,109 @@ def test_bar_store_resume_reuses_completed_outputs(
     }
     first = build_symbol_bar_store(**arguments)
     before = sha256_file(first.bar_store_manifest_path)
-    second = build_symbol_bar_store(**arguments)
+    second = build_symbol_bar_store(**arguments, workers=4)
 
     assert sha256_file(second.bar_store_manifest_path) == before
     assert second.split_counts == first.split_counts
+
+
+def test_memory_planner_reduces_workers_and_rejects_unsafe_single_task() -> None:
+    available = 16 * bar_store_module.GIB
+    budget = bar_store_module._safe_worker_memory_budget(available, None)
+    task_memory = 3 * bar_store_module.GIB
+    plan = bar_store_module._plan_phase_workers(
+        phase="test_compaction",
+        requested_workers=16,
+        detected_cpu_count=16,
+        task_memory_bytes=[task_memory] * 8,
+        task_count=8,
+        reused_tasks=0,
+        available_memory_bytes=available,
+        worker_memory_budget_bytes=budget,
+    )
+
+    assert plan.effective_workers == 3
+    assert plan.estimated_peak_worker_memory_bytes <= budget
+    assert plan.effective_workers < plan.requested_workers
+    assert plan.as_dict()["native_threads_per_worker"] == 1
+
+    with pytest.raises(
+        bar_store_module.PreparationMemoryLimitExceeded,
+        match="completed checkpoints remain reusable",
+    ):
+        bar_store_module._plan_phase_workers(
+            phase="oversized_bucket",
+            requested_workers=4,
+            detected_cpu_count=4,
+            task_memory_bytes=[budget + 1],
+            task_count=1,
+            reused_tasks=0,
+            available_memory_bytes=available,
+            worker_memory_budget_bytes=budget,
+        )
+
+
+def test_parallel_bar_store_matches_serial_output(
+    tmp_path: Path,
+    market_frame: pd.DataFrame,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = tmp_path / "raw" / "market.parquet"
+    raw.parent.mkdir()
+    market_frame.to_parquet(
+        raw,
+        compression="zstd",
+        index=False,
+        row_group_size=200,
+    )
+    contract = _download_contract(raw, tmp_path, len(market_frame))
+    common = {
+        "raw_path": raw,
+        "download_manifest": contract,
+        "window_size": 32,
+        "bucket_count": 4,
+        "batch_rows": 100,
+        "purge_bars": 20,
+        "embargo_bars": 14,
+        "memory_budget_bytes": 8 * bar_store_module.GIB,
+    }
+    monkeypatch.setattr(bar_store_module, "_visible_cpu_count", lambda: 4)
+    monkeypatch.setattr(
+        bar_store_module,
+        "_detect_available_memory_bytes",
+        lambda: 16 * bar_store_module.GIB,
+    )
+
+    serial = build_symbol_bar_store(
+        **common,
+        output_root=tmp_path / "serial" / "bar-store",
+        workers=1,
+    )
+    parallel = build_symbol_bar_store(
+        **common,
+        output_root=tmp_path / "parallel" / "bar-store",
+        workers=4,
+    )
+
+    serial_manifest = json.loads(serial.bar_store_manifest_path.read_text(encoding="utf-8"))
+    parallel_manifest = json.loads(parallel.bar_store_manifest_path.read_text(encoding="utf-8"))
+    assert serial_manifest["identity_sha256"] == parallel_manifest["identity_sha256"]
+    assert serial.split_counts == parallel.split_counts
+    assert serial.split_audit == parallel.split_audit
+    assert serial.quality == parallel.quality
+    pd.testing.assert_frame_equal(
+        pd.read_parquet(serial.symbol_index_path),
+        pd.read_parquet(parallel.symbol_index_path),
+    )
+    pd.testing.assert_frame_equal(
+        pd.read_parquet(serial.cutoff_ranges_path),
+        pd.read_parquet(parallel.cutoff_ranges_path),
+    )
+    parallelism = parallel.execution["parallelism"]
+    assert parallelism["backend"] == "process_pool_spawn"
+    assert parallelism["native_threads_per_worker"] == 1
+    assert parallelism["phases"]["raw_scan"]["effective_workers"] > 1
+    assert parallelism["phases"]["candidate_ranges"]["effective_workers"] > 1
 
 
 def test_expired_deadline_preserves_identity_and_next_attempt_resumes(
@@ -208,6 +304,10 @@ def test_expired_deadline_preserves_identity_and_next_attempt_resumes(
     assert (store / ".work" / "segments" / "row-group-000000.json").is_file()
     assert (store / ".work" / "segments" / "segment-000000").is_dir()
     assert (store / ".work" / "segments" / "segment-000001").is_dir()
+    execution_plan = json.loads(
+        (store / ".work" / "execution-plan.json").read_text(encoding="utf-8")
+    )
+    assert execution_plan["phases"]["raw_scan"]["effective_workers"] == 1
     assert not (store / "_SUCCESS.json").exists()
     monkeypatch.setattr(bar_store_module._Deadline, "check", original_check)
     resumed = build_symbol_bar_store(**arguments)

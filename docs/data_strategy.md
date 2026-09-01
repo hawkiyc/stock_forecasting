@@ -200,13 +200,20 @@ CPU workflow 預設保留 max runtime 的 25%（最多 2 小時）給 data clean
 `--max-api-calls` 時退出。
 raw Parquet、request log 與 download manifest 先成為 durable `downloaded` checkpoint。
 bar store 的 raw scan、bucket compaction、quality candidates 與 chronological split ranges
-各自原子發布 checkpoint；後續 Pod 可不呼叫 provider，並完全跳過已完成的 raw
-Parquet row groups、scan segments 與 buckets。若中斷位於某個 row group 內，最多只重讀
-該 row group 已走過的部分，已完成 segment 不會重寫。到達安全
+各自以固定 hash 分區，透過 `spawn` process pool 執行並原子發布 checkpoint。worker
+數是 vCPU 設定的上限，不是強制平行度：排程器取 cgroup 與系統可用記憶體的較小值，
+保留 parent process headroom，最多配置當下可用記憶體的 60%，再以該階段最重 task
+的保守記憶體估算降低 process 數；raw scan 最多使用 4 個 process，且每個 child 的
+Arrow／BLAS native threads 固定為 1。單一 task 若已超過安全預算，會在啟動 pool 前
+停止並保留 checkpoint，避免由 OOM killer 非預期中止。後續 Pod 可不呼叫 provider，
+並完全跳過已完成的 raw Parquet row groups、scan segments 與 buckets。若中斷位於某個
+row group 內，最多只重讀該 row group 已走過的部分，已完成 segment 不會重寫。到達安全
 截止時間時 lifecycle 為 `waiting_for_preparation`，成功發布 `_SUCCESS.json` 後才回收
 `.work` 暫存分區。manifest 儲存 SHA-256、
 size、row count、profile、providers、symbols、date range、quality summary 與 request-log
-artifact。secret-like key 不得寫入 manifest。
+artifact。worker 數與記憶體規劃只屬於 execution metadata，不在 dataset identity；換用
+不同 vCPU／RAM 的 Pod 仍能續用既有 raw 與 bucket checkpoints。secret-like key 不得
+寫入 manifest。
 CPU readiness 與訓練 preflight 會依 bar-store manifest 逐 shard 驗證 size 與 SHA-256；
 任何 shard 缺失、截斷或內容不符都不能進入訓練。
 
@@ -500,14 +507,24 @@ its next delay exceeds that boundary while other providers continue. EODHD also
 exits if it reaches `--max-api-calls` first. The workflow
 publishes raw Parquet, the request log, and download manifest as a durable
 `downloaded` checkpoint before preparation. Raw scan, bucket compaction,
-quality candidates, and chronological split ranges each publish atomic
-checkpoints. A later Pod skips provider calls and completely skips finished raw
+quality candidates, and chronological split ranges use fixed hash partitions,
+run in `spawn` process pools, and each publish atomic checkpoints. The configured
+vCPU count is a ceiling rather than mandatory parallelism: the planner uses the
+lower cgroup/OS available-memory value, reserves parent-process headroom, assigns
+at most 60% of currently available memory to workers, and lowers each phase's
+process count using a conservative estimate for its largest task. Raw scan is
+additionally capped at four processes, and every child limits Arrow/BLAS native
+threads to one. If one task exceeds the safe budget, the workflow stops before
+starting the pool and preserves existing checkpoints instead of risking an OOM
+kill. A later Pod skips provider calls and completely skips finished raw
 Parquet row groups, scan segments, and buckets. If interruption occurs inside a
 row group, at most its already traversed portion is read again; completed
 segments are never rewritten. Reaching the safe deadline produces `waiting_for_preparation`;
 `.work` is reclaimed only after `_SUCCESS.json` is published.
 Manifests bind SHA-256, size, row count, profile, providers,
-symbols, dates, quality, and the request log. Secret-like keys are rejected.
+symbols, dates, quality, and the request log. Worker count and memory planning are
+execution metadata, not dataset identity, so a Pod with different vCPU/RAM can
+reuse existing raw and bucket checkpoints. Secret-like keys are rejected.
 CPU readiness and training preflight validate every shard's size and SHA-256
 against the bar-store manifest; missing, truncated, or altered shards cannot train.
 

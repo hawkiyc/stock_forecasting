@@ -809,8 +809,15 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    再次呼叫 provider。腳本會同時讀取使用者要求的 vCPU 數、RunPod 提供的
    `RUNPOD_CPU_COUNT` 與容器實際可見核心數，採三者最小值作為 worker 數；
    EODHD、TWSE 與 TPEx 以三個獨立頂層迴圈平行抓取，迴圈內再依商品／官方 benchmark
-   所列實際交易日使用 thread pool；bar-store preparation 依固定 hash bucket 分段，pytest worker 也不會超過
-   這個有效核心數。每個 provider 有自己的 QPS limiter。`--max-api-calls` 只限制 EODHD，
+   所列實際交易日使用 thread pool；bar-store preparation 的 raw scan、bucket compaction、
+   candidate ranges 與 split ranges 使用 `spawn` process pool，pytest worker 也不會超過
+   這個有效核心數。process 數不是直接照搬 vCPU 數：程式會取 cgroup 與作業系統可用
+   記憶體的較小值、保留 parent process headroom，最多只把 60% 的當下可用記憶體列入
+   worker 預算，再依該階段最重 task 的保守膨脹估算降低 worker 數；raw scan 另限制最多
+   4 個 process。每個 child 的 Arrow／BLAS native thread 固定為 1，避免 process 與 native
+   thread 相乘。若單一 bucket 的估算已超過安全預算，process pool 不會啟動，已完成的
+   checkpoint 仍可由較大記憶體的後續 Pod 接續。每個 provider 有自己的 QPS limiter。
+   `--max-api-calls` 只限制 EODHD，
    TWSE／TPEx 沒有專案端 request-count ceiling；三個 provider 都由同一個
    `--maxBackoff` 值控制各自的退避邊界。
    任一 provider 先退出都不會取消另外兩個；完成的 provider 會先原子發布 durable
@@ -828,6 +835,7 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/symbol-index.parquet` | symbol → shard/row-group 索引 |
    | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/cutoff-ranges.parquet` | train/validation/test 的連續有效 cutoff ranges |
    | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/_SUCCESS.json` | bar store 完成與完整性 checkpoint |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/.work/execution-plan.json` | 建置中各階段的記憶體預算、有效 process 數與續用 task 數；成功後回收 |
    | `/runpod-volume/datasets/<dataset-request-sha256>/download-manifest.json` | 實際 provider、profile、symbols 與下載 provenance |
    | `/runpod-volume/datasets/<dataset-request-sha256>/dataset-manifest.json` | split counts、hash 與資料契約                     |
    | `/runpod-volume/datasets/<dataset-request-sha256>/manifests/api-request-log.jsonl` | 不含 token 的 request audit             |
@@ -840,7 +848,9 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    建置期間若剩餘時間到達安全截止點，則以 `waiting_for_preparation` 與 exit code 75
    結束；下一個 CPU Pod 會完全跳過已完成的 raw Parquet row groups、scan segments 與
    buckets。若中斷發生在單一 row group 內，最多只重新順序讀取該 row group 的已走過
-   部分，已原子完成的 segment 不會重寫。其後才將
+   部分，已原子完成的 segment 不會重寫。worker 數與執行時記憶體規劃只影響排程，
+   不屬於 dataset identity；改用不同 vCPU／RAM 的 CPU Pod 不會重新下載 provider 資料，
+   也不會使既有 bucket checkpoint 失效。其後才將
    selection ID/SHA、dataset request SHA、stage/config SHA、requested
    profile/date/universe 與 resolved artifact hashes 綁入
    `/runpod-volume/lifecycle/stage1/dataset.json`；只有全部檢查成功才發布並
@@ -2200,8 +2210,17 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    then uses the minimum as its worker count. EODHD, TWSE, and TPEx run as three
    independent top-level acquisition loops; each loop uses a thread pool across
    instruments or actual sessions listed by official benchmark history.
-   Bar-store preparation advances through fixed hash buckets, and pytest workers never
-   exceed the effective CPU count. Each provider has its own QPS limiter.
+   Raw scan, bucket compaction, candidate ranges, and split ranges use `spawn`
+   process pools, and pytest workers never exceed the effective CPU count. The
+   process count is not copied directly from the vCPU count: the planner takes
+   the lower cgroup/OS available-memory estimate, reserves parent-process
+   headroom, assigns at most 60% of currently available memory to workers, and
+   lowers each phase's process count using a conservative estimate for its
+   largest task. Raw scan has an additional four-process cap. Each child limits
+   Arrow/BLAS native threads to one so process and native-thread counts cannot
+   multiply. If one bucket alone exceeds the safe estimate, no process pool is
+   started and completed checkpoints remain available for a later Pod with more
+   memory. Each provider has its own QPS limiter.
    `--max-api-calls` limits only EODHD; TWSE/TPEx have no project-side request
    counter ceiling. All three providers use the same `--maxBackoff` value for
    their independent retry boundary. One provider exiting never
@@ -2223,6 +2242,7 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/symbol-index.parquet` | Symbol-to-shard/row-group index                    |
    | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/cutoff-ranges.parquet` | Contiguous valid train/validation/test cutoffs      |
    | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/_SUCCESS.json` | Completed bar-store integrity checkpoint          |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/.work/execution-plan.json` | In-progress memory budget, effective processes, and reused-task counts by phase; reclaimed after success |
    | `/runpod-volume/datasets/<dataset-request-sha256>/download-manifest.json`         | Actual providers, profile, symbols, and download provenance |
    | `/runpod-volume/datasets/<dataset-request-sha256>/dataset-manifest.json`          | Split counts, hashes, and data contract                     |
    | `/runpod-volume/datasets/<dataset-request-sha256>/manifests/api-request-log.jsonl` | Request audit without tokens                               |
@@ -2238,6 +2258,9 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    Pod completely skips finished raw Parquet row groups, scan segments, and buckets.
    If interruption occurs inside one row group, at most the already traversed part
    of that row group is read again; atomically completed segments are never rewritten.
+   Worker count and runtime memory planning affect scheduling only and are not part
+   of dataset identity, so resuming on a CPU Pod with different vCPU/RAM does not
+   repeat provider downloads or invalidate finished bucket checkpoints.
    It then binds the selection ID/SHA,
    dataset request SHA, stage/config SHA, requested
    profile/date/universe, and resolved artifact hashes into

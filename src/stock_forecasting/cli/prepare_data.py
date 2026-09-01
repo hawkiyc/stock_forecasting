@@ -77,7 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers",
         type=int,
         default=int(os.environ.get("FIN_TS_CPU_WORKERS", "1")),
-        help="Recorded CPU allocation; bar-store memory remains bucket bounded.",
+        help=(
+            "Maximum process workers; each preparation phase lowers this value when "
+            "CPU visibility or its conservative memory budget requires it."
+        ),
     )
     return parser
 
@@ -121,9 +124,9 @@ def _load_benchmark_mapping(path: Path | None) -> tuple[dict[str, str], str]:
 
 def _relative_download_manifest(path: Path, manifest_root: Path) -> dict[str, Any]:
     return {
-        "relative_path": path.resolve(strict=True).relative_to(
-            manifest_root.resolve(strict=True)
-        ).as_posix(),
+        "relative_path": path.resolve(strict=True)
+        .relative_to(manifest_root.resolve(strict=True))
+        .as_posix(),
         "sha256": sha256_file(path),
     }
 
@@ -153,9 +156,7 @@ def _ready_manifest(
         diagnostic_horizons=list(arguments.diagnostic_horizons),
         flat_volatility_multiplier=arguments.flat_volatility_multiplier,
     )
-    bar_store_payload = json.loads(
-        result.bar_store_manifest_path.read_text(encoding="utf-8")
-    )
+    bar_store_payload = json.loads(result.bar_store_manifest_path.read_text(encoding="utf-8"))
     return {
         "schema_version": DATASET_MANIFEST_SCHEMA_VERSION,
         "kind": DATASET_MANIFEST_KIND,
@@ -197,9 +198,7 @@ def _ready_manifest(
         "quality": {
             "download": download["quality"],
             "bar_store": result.quality,
-            "split_dropped_counts_by_reason": result.split_audit[
-                "dropped_counts_by_reason"
-            ],
+            "split_dropped_counts_by_reason": result.split_audit["dropped_counts_by_reason"],
         },
         "execution": {
             **result.execution,
@@ -242,12 +241,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("workers must be positive")
 
     manifest_root = _manifest_root(arguments.input)
-    download_manifest_path = (
-        arguments.download_manifest or manifest_root / "download-manifest.json"
-    )
-    dataset_manifest_path = (
-        arguments.dataset_manifest or manifest_root / "dataset-manifest.json"
-    )
+    download_manifest_path = arguments.download_manifest or manifest_root / "download-manifest.json"
+    dataset_manifest_path = arguments.dataset_manifest or manifest_root / "dataset-manifest.json"
     if dataset_manifest_path.exists():
         raise FileExistsError(
             f"Refusing to overwrite ready dataset manifest: {dataset_manifest_path}"
@@ -275,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
             bucket_count=arguments.bucket_count,
             batch_rows=arguments.batch_rows,
             deadline_epoch_seconds=arguments.deadline_epoch_seconds,
+            workers=arguments.workers,
         )
     except PreparationPaused as error:
         print(

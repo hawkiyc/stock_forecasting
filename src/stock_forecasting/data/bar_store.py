@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
 import time
 import uuid
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
+from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
@@ -37,10 +44,29 @@ DEFAULT_BATCH_ROWS = 1_000_000
 DEFAULT_MAX_HORIZON = 14
 RAW_SCAN_ALGORITHM = "parquet-row-group-checkpoints-v2"
 SPLIT_ASSIGNMENT_ALGORITHM = "vectorized-bucket-checkpoints-v1"
+MULTIPROCESS_BACKEND = "process_pool_spawn"
+NATIVE_THREADS_PER_WORKER = 1
+RAW_SCAN_WORKER_CAP = 4
+MIB = 1024**2
+GIB = 1024**3
+WORKER_BASE_MEMORY_BYTES = 512 * MIB
+SAFE_MEMORY_FRACTION = 0.60
+MINIMUM_PARENT_HEADROOM_BYTES = GIB
+_NATIVE_THREAD_ENVIRONMENT = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "PYARROW_NUM_THREADS",
+)
 
 
 class PreparationPaused(RuntimeError):
     """Signal that all durable checkpoints are safe and another Pod may resume."""
+
+
+class PreparationMemoryLimitExceeded(PreparationPaused):
+    """Signal that the current Pod cannot safely run even one pending task."""
 
 
 @dataclass(frozen=True)
@@ -57,6 +83,87 @@ class BarStoreBuildResult:
     execution: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class _PhasePlan:
+    """Memory-bounded process count for one durable preparation phase."""
+
+    phase: str
+    requested_workers: int
+    detected_cpu_count: int
+    task_count: int
+    pending_tasks: int
+    reused_tasks: int
+    worker_cap: int | None
+    available_memory_bytes: int
+    worker_memory_budget_bytes: int
+    maximum_task_memory_bytes: int
+    effective_workers: int
+    estimated_peak_worker_memory_bytes: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "backend": MULTIPROCESS_BACKEND,
+            "requested_workers": self.requested_workers,
+            "detected_cpu_count": self.detected_cpu_count,
+            "task_count": self.task_count,
+            "pending_tasks": self.pending_tasks,
+            "reused_tasks": self.reused_tasks,
+            "worker_cap": self.worker_cap,
+            "available_memory_bytes": self.available_memory_bytes,
+            "worker_memory_budget_bytes": self.worker_memory_budget_bytes,
+            "maximum_task_memory_bytes": self.maximum_task_memory_bytes,
+            "effective_workers": self.effective_workers,
+            "estimated_peak_worker_memory_bytes": (self.estimated_peak_worker_memory_bytes),
+            "native_threads_per_worker": NATIVE_THREADS_PER_WORKER,
+        }
+
+
+@dataclass(frozen=True)
+class _ScanRowGroupTask:
+    raw_path: str
+    work_root: str
+    row_group: int
+    row_group_rows: int
+    segment_start: int
+    segment_count: int
+    bucket_count: int
+    batch_rows: int
+    deadline_epoch_seconds: float | None
+
+
+@dataclass(frozen=True)
+class _CompactBucketTask:
+    output_root: str
+    work_root: str
+    bucket: int
+    bucket_count: int
+    benchmark_mapping: dict[str, str]
+    max_abs_log_return: float
+    deadline_epoch_seconds: float | None
+
+
+@dataclass(frozen=True)
+class _CandidateBucketTask:
+    output_root: str
+    work_root: str
+    bucket: int
+    planning_index_path: str
+    window_size: int
+    max_horizon: int
+    deadline_epoch_seconds: float | None
+
+
+@dataclass(frozen=True)
+class _SplitBucketTask:
+    output_root: str
+    work_root: str
+    candidate_part: str
+    planning_index_path: str
+    boundaries: dict[str, Any]
+    max_horizon: int
+    deadline_epoch_seconds: float | None
+
+
 class _Deadline:
     def __init__(self, epoch_seconds: float | None) -> None:
         self.epoch_seconds = epoch_seconds
@@ -66,6 +173,319 @@ class _Deadline:
             raise PreparationPaused(
                 f"Bar-store preparation paused before {operation}; durable checkpoints remain"
             )
+
+
+def _visible_cpu_count() -> int:
+    """Return the CPU count visible to this process, including affinity limits."""
+
+    affinity_count: int | None = None
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            affinity_count = len(os.sched_getaffinity(0))
+        except OSError:
+            affinity_count = None
+    reported = os.cpu_count() or 1
+    return max(1, min(reported, affinity_count or reported))
+
+
+def _read_positive_integer(path: Path) -> int | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    if not value or value == "max":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _detect_available_memory_bytes() -> int:
+    """Return the strictest host/cgroup memory estimate available at runtime."""
+
+    candidates: list[int] = []
+    cgroup_pairs = (
+        (
+            Path("/sys/fs/cgroup/memory.max"),
+            Path("/sys/fs/cgroup/memory.current"),
+        ),
+        (
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+        ),
+    )
+    for limit_path, usage_path in cgroup_pairs:
+        limit = _read_positive_integer(limit_path)
+        usage = _read_positive_integer(usage_path) or 0
+        if limit is not None and limit > usage:
+            candidates.append(limit - usage)
+
+    try:
+        meminfo = Path("/proc/meminfo").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        meminfo = ""
+    for line in meminfo.splitlines():
+        fields = line.split()
+        if line.startswith("MemAvailable:") and len(fields) >= 2 and fields[1].isdigit():
+            candidates.append(int(fields[1]) * 1024)
+            break
+
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    else:
+        if page_size > 0 and available_pages > 0:
+            candidates.append(page_size * available_pages)
+
+    if not candidates:
+        raise RuntimeError(
+            "Unable to determine available memory for safe bar-store multiprocessing"
+        )
+    return min(candidates)
+
+
+def _safe_worker_memory_budget(
+    available_memory_bytes: int,
+    memory_budget_bytes: int | None,
+) -> int:
+    if available_memory_bytes < 1:
+        raise ValueError("available_memory_bytes must be positive")
+    if memory_budget_bytes is not None and memory_budget_bytes < 1:
+        raise ValueError("memory_budget_bytes must be positive")
+
+    proportional = int(available_memory_bytes * SAFE_MEMORY_FRACTION)
+    reserved = min(
+        MINIMUM_PARENT_HEADROOM_BYTES,
+        max(available_memory_bytes // 3, 256 * MIB),
+    )
+    after_headroom = max(available_memory_bytes - reserved, 0)
+    automatic = min(proportional, after_headroom)
+    if memory_budget_bytes is not None:
+        automatic = min(automatic, memory_budget_bytes)
+    if automatic < 256 * MIB:
+        raise PreparationMemoryLimitExceeded(
+            "Available memory leaves less than 256 MiB for bar-store workers after "
+            "reserving parent-process headroom; completed checkpoints remain reusable"
+        )
+    return automatic
+
+
+def _plan_phase_workers(
+    *,
+    phase: str,
+    requested_workers: int,
+    detected_cpu_count: int,
+    task_memory_bytes: Sequence[int],
+    task_count: int,
+    reused_tasks: int,
+    available_memory_bytes: int,
+    worker_memory_budget_bytes: int,
+    worker_cap: int | None = None,
+) -> _PhasePlan:
+    """Choose a conservative worker count before allocating any child process."""
+
+    if requested_workers < 1:
+        raise ValueError("requested_workers must be positive")
+    if detected_cpu_count < 1:
+        raise ValueError("detected_cpu_count must be positive")
+    if task_count < 0 or reused_tasks < 0 or reused_tasks > task_count:
+        raise ValueError("phase task counters are invalid")
+    if worker_cap is not None and worker_cap < 1:
+        raise ValueError("worker_cap must be positive")
+    if any(value < 1 for value in task_memory_bytes):
+        raise ValueError("task memory estimates must be positive")
+
+    pending_tasks = len(task_memory_bytes)
+    if pending_tasks != task_count - reused_tasks:
+        raise ValueError("pending task estimates do not match phase task counters")
+    maximum_task_memory = max(task_memory_bytes, default=0)
+    if maximum_task_memory > worker_memory_budget_bytes:
+        raise PreparationMemoryLimitExceeded(
+            f"{phase} requires an estimated {maximum_task_memory} bytes for one task, "
+            f"but only {worker_memory_budget_bytes} safe worker bytes are available; "
+            "completed checkpoints remain reusable"
+        )
+
+    effective_workers = 0
+    if pending_tasks:
+        memory_workers = worker_memory_budget_bytes // maximum_task_memory
+        limits = [
+            requested_workers,
+            detected_cpu_count,
+            pending_tasks,
+            max(int(memory_workers), 1),
+        ]
+        if worker_cap is not None:
+            limits.append(worker_cap)
+        effective_workers = min(limits)
+
+    return _PhasePlan(
+        phase=phase,
+        requested_workers=requested_workers,
+        detected_cpu_count=detected_cpu_count,
+        task_count=task_count,
+        pending_tasks=pending_tasks,
+        reused_tasks=reused_tasks,
+        worker_cap=worker_cap,
+        available_memory_bytes=available_memory_bytes,
+        worker_memory_budget_bytes=worker_memory_budget_bytes,
+        maximum_task_memory_bytes=maximum_task_memory,
+        effective_workers=effective_workers,
+        estimated_peak_worker_memory_bytes=(effective_workers * maximum_task_memory),
+    )
+
+
+@contextmanager
+def _single_threaded_child_environment() -> Any:
+    """Prevent native BLAS/Arrow pools from multiplying every process worker."""
+
+    previous = {name: os.environ.get(name) for name in _NATIVE_THREAD_ENVIRONMENT}
+    try:
+        for name in _NATIVE_THREAD_ENVIRONMENT:
+            os.environ[name] = str(NATIVE_THREADS_PER_WORKER)
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _initialize_process_worker() -> None:
+    """Apply per-process native thread limits after the spawned interpreter starts."""
+
+    for name in _NATIVE_THREAD_ENVIRONMENT:
+        os.environ[name] = str(NATIVE_THREADS_PER_WORKER)
+    try:
+        import pyarrow as pa
+    except ImportError:
+        return
+    pa.set_cpu_count(NATIVE_THREADS_PER_WORKER)
+    if hasattr(pa, "set_io_thread_count"):
+        pa.set_io_thread_count(NATIVE_THREADS_PER_WORKER)
+
+
+@contextmanager
+def _single_threaded_arrow_runtime() -> Any:
+    """Temporarily cap Arrow threads when a phase runs in the parent process."""
+
+    try:
+        import pyarrow as pa
+    except ImportError:
+        yield
+        return
+    original_cpu_count = pa.cpu_count()
+    original_io_thread_count = pa.io_thread_count() if hasattr(pa, "io_thread_count") else None
+    try:
+        pa.set_cpu_count(NATIVE_THREADS_PER_WORKER)
+        if hasattr(pa, "set_io_thread_count"):
+            pa.set_io_thread_count(NATIVE_THREADS_PER_WORKER)
+        yield
+    finally:
+        pa.set_cpu_count(original_cpu_count)
+        if original_io_thread_count is not None and hasattr(pa, "set_io_thread_count"):
+            pa.set_io_thread_count(original_io_thread_count)
+
+
+def _run_phase_tasks(
+    *,
+    plan: _PhasePlan,
+    tasks: Sequence[Any],
+    runner: Callable[[Any], Any],
+    deadline: _Deadline,
+) -> None:
+    """Run bounded spawn workers while allowing only one in-flight task per worker."""
+
+    if len(tasks) != plan.pending_tasks:
+        raise ValueError("phase task list does not match its execution plan")
+    if not tasks:
+        return
+    if plan.effective_workers == 1:
+        with (
+            _single_threaded_child_environment(),
+            _single_threaded_arrow_runtime(),
+        ):
+            for task_index, task in enumerate(tasks):
+                deadline.check(f"{plan.phase} task {task_index}")
+                runner(task)
+        return
+
+    task_iterator = iter(tasks)
+    futures: dict[Any, int] = {}
+    try:
+        with (
+            _single_threaded_child_environment(),
+            ProcessPoolExecutor(
+                max_workers=plan.effective_workers,
+                mp_context=get_context("spawn"),
+                initializer=_initialize_process_worker,
+            ) as executor,
+        ):
+            for task_index in range(plan.effective_workers):
+                deadline.check(f"{plan.phase} task {task_index} submission")
+                futures[executor.submit(runner, next(task_iterator))] = task_index
+
+            next_task_index = plan.effective_workers
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    futures.pop(future)
+                    future.result()
+                    try:
+                        next_task = next(task_iterator)
+                    except StopIteration:
+                        continue
+                    deadline.check(f"{plan.phase} task {next_task_index} submission")
+                    futures[executor.submit(runner, next_task)] = next_task_index
+                    next_task_index += 1
+    except BrokenProcessPool as error:
+        raise RuntimeError(
+            f"{plan.phase} process worker exited unexpectedly, possibly because of "
+            "an external OOM kill; completed checkpoints remain reusable"
+        ) from error
+
+
+def _initialize_execution_plan(
+    *,
+    work_root: Path,
+    requested_workers: int,
+    detected_cpu_count: int,
+    available_memory_bytes: int,
+    worker_memory_budget_bytes: int,
+    memory_budget_override_bytes: int | None,
+) -> None:
+    atomic_write_json(
+        work_root / "execution-plan.json",
+        {
+            "schema_version": 1,
+            "kind": "bar-store-execution-plan",
+            "backend": MULTIPROCESS_BACKEND,
+            "requested_workers": requested_workers,
+            "detected_cpu_count": detected_cpu_count,
+            "available_memory_bytes_at_planning": available_memory_bytes,
+            "worker_memory_budget_bytes": worker_memory_budget_bytes,
+            "memory_budget_override_bytes": memory_budget_override_bytes,
+            "safe_memory_fraction": SAFE_MEMORY_FRACTION,
+            "minimum_parent_headroom_bytes": MINIMUM_PARENT_HEADROOM_BYTES,
+            "native_threads_per_worker": NATIVE_THREADS_PER_WORKER,
+            "phases": {},
+        },
+    )
+
+
+def _record_phase_plan(work_root: Path, plan: _PhasePlan) -> None:
+    path = work_root / "execution-plan.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    phases = payload.setdefault("phases", {})
+    if not isinstance(phases, dict):
+        raise ValueError("Bar-store execution plan has invalid phase metadata")
+    phases[plan.phase] = plan.as_dict()
+    atomic_write_json(path, payload)
 
 
 def _require_pyarrow() -> tuple[Any, Any]:
@@ -134,17 +554,20 @@ def _remove_generated_tree(path: Path) -> None:
 def _cleanup_completed_work(work_root: Path) -> None:
     """Reclaim resumability artifacts only after immutable outputs are complete."""
 
+    _load_planning_symbol_index.cache_clear()
     generated_names = (
         "segments",
         "compaction-staging",
         "candidate-staging",
         "candidates",
+        "planning",
         "split-staging",
         "split-ranges",
     )
     for name in generated_names:
         _remove_generated_tree(work_root / name)
     (work_root / "build-state.json").unlink(missing_ok=True)
+    (work_root / "execution-plan.json").unlink(missing_ok=True)
 
 
 def _metadata_value(frame: pd.DataFrame, column: str) -> Any:
@@ -172,10 +595,7 @@ def _true_ranges(mask: np.ndarray, *, offset: int = 0) -> list[tuple[int, int]]:
         return []
     boundaries = np.flatnonzero(np.diff(positions) != 1) + 1
     groups = np.split(positions, boundaries)
-    return [
-        (int(group[0]) + offset, int(group[-1]) + offset + 1)
-        for group in groups
-    ]
+    return [(int(group[0]) + offset, int(group[-1]) + offset + 1) for group in groups]
 
 
 def _validated_scan_segment(
@@ -277,6 +697,106 @@ def _completed_scan_row_group(
     return segment_count
 
 
+def _scan_row_group_task(task: _ScanRowGroupTask) -> dict[str, int]:
+    """Scan one Parquet row group into uniquely owned durable segment paths."""
+
+    _, pq = _require_pyarrow()
+    deadline = _Deadline(task.deadline_epoch_seconds)
+    segments_root = Path(task.work_root) / "segments"
+    completed = _completed_scan_row_group(
+        segments_root,
+        row_group=task.row_group,
+        row_group_rows=task.row_group_rows,
+        segment_start=task.segment_start,
+        batch_rows=task.batch_rows,
+        bucket_count=task.bucket_count,
+    )
+    if completed is not None:
+        return {"rows": task.row_group_rows, "segments": completed}
+
+    parquet = pq.ParquetFile(task.raw_path)
+    observed_rows = 0
+    observed_batches = 0
+    batches = parquet.iter_batches(
+        batch_size=task.batch_rows,
+        row_groups=[task.row_group],
+    )
+    for batch_in_row_group, batch in enumerate(batches):
+        segment_index = task.segment_start + batch_in_row_group
+        deadline.check(f"raw segment {segment_index}")
+        segment_name = f"segment-{segment_index:06d}"
+        segment_root = segments_root / segment_name
+        observed_rows += batch.num_rows
+        observed_batches += 1
+        if _validated_scan_segment(
+            segment_root,
+            segment_index=segment_index,
+            row_group=task.row_group,
+            batch_in_row_group=batch_in_row_group,
+            expected_rows=batch.num_rows,
+            bucket_count=task.bucket_count,
+        ):
+            continue
+        if segment_root.exists() or segment_root.is_symlink():
+            _remove_generated_tree(segment_root)
+        _discard_stale_staging(segments_root, segment_name)
+        staging = _staging_directory(segments_root, segment_name)
+        try:
+            frame = ensure_adjustment_columns(normalize_ohlcv_frame(batch.to_pandas()))
+            unique_symbols = [str(value) for value in frame["symbol"].unique()]
+            buckets = {
+                symbol: _symbol_bucket(symbol, task.bucket_count) for symbol in unique_symbols
+            }
+            bucket_ids = frame["symbol"].map(buckets).to_numpy(dtype=np.int64)
+            populated: list[int] = []
+            for bucket in sorted(set(int(value) for value in bucket_ids)):
+                selected = frame.loc[bucket_ids == bucket].reset_index(drop=True)
+                _atomic_parquet(
+                    selected,
+                    staging / f"bucket-{bucket:04d}.parquet",
+                )
+                populated.append(bucket)
+            atomic_write_json(
+                staging / "checkpoint.json",
+                {
+                    "schema_version": BAR_STORE_SCHEMA_VERSION,
+                    "kind": "bar-store-scan-segment",
+                    "algorithm": RAW_SCAN_ALGORITHM,
+                    "segment": segment_index,
+                    "row_group": task.row_group,
+                    "batch_in_row_group": batch_in_row_group,
+                    "rows": len(frame),
+                    "populated_buckets": populated,
+                },
+            )
+            _atomic_directory(staging, segment_root)
+        except Exception:
+            _remove_generated_tree(staging)
+            raise
+
+    if observed_rows != task.row_group_rows or observed_batches != task.segment_count:
+        raise RuntimeError(
+            f"Raw row group {task.row_group} yielded {observed_rows} rows and "
+            f"{observed_batches} segments; expected {task.row_group_rows} rows and "
+            f"{task.segment_count} segments"
+        )
+    deadline.check(f"raw row group {task.row_group} checkpoint publication")
+    atomic_write_json(
+        segments_root / f"row-group-{task.row_group:06d}.json",
+        {
+            "schema_version": BAR_STORE_SCHEMA_VERSION,
+            "kind": "bar-store-scan-row-group",
+            "algorithm": RAW_SCAN_ALGORITHM,
+            "row_group": task.row_group,
+            "rows": task.row_group_rows,
+            "segment_start": task.segment_start,
+            "segments": observed_batches,
+            "batch_rows": task.batch_rows,
+        },
+    )
+    return {"rows": observed_rows, "segments": observed_batches}
+
+
 def _write_scan_segments(
     *,
     raw_path: Path,
@@ -284,14 +804,27 @@ def _write_scan_segments(
     bucket_count: int,
     batch_rows: int,
     deadline: _Deadline,
-) -> dict[str, int]:
-    """Partition raw row batches into resumable hash buckets."""
+    requested_workers: int,
+    detected_cpu_count: int,
+    available_memory_bytes: int,
+    worker_memory_budget_bytes: int,
+) -> tuple[dict[str, int], _PhasePlan]:
+    """Partition raw row groups with memory-bounded, resumable processes."""
 
     _, pq = _require_pyarrow()
     segments_root = work_root / "segments"
     segments_root.mkdir(parents=True, exist_ok=True)
     parquet = pq.ParquetFile(raw_path)
     scan_success = segments_root / "_SUCCESS.json"
+
+    layouts: list[tuple[int, int, int, int]] = []
+    segment_count = 0
+    for row_group in range(parquet.num_row_groups):
+        row_group_rows = parquet.metadata.row_group(row_group).num_rows
+        row_group_segments = math.ceil(row_group_rows / batch_rows)
+        layouts.append((row_group, row_group_rows, segment_count, row_group_segments))
+        segment_count += row_group_segments
+
     if scan_success.is_file():
         payload = json.loads(scan_success.read_text(encoding="utf-8"))
         completed_segments = sorted(
@@ -309,134 +842,123 @@ def _write_scan_segments(
             or payload.get("row_groups") != parquet.num_row_groups
             or payload.get("batch_rows") != batch_rows
             or payload.get("rows") != parquet.metadata.num_rows
-            or payload.get("segments") != len(completed_segments)
+            or payload.get("segments") != segment_count
+            or len(completed_segments) != segment_count
             or len(completed_row_groups) != parquet.num_row_groups
             or [path.name for path in completed_segments] != expected_segment_names
             or [path.name for path in completed_row_groups]
-            != [
-                f"row-group-{index:06d}.json"
-                for index in range(parquet.num_row_groups)
-            ]
+            != [f"row-group-{index:06d}.json" for index in range(parquet.num_row_groups)]
         ):
             raise ValueError("Completed raw-scan checkpoint is inconsistent")
-        validated_segments = 0
         validated_rows = 0
-        for row_group in range(parquet.num_row_groups):
-            row_group_rows = parquet.metadata.row_group(row_group).num_rows
+        for row_group, row_group_rows, segment_start, expected_segments in layouts:
             completed_batches = _completed_scan_row_group(
                 segments_root,
                 row_group=row_group,
                 row_group_rows=row_group_rows,
-                segment_start=validated_segments,
+                segment_start=segment_start,
                 batch_rows=batch_rows,
                 bucket_count=bucket_count,
             )
-            if completed_batches is None:
+            if completed_batches != expected_segments:
                 raise ValueError("Completed raw scan lost a row-group checkpoint")
-            validated_segments += completed_batches
             validated_rows += row_group_rows
-        if (
-            validated_segments != payload.get("segments")
-            or validated_rows != payload.get("rows")
-        ):
+        if validated_rows != payload.get("rows"):
             raise ValueError("Completed raw-scan totals are inconsistent")
+        plan = _plan_phase_workers(
+            phase="raw_scan",
+            requested_workers=requested_workers,
+            detected_cpu_count=detected_cpu_count,
+            task_memory_bytes=[],
+            task_count=parquet.num_row_groups,
+            reused_tasks=parquet.num_row_groups,
+            available_memory_bytes=available_memory_bytes,
+            worker_memory_budget_bytes=worker_memory_budget_bytes,
+            worker_cap=RAW_SCAN_WORKER_CAP,
+        )
+        _record_phase_plan(work_root, plan)
         return {
             "segments": int(payload["segments"]),
             "rows": int(payload["rows"]),
-        }
-    total_rows = 0
-    segment_count = 0
-    for row_group in range(parquet.num_row_groups):
-        row_group_rows = parquet.metadata.row_group(row_group).num_rows
-        group_start_segment = segment_count
+        }, plan
+
+    pending_tasks: list[_ScanRowGroupTask] = []
+    task_memory_bytes: list[int] = []
+    reused_row_groups = 0
+    for row_group, row_group_rows, segment_start, row_group_segments in layouts:
         completed_batches = _completed_scan_row_group(
             segments_root,
             row_group=row_group,
             row_group_rows=row_group_rows,
-            segment_start=group_start_segment,
+            segment_start=segment_start,
             batch_rows=batch_rows,
             bucket_count=bucket_count,
         )
         if completed_batches is not None:
-            total_rows += row_group_rows
-            segment_count += completed_batches
+            if completed_batches != row_group_segments:
+                raise ValueError(f"Raw row group {row_group} has an inconsistent segment count")
+            reused_row_groups += 1
             continue
-
-        observed_row_group_rows = 0
-        observed_batches = 0
-        batches = parquet.iter_batches(
-            batch_size=batch_rows,
-            row_groups=[row_group],
-        )
-        for batch_in_row_group, batch in enumerate(batches):
-            segment_index = group_start_segment + batch_in_row_group
-            deadline.check(f"raw segment {segment_index}")
-            segment_name = f"segment-{segment_index:06d}"
-            segment_root = segments_root / segment_name
-            observed_row_group_rows += batch.num_rows
-            observed_batches += 1
-            if _validated_scan_segment(
-                segment_root,
-                segment_index=segment_index,
+        pending_tasks.append(
+            _ScanRowGroupTask(
+                raw_path=str(raw_path),
+                work_root=str(work_root),
                 row_group=row_group,
-                batch_in_row_group=batch_in_row_group,
-                expected_rows=batch.num_rows,
+                row_group_rows=row_group_rows,
+                segment_start=segment_start,
+                segment_count=row_group_segments,
                 bucket_count=bucket_count,
-            ):
-                continue
-            if segment_root.exists() or segment_root.is_symlink():
-                _remove_generated_tree(segment_root)
-            _discard_stale_staging(segments_root, segment_name)
-            staging = _staging_directory(segments_root, segment_name)
-            frame = ensure_adjustment_columns(normalize_ohlcv_frame(batch.to_pandas()))
-            unique_symbols = [str(value) for value in frame["symbol"].unique()]
-            buckets = {
-                symbol: _symbol_bucket(symbol, bucket_count) for symbol in unique_symbols
-            }
-            bucket_ids = frame["symbol"].map(buckets).to_numpy(dtype=np.int64)
-            populated: list[int] = []
-            for bucket in sorted(set(int(value) for value in bucket_ids)):
-                selected = frame.loc[bucket_ids == bucket].reset_index(drop=True)
-                _atomic_parquet(selected, staging / f"bucket-{bucket:04d}.parquet")
-                populated.append(bucket)
-            atomic_write_json(
-                staging / "checkpoint.json",
-                {
-                    "schema_version": BAR_STORE_SCHEMA_VERSION,
-                    "kind": "bar-store-scan-segment",
-                    "algorithm": RAW_SCAN_ALGORITHM,
-                    "segment": segment_index,
-                    "row_group": row_group,
-                    "batch_in_row_group": batch_in_row_group,
-                    "rows": len(frame),
-                    "populated_buckets": populated,
-                },
+                batch_rows=batch_rows,
+                deadline_epoch_seconds=deadline.epoch_seconds,
             )
-            _atomic_directory(staging, segment_root)
-        if observed_row_group_rows != row_group_rows:
-            raise RuntimeError(
-                f"Raw row group {row_group} yielded {observed_row_group_rows} rows; "
-                f"expected {row_group_rows}"
-            )
-        deadline.check(f"raw row group {row_group} checkpoint publication")
-        atomic_write_json(
-            segments_root / f"row-group-{row_group:06d}.json",
-            {
-                "schema_version": BAR_STORE_SCHEMA_VERSION,
-                "kind": "bar-store-scan-row-group",
-                "algorithm": RAW_SCAN_ALGORITHM,
-                "row_group": row_group,
-                "rows": row_group_rows,
-                "segment_start": group_start_segment,
-                "segments": observed_batches,
-                "batch_rows": batch_rows,
-            },
         )
-        total_rows += row_group_rows
-        segment_count += observed_batches
-    if total_rows != parquet.metadata.num_rows:
+        metadata_bytes = max(
+            int(parquet.metadata.row_group(row_group).total_byte_size),
+            row_group_rows,
+        )
+        largest_batch_rows = min(batch_rows, row_group_rows)
+        batch_fraction_bytes = math.ceil(
+            metadata_bytes * largest_batch_rows / max(row_group_rows, 1)
+        )
+        task_memory_bytes.append(
+            WORKER_BASE_MEMORY_BYTES + max(batch_fraction_bytes * 6, largest_batch_rows * 256)
+        )
+
+    plan = _plan_phase_workers(
+        phase="raw_scan",
+        requested_workers=requested_workers,
+        detected_cpu_count=detected_cpu_count,
+        task_memory_bytes=task_memory_bytes,
+        task_count=parquet.num_row_groups,
+        reused_tasks=reused_row_groups,
+        available_memory_bytes=available_memory_bytes,
+        worker_memory_budget_bytes=worker_memory_budget_bytes,
+        worker_cap=RAW_SCAN_WORKER_CAP,
+    )
+    _record_phase_plan(work_root, plan)
+    _run_phase_tasks(
+        plan=plan,
+        tasks=pending_tasks,
+        runner=_scan_row_group_task,
+        deadline=deadline,
+    )
+
+    validated_rows = 0
+    for row_group, row_group_rows, segment_start, row_group_segments in layouts:
+        completed_batches = _completed_scan_row_group(
+            segments_root,
+            row_group=row_group,
+            row_group_rows=row_group_rows,
+            segment_start=segment_start,
+            batch_rows=batch_rows,
+            bucket_count=bucket_count,
+        )
+        if completed_batches != row_group_segments:
+            raise RuntimeError(f"Raw row group {row_group} was not completed")
+        validated_rows += row_group_rows
+    if validated_rows != parquet.metadata.num_rows:
         raise RuntimeError(
-            f"Raw scan observed {total_rows} rows; expected {parquet.metadata.num_rows}"
+            f"Raw scan observed {validated_rows} rows; expected {parquet.metadata.num_rows}"
         )
     deadline.check("raw scan checkpoint publication")
     atomic_write_json(
@@ -448,18 +970,16 @@ def _write_scan_segments(
             "row_groups": parquet.num_row_groups,
             "batch_rows": batch_rows,
             "segments": segment_count,
-            "rows": total_rows,
+            "rows": validated_rows,
         },
     )
-    return {"segments": segment_count, "rows": total_rows}
+    return {"segments": segment_count, "rows": validated_rows}, plan
 
 
 def _bucket_part_paths(work_root: Path, bucket: int) -> list[Path]:
     return sorted(
         path
-        for path in (work_root / "segments").glob(
-            f"segment-*/bucket-{bucket:04d}.parquet"
-        )
+        for path in (work_root / "segments").glob(f"segment-*/bucket-{bucket:04d}.parquet")
         if path.is_file()
     )
 
@@ -496,9 +1016,7 @@ def _compact_bucket(
     same_symbol = symbols[1:] == symbols[:-1]
     log_returns = np.zeros(max(len(frame) - 1, 0), dtype=np.float64)
     if len(frame) > 1:
-        log_returns[same_symbol] = np.diff(
-            np.log(np.maximum(adjusted_close, 1e-12))
-        )[same_symbol]
+        log_returns[same_symbol] = np.diff(np.log(np.maximum(adjusted_close, 1e-12)))[same_symbol]
         transitions[1:] = same_symbol & (np.abs(log_returns) > max_abs_log_return)
         timestamp_days = timestamps.asi8 // (24 * 60 * 60 * 1_000_000_000)
         calendar_gap_days[1:] = np.where(
@@ -560,9 +1078,7 @@ def _compact_bucket(
                     "market": str(market or "unknown"),
                     "provider": str(_metadata_value(ordered, "provider") or "unknown"),
                     "currency": str(_metadata_value(ordered, "currency") or "unknown"),
-                    "source_symbol": str(
-                        _metadata_value(ordered, "source_symbol") or symbol_text
-                    ),
+                    "source_symbol": str(_metadata_value(ordered, "source_symbol") or symbol_text),
                     "is_active": _metadata_value(ordered, "is_active"),
                     "dataset_profile": str(
                         _metadata_value(ordered, "dataset_profile") or "unknown"
@@ -573,12 +1089,8 @@ def _compact_bucket(
                     ),
                     "benchmark_symbol": decision.benchmark_symbol or "",
                     "benchmark_policy": decision.policy,
-                    "extreme_transition_count": int(
-                        ordered["adjusted_transition_extreme"].sum()
-                    ),
-                    "long_calendar_gap_count": int(
-                        (ordered["calendar_gap_days"] > 10).sum()
-                    ),
+                    "extreme_transition_count": int(ordered["adjusted_transition_extreme"].sum()),
+                    "long_calendar_gap_count": int((ordered["calendar_gap_days"] > 10).sum()),
                 }
             )
             row_group += 1
@@ -609,6 +1121,85 @@ def _compact_bucket(
     _atomic_directory(staging, destination)
 
 
+def _compact_bucket_task(task: _CompactBucketTask) -> None:
+    _compact_bucket(
+        output_root=Path(task.output_root),
+        work_root=Path(task.work_root),
+        bucket=task.bucket,
+        bucket_count=task.bucket_count,
+        benchmark_mapping=task.benchmark_mapping,
+        max_abs_log_return=task.max_abs_log_return,
+        deadline=_Deadline(task.deadline_epoch_seconds),
+    )
+
+
+def _run_bucket_compaction(
+    *,
+    output_root: Path,
+    work_root: Path,
+    bucket_count: int,
+    benchmark_mapping: dict[str, str],
+    max_abs_log_return: float,
+    deadline: _Deadline,
+    requested_workers: int,
+    detected_cpu_count: int,
+    available_memory_bytes: int,
+    worker_memory_budget_bytes: int,
+) -> _PhasePlan:
+    """Compact independent hash buckets with a conservative expansion estimate."""
+
+    pending: list[tuple[int, _CompactBucketTask]] = []
+    reused_tasks = 0
+    task_count = 0
+    for bucket in range(bucket_count):
+        parts = _bucket_part_paths(work_root, bucket)
+        if not parts:
+            continue
+        task_count += 1
+        destination = output_root / "shards" / f"bucket-{bucket:04d}"
+        if destination.is_dir() and (destination / "checkpoint.json").is_file():
+            reused_tasks += 1
+            continue
+        compressed_bytes = sum(path.stat().st_size for path in parts)
+        estimated_bytes = WORKER_BASE_MEMORY_BYTES + max(
+            compressed_bytes * 48,
+            compressed_bytes + 128 * MIB,
+        )
+        pending.append(
+            (
+                estimated_bytes,
+                _CompactBucketTask(
+                    output_root=str(output_root),
+                    work_root=str(work_root),
+                    bucket=bucket,
+                    bucket_count=bucket_count,
+                    benchmark_mapping=benchmark_mapping,
+                    max_abs_log_return=max_abs_log_return,
+                    deadline_epoch_seconds=deadline.epoch_seconds,
+                ),
+            )
+        )
+    pending.sort(key=lambda item: (-item[0], item[1].bucket))
+    plan = _plan_phase_workers(
+        phase="bucket_compaction",
+        requested_workers=requested_workers,
+        detected_cpu_count=detected_cpu_count,
+        task_memory_bytes=[item[0] for item in pending],
+        task_count=task_count,
+        reused_tasks=reused_tasks,
+        available_memory_bytes=available_memory_bytes,
+        worker_memory_budget_bytes=worker_memory_budget_bytes,
+    )
+    _record_phase_plan(work_root, plan)
+    _run_phase_tasks(
+        plan=plan,
+        tasks=[item[1] for item in pending],
+        runner=_compact_bucket_task,
+        deadline=deadline,
+    )
+    return plan
+
+
 def _load_symbol_index(output_root: Path) -> pd.DataFrame:
     parts = sorted((output_root / "shards").glob("bucket-*/symbol-index.parquet"))
     if not parts:
@@ -618,6 +1209,15 @@ def _load_symbol_index(output_root: Path) -> pd.DataFrame:
         .sort_values("symbol", kind="stable")
         .reset_index(drop=True)
     )
+
+
+@lru_cache(maxsize=4)
+def _load_planning_symbol_index(
+    path_text: str,
+) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
+    index = pd.read_parquet(path_text)
+    index_by_symbol = {str(row["symbol"]): row for row in index.to_dict(orient="records")}
+    return index, index_by_symbol
 
 
 def _candidate_mask(
@@ -731,16 +1331,88 @@ def _build_candidate_bucket(
     _atomic_directory(staging, destination)
 
 
+def _candidate_bucket_task(task: _CandidateBucketTask) -> None:
+    index, index_by_symbol = _load_planning_symbol_index(task.planning_index_path)
+    _build_candidate_bucket(
+        output_root=Path(task.output_root),
+        work_root=Path(task.work_root),
+        bucket=task.bucket,
+        index=index,
+        index_by_symbol=index_by_symbol,
+        window_size=task.window_size,
+        max_horizon=task.max_horizon,
+        deadline=_Deadline(task.deadline_epoch_seconds),
+    )
+
+
+def _run_candidate_buckets(
+    *,
+    output_root: Path,
+    work_root: Path,
+    bucket_count: int,
+    planning_index_path: Path,
+    window_size: int,
+    max_horizon: int,
+    deadline: _Deadline,
+    requested_workers: int,
+    detected_cpu_count: int,
+    available_memory_bytes: int,
+    worker_memory_budget_bytes: int,
+) -> _PhasePlan:
+    pending: list[tuple[int, _CandidateBucketTask]] = []
+    reused_tasks = 0
+    for bucket in range(bucket_count):
+        destination = work_root / "candidates" / f"bucket-{bucket:04d}"
+        if destination.is_dir() and (destination / "checkpoint.json").is_file():
+            reused_tasks += 1
+            continue
+        shard = output_root / "shards" / f"bucket-{bucket:04d}" / "shard.parquet"
+        compressed_bytes = shard.stat().st_size if shard.is_file() else 0
+        estimated_bytes = WORKER_BASE_MEMORY_BYTES + max(
+            compressed_bytes * 24,
+            128 * MIB,
+        )
+        pending.append(
+            (
+                estimated_bytes,
+                _CandidateBucketTask(
+                    output_root=str(output_root),
+                    work_root=str(work_root),
+                    bucket=bucket,
+                    planning_index_path=str(planning_index_path),
+                    window_size=window_size,
+                    max_horizon=max_horizon,
+                    deadline_epoch_seconds=deadline.epoch_seconds,
+                ),
+            )
+        )
+    pending.sort(key=lambda item: (-item[0], item[1].bucket))
+    plan = _plan_phase_workers(
+        phase="candidate_ranges",
+        requested_workers=requested_workers,
+        detected_cpu_count=detected_cpu_count,
+        task_memory_bytes=[item[0] for item in pending],
+        task_count=bucket_count,
+        reused_tasks=reused_tasks,
+        available_memory_bytes=available_memory_bytes,
+        worker_memory_budget_bytes=worker_memory_budget_bytes,
+    )
+    _record_phase_plan(work_root, plan)
+    _run_phase_tasks(
+        plan=plan,
+        tasks=[item[1] for item in pending],
+        runner=_candidate_bucket_task,
+        deadline=deadline,
+    )
+    return plan
+
+
 def _global_dates(
     output_root: Path,
     work_root: Path,
 ) -> tuple[list[pd.Timestamp], list[pd.Timestamp]]:
-    observed_parts = sorted(
-        (output_root / "shards").glob("bucket-*/observed-dates.parquet")
-    )
-    candidate_parts = sorted(
-        (work_root / "candidates").glob("bucket-*/candidate-dates.parquet")
-    )
+    observed_parts = sorted((output_root / "shards").glob("bucket-*/observed-dates.parquet"))
+    candidate_parts = sorted((work_root / "candidates").glob("bucket-*/candidate-dates.parquet"))
     observed = sorted(
         {
             pd.Timestamp(value)
@@ -793,11 +1465,14 @@ def _split_boundaries(
         "test_start": validation_boundary_index + embargo_bars,
         "observed_index": observed_index,
     }
-    if min(
-        int(bounds["train_stop"]),
-        int(bounds["validation_stop"]) - int(bounds["validation_start"]),
-        len(observed_dates) - int(bounds["test_start"]),
-    ) <= 0:
+    if (
+        min(
+            int(bounds["train_stop"]),
+            int(bounds["validation_stop"]) - int(bounds["validation_start"]),
+            len(observed_dates) - int(bounds["test_start"]),
+        )
+        <= 0
+    ):
         raise ValueError("Purge and embargo leave an empty chronological split")
     return bounds
 
@@ -871,25 +1546,19 @@ def _build_split_bucket(
                 codes[train_ok] = 1
                 dropped["label_crosses_train_boundary"] += int(train_crossed.sum())
 
-                validation_region = (
-                    observed_positions >= int(boundaries["validation_start"])
-                ) & (observed_positions < int(boundaries["validation_stop"]))
-                validation_ok = validation_region & (
-                    label_end_ns < validation_boundary_ns
+                validation_region = (observed_positions >= int(boundaries["validation_start"])) & (
+                    observed_positions < int(boundaries["validation_stop"])
                 )
+                validation_ok = validation_region & (label_end_ns < validation_boundary_ns)
                 validation_crossed = validation_region & ~validation_ok
                 codes[validation_ok] = 2
-                dropped["label_crosses_validation_boundary"] += int(
-                    validation_crossed.sum()
-                )
+                dropped["label_crosses_validation_boundary"] += int(validation_crossed.sum())
 
                 test_region = observed_positions >= int(boundaries["test_start"])
                 codes[test_region] = 3
                 unassigned = codes == 0
                 dropped["purge_or_embargo"] += int(
-                    unassigned.sum()
-                    - train_crossed.sum()
-                    - validation_crossed.sum()
+                    unassigned.sum() - train_crossed.sum() - validation_crossed.sum()
                 )
 
                 for code, split in ((1, "train"), (2, "validation"), (3, "test")):
@@ -932,50 +1601,95 @@ def _build_split_bucket(
         raise
 
 
+def _split_bucket_task(task: _SplitBucketTask) -> None:
+    _, index_by_symbol = _load_planning_symbol_index(task.planning_index_path)
+    _build_split_bucket(
+        output_root=Path(task.output_root),
+        work_root=Path(task.work_root),
+        candidate_part=Path(task.candidate_part),
+        index_by_symbol=index_by_symbol,
+        boundaries=task.boundaries,
+        max_horizon=task.max_horizon,
+        deadline=_Deadline(task.deadline_epoch_seconds),
+    )
+
+
 def _assign_split_ranges(
     *,
     output_root: Path,
     work_root: Path,
-    index_by_symbol: dict[str, dict[str, Any]],
+    planning_index_path: Path,
     boundaries: dict[str, Any],
     max_horizon: int,
     deadline: _Deadline,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    candidate_parts = sorted(
-        (work_root / "candidates").glob("bucket-*/candidate-ranges.parquet")
-    )
+    requested_workers: int,
+    detected_cpu_count: int,
+    available_memory_bytes: int,
+    worker_memory_budget_bytes: int,
+) -> tuple[pd.DataFrame, dict[str, Any], _PhasePlan]:
+    candidate_parts = sorted((work_root / "candidates").glob("bucket-*/candidate-ranges.parquet"))
+    pending: list[tuple[int, _SplitBucketTask]] = []
+    reused_tasks = 0
     for part in candidate_parts:
-        _build_split_bucket(
-            output_root=output_root,
-            work_root=work_root,
-            candidate_part=part,
-            index_by_symbol=index_by_symbol,
-            boundaries=boundaries,
-            max_horizon=max_horizon,
-            deadline=deadline,
+        destination = work_root / "split-ranges" / part.parent.name
+        if destination.is_dir() and (destination / "checkpoint.json").is_file():
+            reused_tasks += 1
+            continue
+        shard = output_root / "shards" / part.parent.name / "shard.parquet"
+        shard_bytes = shard.stat().st_size if shard.is_file() else 0
+        candidate_bytes = part.stat().st_size
+        estimated_bytes = WORKER_BASE_MEMORY_BYTES + max(
+            shard_bytes * 16 + candidate_bytes * 32,
+            128 * MIB,
         )
-
-    split_parts = sorted(
-        (work_root / "split-ranges").glob("bucket-*/cutoff-ranges.parquet")
+        pending.append(
+            (
+                estimated_bytes,
+                _SplitBucketTask(
+                    output_root=str(output_root),
+                    work_root=str(work_root),
+                    candidate_part=str(part),
+                    planning_index_path=str(planning_index_path),
+                    boundaries=boundaries,
+                    max_horizon=max_horizon,
+                    deadline_epoch_seconds=deadline.epoch_seconds,
+                ),
+            )
+        )
+    pending.sort(key=lambda item: (-item[0], item[1].candidate_part))
+    plan = _plan_phase_workers(
+        phase="split_ranges",
+        requested_workers=requested_workers,
+        detected_cpu_count=detected_cpu_count,
+        task_memory_bytes=[item[0] for item in pending],
+        task_count=len(candidate_parts),
+        reused_tasks=reused_tasks,
+        available_memory_bytes=available_memory_bytes,
+        worker_memory_budget_bytes=worker_memory_budget_bytes,
     )
+    _record_phase_plan(work_root, plan)
+    _run_phase_tasks(
+        plan=plan,
+        tasks=[item[1] for item in pending],
+        runner=_split_bucket_task,
+        deadline=deadline,
+    )
+
+    split_parts = sorted((work_root / "split-ranges").glob("bucket-*/cutoff-ranges.parquet"))
     if not split_parts:
         raise ValueError("Chronological split produced no lazy cutoff ranges")
     ranges = pd.concat(
         [pd.read_parquet(path) for path in split_parts], ignore_index=True
     ).sort_values(["split", "symbol", "start_index"], kind="stable")
     dropped: Counter[str] = Counter()
-    for checkpoint_path in sorted(
-        (work_root / "split-ranges").glob("bucket-*/checkpoint.json")
-    ):
+    for checkpoint_path in sorted((work_root / "split-ranges").glob("bucket-*/checkpoint.json")):
         checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         if checkpoint.get("algorithm") != SPLIT_ASSIGNMENT_ALGORITHM:
             raise ValueError(f"Unsupported split checkpoint: {checkpoint_path}")
         dropped.update(
             {
                 str(key): int(value)
-                for key, value in checkpoint.get(
-                    "dropped_counts_by_reason", {}
-                ).items()
+                for key, value in checkpoint.get("dropped_counts_by_reason", {}).items()
             }
         )
 
@@ -1000,10 +1714,7 @@ def _assign_split_ranges(
         }
     if pd.Timestamp(summaries["train"]["label_end_max_at"]) >= train_boundary:
         raise RuntimeError("Train labels cross the global train boundary")
-    if (
-        pd.Timestamp(summaries["validation"]["label_end_max_at"])
-        >= validation_boundary
-    ):
+    if pd.Timestamp(summaries["validation"]["label_end_max_at"]) >= validation_boundary:
         raise RuntimeError("Validation labels cross the global validation boundary")
     split_audit = {
         "schema_version": "causal-split-audit-v1",
@@ -1016,13 +1727,12 @@ def _assign_split_ranges(
         "test_start": summaries["test"]["cutoff_start_at"],
         "label_end_counts": counts,
         "maximum_label_end": {
-            split: summaries[split]["label_end_max_at"]
-            for split in ("train", "validation", "test")
+            split: summaries[split]["label_end_max_at"] for split in ("train", "validation", "test")
         },
         "dropped_counts_by_reason": dict(sorted(dropped.items())),
         "splits": summaries,
     }
-    return ranges.reset_index(drop=True), split_audit
+    return ranges.reset_index(drop=True), split_audit, plan
 
 
 def _combine_quality(
@@ -1031,16 +1741,12 @@ def _combine_quality(
     work_root: Path,
 ) -> dict[str, Any]:
     candidate_exclusions: Counter[str] = Counter()
-    for checkpoint_path in sorted(
-        (work_root / "candidates").glob("bucket-*/checkpoint.json")
-    ):
+    for checkpoint_path in sorted((work_root / "candidates").glob("bucket-*/checkpoint.json")):
         checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         candidate_exclusions.update(
             {
                 str(key): int(value)
-                for key, value in checkpoint.get(
-                    "excluded_symbols_by_reason", {}
-                ).items()
+                for key, value in checkpoint.get("excluded_symbols_by_reason", {}).items()
             }
         )
     return {
@@ -1057,9 +1763,7 @@ def _combine_quality(
             .sort_index()
             .items()
         },
-        "eligible_symbols_without_valid_cutoffs": dict(
-            sorted(candidate_exclusions.items())
-        ),
+        "eligible_symbols_without_valid_cutoffs": dict(sorted(candidate_exclusions.items())),
         "extreme_return_transitions": int(index["extreme_transition_count"].sum()),
         "calendar_gaps_over_10_days": int(index["long_calendar_gap_count"].sum()),
         "quality_policy": (
@@ -1084,6 +1788,8 @@ def build_symbol_bar_store(
     bucket_count: int = DEFAULT_BUCKET_COUNT,
     batch_rows: int = DEFAULT_BATCH_ROWS,
     deadline_epoch_seconds: float | None = None,
+    workers: int = 1,
+    memory_budget_bytes: int | None = None,
 ) -> BarStoreBuildResult:
     """Build or resume an immutable compressed bar store without materializing windows."""
 
@@ -1093,6 +1799,10 @@ def build_symbol_bar_store(
         raise ValueError("bucket_count must be between 1 and 4096")
     if batch_rows < 1:
         raise ValueError("batch_rows must be positive")
+    if workers < 1:
+        raise ValueError("workers must be positive")
+    if memory_budget_bytes is not None and memory_budget_bytes < 1:
+        raise ValueError("memory_budget_bytes must be positive")
     if window_size < 2 or max_horizon != DEFAULT_MAX_HORIZON:
         raise ValueError("The approved bar store requires window_size>=2 and max_horizon=14")
     if max_abs_log_return <= 0.0:
@@ -1104,8 +1814,7 @@ def build_symbol_bar_store(
     work_root.mkdir(parents=True, exist_ok=True)
     deadline = _Deadline(deadline_epoch_seconds)
     mapping = {
-        str(key).upper(): str(value).upper()
-        for key, value in (benchmark_mapping or {}).items()
+        str(key).upper(): str(value).upper() for key, value in (benchmark_mapping or {}).items()
     }
     raw_artifact = download_manifest.get("artifacts", {}).get("raw")
     if not isinstance(raw_artifact, Mapping):
@@ -1159,9 +1868,8 @@ def build_symbol_bar_store(
     manifest_path = root / "bar-store.json"
     index_path = root / "symbol-index.parquet"
     ranges_path = root / "cutoff-ranges.parquet"
-    if (
-        not success_path.exists()
-        and all(path.is_file() for path in (manifest_path, index_path, ranges_path))
+    if not success_path.exists() and all(
+        path.is_file() for path in (manifest_path, index_path, ranges_path)
     ):
         recovered_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if (
@@ -1215,53 +1923,75 @@ def build_symbol_bar_store(
             execution=dict(manifest["execution"]),
         )
 
-    scan = _write_scan_segments(
+    detected_cpu_count = _visible_cpu_count()
+    available_memory_bytes = _detect_available_memory_bytes()
+    worker_memory_budget_bytes = _safe_worker_memory_budget(
+        available_memory_bytes,
+        memory_budget_bytes,
+    )
+    _initialize_execution_plan(
+        work_root=work_root,
+        requested_workers=workers,
+        detected_cpu_count=detected_cpu_count,
+        available_memory_bytes=available_memory_bytes,
+        worker_memory_budget_bytes=worker_memory_budget_bytes,
+        memory_budget_override_bytes=memory_budget_bytes,
+    )
+    scan, scan_plan = _write_scan_segments(
         raw_path=source,
         work_root=work_root,
         bucket_count=bucket_count,
         batch_rows=batch_rows,
         deadline=deadline,
+        requested_workers=workers,
+        detected_cpu_count=detected_cpu_count,
+        available_memory_bytes=available_memory_bytes,
+        worker_memory_budget_bytes=worker_memory_budget_bytes,
     )
     if scan["rows"] != raw_rows:
         raise ValueError("Raw Parquet row count differs from the download manifest")
-    for bucket in range(bucket_count):
-        _compact_bucket(
-            output_root=root,
-            work_root=work_root,
-            bucket=bucket,
-            bucket_count=bucket_count,
-            benchmark_mapping=mapping,
-            max_abs_log_return=max_abs_log_return,
-            deadline=deadline,
-        )
+    compaction_plan = _run_bucket_compaction(
+        output_root=root,
+        work_root=work_root,
+        bucket_count=bucket_count,
+        benchmark_mapping=mapping,
+        max_abs_log_return=max_abs_log_return,
+        deadline=deadline,
+        requested_workers=workers,
+        detected_cpu_count=detected_cpu_count,
+        available_memory_bytes=available_memory_bytes,
+        worker_memory_budget_bytes=worker_memory_budget_bytes,
+    )
     index = _load_symbol_index(root)
     if index["symbol"].duplicated().any():
         raise ValueError("Bar-store symbol index contains duplicate symbols")
     if int(index["row_count"].sum()) != raw_rows:
         raise ValueError("Bar-store symbol rows differ from the immutable raw artifact")
-    index_by_symbol = {
-        str(row["symbol"]): row for row in index.to_dict(orient="records")
-    }
+    index_by_symbol = {str(row["symbol"]): row for row in index.to_dict(orient="records")}
     missing_benchmarks = index["eligible"].astype(bool) & ~index["benchmark_symbol"].isin(
         index_by_symbol
     )
     if missing_benchmarks.any():
         index.loc[missing_benchmarks, "eligible"] = False
         index.loc[missing_benchmarks, "eligibility_reason"] = "missing_benchmark"
-    index_by_symbol = {
-        str(row["symbol"]): row for row in index.to_dict(orient="records")
-    }
-    for bucket in range(bucket_count):
-        _build_candidate_bucket(
-            output_root=root,
-            work_root=work_root,
-            bucket=bucket,
-            index=index,
-            index_by_symbol=index_by_symbol,
-            window_size=window_size,
-            max_horizon=max_horizon,
-            deadline=deadline,
-        )
+    planning_root = work_root / "planning"
+    planning_root.mkdir(parents=True, exist_ok=True)
+    planning_index_path = planning_root / "symbol-index.parquet"
+    _load_planning_symbol_index.cache_clear()
+    _atomic_parquet(index, planning_index_path)
+    candidate_plan = _run_candidate_buckets(
+        output_root=root,
+        work_root=work_root,
+        bucket_count=bucket_count,
+        planning_index_path=planning_index_path,
+        window_size=window_size,
+        max_horizon=max_horizon,
+        deadline=deadline,
+        requested_workers=workers,
+        detected_cpu_count=detected_cpu_count,
+        available_memory_bytes=available_memory_bytes,
+        worker_memory_budget_bytes=worker_memory_budget_bytes,
+    )
     observed_dates, candidate_dates = _global_dates(root, work_root)
     boundaries = _split_boundaries(
         observed_dates,
@@ -1271,13 +2001,17 @@ def build_symbol_bar_store(
         purge_bars=purge_bars,
         embargo_bars=embargo_bars,
     )
-    ranges, split_audit = _assign_split_ranges(
+    ranges, split_audit, split_plan = _assign_split_ranges(
         output_root=root,
         work_root=work_root,
-        index_by_symbol=index_by_symbol,
+        planning_index_path=planning_index_path,
         boundaries=boundaries,
         max_horizon=max_horizon,
         deadline=deadline,
+        requested_workers=workers,
+        detected_cpu_count=detected_cpu_count,
+        available_memory_bytes=available_memory_bytes,
+        worker_memory_budget_bytes=worker_memory_budget_bytes,
     )
     split_counts = {
         split: int(ranges.loc[ranges["split"] == split, "count"].sum())
@@ -1301,10 +2035,7 @@ def build_symbol_bar_store(
             or checkpoint.get("symbols") != len(selected)
             or not isinstance(checkpoint.get("shard_sha256"), str)
             or len(checkpoint["shard_sha256"]) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in checkpoint["shard_sha256"]
-            )
+            or any(character not in "0123456789abcdef" for character in checkpoint["shard_sha256"])
         ):
             raise ValueError(f"Compaction checkpoint is invalid: {checkpoint_path}")
         shard_records.append(
@@ -1323,6 +2054,26 @@ def build_symbol_bar_store(
         "raw_scan_algorithm": RAW_SCAN_ALGORITHM,
         "raw_scan_batch_rows": batch_rows,
         "raw_scan_segments": scan["segments"],
+        "parallelism": {
+            "backend": MULTIPROCESS_BACKEND,
+            "requested_workers": workers,
+            "detected_cpu_count": detected_cpu_count,
+            "available_memory_bytes_at_planning": available_memory_bytes,
+            "worker_memory_budget_bytes": worker_memory_budget_bytes,
+            "memory_budget_override_bytes": memory_budget_bytes,
+            "safe_memory_fraction": SAFE_MEMORY_FRACTION,
+            "minimum_parent_headroom_bytes": MINIMUM_PARENT_HEADROOM_BYTES,
+            "native_threads_per_worker": NATIVE_THREADS_PER_WORKER,
+            "phases": {
+                plan.phase: plan.as_dict()
+                for plan in (
+                    scan_plan,
+                    compaction_plan,
+                    candidate_plan,
+                    split_plan,
+                )
+            },
+        },
         "resumable_checkpoints": [
             "raw_segments",
             "compacted_buckets",
