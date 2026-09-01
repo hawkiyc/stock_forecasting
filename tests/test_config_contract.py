@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -19,6 +22,30 @@ from stock_forecasting.run_contract import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_config_import_is_cycle_safe_in_a_fresh_interpreter() -> None:
+    environment = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from stock_forecasting.config import ExperimentConfig; "
+                "from stock_forecasting.data import FinancialWindowDataset; "
+                "assert ExperimentConfig.__name__ == 'ExperimentConfig'; "
+                "assert FinancialWindowDataset.__name__ == 'FinancialWindowDataset'"
+            ),
+        ],
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_lora_targets_normalize_without_recursive_assignment_validation() -> None:
