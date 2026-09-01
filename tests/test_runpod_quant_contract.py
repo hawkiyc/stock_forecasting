@@ -610,7 +610,7 @@ def test_cpu_prepare_without_options_is_interactive_and_cancel_safe() -> None:
     assert "Maximum additional EODHD network attempts for this CPU Pod (required):" in combined
     assert "EODHD requests per second [16]:" in combined
     assert "TWSE/TPEx requests per second per provider [0.5]:" in combined
-    assert "Time reserved for data cleaning/window construction [auto]:" in combined
+    assert "Time reserved for data cleaning/bar-store construction [auto]:" in combined
     assert "Maximum provider retry backoff [1m]:" in combined
     assert "vCPU count [8]:" in combined
     assert "CPU flavor [cpu3g]:" in combined
