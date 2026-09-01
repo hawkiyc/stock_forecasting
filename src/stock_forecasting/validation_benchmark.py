@@ -11,7 +11,7 @@ import uuid
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -28,8 +28,10 @@ from stock_forecasting.baselines import (
 )
 from stock_forecasting.cli.evaluate import evaluate_checkpoint, resolve_checkpoint
 from stock_forecasting.config import ExperimentConfig
-from stock_forecasting.data import FinancialWindowDataset
-from stock_forecasting.data.io import read_processed_records
+from stock_forecasting.data import (
+    BlockwisePermutationSampler,
+    LazyFinancialWindowDataset,
+)
 from stock_forecasting.run_contract import (
     training_resume_contract_fingerprint,
     validate_training_resume_contract,
@@ -46,10 +48,7 @@ from stock_forecasting.run_paths import (
     validate_validation_lifecycle_path,
     validate_wandb_directory,
 )
-from stock_forecasting.training import (
-    deterministic_stratified_indices,
-    resolve_processed_dataset,
-)
+from stock_forecasting.training_paths import resolve_bar_store_path
 from stock_forecasting.wandb_status import update_wandb_status
 
 LEARNED_BASELINES = ("gbdt", "gru", "dlinear", "patchtst")
@@ -316,25 +315,36 @@ def _median_metric(payloads: list[dict[str, Any]], path: str) -> float | None:
     return float(np.median(finite)) if finite else None
 
 
-def select_training_records(
-    records: list[dict[str, Any]],
-    fraction: float,
-    max_samples: int | None,
-    alpha_horizons: list[int],
-) -> list[dict[str, Any]]:
-    """Use the exact deterministic market/asset stratification used by training."""
+def _lazy_baseline_arrays(
+    config: ExperimentConfig,
+    *,
+    split: Literal["train", "validation", "test"],
+    seed: int,
+    build_arrays: bool = True,
+) -> tuple[int, int, BaselineArrays | None]:
+    """Stream a bounded lazy sample into numerical arrays, never window artifacts."""
 
-    dataset = FinancialWindowDataset(
-        records,
-        split=None,
-        alpha_horizons=alpha_horizons,
+    dataset = LazyFinancialWindowDataset(
+        resolve_bar_store_path(config.data.bar_store_path),
+        split=split,
+        window_size=config.data.input_length,
+        h_start=config.data.h_start,
     )
-    indices = deterministic_stratified_indices(
-        dataset,
-        fraction=fraction,
-        max_samples=max_samples,
+    maximum = config.validation.baseline_max_samples_per_split
+    if split == "train" and config.data.max_samples is not None:
+        maximum = min(maximum, config.data.max_samples)
+    sampler = BlockwisePermutationSampler(
+        len(dataset),
+        fraction=config.data.train_fraction if split == "train" else 1.0,
+        max_samples=maximum,
+        seed=seed,
     )
-    return [dataset.records[index] for index in indices]
+    arrays = (
+        baseline_arrays(dataset.record_at(index) for index in sampler)
+        if build_arrays
+        else None
+    )
+    return len(dataset), len(sampler), arrays
 
 
 def _comparison_summary(models: dict[str, Any]) -> dict[str, Any]:
@@ -474,7 +484,9 @@ class ValidationBenchmark:
                     "the value aggregates normalized pinball over horizons "
                     f"{self.config.data.h_start} through {self.config.data.max_horizon}."
                 ),
-                "training_subset": "Matches the trainer's exact deterministic stratification.",
+                "training_subset": (
+                    "Matches the trainer's deterministic blockwise target-count policy."
+                ),
                 "test_policy": "The test split is counted but never evaluated.",
                 "classification": (
                     "No classifier is trained; signals are distribution post-processing."
@@ -620,33 +632,25 @@ class ValidationBenchmark:
         self._publish_lifecycle("preparing")
         self._publish()
         try:
-            records = read_processed_records(
-                resolve_processed_dataset(self.config.data.processed_path)
-            )
-            split_records = {
-                split: [record for record in records if record.get("split") == split]
-                for split in ("train", "validation", "test")
-            }
-            if any(not split_records[split] for split in split_records):
-                raise ValueError("Validation requires non-empty chronological splits")
-            self.payload["raw_sample_counts"] = {
-                split: len(values) for split, values in split_records.items()
-            }
-            split_records["train"] = select_training_records(
-                split_records["train"],
-                self.config.data.train_fraction,
-                self.config.data.max_samples,
-                self.config.data.alpha_horizons,
-            )
-            self.payload["sample_counts"] = {
-                split: len(values) for split, values in split_records.items()
-            }
+            arrays: dict[str, BaselineArrays] = {}
+            raw_counts: dict[str, int] = {}
+            sample_counts: dict[str, int] = {}
+            for position, split in enumerate(("train", "validation", "test")):
+                raw_count, sample_count, split_arrays = _lazy_baseline_arrays(
+                    self.config,
+                    split=split,
+                    seed=self.config.training.seed + position,
+                    build_arrays=split != "test",
+                )
+                raw_counts[split] = raw_count
+                sample_counts[split] = sample_count
+                if split_arrays is not None:
+                    arrays[split] = split_arrays
+            self.payload["raw_sample_counts"] = raw_counts
+            self.payload["sample_counts"] = sample_counts
             self.payload["runtime"] = {
                 "cuda_available": torch.cuda.is_available(),
                 "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "",
-            }
-            arrays = {
-                split: baseline_arrays(split_records[split]) for split in ("train", "validation")
             }
             requested_rules = [name for name in RULE_BASELINE_NAMES if name in self.models]
             if requested_rules and any(not self._completed(name) for name in requested_rules):

@@ -14,7 +14,7 @@ from stock_forecasting.data.manifest import (
     validate_training_dataset_manifest,
 )
 from stock_forecasting.factory import verify_kronos_source_revision
-from stock_forecasting.training_paths import resolve_processed_dataset_path
+from stock_forecasting.training_paths import resolve_bar_store_path
 
 
 @dataclass
@@ -40,7 +40,7 @@ def _is_ephemeral_runpod_path(path: Path) -> bool:
 def _persistent_paths(config: ExperimentConfig) -> list[Path]:
     return [
         config.data.raw_path,
-        config.data.processed_path,
+        config.data.bar_store_path,
         config.data.resolved_manifest_path,
         config.training.output_root,
         config.validation.output_root,
@@ -79,18 +79,18 @@ def run_preflight(
 
     if require_data:
         try:
-            processed = resolve_processed_dataset_path(config.data.processed_path)
-            report.facts["processed_dataset"] = str(processed)
+            bar_store = resolve_bar_store_path(config.data.bar_store_path)
+            report.facts["bar_store"] = str(bar_store)
         except (FileNotFoundError, ValueError) as error:
             report.errors.append(str(error))
-            processed = config.data.processed_path
+            bar_store = config.data.bar_store_path
         if config.data.require_ready_manifest:
             try:
                 manifest = validate_training_dataset_manifest(
                     config.data.resolved_manifest_path,
                     profile=config.data.dataset_profile,
                     raw_path=config.data.raw_path,
-                    processed_path=processed,
+                    bar_store_path=bar_store,
                 )
             except (FileNotFoundError, ValueError) as error:
                 report.errors.append(str(error))
@@ -120,8 +120,8 @@ def run_preflight(
                     report.facts["dataset_manifest"] = str(config.data.resolved_manifest_path)
                     report.facts["split_counts"] = str(manifest["split_counts"])
                     report.facts["raw_rows"] = str(manifest["artifacts"]["raw"]["row_count"])
-                    report.facts["processed_rows"] = str(
-                        manifest["artifacts"]["processed"]["row_count"]
+                    report.facts["valid_cutoffs"] = str(
+                        sum(manifest["split_counts"].values())
                     )
                     report.facts["preparation_spec_sha256"] = str(
                         manifest["preparation_spec_sha256"]

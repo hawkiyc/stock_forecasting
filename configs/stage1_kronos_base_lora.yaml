@@ -3,7 +3,7 @@ description: Quant-only script validation on an exact deterministic 15% training
 
 data:
   raw_path: ${DATA_ROOT:-/runpod-volume/data}/raw/market.parquet
-  processed_path: ${DATA_ROOT:-/runpod-volume/data}/processed/windows.parquet
+  bar_store_path: ${DATA_ROOT:-/runpod-volume/data}/prepared/bar-store
   manifest_path: ${DATA_ROOT:-/runpod-volume/data}/dataset-manifest.json
   dataset_profile: ${FIN_TS_DATASET_PROFILE:-us_tw_eodhd}
   input_length: 128
@@ -19,6 +19,7 @@ data:
   embargo_trading_days: 5
   effective_embargo_trading_days: 14
   max_samples: null
+  label_scale_calibration_samples: 50000
   require_ready_manifest: true
 
 model:
@@ -74,6 +75,7 @@ training:
   resume_checkpoint: null
   mixed_precision: bf16
   num_workers: 2
+  evaluation_max_samples: 20000
 
 wandb:
   enabled: true
@@ -112,6 +114,7 @@ validation:
   neural_learning_rate: 0.001
   recompute_full_model: false
   resume_completed_models: true
+  baseline_max_samples_per_split: 20000
 
 runtime:
   max_runtime_seconds: ${MAX_RUNTIME_SECONDS:-21600}

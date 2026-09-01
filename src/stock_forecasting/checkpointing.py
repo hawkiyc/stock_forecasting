@@ -51,6 +51,54 @@ def _is_non_negative_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def _runtime_robust_scales(payload: dict[str, Any], label: str) -> list[float]:
+    values = payload.get("runtime_robust_scales")
+    if (
+        not isinstance(values, list)
+        or not 12 <= len(values) <= 14
+        or any(
+            not isinstance(value, int | float)
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+            for value in values
+        )
+    ):
+        raise ValueError(f"{label} has invalid runtime robust scales")
+    return [float(value) for value in values]
+
+
+def _model_runtime_robust_scales(model: torch.nn.Module) -> list[float]:
+    alpha_head = getattr(model, "alpha_head", None)
+    values = getattr(alpha_head, "robust_scales", None)
+    if not isinstance(values, torch.Tensor) or values.ndim != 1:
+        raise ValueError("Quant model has no one-dimensional runtime robust scales")
+    scales = [float(value) for value in values.detach().float().cpu().tolist()]
+    return _runtime_robust_scales(
+        {"runtime_robust_scales": scales},
+        "Quant model",
+    )
+
+
+def _restore_runtime_robust_scales(
+    model: torch.nn.Module,
+    trainer_state: dict[str, Any],
+    *,
+    require_match: bool,
+) -> None:
+    stored = _runtime_robust_scales(trainer_state, "Trainer state")
+    alpha_head = getattr(model, "alpha_head", None)
+    current = getattr(alpha_head, "robust_scales", None)
+    if not isinstance(current, torch.Tensor) or current.ndim != 1:
+        raise ValueError("Quant model has no one-dimensional runtime robust scales")
+    restored = current.new_tensor(stored)
+    if restored.shape != current.shape:
+        raise ValueError("Checkpoint runtime robust scales do not match model horizons")
+    if require_match and not torch.allclose(current, restored, rtol=0.0, atol=1e-8):
+        raise ValueError("Checkpoint runtime robust scales differ from train calibration")
+    current.copy_(restored)
+
+
 def _file_integrity(path: Path) -> dict[str, Any]:
     digest = hashlib.sha256()
     size_bytes = 0
@@ -265,6 +313,7 @@ def validate_checkpoint_trainer_state(
         raise ValueError("Trainer state step or batch position is not canonical")
     _validate_rng_state_payload(state.get("rng_state"))
     _validate_validation_selection(state.get("selection"), "Trainer state")
+    _runtime_robust_scales(state, "Trainer state")
     _validate_checkpoint_file_integrity(source, state)
     return state
 
@@ -506,6 +555,7 @@ def _stage_checkpoint(
         "time_series_model_revision": config.model.time_series_model_revision,
         "time_series_tokenizer_revision": config.model.time_series_tokenizer_revision,
         "kronos_source_revision": config.model.kronos_source_revision,
+        "runtime_robust_scales": _model_runtime_robust_scales(model),
         "selection": selection,
         "rng_state": _capture_rng_state(),
     }
@@ -653,6 +703,7 @@ def _ranked_checkpoint_rows(
             or state.get("training_stage") not in {"stage1", "stage2"}
         ):
             raise ValueError(f"Checkpoint {checkpoint} has inconsistent run identity or step")
+        _runtime_robust_scales(state, f"Checkpoint {checkpoint}")
         selection = _validate_validation_selection(
             state.get("selection"),
             f"Checkpoint {checkpoint}",
@@ -824,6 +875,7 @@ def _validate_transaction_checkpoint(
     ):
         raise ValueError(f"Checkpoint transaction metadata disagrees with {canonical_name}")
     _validate_rng_state_payload(state.get("rng_state"))
+    _runtime_robust_scales(state, "Trainer state")
     _validate_checkpoint_file_integrity(directory, state)
 
 
@@ -1264,6 +1316,11 @@ def load_checkpoint(
     if (optimizer is None) != (scheduler is None):
         raise ValueError("Training resume requires both optimizer and scheduler state")
     trainer_state = validate_checkpoint_trainer_state(source)
+    _restore_runtime_robust_scales(
+        model,
+        trainer_state,
+        require_match=optimizer is not None,
+    )
     missing = _load_trainable_model_state(
         model,
         load_file(source / "adapter.safetensors"),

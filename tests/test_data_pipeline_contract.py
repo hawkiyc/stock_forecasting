@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import json
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +13,7 @@ import pytest
 
 from stock_forecasting.baselines import baseline_arrays
 from stock_forecasting.data.adjustments import asof_adjusted_window
+from stock_forecasting.data.bar_store import bar_store_preparation_spec
 from stock_forecasting.data.benchmarks import resolve_benchmark
 from stock_forecasting.data.dataset import FinancialBatchCollator, FinancialWindowDataset
 from stock_forecasting.data.manifest import (
@@ -32,7 +32,6 @@ from stock_forecasting.data.schema import (
 )
 from stock_forecasting.data.splits import SPLIT_POLICY, chronological_split
 from stock_forecasting.data.windows import DEFAULT_ALPHA_HORIZONS, build_causal_windows
-from stock_forecasting.training import deterministic_stratified_indices
 
 
 def test_causal_records_have_paired_historical_inputs_and_future_labels_only(
@@ -446,25 +445,6 @@ def test_baselines_ignore_non_contract_context_fields(
     assert (raw.sequences == extra.sequences).all()
 
 
-def test_stage1_subset_is_exact_deterministic_and_stratified(
-    window_records: list[dict[str, object]],
-) -> None:
-    dataset = FinancialWindowDataset(window_records, split="train")
-    first = deterministic_stratified_indices(dataset, fraction=0.15)
-    second = deterministic_stratified_indices(dataset, fraction=0.15)
-
-    assert first == second
-    assert len(first) == max(1, int(len(dataset) * 0.15))
-    selected_groups = Counter(
-        (
-            str(dataset.records[index]["metadata"]["market"]),
-            str(dataset.records[index]["asset_type"]),
-        )
-        for index in first
-    )
-    assert set(selected_groups) == {("TWSE", "etf"), ("US", "stock")}
-
-
 def test_schema_rejects_duplicate_bars_and_invalid_ranges(
     market_frame: pd.DataFrame,
 ) -> None:
@@ -480,44 +460,46 @@ def test_schema_rejects_duplicate_bars_and_invalid_ranges(
 
 def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path: Path) -> None:
     raw = tmp_path / "raw" / "market.parquet"
-    processed = tmp_path / "processed" / "windows.parquet"
+    bar_store = tmp_path / "prepared" / "bar-store"
     raw.parent.mkdir()
-    processed.parent.mkdir()
+    bar_store.mkdir(parents=True)
     raw.write_bytes(b"immutable raw parquet fixture")
-    processed.write_bytes(b"immutable processed parquet fixture")
+    symbol_index = bar_store / "symbol-index.parquet"
+    cutoff_ranges = bar_store / "cutoff-ranges.parquet"
+    symbol_index.write_bytes(b"immutable symbol index fixture")
+    cutoff_ranges.write_bytes(b"immutable cutoff ranges fixture")
+    bar_store_manifest = bar_store / "bar-store.json"
+    atomic_write_json(
+        bar_store_manifest,
+        {
+            "schema_version": "1.0",
+            "kind": "symbol-oriented-ohlcv-bar-store",
+            "state": "ready",
+            "split_counts": {"test": 1, "train": 3, "validation": 1},
+        },
+    )
     manifest = tmp_path / "dataset-manifest.json"
-    preparation_spec = {
-        "processed_schema_version": "4.0",
-        "window_size": 128,
-        "h_start": 3,
-        "max_horizon": 14,
-        "target_horizon": 5,
-        "diagnostic_horizons": [1, 20],
-        "stride": 5,
-        "effective_sample_stride": 1,
-        "alpha_horizons": list(DEFAULT_ALPHA_HORIZONS),
-        "label_kind": "benchmark_relative_adjusted_log_return",
-        "signal_timing": "after_close_t",
-        "entry_timing": "regular_session_open_t_plus_1",
-        "entry_day_counts_as_holding_day_one": True,
-        "exit_timing": "regular_session_close_t_plus_h",
-        "input_adjustment": "point_in_time_total_return_ohlc_split_adjusted_volume",
-        "training_security_scope": TRAINING_SECURITY_SCOPE,
-        "split_policy": SPLIT_POLICY,
-        "benchmark_mapping_sha256": canonical_json_sha256({}),
-        "flat_volatility_multiplier": 0.25,
-        "max_abs_log_return": 0.5,
-        "train_fraction": 0.70,
-        "validation_fraction": 0.15,
-        "purge_bars": 20,
-        "embargo_bars": 5,
-        "effective_embargo_bars": 14,
-    }
+    preparation_spec = bar_store_preparation_spec(
+        window_size=128,
+        max_horizon=14,
+        benchmark_mapping_sha256=canonical_json_sha256({}),
+        max_abs_log_return=0.5,
+        train_fraction=0.70,
+        validation_fraction=0.15,
+        purge_bars=20,
+        compatibility_stride=5,
+        effective_sample_stride=1,
+        compatibility_embargo_bars=5,
+        effective_embargo_bars=14,
+        target_horizon=5,
+        diagnostic_horizons=[1, 20],
+        flat_volatility_multiplier=0.25,
+    )
     label_statistics = {
+        "state": "runtime_calibration_required",
         "source_split": "train",
-        "horizons": list(DEFAULT_ALPHA_HORIZONS),
+        "horizons_available": list(range(1, 15)),
         "robust_scale_method": "max(iqr,mad_x_1.4826,1e-4)",
-        "robust_scales": [0.01] * len(DEFAULT_ALPHA_HORIZONS),
         "prediction_units": "benchmark_relative_log_return",
     }
     split_audit = {
@@ -558,8 +540,8 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
         },
     }
     payload = {
-        "schema_version": "2.0",
-        "kind": "ohlcv-dataset",
+        "schema_version": "3.0",
+        "kind": "ohlcv-bar-store-dataset",
         "state": "ready",
         "training_security_scope": TRAINING_SECURITY_SCOPE,
         "dataset_profile": "tw_only",
@@ -571,7 +553,11 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
         "label_statistics": label_statistics,
         "artifacts": {
             "raw": artifact_metadata(raw, root=tmp_path, row_count=10),
-            "processed": artifact_metadata(processed, root=tmp_path, row_count=5),
+            "bar_store_manifest": artifact_metadata(
+                bar_store_manifest, root=tmp_path, row_count=1
+            ),
+            "symbol_index": artifact_metadata(symbol_index, root=tmp_path, row_count=2),
+            "cutoff_ranges": artifact_metadata(cutoff_ranges, root=tmp_path, row_count=3),
         },
     }
     atomic_write_json(manifest, payload)
@@ -580,7 +566,7 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
         manifest,
         profile="tw_only",
         raw_path=raw,
-        processed_path=processed,
+        bar_store_path=bar_store,
     )
     assert (
         validate_dataset_preparation_contract(
@@ -648,7 +634,7 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
             manifest,
             profile="tw_only",
             raw_path=raw,
-            processed_path=processed,
+            bar_store_path=bar_store,
         )
 
 

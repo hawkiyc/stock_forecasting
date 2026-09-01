@@ -72,6 +72,7 @@ def test_dataset_lifecycle_accepts_matching_resumable_progress(
         "waiting_for_provider",
         "waiting_for_budget",
         "waiting_for_resume",
+        "waiting_for_preparation",
         "downloaded",
     ):
         progress_path.write_text(
@@ -79,7 +80,7 @@ def test_dataset_lifecycle_accepts_matching_resumable_progress(
                 {
                     "schema_version": 1,
                     "kind": "ohlcv-download-progress",
-                    "state": state,
+                    "state": "downloaded" if state == "waiting_for_preparation" else state,
                     "identity": identity,
                     "identity_sha256": identity_sha256,
                 }
@@ -244,8 +245,17 @@ def test_same_launch_terminal_finalizer_preserves_download_progress(
     assert payload["progress_path"] == str(progress_path.resolve())
 
 
+@pytest.mark.parametrize(
+    ("lifecycle_state", "progress_state"),
+    (
+        ("waiting_for_provider", "waiting_for_provider"),
+        ("waiting_for_preparation", "downloaded"),
+    ),
+)
 def test_tmux_resumable_dataset_validator_requires_matching_progress(
     tmp_path: Path,
+    lifecycle_state: str,
+    progress_state: str,
 ) -> None:
     volume_root = tmp_path / "runpod-volume"
     digest = "d" * 64
@@ -257,7 +267,7 @@ def test_tmux_resumable_dataset_validator_requires_matching_progress(
             {
                 "schema_version": 1,
                 "kind": "ohlcv-download-progress",
-                "state": "waiting_for_provider",
+                "state": progress_state,
                 "identity": identity,
                 "identity_sha256": hashlib.sha256(
                     json.dumps(
@@ -285,7 +295,7 @@ def test_tmux_resumable_dataset_validator_requires_matching_progress(
             "--kind",
             "stage1-dataset",
             "--state",
-            "waiting_for_provider",
+            lifecycle_state,
             "--launch-id",
             "test-launch",
             "--exit-code",
@@ -318,7 +328,7 @@ def test_tmux_resumable_dataset_validator_requires_matching_progress(
 
     assert write_result.returncode == 0, write_result.stderr
     assert validate_result.returncode == 0, validate_result.stderr
-    assert validate_result.stdout.strip() == "waiting_for_provider"
+    assert validate_result.stdout.strip() == lifecycle_state
 
 
 def test_runpod_entrypoints_use_only_two_quant_stages() -> None:
@@ -445,16 +455,56 @@ def test_cpu_acquisition_budget_is_resumable_and_reserves_preparation_time() -> 
     assert 'for key in ("category", "error_type", "operation", "item", "status_code")' in status
     assert 'ln "${RAW_STAGING}" "${RAW_FINAL}"' in prepare
     assert "fin-ts-verify-download" in prepare
+    assert '--output "${BAR_STORE_FINAL}"' in prepare
+    assert '--deadline-epoch-seconds "$((WORKFLOW_DEADLINE_EPOCH - 120))"' in prepare
+    assert 'PREP_RESUMABLE_STATE=waiting_for_preparation' in prepare
+    assert 'BAR_STORE_SUCCESS="${BAR_STORE_FINAL}/_SUCCESS.json"' in prepare
+    assert "PROCESSED_FINAL" not in prepare
+    acquisition_branch = prepare.index("if [[ ${REUSE_DOWNLOADED_DATASET} -eq 0 ]]")
+    eodhd_secret_check = prepare.index(
+        "EODHD_API_TOKEN RunPod Secret is missing or was not resolved"
+    )
+    assert acquisition_branch < eodhd_secret_check < prepare.index("DOWNLOAD_ARGUMENTS=(")
     assert "obsolete-security-scope" in prepare
     assert "rebuilding from verified provider cache entries" in prepare
     assert "resumable-dataset-lifecycle" in tmux
     assert "${cpu_resumable_lifecycle_valid} -ne 1" in tmux
     assert "The CPU worker publishes the precise waiting state" in tmux
     assert "same_launch" in readiness
-    for state in ("waiting_for_budget", "waiting_for_resume", "downloaded"):
+    for state in (
+        "waiting_for_budget",
+        "waiting_for_resume",
+        "waiting_for_preparation",
+        "downloaded",
+    ):
         assert state in guard
     assert 'print("downloaded_active")' in guard
     assert 'payload.get("exit_code") != 75' in guard
+
+
+def test_gpu_gate_verifies_lazy_bar_store_artifacts() -> None:
+    gate = (ROOT / "scripts/verify_runpod_stage_readiness.sh").read_text(
+        encoding="utf-8"
+    )
+
+    for artifact in ("bar_store_manifest", "symbol_index", "cutoff_ranges"):
+        assert f"verify_remote_size {artifact}" in gate
+    assert "verify_remote_size processed" not in gate
+
+
+def test_checkpoint_contract_persists_runtime_label_scales() -> None:
+    checkpointing = (ROOT / "src/stock_forecasting/checkpointing.py").read_text(
+        encoding="utf-8"
+    )
+    contract = (ROOT / "src/stock_forecasting/run_contract.py").read_text(
+        encoding="utf-8"
+    )
+    readiness = (ROOT / "scripts/runpod_readiness.py").read_text(encoding="utf-8")
+
+    assert 'CHECKPOINT_ARTIFACT_SCHEMA_VERSION = "4.0"' in contract
+    assert '"runtime_robust_scales": _model_runtime_robust_scales(model)' in checkpointing
+    assert "_restore_runtime_robust_scales(" in checkpointing
+    assert "_validate_runtime_robust_scales(trainer_state)" in readiness
 
 
 def test_network_volume_identity_and_exact_mount_are_fail_closed() -> None:
@@ -702,7 +752,7 @@ def test_checkpoint_download_names_follow_validated_retention_manifest(
         },
     ]
     leaderboard = {
-        "schema_version": "3.0",
+        "schema_version": "4.0",
         "run_id": run_id,
         "run_key": run_id,
         "training_resume_contract_sha256": contract_digest,
@@ -715,7 +765,7 @@ def test_checkpoint_download_names_follow_validated_retention_manifest(
         "checkpoints": checkpoints,
     }
     pointer = {
-        "schema_version": "3.0",
+        "schema_version": "4.0",
         "run_id": run_id,
         "run_key": run_id,
         "training_resume_contract_sha256": contract_digest,

@@ -26,7 +26,7 @@ from stock_forecasting.data.benchmarks import (
 )
 from stock_forecasting.data.download_progress import DownloadProgress
 from stock_forecasting.data.manifest import (
-    DATASET_MANIFEST_SCHEMA_VERSION,
+    DOWNLOAD_MANIFEST_SCHEMA_VERSION,
     artifact_metadata,
     atomic_write_json,
 )
@@ -1478,7 +1478,7 @@ def ingest_daily_ohlcv(
         row_count=request_log.count,
     )
     payload = {
-        "schema_version": DATASET_MANIFEST_SCHEMA_VERSION,
+        "schema_version": DOWNLOAD_MANIFEST_SCHEMA_VERSION,
         "kind": "ohlcv-dataset",
         "state": "downloaded",
         "created_at": datetime.now(UTC).isoformat(),

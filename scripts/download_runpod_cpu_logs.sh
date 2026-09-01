@@ -47,6 +47,7 @@ if state not in {
     "waiting_for_provider",
     "waiting_for_budget",
     "waiting_for_resume",
+    "waiting_for_preparation",
     "downloaded",
 }:
     raise SystemExit(f"CPU dataset lifecycle is not terminal: {state or '<missing>'}")
@@ -54,6 +55,7 @@ if state in {
     "waiting_for_provider",
     "waiting_for_budget",
     "waiting_for_resume",
+    "waiting_for_preparation",
     "downloaded",
 } and payload.get("exit_code") != 75:
     raise SystemExit(f"CPU dataset lifecycle is still active: {state}")

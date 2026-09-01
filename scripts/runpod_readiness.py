@@ -16,7 +16,7 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 LIFECYCLE_SCHEMA_VERSION = 1
-CHECKPOINT_ARTIFACT_SCHEMA_VERSION = "3.0"
+CHECKPOINT_ARTIFACT_SCHEMA_VERSION = "4.0"
 TRAINING_COMPLETION_SCHEMA_VERSION = "1.0"
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.^_-]+$")
 SOURCE_ROOT_NAMES = ("src", "configs", "scripts", "tests")
@@ -32,6 +32,7 @@ DATASET_RESUMABLE_STATES = frozenset(
         "waiting_for_provider",
         "waiting_for_budget",
         "waiting_for_resume",
+        "waiting_for_preparation",
         "downloaded",
     }
 )
@@ -554,6 +555,20 @@ def _payload_sha256(payload):
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _dataset_request_sha256(payload):
+    if not isinstance(payload, dict):
+        return ""
+    normalized = dict(payload)
+    preparation = payload.get("preparation")
+    if isinstance(preparation, dict):
+        normalized["preparation"] = {
+            **preparation,
+            "h_start": 1,
+            "alpha_horizons": list(range(1, 15)),
+        }
+    return _payload_sha256(normalized)
+
+
 def _parse_utc_timestamp(value, label):
     if not isinstance(value, str) or not value:
         raise ValueError(f"{label} is not a timestamp")
@@ -602,11 +617,22 @@ def _validate_causal_split_audit(audit, split_counts, label):
     if validation_start >= test_start:
         raise ValueError(f"{label} validation boundary does not precede test")
 
+    train_boundary = _parse_utc_timestamp(
+        audit.get("train_boundary_exclusive"),
+        f"{label} train_boundary_exclusive",
+    )
+    validation_boundary = _parse_utc_timestamp(
+        audit.get("validation_boundary_exclusive"),
+        f"{label} validation_boundary_exclusive",
+    )
+    if not train_boundary <= validation_start < validation_boundary <= test_start:
+        raise ValueError(f"{label} causal split boundaries are inconsistent")
+
     counts = audit.get("label_end_counts")
     maxima = audit.get("maximum_label_end")
     if not isinstance(counts, dict) or not isinstance(maxima, dict):
         raise ValueError(f"{label} causal split audit is incomplete")
-    boundaries = {"train": validation_start, "validation": test_start}
+    boundaries = {"train": train_boundary, "validation": validation_boundary}
     for split, boundary in boundaries.items():
         if counts.get(split) != split_counts[split]:
             raise ValueError(f"{label} {split} label-end count is inconsistent")
@@ -645,7 +671,7 @@ def _validate_quant_dataset_payload(
     requested_dataset = payload.get("requested_dataset")
     if (
         not isinstance(requested_dataset, dict)
-        or _payload_sha256(requested_dataset) != dataset_request_sha256
+        or _dataset_request_sha256(requested_dataset) != dataset_request_sha256
     ):
         raise ValueError("Dataset readiness requested dataset contract is invalid")
     expected_data_root = f"datasets/{dataset_request_sha256}"
@@ -666,7 +692,11 @@ def _validate_quant_dataset_payload(
 
     approved_paths = {
         "raw": f"{expected_data_root}/raw/market.parquet",
-        "processed": f"{expected_data_root}/processed/windows.parquet",
+        "bar_store_manifest": (
+            f"{expected_data_root}/prepared/bar-store/bar-store.json"
+        ),
+        "symbol_index": f"{expected_data_root}/prepared/bar-store/symbol-index.parquet",
+        "cutoff_ranges": f"{expected_data_root}/prepared/bar-store/cutoff-ranges.parquet",
         "dataset_manifest": f"{expected_data_root}/dataset-manifest.json",
         "download_manifest": f"{expected_data_root}/download-manifest.json",
         "request_log": f"{expected_data_root}/manifests/api-request-log.jsonl",
@@ -742,6 +772,24 @@ def _validate_quant_dataset_payload(
         raise ValueError("Quant maximum alpha horizon must remain 14 trading days")
     if preparation_spec.get("alpha_horizons") != list(range(h_start, 15)):
         raise ValueError("Quant alpha horizons must be contiguous from h_start through day 14")
+    if (
+        preparation_spec.get("storage_kind")
+        != "symbol-oriented-ohlcv-bar-store"
+        or preparation_spec.get("window_materialized") is not False
+        or preparation_spec.get("labels_materialized") is not False
+        or preparation_spec.get("supported_h_start") != [1, 2, 3]
+    ):
+        raise ValueError("Quant dataset must use lazy bar storage and runtime labels")
+    storage_preparation = dict(preparation_spec)
+    storage_preparation.pop("h_start", None)
+    storage_preparation.pop("alpha_horizons", None)
+    storage_preparation_sha256 = payload.get("storage_preparation_spec_sha256")
+    if (
+        not isinstance(storage_preparation_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", storage_preparation_sha256)
+        or storage_preparation_sha256 != _payload_sha256(storage_preparation)
+    ):
+        raise ValueError("Dataset readiness storage preparation spec is invalid")
     requested_preparation = requested_dataset.get("preparation")
     if not isinstance(requested_preparation, dict):
         raise ValueError("Dataset readiness requested preparation contract is invalid")
@@ -777,7 +825,7 @@ def _validate_quant_dataset_payload(
             not isinstance(value, int) or isinstance(value, bool) or value < 1
             for value in split_counts.values()
         )
-        or sum(split_counts.values()) != artifacts["processed"]["row_count"]
+        or sum(split_counts.values()) != payload.get("valid_cutoff_count")
     ):
         raise ValueError("Dataset readiness split counts are invalid")
     _validate_causal_split_audit(
@@ -822,7 +870,9 @@ def _verify_dataset_artifacts(payload, network_volume_root):
     volume_root = network_volume_root.resolve()
     artifact_names = (
         "raw",
-        "processed",
+        "bar_store_manifest",
+        "symbol_index",
+        "cutoff_ranges",
         "dataset_manifest",
         "download_manifest",
         "request_log",
@@ -844,15 +894,16 @@ def _verify_dataset_artifacts(payload, network_volume_root):
 
     dataset_payload = _load_json(str(paths["dataset_manifest"]))
     if (
-        dataset_payload.get("schema_version") != "2.0"
-        or dataset_payload.get("kind") != "ohlcv-dataset"
+        dataset_payload.get("schema_version") != "3.0"
+        or dataset_payload.get("kind") != "ohlcv-bar-store-dataset"
         or dataset_payload.get("state") != "ready"
         or dataset_payload.get("dataset_profile") != payload.get("dataset_profile")
         or dataset_payload.get("selected_datasets") != payload.get("selected_datasets")
         or dataset_payload.get("training_security_scope")
         != payload.get("training_security_scope")
         or dataset_payload.get("data_pipeline_digest") != payload.get("data_pipeline_digest")
-        or dataset_payload.get("preparation_spec_sha256") != payload.get("preparation_spec_sha256")
+        or dataset_payload.get("preparation_spec_sha256")
+        != payload.get("storage_preparation_spec_sha256")
         or dataset_payload.get("universe_sha256") != payload.get("universe_sha256")
         or dataset_payload.get("split_counts") != payload.get("split_counts")
         or dataset_payload.get("split_audit") != payload.get("split_audit")
@@ -861,7 +912,7 @@ def _verify_dataset_artifacts(payload, network_volume_root):
     dataset_artifacts = dataset_payload.get("artifacts")
     if not isinstance(dataset_artifacts, dict):
         raise ValueError("Dataset manifest artifacts are invalid")
-    for name in ("raw", "processed"):
+    for name in ("raw", "bar_store_manifest", "symbol_index", "cutoff_ranges"):
         source = dataset_artifacts.get(name)
         if (
             not isinstance(source, dict)
@@ -912,8 +963,8 @@ def command_check_dataset(arguments):
     if arguments.network_volume_root is not None:
         _verify_dataset_artifacts(payload, arguments.network_volume_root)
     print(
-        "Stage 1 data ready: {} raw rows, {} processed windows".format(
-            payload["raw"]["row_count"], payload["processed"]["row_count"]
+        "Stage 1 data ready: {} raw rows, {} lazy valid cutoffs".format(
+            payload["raw"]["row_count"], payload["valid_cutoff_count"]
         )
     )
     return 0
@@ -990,6 +1041,22 @@ def _validate_checkpoint_artifact_files(payload):
             or size_bytes < 1
         ):
             raise ValueError(f"Trainer state has invalid integrity metadata for {name}")
+
+
+def _validate_runtime_robust_scales(payload):
+    values = payload.get("runtime_robust_scales")
+    if (
+        not isinstance(values, list)
+        or not 12 <= len(values) <= 14
+        or any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+            for value in values
+        )
+    ):
+        raise ValueError("Trainer state has invalid runtime robust scales")
 
 
 def _validate_run_lifecycle_paths(payload, volume_root):
@@ -1271,10 +1338,13 @@ def command_resumable_dataset_lifecycle(arguments):
         raise ValueError("Dataset progress path is not canonical")
     progress = _load_json(progress_path)
     identity = progress.get("identity")
+    expected_progress_state = (
+        "downloaded" if state == "waiting_for_preparation" else state
+    )
     if (
         progress.get("schema_version") != 1
         or progress.get("kind") != "ohlcv-download-progress"
-        or progress.get("state") != state
+        or progress.get("state") != expected_progress_state
         or not isinstance(identity, dict)
         or progress.get("identity_sha256") != _payload_sha256(identity)
         or identity.get("dataset_request_sha256") != relative.parts[0]
@@ -1404,6 +1474,7 @@ def _validate_trainer_state_identity(
     contract_digest,
 ):
     _validate_checkpoint_artifact_files(trainer_state)
+    _validate_runtime_robust_scales(trainer_state)
     if _checkpoint_artifact_contract_digest(trainer_state, "Trainer state") != contract_digest:
         raise ValueError("Trainer state and checkpoint leaderboard contracts disagree")
     if trainer_state.get("run_id") != run_id or trainer_state.get("run_key") != run_id:
@@ -1611,9 +1682,14 @@ def command_write_state(arguments):
             or progress_identity.get("dataset_request_sha256") != progress_relative.parts[0]
         ):
             raise ValueError("Download progress identity does not match its dataset namespace")
+        expected_progress_state = (
+            "downloaded"
+            if arguments.state == "waiting_for_preparation"
+            else arguments.state
+        )
         if (
             arguments.state in DATASET_RESUMABLE_STATES
-            and progress_payload.get("state") != arguments.state
+            and progress_payload.get("state") != expected_progress_state
         ):
             raise ValueError(f"{arguments.state} lifecycle requires matching download progress")
     elif arguments.state in DATASET_RESUMABLE_STATES:
@@ -1636,6 +1712,7 @@ def command_write_state(arguments):
             "waiting_for_provider",
             "waiting_for_budget",
             "waiting_for_resume",
+            "waiting_for_preparation",
             "downloaded",
         }
         if existing_state not in active_states | terminal_states:
@@ -1867,6 +1944,7 @@ def build_parser():
             "waiting_for_provider",
             "waiting_for_budget",
             "waiting_for_resume",
+            "waiting_for_preparation",
             "downloaded",
         ),
         required=True,

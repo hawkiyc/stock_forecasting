@@ -17,7 +17,12 @@ from stock_forecasting.data.horizons import MAX_ALPHA_HORIZON, alpha_horizons_fr
 from stock_forecasting.data.schema import TRAINING_SECURITY_SCOPE
 from stock_forecasting.data.splits import SPLIT_POLICY
 
-DATASET_MANIFEST_SCHEMA_VERSION = "2.0"
+DOWNLOAD_MANIFEST_SCHEMA_VERSION = "2.0"
+DATASET_MANIFEST_SCHEMA_VERSION = "3.0"
+DATASET_MANIFEST_KIND = "ohlcv-bar-store-dataset"
+BAR_STORE_SCHEMA_VERSION = "1.0"
+BAR_STORE_KIND = "symbol-oriented-ohlcv-bar-store"
+SUPPORTED_H_START = (1, 2, 3)
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _SECRET_KEY_PATTERN = re.compile(r"(?i)(api[_-]?key|api[_-]?token|password|secret)")
 
@@ -157,10 +162,14 @@ def load_dataset_manifest(
     if not isinstance(payload, dict):
         raise ValueError("Dataset manifest must contain a JSON object")
     _assert_no_secrets(payload)
-    if (
-        payload.get("schema_version") != DATASET_MANIFEST_SCHEMA_VERSION
-        or payload.get("kind") != "ohlcv-dataset"
-    ):
+    state = payload.get("state")
+    expected_contract = {
+        "downloaded": (DOWNLOAD_MANIFEST_SCHEMA_VERSION, "ohlcv-dataset"),
+        "ready": (DATASET_MANIFEST_SCHEMA_VERSION, DATASET_MANIFEST_KIND),
+    }.get(state)
+    if expected_contract is None or (
+        payload.get("schema_version"), payload.get("kind")
+    ) != expected_contract:
         raise ValueError("Dataset manifest schema or kind is unsupported")
     if required_state is not None and payload.get("state") != required_state:
         raise ValueError(f"Dataset manifest state must be {required_state}")
@@ -203,9 +212,9 @@ def validate_training_dataset_manifest(
     *,
     profile: DatasetProfile,
     raw_path: str | Path,
-    processed_path: str | Path,
+    bar_store_path: str | Path,
 ) -> dict[str, Any]:
-    """Bind a training run to exact offline raw and processed Parquet artifacts."""
+    """Bind training to immutable raw bars and the lazy bar-store indexes."""
 
     manifest_path = Path(path).resolve(strict=True)
     payload = load_dataset_manifest(manifest_path, required_state="ready")
@@ -225,26 +234,61 @@ def validate_training_dataset_manifest(
     if selected != expected_selected:
         raise ValueError("Dataset manifest selected_datasets do not match its profile")
     artifacts = payload.get("artifacts")
-    if not isinstance(artifacts, dict) or set(artifacts) != {"raw", "processed"}:
-        raise ValueError("Dataset manifest must bind raw and processed artifacts")
+    expected_artifacts = {
+        "raw",
+        "bar_store_manifest",
+        "symbol_index",
+        "cutoff_ranges",
+    }
+    if not isinstance(artifacts, dict) or set(artifacts) != expected_artifacts:
+        raise ValueError("Dataset manifest must bind raw bars and lazy bar-store indexes")
     raw_artifact, _ = _validate_artifact(
         artifacts["raw"],
         manifest_root=manifest_path.parent,
         label="raw",
     )
-    processed_artifact, _ = _validate_artifact(
-        artifacts["processed"],
+    bar_store_manifest, _ = _validate_artifact(
+        artifacts["bar_store_manifest"],
         manifest_root=manifest_path.parent,
-        label="processed",
+        label="bar-store manifest",
+    )
+    symbol_index, _ = _validate_artifact(
+        artifacts["symbol_index"],
+        manifest_root=manifest_path.parent,
+        label="symbol index",
+    )
+    cutoff_ranges, _ = _validate_artifact(
+        artifacts["cutoff_ranges"],
+        manifest_root=manifest_path.parent,
+        label="cutoff ranges",
     )
     configured_raw = Path(raw_path).resolve(strict=False)
-    configured_processed = Path(processed_path).resolve(strict=False)
-    if configured_processed.is_dir():
-        configured_processed = configured_processed / "windows.parquet"
+    configured_bar_store = Path(bar_store_path).resolve(strict=False)
+    if configured_bar_store.name == "bar-store.json":
+        configured_bar_store_root = configured_bar_store.parent
+    else:
+        configured_bar_store_root = configured_bar_store
+        configured_bar_store = configured_bar_store / "bar-store.json"
     if raw_artifact != configured_raw:
         raise ValueError("Configured raw_path does not match the dataset manifest")
-    if processed_artifact != configured_processed:
-        raise ValueError("Configured processed_path does not match the dataset manifest")
+    if bar_store_manifest != configured_bar_store:
+        raise ValueError("Configured bar_store_path does not match the dataset manifest")
+    if symbol_index != configured_bar_store_root / "symbol-index.parquet":
+        raise ValueError("Dataset symbol index is outside the configured bar store")
+    if cutoff_ranges != configured_bar_store_root / "cutoff-ranges.parquet":
+        raise ValueError("Dataset cutoff ranges are outside the configured bar store")
+    try:
+        store_payload = json.loads(bar_store_manifest.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError("Bar-store manifest is not valid JSON") from error
+    if (
+        not isinstance(store_payload, dict)
+        or store_payload.get("schema_version") != BAR_STORE_SCHEMA_VERSION
+        or store_payload.get("kind") != BAR_STORE_KIND
+        or store_payload.get("state") != "ready"
+        or store_payload.get("split_counts") != payload.get("split_counts")
+    ):
+        raise ValueError("Bar-store manifest contract is invalid")
     split_counts = payload.get("split_counts")
     if (
         not isinstance(split_counts, dict)
@@ -290,9 +334,10 @@ def validate_dataset_preparation_contract(
     if digest != canonical_json_sha256(preparation_spec):
         raise ValueError("Dataset manifest preparation_spec digest is invalid")
 
+    if h_start not in SUPPORTED_H_START:
+        raise ValueError("Configured h_start is not supported by the lazy bar store")
     expected_integers = {
         "window_size": input_length,
-        "h_start": h_start,
         "max_horizon": max_horizon,
         "target_horizon": forecast_horizon,
         "stride": stride,
@@ -307,7 +352,13 @@ def validate_dataset_preparation_contract(
             )
     expected_exact = {
         "processed_schema_version": "4.0",
-        "alpha_horizons": alpha_horizons,
+        "bar_store_schema_version": BAR_STORE_SCHEMA_VERSION,
+        "storage_kind": BAR_STORE_KIND,
+        "supported_h_start": list(SUPPORTED_H_START),
+        "alpha_horizons_available": list(range(1, MAX_ALPHA_HORIZON + 1)),
+        "window_materialized": False,
+        "labels_materialized": False,
+        "label_computation": "lazy_in_dataloader_from_raw_adjusted_execution_bars",
         "label_kind": "benchmark_relative_adjusted_log_return",
         "signal_timing": "after_close_t",
         "entry_timing": "regular_session_open_t_plus_1",
@@ -436,20 +487,13 @@ def validate_dataset_preparation_contract(
     statistics = payload.get("label_statistics")
     if not isinstance(statistics, dict):
         raise ValueError("Dataset manifest has no label_statistics")
-    scales = statistics.get("robust_scales")
     if (
         statistics.get("source_split") != "train"
-        or statistics.get("horizons") != alpha_horizons
+        or statistics.get("state") != "runtime_calibration_required"
+        or statistics.get("horizons_available")
+        != list(range(1, MAX_ALPHA_HORIZON + 1))
         or statistics.get("prediction_units") != "benchmark_relative_log_return"
-        or not isinstance(scales, list)
-        or len(scales) != len(alpha_horizons)
-        or any(
-            not isinstance(value, int | float)
-            or isinstance(value, bool)
-            or not math.isfinite(float(value))
-            or float(value) <= 0.0
-            for value in scales
-        )
+        or "robust_scales" in statistics
     ):
         raise ValueError("Dataset manifest label_statistics are invalid")
     return preparation_spec

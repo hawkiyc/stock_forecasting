@@ -70,7 +70,15 @@ def _marker(selection: dict[str, object]) -> dict[str, object]:
         "requested_dataset": request,
         "data_root_relative": root,
         "raw": {"relative_path": f"{root}/raw/market.parquet"},
-        "processed": {"relative_path": f"{root}/processed/windows.parquet"},
+        "bar_store_manifest": {
+            "relative_path": f"{root}/prepared/bar-store/bar-store.json"
+        },
+        "symbol_index": {
+            "relative_path": f"{root}/prepared/bar-store/symbol-index.parquet"
+        },
+        "cutoff_ranges": {
+            "relative_path": f"{root}/prepared/bar-store/cutoff-ranges.parquet"
+        },
         "dataset_manifest": {"relative_path": f"{root}/dataset-manifest.json"},
         "download_manifest": {"relative_path": f"{root}/download-manifest.json"},
         "request_log": {"relative_path": f"{root}/manifests/api-request-log.jsonl"},
@@ -182,14 +190,15 @@ def test_date_or_universe_changes_dataset_request_identity(tmp_path: Path) -> No
     assert baseline["dataset_request_sha256"] != explicit_universe["dataset_request_sha256"]
 
 
-def test_h_start_changes_processed_dataset_identity_but_not_provider_cache_revision(
+def test_h_start_changes_training_selection_but_reuses_the_same_bar_store_namespace(
     tmp_path: Path,
 ) -> None:
     project_root = _project_root(tmp_path)
     first_day = SELECTION._build_selection(_arguments(h_start=1), project_root)
     third_day = SELECTION._build_selection(_arguments(h_start=3), project_root)
 
-    assert first_day["dataset_request_sha256"] != third_day["dataset_request_sha256"]
+    assert first_day["dataset_request_sha256"] == third_day["dataset_request_sha256"]
+    assert first_day["selection_sha256"] != third_day["selection_sha256"]
     assert first_day["dataset_request"]["revision"] == "v1"
     assert third_day["dataset_request"]["revision"] == "v1"
     assert first_day["dataset_request"]["preparation"]["alpha_horizons"] == list(

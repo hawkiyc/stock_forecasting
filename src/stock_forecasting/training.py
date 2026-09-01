@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 import math
 import random
-from collections import defaultdict
-from collections.abc import Sized
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +16,7 @@ from numpy.typing import NDArray
 from torch import Tensor
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader
 
 from stock_forecasting.checkpointing import (
     load_checkpoint,
@@ -28,9 +26,10 @@ from stock_forecasting.checkpointing import (
 )
 from stock_forecasting.config import ExperimentConfig
 from stock_forecasting.data import (
+    BlockwisePermutationSampler,
     FinancialBatchCollator,
-    FinancialWindowDataset,
-    read_processed_records,
+    FixedSizeBatchSampler,
+    LazyFinancialWindowDataset,
 )
 from stock_forecasting.factory import ModelBundle, build_model_bundle
 from stock_forecasting.metrics import (
@@ -46,7 +45,7 @@ from stock_forecasting.tracking import (
     training_run_lease,
     validate_tracking_run_contract,
 )
-from stock_forecasting.training_paths import resolve_processed_dataset_path
+from stock_forecasting.training_paths import resolve_bar_store_path
 
 
 def set_global_seed(seed: int) -> None:
@@ -57,137 +56,118 @@ def set_global_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def resolve_processed_dataset(path: Path) -> Path:
-    return resolve_processed_dataset_path(path)
-
-
-def deterministic_stratified_indices(
-    dataset: FinancialWindowDataset,
-    *,
-    fraction: float,
-    max_samples: int | None = None,
-) -> list[int]:
-    """Select an exact, deterministic fraction stratified by market and asset type."""
-
-    count = len(dataset)
-    target = count if fraction >= 1.0 else max(1, int(count * fraction))
-    if max_samples is not None:
-        target = min(target, max_samples)
-    if target >= count:
-        return list(range(count))
-
-    groups: dict[tuple[str, str], list[int]] = defaultdict(list)
-    for index, record in enumerate(dataset.records):
-        metadata = record.get("metadata", {})
-        key = (
-            str(metadata.get("market", "unknown")),
-            str(record.get("asset_type", "unknown")),
-        )
-        groups[key].append(index)
-
-    effective_fraction = target / count
-    quotas: dict[tuple[str, str], int] = {}
-    fractional: list[tuple[float, tuple[str, str]]] = []
-    for key, indices in sorted(groups.items()):
-        exact = len(indices) * effective_fraction
-        quota = min(len(indices), math.floor(exact))
-        quotas[key] = quota
-        fractional.append((exact - quota, key))
-    remaining = target - sum(quotas.values())
-    for _fractional_part, key in sorted(fractional, key=lambda item: (-item[0], item[1])):
-        if remaining == 0:
-            break
-        if quotas[key] < len(groups[key]):
-            quotas[key] += 1
-            remaining -= 1
-    if remaining:
-        for key in sorted(groups):
-            while remaining and quotas[key] < len(groups[key]):
-                quotas[key] += 1
-                remaining -= 1
-    if remaining:
-        raise RuntimeError("Could not allocate the requested deterministic subset")
-
-    selected: list[int] = []
-    for key, indices in sorted(groups.items()):
-        ordered = sorted(
-            indices,
-            key=lambda index: (
-                str(dataset.records[index]["cutoff_at"]),
-                str(dataset.records[index]["symbol"]),
-                index,
-            ),
-        )
-        quota = quotas[key]
-        if quota == 0:
-            continue
-        positions = np.linspace(0, len(ordered) - 1, num=quota, dtype=np.int64)
-        selected.extend(ordered[int(position)] for position in positions)
-    selected = sorted(set(selected))
-    if len(selected) != target:
-        raise RuntimeError(
-            f"Deterministic subset selected {len(selected)} rows; expected exactly {target}"
-        )
-    return selected
-
-
 def build_dataloaders(
     config: ExperimentConfig,
 ) -> tuple[DataLoader[Any], DataLoader[Any], DataLoader[Any]]:
-    dataset_path = resolve_processed_dataset(config.data.processed_path)
-    records = read_processed_records(dataset_path)
-    train_source = FinancialWindowDataset(
-        records,
+    bar_store = resolve_bar_store_path(config.data.bar_store_path)
+    train_source = LazyFinancialWindowDataset(
+        bar_store,
         split="train",
-        alpha_horizons=config.data.alpha_horizons,
+        window_size=config.data.input_length,
+        h_start=config.data.h_start,
     )
-    validation_dataset = FinancialWindowDataset(
-        records,
+    validation_dataset = LazyFinancialWindowDataset(
+        bar_store,
         split="validation",
-        alpha_horizons=config.data.alpha_horizons,
+        window_size=config.data.input_length,
+        h_start=config.data.h_start,
     )
-    test_dataset = FinancialWindowDataset(
-        records,
+    test_dataset = LazyFinancialWindowDataset(
+        bar_store,
         split="test",
-        alpha_horizons=config.data.alpha_horizons,
+        window_size=config.data.input_length,
+        h_start=config.data.h_start,
     )
-    indices = deterministic_stratified_indices(
-        train_source,
+    train_sampler = BlockwisePermutationSampler(
+        len(train_source),
         fraction=config.data.train_fraction,
         max_samples=config.data.max_samples,
+        seed=config.training.seed,
+        block_size=max(1, config.training.batch_size // 2),
     )
-    train_dataset: Dataset[Any] = (
-        train_source if len(indices) == len(train_source) else Subset(train_source, indices)
+    validation_sampler = BlockwisePermutationSampler(
+        len(validation_dataset),
+        max_samples=config.training.evaluation_max_samples,
+        seed=config.training.seed + 1,
+        block_size=max(1, config.training.evaluation_batch_size // 2),
+    )
+    test_sampler = BlockwisePermutationSampler(
+        len(test_dataset),
+        max_samples=config.training.evaluation_max_samples,
+        seed=config.training.seed + 2,
+        block_size=max(1, config.training.evaluation_batch_size // 2),
+    )
+    if len(train_sampler) < config.training.batch_size:
+        raise ValueError("Selected training samples do not fill one fixed-size batch")
+    train_batch_sampler = FixedSizeBatchSampler(
+        train_sampler,
+        batch_size=config.training.batch_size,
     )
     collator = FinancialBatchCollator()
     pin_memory = torch.cuda.is_available()
-    generator = torch.Generator().manual_seed(config.training.seed)
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=True,
-        generator=generator,
+        train_source,
+        batch_sampler=train_batch_sampler,
         collate_fn=collator,
         num_workers=config.training.num_workers,
         pin_memory=pin_memory,
+        persistent_workers=config.training.num_workers > 0,
     )
     validation_loader = DataLoader(
         validation_dataset,
         batch_size=config.training.evaluation_batch_size,
+        sampler=validation_sampler,
         shuffle=False,
         collate_fn=collator,
         num_workers=config.training.num_workers,
         pin_memory=pin_memory,
+        persistent_workers=config.training.num_workers > 0,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=config.training.evaluation_batch_size,
+        sampler=test_sampler,
         shuffle=False,
         collate_fn=collator,
         num_workers=config.training.num_workers,
         pin_memory=pin_memory,
+        persistent_workers=config.training.num_workers > 0,
     )
     return train_loader, validation_loader, test_loader
+
+
+def estimate_runtime_robust_scales(
+    dataset: LazyFinancialWindowDataset,
+    *,
+    sample_count: int,
+    seed: int,
+) -> tuple[float, ...]:
+    """Estimate train-only label scales without persisting any label rows."""
+
+    sampler = BlockwisePermutationSampler(
+        len(dataset),
+        fraction=1.0,
+        max_samples=min(sample_count, len(dataset)),
+        seed=seed,
+    )
+    columns: list[list[float]] = [[] for _ in dataset.horizons]
+    for index in sampler:
+        values = dataset.target_at(index).numpy()
+        for position, value in enumerate(values):
+            columns[position].append(float(value))
+    scales: list[float] = []
+    for horizon, values in zip(dataset.horizons, columns, strict=True):
+        array = np.asarray(values, dtype=np.float64)
+        if array.size < 4:
+            raise ValueError(
+                f"At least four runtime calibration labels are required for horizon {horizon}"
+            )
+        q25, q75 = np.quantile(array, [0.25, 0.75])
+        median = float(np.median(array))
+        iqr = float(q75 - q25)
+        mad_scale = float(np.median(np.abs(array - median)) * 1.4826)
+        scales.append(max(iqr, mad_scale, 1e-4))
+    return tuple(scales)
 
 
 def _autocast_context(config: ExperimentConfig, device: torch.device) -> Any:
@@ -469,6 +449,7 @@ class TrainingResult:
     dataset_profile: str
     selected_datasets: tuple[str, ...]
     train_samples: int
+    robust_scales: tuple[float, ...]
     validation_metrics: dict[str, Any]
 
 
@@ -484,7 +465,15 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
     set_global_seed(config.training.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader, validation_loader, _test_loader = build_dataloaders(config)
-    bundle = build_model_bundle(config, device)
+    train_dataset = cast(LazyFinancialWindowDataset, train_loader.dataset)
+    train_batch_sampler = cast(FixedSizeBatchSampler, train_loader.batch_sampler)
+    selected_train_samples = len(train_batch_sampler.sampler)
+    robust_scales = estimate_runtime_robust_scales(
+        train_dataset,
+        sample_count=config.data.label_scale_calibration_samples,
+        seed=config.training.seed + 17,
+    )
+    bundle = build_model_bundle(config, device, robust_scales=robust_scales)
     parameter_groups, trainable = _optimizer_parameter_groups(bundle, config)
     optimizer = AdamW(
         parameter_groups,
@@ -558,9 +547,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
         for epoch in range(starting_epoch, config.training.epochs):
             if stop_training:
                 break
-            loader_generator = getattr(train_loader, "generator", None)
-            if loader_generator is not None:
-                loader_generator.manual_seed(config.training.seed + epoch)
+            train_batch_sampler.set_epoch(epoch)
             for batch_index, batch in enumerate(train_loader):
                 if epoch == starting_epoch and batch_index < resume_batch_index:
                     continue
@@ -703,7 +690,21 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 "training_fraction": config.data.train_fraction,
                 "dataset_profile": config.data.dataset_profile,
                 "selected_datasets": config.data.selected_datasets,
-                "train_samples": len(cast(Sized, train_loader.dataset)),
+                "train_samples": selected_train_samples,
+                "training_batch_padding_per_epoch": (
+                    train_batch_sampler.padded_sample_count
+                ),
+                "runtime_label_calibration": {
+                    "source_split": "train",
+                    "sample_count": min(
+                        config.data.label_scale_calibration_samples,
+                        len(train_dataset),
+                    ),
+                    "seed": config.training.seed + 17,
+                    "horizons": config.data.alpha_horizons,
+                    "method": "max(iqr,mad_x_1.4826,1e-4)",
+                    "robust_scales": list(robust_scales),
+                },
                 "model_architecture_sha256": architecture_digest,
                 "lora_module_names": list(bundle.lora_module_names),
                 "lora_parameter_names": list(bundle.lora_parameter_names),
@@ -732,7 +733,8 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
             model_architecture_sha256=architecture_digest,
             dataset_profile=config.data.dataset_profile,
             selected_datasets=tuple(config.data.selected_datasets),
-            train_samples=len(cast(Sized, train_loader.dataset)),
+            train_samples=selected_train_samples,
+            robust_scales=robust_scales,
             validation_metrics=validation_metrics,
         )
     except BaseException:
@@ -761,6 +763,7 @@ def write_training_result(result: TrainingResult) -> None:
                 "dataset_profile": result.dataset_profile,
                 "selected_datasets": list(result.selected_datasets),
                 "train_samples": result.train_samples,
+                "robust_scales": list(result.robust_scales),
                 "validation_metrics": result.validation_metrics,
             },
             ensure_ascii=False,

@@ -114,7 +114,9 @@ verify_remote_size() {
 }
 
 verify_remote_size raw "Raw dataset"
-verify_remote_size processed "Processed dataset"
+verify_remote_size bar_store_manifest "Bar-store manifest"
+verify_remote_size symbol_index "Symbol index"
+verify_remote_size cutoff_ranges "Lazy cutoff ranges"
 verify_remote_size dataset_manifest "Dataset manifest"
 verify_remote_size download_manifest "Download manifest"
 verify_remote_size request_log "API request log"

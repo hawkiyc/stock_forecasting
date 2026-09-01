@@ -41,13 +41,13 @@ median correlation 或 calibration，而不是只在單一五日方向分類上�
 每次 run 必須綁定：
 
 - dataset profile 與 `selected_datasets`
-- raw/processed Parquet SHA-256、size、row count
+- raw Parquet、bar-store manifest、symbol index 與 cutoff ranges 的 SHA-256、size、row count
 - provider、market、symbol、asset type 與 date range
 - benchmark mapping SHA-256
-- window/preparation spec 與 data-pipeline digest
-- `h_start`、固定 `max_horizon=14` 與完整 horizon 序列
-- train-only robust scales
-- chronological split counts 與 window exclusion audit
+- h_start-independent bar-store preparation spec 與 data-pipeline digest
+- training selection 的 `h_start`、固定 `max_horizon=14` 與完整 horizon 序列
+- train-only runtime calibration 樣本數、seed 與 checkpoint 內的 robust scales
+- chronological split counts 與 cutoff exclusion audit
 
 正式比較不得混用不同 profile、universe、資料版本或 benchmark mapping。EODHD 與
 官方台股資料的來源差異必須在報告中揭露。
@@ -76,23 +76,25 @@ asset return、CAPM diagnostic 與任何 future label 都不得出現在 input t
 
 ### 6. Split 與 Stage 設計
 
-先建立全部 causal windows，再作 chronological 70/15/15 train/validation/test split，
-邊界使用 purge 20 bars 與 effective embargo 14 bars。不要隨機切 asset-day rows，也不要
-讓同一 future label interval 跨越 split 邊界。
+先從壓縮 symbol bar store 計算連續有效 cutoff ranges，再依全域市場日期作
+chronological 70/15/15 train/validation/test split；邊界使用 purge 20 bars 與 effective
+embargo 14 bars。磁碟上不建立 causal windows 或 labels，也不得讓同一 future label
+interval 跨越 split 邊界。
 
 | 項目 | Stage 1 | Stage 2 |
 |---|---|---|
 | 目的 | 驗證完整腳本、資料、GPU、loss、checkpoint 與 validation | 完整 train split 的 PoC 結果 |
-| train 樣本 | 依 market/asset type 確定性配置、精確 15% target count | 100% train split |
-| validation/test | 完整保留 | 完整保留 |
+| train 樣本 | O(1) blockwise permutation 的精確 15% target set | 100% train split |
+| validation/test | 完整 ranges 保留；例行評估依 config 確定性限量 | 同左 |
 | 模型架構 | Kronos-base + LoRA + shared resampler + conditioner + alpha head | 完全相同 |
 | 初始化 | 原始 pretrained base | 原始 pretrained base |
 | 接續 Stage 1 checkpoint | 否 | 否 |
 
 Stage 1 不是「最早 15% 時間」，也不是縮短 validation/test。兩個 config 的
 `config.model_architecture_digest()` 必須相同；此 digest 包含 `h_start`／輸出維度，
-Stage 2 重新從相同 pretrained revision
-開始，以免把 Stage 1 script smoke 當成額外訓練資料。
+最後不足一個 training batch 的 target set 會從同一集合開頭確定性補齊，且將補齊數量
+寫入 training summary。Stage 2 重新從相同 pretrained revision 開始，以免把 Stage 1
+script smoke 當成額外訓練資料。
 
 ### 7. Objective
 
@@ -251,13 +253,15 @@ be claimed.
 
 ### 4. Dataset identity
 
-Every run binds dataset profile and selected sources, raw/processed hashes and
-sizes, providers/markets/symbols/types/dates, benchmark-mapping hash, preparation
-and pipeline digests, `h_start`, fixed `max_horizon=14`, the full horizon sequence,
-train-only robust scales, split counts, and exclusion
-audit. Formal comparisons cannot mix profiles, universes, dataset versions, or
-benchmark mappings. EODHD versus official Taiwan source differences must be
-disclosed.
+Every run binds dataset profile and selected sources; raw Parquet, bar-store
+manifest, symbol-index, and cutoff-range hashes/sizes/counts; provider, market,
+symbol, type, and date provenance; benchmark-mapping hash; the
+`h_start`-independent storage preparation and pipeline digests; the training
+selection's `h_start`, fixed `max_horizon=14`, and full horizon sequence; the
+train-only runtime-calibration sample count, seed, and checkpoint-persisted robust scales; split
+counts; and cutoff-exclusion audit. Formal comparisons cannot mix profiles,
+universes, dataset versions, or benchmark mappings. EODHD versus official
+Taiwan source differences must be disclosed.
 
 ### 5. Labels and causality
 
@@ -279,22 +283,25 @@ fail-closed benchmark calendar gaps.
 
 ### 6. Splits and stages
 
-Build all causal windows first, then assign chronological 70/15/15 train/
-validation/test splits with 20-bar purge and effective 14-bar embargo. Never
-randomly split asset-day rows or let one future label interval cross a boundary.
+Derive contiguous valid-cutoff ranges from the compressed symbol bar store, then
+assign chronological 70/15/15 train/validation/test splits on global market
+dates with a 20-bar purge and effective 14-bar embargo. No causal window or label
+is stored, and no future label interval may cross a split boundary.
 
 | Item | Stage 1 | Stage 2 |
 |---|---|---|
 | Purpose | Validate the complete script/data/GPU/loss/checkpoint/validation path | Full-train PoC result |
-| Train samples | Exact deterministic 15% target count allocated by market/type | 100% of train |
-| Validation/test | Fully retained | Fully retained |
+| Train samples | Exact 15% target set from an O(1)-state blockwise permutation | 100% of train |
+| Validation/test | Full ranges retained; routine evaluation deterministically capped by config | Same |
 | Architecture | Kronos-base + LoRA + shared resampler + conditioner + alpha head | Identical |
 | Initialization | Original pretrained base | Original pretrained base |
 | Continue Stage 1 checkpoint | No | No |
 
 Stage 1 is not the earliest 15% of time and does not shrink validation/test.
-Both configs require the same architecture digest. Stage 2 restarts from the
-same pretrained revisions so the Stage 1 smoke run is not hidden extra training.
+Both configs require the same architecture digest. A short final training batch
+is deterministically filled from the beginning of the same target set, and the
+padding count is written to the training summary. Stage 2 restarts from the same
+pretrained revisions so the Stage 1 smoke run is not hidden extra training.
 
 ### 7. Objective
 

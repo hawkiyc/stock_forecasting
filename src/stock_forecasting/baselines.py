@@ -5,7 +5,9 @@ from __future__ import annotations
 import copy
 import math
 import random
+from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import chain
 from typing import Any, cast
 
 import numpy as np
@@ -135,20 +137,23 @@ def _relative_sequence(context: dict[str, Any]) -> NDArray[np.float32]:
     return values
 
 
-def baseline_arrays(records: list[dict[str, Any]]) -> BaselineArrays:
-    """Convert conditional-alpha records without reading any future feature."""
+def baseline_arrays(records: Iterable[dict[str, Any]]) -> BaselineArrays:
+    """Stream conditional-alpha records into bounded numerical baseline arrays."""
 
-    if not records:
-        raise ValueError("Baseline records cannot be empty")
+    iterator = iter(records)
+    try:
+        first_record = next(iterator)
+    except StopIteration as error:
+        raise ValueError("Baseline records cannot be empty") from error
     features: list[list[float]] = []
     sequences: list[NDArray[np.float32]] = []
     targets: list[list[float]] = []
     dates: list[str] = []
     symbols: list[str] = []
     asset_types: list[str] = []
-    first_label = records[0].get("label", {})
+    first_label = first_record.get("label", {})
     horizons = validate_alpha_horizons(first_label.get("horizons", ()))
-    for record in records:
+    for record in chain((first_record,), iterator):
         asset_summary = _numeric_summary(record["context"])
         benchmark_summary = _numeric_summary(record["benchmark_context"])
         feature_row = [
@@ -185,7 +190,7 @@ def baseline_arrays(records: list[dict[str, Any]]) -> BaselineArrays:
     return BaselineArrays(
         features=feature_array,
         sequences=np.stack(sequences).astype(np.float32),
-        instrument_mask=np.ones((len(records), 2), dtype=np.bool_),
+        instrument_mask=np.ones((len(targets), 2), dtype=np.bool_),
         auxiliary=feature_array.astype(np.float32),
         targets=target_array,
         dates=dates,

@@ -215,6 +215,17 @@ def _selection_core(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _dataset_request_core(payload: Dict[str, Any]) -> Dict[str, Any]:
+    preparation = payload.get("preparation")
+    normalized_preparation = preparation
+    if isinstance(preparation, dict):
+        # The compressed bars and valid cutoff ranges support h_start 1-3.
+        # Normalize only the runtime label subset so the existing h_start=1
+        # namespace remains reusable and changing h_start never re-fetches data.
+        normalized_preparation = {
+            **preparation,
+            "h_start": 1,
+            "alpha_horizons": list(range(1, 15)),
+        }
     return {
         "schema_version": payload.get("schema_version"),
         "profile": payload.get("profile"),
@@ -222,7 +233,7 @@ def _dataset_request_core(payload: Dict[str, Any]) -> Dict[str, Any]:
         "selected_datasets": payload.get("selected_datasets"),
         "date_range": payload.get("date_range"),
         "universe": payload.get("universe"),
-        "preparation": payload.get("preparation"),
+        "preparation": normalized_preparation,
     }
 
 
@@ -651,7 +662,15 @@ def _assert_equal(actual: Any, expected: Any, label: str) -> None:
 
 def _validate_marker_artifact_paths(marker: Dict[str, Any], dataset_request_sha256: str) -> None:
     dataset_prefix = f"datasets/{dataset_request_sha256}/"
-    for name in ("raw", "processed", "dataset_manifest", "download_manifest", "request_log"):
+    for name in (
+        "raw",
+        "bar_store_manifest",
+        "symbol_index",
+        "cutoff_ranges",
+        "dataset_manifest",
+        "download_manifest",
+        "request_log",
+    ):
         artifact = marker.get(name)
         if not isinstance(artifact, dict):
             _fail(f"Readiness marker artifact is missing: {name}")

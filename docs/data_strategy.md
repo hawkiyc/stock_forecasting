@@ -77,16 +77,17 @@ rows；兩者皆發生於區間內的商品，必須由 EODHD delisted discovery
 才會納入。`is_active` 是 discovery 當下狀態，不是每個 timestamp 的狀態。
 
 官方只保證 2018 年前下市商品的 EOD，不保證 splits/dividends 等輔助資料。這些 EOD
-rows 仍可進入 windows，但 split-adjusted volume 覆蓋可能不完整；download manifest
+rows 仍可進入 eligible cutoff ranges，但 split-adjusted volume 覆蓋可能不完整；download manifest
 會以 `delisted_pre_2018_auxiliary_coverage_warning` 列出受影響數量與 symbols。
 
-第一次 PoC 建議明確指定少量股票與 ETF；完整 discovery 可能同時受到 API 額度、
-訂閱權限、CPU preparation 時間、Parquet 大小與記憶體限制。raw Parquet 是串流分批
-寫入，但 processed windows 及訓練 dataset 目前仍載入記憶體；全市場長歷史之前應先
-實作 partitioned/lazy windows。
+完整 discovery 仍可能同時受到 API 額度、訂閱權限、CPU preparation 時間與 Parquet
+大小限制，但不再要求 RAM 容納全部 bars 或逐-window 資料集。raw Parquet 串流分批
+寫入；preparation 以 128 個 bounded hash buckets 建立 symbol-oriented compressed bar
+store、索引與有效 cutoff ranges。訓練只按需讀取 symbol row group 並動態建立 context
+與 label。
 
 台股官方日報會取得全市場可解析股票與 ETF。是否可成為 target 仍由 benchmark policy
-決定；不合適的 ETF 會在 window construction fail closed，而不是被錯誤對到大盤。
+決定；不合適的 ETF 會在 cutoff eligibility 建置時 fail closed，而不是被錯誤對到大盤。
 
 ### 5. Canonical raw schema
 
@@ -169,7 +170,8 @@ JSON object，但只能替 allowlist 內的 ETF 選擇另一個 benchmark，不�
 ```
 
 mapping 內容的 canonical JSON SHA-256 會寫入 preparation spec；修改 mapping 後舊
-dataset readiness 不再有效，必須重建 processed data。
+dataset readiness 不再有效，必須由既有 raw Parquet 重建 bar store 與 cutoff ranges，
+但不需要重新呼叫 provider。
 
 ### 8. API 與 immutable artifact 流程
 
@@ -179,8 +181,8 @@ provider API
   -> api-request-log.jsonl (no secret)
   -> raw/market.parquet
   -> download-manifest.json (state=downloaded)
-  -> causal windows + chronological purge/embargo
-  -> processed/windows.parquet
+  -> resumable symbol bar-store buckets
+  -> symbol-index.parquet + cutoff-ranges.parquet
   -> dataset-manifest.json (state=ready)
 ```
 
@@ -190,29 +192,37 @@ cache reuse、provider-local staging writes、固定順序合併與拒絕 silent
 完整計畫 estimate 不阻止執行；
 `--max-api-calls`、`--eodhd-qps`、`--taiwan-qps` 與 `--maxBackoff` 都由每次
 `runpod_workflow.sh cpu prepare` 設定，不屬於 dataset identity；
-CPU workflow 預設保留 max runtime 的 25%（最多 2 小時）給 data cleaning/window construction。
+CPU workflow 預設保留 max runtime 的 25%（最多 2 小時）給 data cleaning/bar-store construction。
 可透過 `runpod_workflow.sh cpu prepare --prepareReserve DURATION` 明確調整，或使用
 `--prepareReserve auto` 保留自動值；明確值必須短於 max runtime。
 `--maxBackoff DURATION` 預設 `1m`；EODHD、TWSE 或 TPEx 的下一次退避大於此值時，
 只有該迴圈退出，其他 provider 仍會繼續到自己的退出條件。EODHD 也會在先達到
 `--max-api-calls` 時退出。
-raw Parquet、request log 與 download manifest 先成為 durable `downloaded` checkpoint，
-後續 Pod 可不呼叫 provider 而直接準備 processed data。manifest 儲存 SHA-256、
+raw Parquet、request log 與 download manifest 先成為 durable `downloaded` checkpoint。
+bar store 的 raw scan、bucket compaction、quality candidates 與 chronological split ranges
+各自原子發布 checkpoint；後續 Pod 可不呼叫 provider，並完全跳過已完成的 raw
+Parquet row groups、scan segments 與 buckets。若中斷位於某個 row group 內，最多只重讀
+該 row group 已走過的部分，已完成 segment 不會重寫。到達安全
+截止時間時 lifecycle 為 `waiting_for_preparation`，成功發布 `_SUCCESS.json` 後才回收
+`.work` 暫存分區。manifest 儲存 SHA-256、
 size、row count、profile、providers、symbols、date range、quality summary 與 request-log
 artifact。secret-like key 不得寫入 manifest。
+CPU readiness 與訓練 preflight 會依 bar-store manifest 逐 shard 驗證 size 與 SHA-256；
+任何 shard 缺失、截斷或內容不符都不能進入訓練。
 
 RunPod CPU wrapper 發布到固定 `DATA_ROOT`。要建立另一資料版本，應使用新的版本化
 `DATA_ROOT` 或新的 network volume；不要刪除或覆寫既有 immutable artifacts。
 
-`h_start` 是 processed label 契約，因此修改它會得到新的 dataset request SHA 與
-`DATA_ROOT`，並重算 windows、labels、robust scales 與 split audit。它不會傳給
-provider downloader，也不會改變 `cache_revision`。新 namespace 會唯讀掃描其他
-namespace 中相同 revision 的 API cache；相同 URL／參數的 response 是 cache hit，
-不消耗新的 network API call。只有缺少、先前失敗或 request 參數已改變的資料需要下載。
+`h_start` 是 runtime label/model-output 契約，不是 bar-store identity。`h_start=1`、`2`、
+`3` 共用同一 dataset request SHA、`DATA_ROOT`、raw Parquet、bar store、cutoff ranges 與
+split audit；變更它只會得到新的 training selection SHA。DataLoader 在取樣時動態計算
+`h_start...14` labels，train-only robust scales 在每次訓練啟動時由 train split 抽樣估計，
+並寫入 checkpoint 供續訓、評估與推論還原；不會重建資料或呼叫 provider。
 
-### 9. Processed record contract
+### 9. Lazy sample contract
 
-每筆 schema `4.0` record 包含：
+磁碟只保存每個 symbol 一份 bars 與連續有效 cutoff ranges，不保存 schema `4.0` window
+records。DataLoader 取得一個 `(symbol, cutoff_index)` 後，在記憶體中暫時建立：
 
 - `context`：商品截至 `cutoff_at` 的 point-in-time adjusted OHLCV。
 - `benchmark_context`：同日期、同長度的 benchmark adjusted OHLCV。
@@ -222,25 +232,31 @@ namespace 中相同 revision 的 API cache；相同 URL／參數的 response 是
 - `diagnostics.capm_abnormal_return=null`：預留 diagnostic，不是 target。
 - provider、market、benchmark policy、dataset profile 等 metadata。
 
-entry/exit label dates 不會被序列化到任一 context。缺 benchmark 日期、極端 adjusted
-transition、歷史不足或 benchmark mapping 不明確的樣本會被排除並寫入 window audit。
+entry/exit label dates 不會被序列化到任一 context 或磁碟 label artifact。缺 benchmark
+日期、極端 adjusted transition、歷史不足或 benchmark mapping 不明確的 cutoff 會在
+preparation 時從 ranges 排除並寫入 quality/split audit。
 
 ### 10. Split、purge 與 robust scale
 
-先依時間建立 windows，再以 chronological 70% train、15% validation、15% test
-切分，並在邊界套用 purge 20 bars 與 effective embargo 14 bars。sample stride 是 1。
+先從全市場有效 cutoff dates 決定 chronological 70% train、15% validation、15% test
+邊界，再以向量化 bucket assignment 套用 purge 20 bars 與 effective embargo 14 bars。
+不建立 windows；sample stride 是 1。
 此外，train 與 validation 中每個樣本的最晚 `label.end_at` 必須嚴格早於下一個
 split boundary；任何跨界 ground truth 都會被排除並記入 split audit。
 RunPod 穩定 shell 仍傳入 legacy `stride=5`、`embargo=5` readiness sentinels；ready
 manifest 同時記錄 effective values，訓練前會雙重驗證。
 
-每個 horizon 的 loss scale 只從 train split label 計算：
+每個 horizon 的 loss scale 只從 train split 的動態 label 抽樣計算：
 
 ```text
 max(IQR, 1.4826 * MAD, 1e-4)
 ```
 
 validation/test 不參與 scaling。test 保持 sealed，直到研究流程明確 unlock。
+
+訓練 sampler 以 O(1) 狀態對 valid cutoffs 作 deterministic blockwise permutation。
+Stage 1 的 target set 精確為 15%，Stage 2 為 100%；最後不足一個 batch 時只從同一
+target set 開頭補齊，補齊數量寫入 training summary，不配置全量 window index。
 
 ### 11. 資料 QA 與已知限制
 
@@ -253,7 +269,8 @@ benchmark calendar gaps、symbol/date coverage、corporate-action 前後連續�
 - EODHD PoC 資料不等於 exchange-grade truth。
 - 官方 endpoint schema 可能更動，remote tests 必須驗證 parser。
 - `is_active` 無法從台股每日行情單獨證明，因此保持 unknown。
-- 全市場 processed data 尚未 out-of-core。
+- 首次 bar-store 建置期間會暫時同時保留 raw Parquet、已完成 shards 與可續傳工作分區；
+  `_SUCCESS.json` 發布後會回收工作分區，但 raw Parquet 仍作為不可變下載證據保留。
 - 點時 universe、下市完整性與正式交易成本研究仍需加強。
 
 ### 12. 來源
@@ -363,19 +380,22 @@ it and the account is entitled to it. `is_active` is the discovery-time state,
 not a timestamp-by-timestamp state.
 
 EODHD guarantees only EOD—not splits/dividends and other auxiliary data—for
-instruments delisted before 2018. Those EOD rows can still enter windows, but
+instruments delisted before 2018. Those EOD rows can still enter eligible cutoff
+ranges, but
 split-adjusted-volume coverage may be incomplete. The download manifest records
 the affected count and symbols under
 `delisted_pre_2018_auxiliary_coverage_warning`.
 
-The first PoC should use a small explicit universe. Complete discovery can hit
-API quota, subscription, preparation-time, Parquet-size, and memory limits. Raw
-Parquet is streamed, but processed windows and training data currently load in
-memory. Full-market long history needs partitioned/lazy windows first.
+Complete discovery can still hit API quota, subscription, preparation-time,
+and Parquet-size limits, but RAM no longer needs to hold all bars or a
+per-window dataset. Raw Parquet is streamed. Preparation uses 128 bounded hash
+buckets to build a symbol-oriented compressed bar store, indexes, and valid
+cutoff ranges. Training reads symbol row groups on demand and constructs
+contexts and labels dynamically.
 
 Taiwan daily reports provide every parseable stock and ETF. Benchmark policy
-still decides target eligibility; inappropriate ETFs fail closed during window
-construction instead of receiving a misleading broad-market benchmark.
+still decides target eligibility; inappropriate ETFs fail closed during cutoff
+eligibility construction instead of receiving a misleading broad-market benchmark.
 
 ### 5. Canonical raw schema
 
@@ -447,7 +467,8 @@ ETF; it cannot expand the universe. It is a JSON object such as:
 ```
 
 The canonical mapping SHA-256 is stored in the preparation spec. Changing the
-mapping invalidates old readiness and requires rebuilding processed data.
+mapping invalidates old readiness and requires rebuilding the bar store and
+cutoff ranges from existing raw Parquet, but no provider call.
 
 ### 8. API and immutable-artifact flow
 
@@ -457,8 +478,8 @@ provider API
   -> api-request-log.jsonl (no secret)
   -> raw/market.parquet
   -> download-manifest.json (state=downloaded)
-  -> causal windows + chronological purge/embargo
-  -> processed/windows.parquet
+  -> resumable symbol bar-store buckets
+  -> symbol-index.parquet + cutoff-ranges.parquet
   -> dataset-manifest.json (state=ready)
 ```
 
@@ -470,7 +491,7 @@ refusal to silently overwrite. `--max-api-calls`, `--eodhd-qps`,
 `--taiwan-qps`, and `--maxBackoff` are supplied for every
 `runpod_workflow.sh cpu prepare` launch and are not part of dataset identity.
 The complete-plan estimate never blocks execution. The CPU workflow reserves
-25% of max runtime for cleaning/window
+25% of max runtime for cleaning/bar-store
 construction by default, capped at 2 hours, with an explicit override available through
 `runpod_workflow.sh cpu prepare --prepareReserve DURATION`; `auto` retains the
 automatic value, and an explicit reserve must be shorter than max runtime.
@@ -478,43 +499,54 @@ automatic value, and an explicit reserve must be shorter than max runtime.
 its next delay exceeds that boundary while other providers continue. EODHD also
 exits if it reaches `--max-api-calls` first. The workflow
 publishes raw Parquet, the request log, and download manifest as a durable
-`downloaded` checkpoint before preparation. A later Pod can skip provider calls.
+`downloaded` checkpoint before preparation. Raw scan, bucket compaction,
+quality candidates, and chronological split ranges each publish atomic
+checkpoints. A later Pod skips provider calls and completely skips finished raw
+Parquet row groups, scan segments, and buckets. If interruption occurs inside a
+row group, at most its already traversed portion is read again; completed
+segments are never rewritten. Reaching the safe deadline produces `waiting_for_preparation`;
+`.work` is reclaimed only after `_SUCCESS.json` is published.
 Manifests bind SHA-256, size, row count, profile, providers,
 symbols, dates, quality, and the request log. Secret-like keys are rejected.
+CPU readiness and training preflight validate every shard's size and SHA-256
+against the bar-store manifest; missing, truncated, or altered shards cannot train.
 
 The CPU wrapper publishes fixed `DATA_ROOT` paths. Create a versioned
 `DATA_ROOT` or separate network volume for a new dataset; do not delete or
 overwrite existing immutable artifacts.
 
-`h_start` is part of the processed-label contract, so changing it creates a new
-dataset request SHA and `DATA_ROOT`, then rebuilds windows, labels, robust scales,
-and split audit. It is never passed to the provider downloader and does not alter
-`cache_revision`. The new namespace scans same-revision API caches in other
-namespaces read-only; an identical URL/parameter response is a cache hit and
-consumes no new network API call. Only missing, previously failed, or
-parameter-changed requests require downloading.
+`h_start` is a runtime label/model-output contract, not bar-store identity.
+Values 1, 2, and 3 share one dataset request SHA, `DATA_ROOT`, raw Parquet, bar
+store, cutoff ranges, and split audit; changing it creates only a new training
+selection SHA. The DataLoader computes `h_start...14` labels on demand, and
+train-only robust scales are sampled from the train split when training starts.
+They are persisted in checkpoints for exact resume, evaluation, and inference
+restoration. No data rebuild or provider request occurs.
 
-### 9. Processed record contract
+### 9. Lazy sample contract
 
-Each schema `4.0` record contains the instrument and aligned benchmark contexts
+Disk stores each symbol's bars once plus contiguous valid cutoff ranges; it does
+not store schema `4.0` window records. Given `(symbol, cutoff_index)`, the
+DataLoader temporarily constructs the instrument and aligned benchmark contexts
 through `cutoff_at`, benchmark-relative alpha labels from `h_start` (1, 2, or 3)
-through fixed day 14, auditable asset/
-benchmark returns outside the input, a reserved null CAPM diagnostic, and
-provider/market/benchmark/profile metadata. Future entry/exit values are never
-serialized into either context. Missing benchmark dates, extreme adjusted
-transitions, inadequate history, and ambiguous ETF mappings are excluded and
-counted in the window audit.
+through fixed day 14, auditable asset/benchmark returns outside the input, a
+reserved null CAPM diagnostic, and provider/market/benchmark/profile metadata.
+Future entry/exit values are never serialized into a context or disk label
+artifact. Cutoffs with missing benchmark dates, extreme adjusted transitions,
+inadequate history, or ambiguous ETF mappings are excluded during preparation
+and counted in quality/split audits.
 
 ### 10. Split, purge, and robust scale
 
-Windows are assigned chronologically to 70% train, 15% validation, and 15% test,
-with 20-bar purge and an effective 14-bar embargo. Effective sample stride is
-one. The latest `label.end_at` of every train and validation sample must also be
+Global valid cutoff dates determine chronological 70% train, 15% validation,
+and 15% test boundaries. Vectorized per-bucket assignment then applies a 20-bar
+purge and effective 14-bar embargo without creating windows. Effective sample
+stride is one. The latest `label.end_at` of every train and validation sample must also be
 strictly earlier than the next split boundary; crossing ground truth is dropped
 and counted in the split audit. Stable RunPod shell passes legacy `stride=5` and `embargo=5` readiness
 sentinels; the manifest separately records effective values and validates both.
 
-Each horizon's loss scale uses train labels only:
+Each horizon's loss scale uses a runtime sample of train-only labels:
 
 ```text
 max(IQR, 1.4826 * MAD, 1e-4)
@@ -522,6 +554,12 @@ max(IQR, 1.4826 * MAD, 1e-4)
 
 Validation/test never influence scaling. Test remains sealed until explicitly
 unlocked by the research protocol.
+
+The training sampler applies a deterministic blockwise permutation with O(1)
+state. Stage 1 targets exactly 15% of valid cutoffs and Stage 2 targets 100%; a
+short final batch is filled only from the beginning of the same target set. The
+padding count is recorded in the training summary without allocating a full
+window-index array.
 
 ### 11. QA and known limitations
 
@@ -531,9 +569,11 @@ corporate-action continuity, split-volume direction, and sampled EODHD overlap
 reconciliation.
 
 Current limitations include non-exchange-grade EODHD data, mutable official
-endpoint schemas, unknown Taiwan `is_active` status from daily reports,
-in-memory processed windows, and incomplete point-in-time universe/delisting/
-transaction-cost research.
+endpoint schemas, unknown Taiwan `is_active` status from daily reports, and
+incomplete point-in-time universe/delisting/transaction-cost research. During
+the first bar-store build, raw Parquet, finished shards, and resumable work
+partitions coexist temporarily. Work partitions are reclaimed after
+`_SUCCESS.json`; raw Parquet remains as immutable acquisition evidence.
 
 ### 12. Sources
 

@@ -136,7 +136,7 @@ def evaluate_checkpoint(
     return {
         "run_id": checkpoint_run_id(resolved_checkpoint),
         "split": split,
-        "samples": len(cast(Sized, loader.dataset)),
+        "samples": len(cast(Sized, loader.sampler)),
         "device": str(device),
         "checkpoint": _checkpoint_summary(resolved_checkpoint, checkpoint_state),
         "data_provenance": provenance_summary(config.data.resolved_manifest_path),

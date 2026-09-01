@@ -19,18 +19,18 @@ from stock_forecasting.data.manifest import (
     validate_dataset_preparation_contract,
     validate_training_dataset_manifest,
 )
+from stock_forecasting.training_paths import resolve_bar_store_path
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PIPELINE_PATHS = (
     "src/stock_forecasting/cli/prepare_data.py",
+    "src/stock_forecasting/data/bar_store.py",
     "src/stock_forecasting/data/adjustments.py",
     "src/stock_forecasting/data/benchmarks.py",
     "src/stock_forecasting/data/horizons.py",
+    "src/stock_forecasting/data/manifest.py",
     "src/stock_forecasting/data/schema.py",
-    "src/stock_forecasting/data/quality.py",
-    "src/stock_forecasting/data/windows.py",
     "src/stock_forecasting/data/splits.py",
-    "src/stock_forecasting/data/io.py",
 )
 
 
@@ -199,18 +199,31 @@ def build_readiness_manifest(
         artifacts.get("raw"),
         label="raw",
     )
-    processed_path = _manifest_artifact_path(
+    bar_store_manifest_path = _manifest_artifact_path(
         dataset_manifest_path,
-        artifacts.get("processed"),
-        label="processed",
+        artifacts.get("bar_store_manifest"),
+        label="bar-store manifest",
     )
+    symbol_index_path = _manifest_artifact_path(
+        dataset_manifest_path,
+        artifacts.get("symbol_index"),
+        label="symbol index",
+    )
+    cutoff_ranges_path = _manifest_artifact_path(
+        dataset_manifest_path,
+        artifacts.get("cutoff_ranges"),
+        label="cutoff ranges",
+    )
+    resolved_bar_store = resolve_bar_store_path(bar_store_manifest_path.parent)
+    if resolved_bar_store != bar_store_manifest_path.parent.resolve(strict=True):
+        raise ValueError("Resolved bar store differs from the dataset manifest")
     validate_training_dataset_manifest(
         dataset_manifest_path,
         profile=config.data.dataset_profile,
         raw_path=raw_path,
-        processed_path=processed_path,
+        bar_store_path=bar_store_manifest_path.parent,
     )
-    validate_dataset_preparation_contract(
+    storage_preparation_spec = validate_dataset_preparation_contract(
         dataset,
         input_length=config.data.input_length,
         h_start=config.data.h_start,
@@ -228,6 +241,11 @@ def build_readiness_manifest(
     )
     if dataset.get("selected_datasets") != sorted(config.data.selected_datasets):
         raise ValueError("Dataset providers differ from the selected data profile")
+    resolved_preparation_spec = {
+        **storage_preparation_spec,
+        "h_start": config.data.h_start,
+        "alpha_horizons": config.data.alpha_horizons,
+    }
 
     download_manifest = dataset.get("download_manifest")
     download_path = _manifest_artifact_path(
@@ -301,9 +319,11 @@ def build_readiness_manifest(
         "symbols": symbol_payload,
         "universe_sha256": dataset["universe_sha256"],
         "split_counts": split_counts,
+        "valid_cutoff_count": sum(split_counts.values()),
         "split_audit": dataset["split_audit"],
-        "preparation_spec": dataset["preparation_spec"],
-        "preparation_spec_sha256": dataset["preparation_spec_sha256"],
+        "preparation_spec": resolved_preparation_spec,
+        "preparation_spec_sha256": canonical_json_sha256(resolved_preparation_spec),
+        "storage_preparation_spec_sha256": dataset["preparation_spec_sha256"],
         "data_pipeline_digest": dataset["data_pipeline_digest"],
         "code_release_digest": code.get("release_digest"),
         "models_local_files_only_verified": True,
@@ -340,11 +360,23 @@ def build_readiness_manifest(
             row_count=int(artifacts["raw"]["row_count"]),
             label="Raw dataset",
         ),
-        "processed": _artifact(
-            processed_path,
+        "bar_store_manifest": _artifact(
+            bar_store_manifest_path,
             volume_root=volume_root,
-            row_count=int(artifacts["processed"]["row_count"]),
-            label="Processed dataset",
+            row_count=1,
+            label="Bar-store manifest",
+        ),
+        "symbol_index": _artifact(
+            symbol_index_path,
+            volume_root=volume_root,
+            row_count=int(artifacts["symbol_index"]["row_count"]),
+            label="Symbol index",
+        ),
+        "cutoff_ranges": _artifact(
+            cutoff_ranges_path,
+            volume_root=volume_root,
+            row_count=int(artifacts["cutoff_ranges"]["row_count"]),
+            label="Cutoff ranges",
         ),
     }
 

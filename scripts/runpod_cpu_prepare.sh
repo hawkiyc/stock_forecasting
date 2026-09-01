@@ -30,12 +30,12 @@ MODEL_MANIFEST="${NETWORK_VOLUME_ROOT}/cache/hf-models.json"
 STAGING_ROOT="${NETWORK_VOLUME_ROOT}/tmp/stage1-prep/${LAUNCH_ID}"
 DATA_STAGING_ROOT="${STAGING_ROOT}/data"
 RAW_STAGING="${DATA_STAGING_ROOT}/raw/market.parquet"
-PROCESSED_STAGING="${DATA_STAGING_ROOT}/processed/windows.parquet"
 DOWNLOAD_MANIFEST_STAGING="${DATA_STAGING_ROOT}/download-manifest.json"
 DATASET_MANIFEST_STAGING="${DATA_STAGING_ROOT}/dataset-manifest.json"
 REQUEST_LOG_STAGING="${DATA_STAGING_ROOT}/manifests/api-request-log.jsonl"
 RAW_FINAL="${DATA_ROOT}/raw/market.parquet"
-PROCESSED_FINAL="${DATA_ROOT}/processed/windows.parquet"
+BAR_STORE_FINAL="${DATA_ROOT}/prepared/bar-store"
+BAR_STORE_SUCCESS="${BAR_STORE_FINAL}/_SUCCESS.json"
 DOWNLOAD_MANIFEST_FINAL="${DATA_ROOT}/download-manifest.json"
 DATASET_MANIFEST_FINAL="${DATA_ROOT}/dataset-manifest.json"
 REQUEST_LOG_FINAL="${DATA_ROOT}/manifests/api-request-log.jsonl"
@@ -44,7 +44,7 @@ PROVIDER_CHECKPOINT_ROOT="${DATA_ROOT}/provider-checkpoints"
 DOWNLOAD_PROGRESS="${DATA_ROOT}/download-progress.json"
 FINAL_DATA_FILES=(
     "${RAW_FINAL}"
-    "${PROCESSED_FINAL}"
+    "${BAR_STORE_FINAL}"
     "${DOWNLOAD_MANIFEST_FINAL}"
     "${DATASET_MANIFEST_FINAL}"
     "${REQUEST_LOG_FINAL}"
@@ -55,7 +55,7 @@ ACQUISITION_FINAL_FILES=(
     "${REQUEST_LOG_FINAL}"
 )
 PREPARATION_FINAL_FILES=(
-    "${PROCESSED_FINAL}"
+    "${BAR_STORE_SUCCESS}"
     "${DATASET_MANIFEST_FINAL}"
 )
 FIN_TS_DATASET_PROFILE="${FIN_TS_DATASET_PROFILE:-us_tw_eodhd}"
@@ -126,23 +126,6 @@ fi
 if [[ "${FIN_TS_DATASET_PROFILE}" == "us_tw_massive" ]]; then
     echo "The Massive provider interface is reserved but not implemented" >&2
     exit 2
-fi
-if [[ "${FIN_TS_DATASET_PROFILE}" == *eodhd* \
-    && ( -z "${EODHD_API_TOKEN:-}" || "${EODHD_API_TOKEN}" == *'{{ RUNPOD_SECRET_'* ) ]]; then
-    echo "EODHD_API_TOKEN RunPod Secret is missing or was not resolved" >&2
-    exit 2
-fi
-if [[ "${FIN_TS_DATASET_PROFILE}" == "tw_only" \
-    || "${FIN_TS_DATASET_PROFILE}" == "us_tw_eodhd" \
-    || "${FIN_TS_DATASET_PROFILE}" == "us_tw_massive" ]]; then
-    if [[ -z "${TPEX_PROXY_TOKEN}" || "${TPEX_PROXY_TOKEN}" == *'{{ RUNPOD_SECRET_'* ]]; then
-        echo "TPEX_PROXY_TOKEN RunPod Secret is missing or was not resolved" >&2
-        exit 2
-    fi
-    if [[ ! "${TPEX_PROXY_URL}" =~ ^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*\.run\.app/?$ ]]; then
-        echo "TPEX_PROXY_URL is missing or is not an approved run.app origin" >&2
-        exit 2
-    fi
 fi
 if [[ ! "${RUNPOD_PYTEST_WORKERS}" =~ ^(auto|0|[1-9][0-9]*)$ ]]; then
     echo "RUNPOD_PYTEST_WORKERS must be auto, 0, or a positive integer" >&2
@@ -223,8 +206,9 @@ fi
 for path_name in \
     PROJECT_ROOT DATA_ROOT LOG_ROOT LIFECYCLE_ROOT POETRY_BIN CONFIG_PATH \
     PREP_DIR PREP_LOG CODE_MARKER DATASET_MARKER MODEL_MANIFEST STAGING_ROOT \
-    DATA_STAGING_ROOT RAW_STAGING PROCESSED_STAGING DOWNLOAD_MANIFEST_STAGING \
-    DATASET_MANIFEST_STAGING REQUEST_LOG_STAGING RAW_FINAL PROCESSED_FINAL \
+    DATA_STAGING_ROOT RAW_STAGING DOWNLOAD_MANIFEST_STAGING \
+    DATASET_MANIFEST_STAGING REQUEST_LOG_STAGING RAW_FINAL BAR_STORE_FINAL \
+    BAR_STORE_SUCCESS \
     DOWNLOAD_MANIFEST_FINAL DATASET_MANIFEST_FINAL REQUEST_LOG_FINAL API_CACHE_ROOT \
     DOWNLOAD_PROGRESS \
     METADATA_PATH RUNPOD_SHUTDOWN_DIR RUNPOD_SHUTDOWN_MARKER HF_HOME \
@@ -284,8 +268,8 @@ bash "${SCRIPT_DIR}/verify_runpod_mounted_readiness.sh" --mount-only
 read -r -a US_SYMBOLS <<< "${STAGE1_US_SYMBOLS}"
 read -r -a US_ETF_SYMBOLS <<< "${STAGE1_US_ETF_SYMBOLS}"
 mkdir -p "${PREP_DIR}" "${DATA_STAGING_ROOT}/raw" \
-    "${DATA_STAGING_ROOT}/processed" "${DATA_STAGING_ROOT}/manifests" \
-    "${LIFECYCLE_ROOT}/stage1" "${DATA_ROOT}/raw" "${DATA_ROOT}/processed" \
+    "${DATA_STAGING_ROOT}/manifests" \
+    "${LIFECYCLE_ROOT}/stage1" "${DATA_ROOT}/raw" "${DATA_ROOT}/prepared" \
     "${DATA_ROOT}/manifests" "${DATA_ROOT}/quarantine" "${API_CACHE_ROOT}" \
     "${RUNPOD_SHUTDOWN_DIR}" "${HF_HOME}"
 
@@ -337,15 +321,18 @@ REUSE_DOWNLOADED_DATASET=0
 if [[ ${ACQUISITION_FINAL_COUNT} -eq ${#ACQUISITION_FINAL_FILES[@]} ]]; then
     if [[ ${PREPARATION_FINAL_COUNT} -eq ${#PREPARATION_FINAL_FILES[@]} ]]; then
         REUSE_READY_DATASET=1
-    elif [[ ${PREPARATION_FINAL_COUNT} -eq 0 ]]; then
-        REUSE_DOWNLOADED_DATASET=1
     else
-        quarantine_known_files incomplete-preparation "${PREPARATION_FINAL_FILES[@]}"
+        if [[ -e "${DATASET_MANIFEST_FINAL}" && ! -e "${BAR_STORE_SUCCESS}" ]]; then
+            quarantine_known_files incomplete-preparation "${DATASET_MANIFEST_FINAL}"
+        fi
+        # A partial or complete bar store without dataset-manifest.json is a
+        # durable preparation checkpoint and must remain available for resume.
         REUSE_DOWNLOADED_DATASET=1
     fi
 elif [[ ${ACQUISITION_FINAL_COUNT} -eq 0 ]]; then
-    if [[ ${PREPARATION_FINAL_COUNT} -ne 0 ]]; then
-        quarantine_known_files orphaned-preparation "${PREPARATION_FINAL_FILES[@]}"
+    if [[ -e "${BAR_STORE_FINAL}" || -e "${DATASET_MANIFEST_FINAL}" ]]; then
+        quarantine_known_files orphaned-preparation \
+            "${BAR_STORE_FINAL}" "${DATASET_MANIFEST_FINAL}"
     fi
 else
     quarantine_known_files incomplete-acquisition "${FINAL_DATA_FILES[@]}"
@@ -509,20 +496,6 @@ publish_download_checkpoint() {
     )
 }
 
-restore_download_checkpoint_to_staging() {
-    local staging_path
-    for staging_path in \
-        "${RAW_STAGING}" "${REQUEST_LOG_STAGING}" "${DOWNLOAD_MANIFEST_STAGING}"; do
-        if [[ -e "${staging_path}" || -L "${staging_path}" ]]; then
-            echo "Refusing to overwrite a launch staging artifact: ${staging_path}" >&2
-            return 3
-        fi
-    done
-    ln "${RAW_FINAL}" "${RAW_STAGING}"
-    ln "${REQUEST_LOG_FINAL}" "${REQUEST_LOG_STAGING}"
-    ln "${DOWNLOAD_MANIFEST_FINAL}" "${DOWNLOAD_MANIFEST_STAGING}"
-}
-
 if [[ ${REUSE_DOWNLOADED_DATASET} -eq 1 ]]; then
     if ! "${POETRY_BIN}" run fin-ts-verify-download \
         --manifest "${DOWNLOAD_MANIFEST_FINAL}" \
@@ -531,11 +504,31 @@ if [[ ${REUSE_DOWNLOADED_DATASET} -eq 1 ]]; then
         REUSE_DOWNLOADED_DATASET=0
         printf 'The invalid downloaded checkpoint was quarantined; rebuilding from verified provider cache entries.\n' >&2
     else
-        restore_download_checkpoint_to_staging
         printf 'Reused durable downloaded checkpoint; no provider API calls are required.\n'
     fi
 fi
 if [[ ${REUSE_DOWNLOADED_DATASET} -eq 0 ]]; then
+    # Provider credentials are acquisition-only. A durable raw/download
+    # checkpoint must remain preparable even when provider Secrets are absent.
+    if [[ "${FIN_TS_DATASET_PROFILE}" == *eodhd* \
+        && ( -z "${EODHD_API_TOKEN:-}" \
+            || "${EODHD_API_TOKEN}" == *'{{ RUNPOD_SECRET_'* ) ]]; then
+        echo "EODHD_API_TOKEN RunPod Secret is missing or was not resolved" >&2
+        exit 2
+    fi
+    if [[ "${FIN_TS_DATASET_PROFILE}" == "tw_only" \
+        || "${FIN_TS_DATASET_PROFILE}" == "us_tw_eodhd" \
+        || "${FIN_TS_DATASET_PROFILE}" == "us_tw_massive" ]]; then
+        if [[ -z "${TPEX_PROXY_TOKEN}" \
+            || "${TPEX_PROXY_TOKEN}" == *'{{ RUNPOD_SECRET_'* ]]; then
+            echo "TPEX_PROXY_TOKEN RunPod Secret is missing or was not resolved" >&2
+            exit 2
+        fi
+        if [[ ! "${TPEX_PROXY_URL}" =~ ^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*\.run\.app/?$ ]]; then
+            echo "TPEX_PROXY_URL is missing or is not an approved run.app origin" >&2
+            exit 2
+        fi
+    fi
     DOWNLOAD_ARGUMENTS=(
         --profile "${FIN_TS_DATASET_PROFILE}"
         --start "${STAGE1_DATA_START}"
@@ -609,10 +602,11 @@ if [[ ${REMAINING_WORKFLOW_SECONDS} -lt ${RUNPOD_CPU_PREPARE_RESERVE_SECONDS} ]]
 fi
 write_lifecycle_state preparing
 
+set +e
 "${POETRY_BIN}" run fin-ts-prepare \
-    --input "${RAW_STAGING}" \
-    --output "${PROCESSED_STAGING}" \
-    --download-manifest "${DOWNLOAD_MANIFEST_STAGING}" \
+    --input "${RAW_FINAL}" \
+    --output "${BAR_STORE_FINAL}" \
+    --download-manifest "${DOWNLOAD_MANIFEST_FINAL}" \
     --dataset-manifest "${DATASET_MANIFEST_STAGING}" \
     --window-size 128 \
     --stride 5 \
@@ -627,7 +621,18 @@ write_lifecycle_state preparing
     --purge-bars 20 \
     --embargo-bars 5 \
     --effective-embargo-bars 14 \
+    --deadline-epoch-seconds "$((WORKFLOW_DEADLINE_EPOCH - 120))" \
     --workers "${FIN_TS_CPU_WORKERS}"
+PREPARE_EXIT_CODE=$?
+set -e
+if [[ ${PREPARE_EXIT_CODE} -eq 75 ]]; then
+    PREP_RESUMABLE_STATE=waiting_for_preparation
+    printf 'Bar-store preparation paused at a durable checkpoint; rerun the same CPU prepare workflow to continue without provider API calls.\n' >&2
+    exit 75
+fi
+if [[ ${PREPARE_EXIT_CODE} -ne 0 ]]; then
+    exit "${PREPARE_EXIT_CODE}"
+fi
 
 # Refuse to publish data if source changed during the CPU preparation run.
 "${RUNPOD_PYTHON_BIN}" "${SCRIPT_DIR}/runpod_readiness.py" check-code \
@@ -643,13 +648,14 @@ write_lifecycle_state preparing
     --launch-id "${LAUNCH_ID}" \
     --verify-only
 
-for final_data_file in "${PREPARATION_FINAL_FILES[@]}"; do
-    if [[ -e "${final_data_file}" || -L "${final_data_file}" ]]; then
-        echo "Refusing to overwrite an existing immutable dataset artifact: ${final_data_file}" >&2
-        exit 3
-    fi
-done
-mv "${PROCESSED_STAGING}" "${PROCESSED_FINAL}"
+if [[ ! -f "${BAR_STORE_SUCCESS}" ]]; then
+    echo "Bar-store preparation returned success without _SUCCESS.json" >&2
+    exit 3
+fi
+if [[ -e "${DATASET_MANIFEST_FINAL}" || -L "${DATASET_MANIFEST_FINAL}" ]]; then
+    echo "Refusing to overwrite an existing immutable dataset manifest: ${DATASET_MANIFEST_FINAL}" >&2
+    exit 3
+fi
 mv "${DATASET_MANIFEST_STAGING}" "${DATASET_MANIFEST_FINAL}"
 
 "${POETRY_BIN}" run fin-ts-verify-stage1-data \

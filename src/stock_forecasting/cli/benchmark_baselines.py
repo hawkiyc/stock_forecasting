@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from stock_forecasting.baselines import (
+    BaselineArrays,
     GradientBoostingBaseline,
     baseline_arrays,
     evaluate_causal_gru,
@@ -15,10 +16,10 @@ from stock_forecasting.baselines import (
     rule_baseline_suite,
 )
 from stock_forecasting.config import ExperimentConfig
-from stock_forecasting.data.io import read_processed_records
+from stock_forecasting.data import BlockwisePermutationSampler, LazyFinancialWindowDataset
 from stock_forecasting.evaluation_paths import validate_standalone_baseline_output
 from stock_forecasting.run_paths import validate_wandb_directory
-from stock_forecasting.training import resolve_processed_dataset
+from stock_forecasting.training_paths import resolve_bar_store_path
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,14 +58,29 @@ def benchmark_baselines(
     gru_patience: int,
     unlock_test: bool,
 ) -> dict[str, Any]:
-    records = read_processed_records(resolve_processed_dataset(config.data.processed_path))
-    split_records = {
-        split: [record for record in records if record.get("split") == split]
-        for split in ("train", "validation", "test")
-    }
-    if any(not split_records[split] for split in split_records):
-        raise ValueError("Baseline benchmark requires non-empty train/validation/test splits")
-    arrays = {split: baseline_arrays(values) for split, values in split_records.items()}
+    bar_store = resolve_bar_store_path(config.data.bar_store_path)
+    arrays: dict[str, BaselineArrays] = {}
+    raw_counts: dict[str, int] = {}
+    sample_counts: dict[str, int] = {}
+    for position, split in enumerate(("train", "validation", "test")):
+        dataset = LazyFinancialWindowDataset(
+            bar_store,
+            split=split,
+            window_size=config.data.input_length,
+            h_start=config.data.h_start,
+        )
+        raw_counts[split] = len(dataset)
+        sampler = BlockwisePermutationSampler(
+            len(dataset),
+            fraction=config.data.train_fraction if split == "train" else 1.0,
+            max_samples=config.validation.baseline_max_samples_per_split,
+            seed=config.training.seed + position,
+        )
+        sample_counts[split] = len(sampler)
+        if split != "test" or unlock_test:
+            arrays[split] = baseline_arrays(
+                dataset.record_at(index) for index in sampler
+            )
     results: dict[str, Any] = {}
     if "rule" in models:
         rule_results = rule_baseline_suite(arrays["train"], arrays["validation"])
@@ -95,7 +111,8 @@ def benchmark_baselines(
         "run_id": None,
         "selection_split": "validation",
         "test_unlocked": unlock_test,
-        "sample_counts": {split: len(values) for split, values in split_records.items()},
+        "raw_sample_counts": raw_counts,
+        "sample_counts": sample_counts,
         "models": results,
     }
 

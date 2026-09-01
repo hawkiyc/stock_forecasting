@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,6 @@ from typing import Any
 import torch
 
 from stock_forecasting.config import ExperimentConfig
-from stock_forecasting.data.manifest import load_dataset_manifest
 from stock_forecasting.models import (
     CausalPerceiverResampler,
     DeterministicTimeSeriesBackbone,
@@ -80,25 +80,12 @@ def _promote_trainable_parameters_to_fp32(model: torch.nn.Module) -> None:
                 parameter.data = parameter.data.to(dtype=torch.float32)
 
 
-def _robust_horizon_scales(config: ExperimentConfig) -> tuple[float, ...]:
-    """Load immutable train-only target scales from the ready dataset manifest."""
-
-    if not config.data.require_ready_manifest:
-        return tuple(1.0 for _ in config.data.alpha_horizons)
-    manifest = load_dataset_manifest(config.data.resolved_manifest_path)
-    statistics = manifest.get("label_statistics")
-    if not isinstance(statistics, dict):
-        raise ValueError("Ready dataset manifest has no label_statistics mapping")
-    raw_scales: Any = statistics.get("robust_scales")
-    raw_horizons: Any = statistics.get("horizons")
-    if raw_horizons != config.data.alpha_horizons:
-        raise ValueError("Dataset label-statistics horizons do not match the config")
-    if not isinstance(raw_scales, list):
-        raise ValueError("Dataset label statistics have no robust_scales list")
-    return tuple(float(value) for value in raw_scales)
-
-
-def build_model_bundle(config: ExperimentConfig, device: torch.device) -> ModelBundle:
+def build_model_bundle(
+    config: ExperimentConfig,
+    device: torch.device,
+    *,
+    robust_scales: Sequence[float] | None = None,
+) -> ModelBundle:
     """Build frozen tokenizer/base weights, predictor LoRA, resampler, and quant head."""
 
     lora_modules: tuple[str, ...] = ()
@@ -151,12 +138,19 @@ def build_model_bundle(config: ExperimentConfig, device: torch.device) -> ModelB
         num_heads=config.model.benchmark_conditioner_heads,
         dropout=config.model.benchmark_conditioner_dropout,
     )
+    resolved_scales = (
+        tuple(float(value) for value in robust_scales)
+        if robust_scales is not None
+        else tuple(1.0 for _ in config.data.alpha_horizons)
+    )
+    if len(resolved_scales) != len(config.data.alpha_horizons):
+        raise ValueError("Runtime robust scales must match the configured alpha horizons")
     alpha_head = MultiHorizonAlphaHead(
         config.model.encoder_dim,
         horizons=tuple(config.data.alpha_horizons),
         hidden_dim=config.model.alpha_head_hidden_dim,
         quantiles=tuple(config.model.alpha_quantiles),
-        robust_scales=_robust_horizon_scales(config),
+        robust_scales=resolved_scales,
         dropout=config.model.alpha_head_dropout,
     )
     model = QuantForecastModel(

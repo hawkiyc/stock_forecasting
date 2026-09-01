@@ -151,12 +151,22 @@ request 估算；估算值不會阻止完整資料集執行。provider 對 2018 
 這可避免股票分割或除權息造成的人為跳空，同時維持下一日 raw open 的可交易 entry
 語意。
 
-目前 raw OHLCV Parquet 會分批寫入，但 processed window 建立與訓練 dataset
-仍會載入選定資料集到記憶體。第一次 PoC 應先用明確的 `--symbols`、
-`--etf-symbols` 或 `--symbol-limit` 驗證容量，再逐步放大；不能因 API 額度足夠就
-假設 CPU RAM 也能容納全美股與全台股的完整歷史。若要把全市場長歷史當成正式
-Stage 2 範圍，下一步必須先把 processed windows 改為 partitioned、lazy
-讀取；這項 out-of-core 改造不包含在目前 PoC。
+raw OHLCV 以不可變的壓縮 Parquet 分批寫入。CPU preparation 不再展開每一個
+128-bar window，也不預先落地 label；它以 128 個 hash buckets 建立按 symbol
+排列、每個 symbol 一個 Parquet row group 的壓縮 bar store，並只保存小型
+`symbol-index.parquet` 與連續有效 cutoff ranges。每個 scan、compaction、quality
+與 split bucket 都有原子 checkpoint；Pod 到達 max runtime 時會以
+`waiting_for_preparation` 結束，下一個相同 dataset namespace 的 CPU Pod 從尚未完成的
+raw row group、segment 或 bucket 接續，已完成項目直接跳過。只有 `_SUCCESS.json`
+發布後才回收 `.work` 暫存分區。
+
+訓練 DataLoader 以 O(1) sampler 狀態從有效 cutoff ranges 取樣，按需讀取一個 symbol
+row group、建立 128-bar asset/benchmark context，並在記憶體中計算從 `h_start` 到第
+14 個持有交易日的 alpha label。磁碟上不會出現逐-window 或逐-label 資料集；Stage 1
+使用精確 15% 的 valid train cutoffs，Stage 2 使用全部 valid train cutoffs，兩者都
+用固定大小 batch。最後不足一個 batch 時，只從同一個 target set 開頭確定性補齊，補齊
+數量會寫入 training summary；不會因此配置全量 index。這個 out-of-core 設計可直接處理
+完整長歷史資料，不需要把全部 bars 或所有可能 window 載入 RAM。
 
 ### 離線資料管線
 
@@ -172,13 +182,16 @@ Stage 2 範圍，下一步必須先把 processed windows 改為 partitioned、la
 canonical daily OHLCV Parquet + download-manifest.json
   │
   ▼
-品質檢查、因果視窗、purge/embargo
+可續傳 symbol bar store + 品質有效 cutoff ranges
   │
   ▼
-processed windows.parquet + dataset-manifest.json
+bar-store/index/ranges + dataset-manifest.json
   │
   ▼
-Stage 1 / Stage 2 訓練（完全離線）
+Lazy DataLoader 動態建立 context/label（完全離線）
+  │
+  ▼
+Stage 1 / Stage 2 訓練
 ```
 
 `train`、`validation`、`test` 依全市場共用的交易日期做 70%／15%／15%
@@ -214,15 +227,18 @@ Stage 1 / Stage 2 訓練（完全離線）
   耗盡時，保留成功的 raw responses 與已完成的 provider materialization checkpoints、
   寫入 `download-progress.json`，並允許下一個 CPU Pod 直接重用已完成 provider，
   只對未完成 provider 補未快取的 requests 並重新 materialize。
-- CPU workflow 預設保留 max runtime 的 25% 給 canonical data cleaning 與 causal
-  window construction（最多 2 小時，亦可用 `--prepareReserve` 明確設定）；下載完成的 raw Parquet、request log
+- CPU workflow 預設保留 max runtime 的 25% 給 canonical data cleaning 與 symbol
+  bar-store/index 建置（最多 2 小時，亦可用 `--prepareReserve` 明確設定）；下載完成的 raw Parquet、request log
   與 download manifest 會先發布成 durable `downloaded` checkpoint。後續 Pod 可完全
-  跳過 API，只有 processed data 與 readiness 都驗證通過才成為 `ready`。
+  跳過 API，從 durable bucket checkpoints 接續；只有 bar store、cutoff ranges 與
+  readiness 都驗證通過才成為 `ready`。
 - API token 不進 cache key、request log 或 manifest。
 - raw cache 與直接執行的下載／準備 CLI 拒絕靜默覆寫。
 - Parquet 與 manifest 的 SHA-256、row count 與 provenance 綁定。
 
-訓練器只接受落地的 `.parquet` 與 `state=ready` 的 dataset manifest；模型訓練、評估及推論程式不呼叫 EODHD、TWSE、TPEx 或 Massive。
+訓練器只接受 `_SUCCESS.json`、完整 shard/index/range 契約與 `state=ready` 的 dataset
+manifest；CPU readiness 與訓練 preflight 會逐 shard 核對 size 與 SHA-256，而不是只驗證
+小型 index。模型訓練、評估及推論程式不呼叫 EODHD、TWSE、TPEx 或 Massive。
 
 ### 遠端執行環境與本機邊界
 
@@ -240,7 +256,7 @@ Poetry environment、重新產生 canonical `poetry.lock`，再執行 lint、完
 工作。修改 `pyproject.toml` 後只需重新同步 source，讓下一次遠端 CPU preparation 重新
 解析 lock；不要在本機嘗試對齊 RunPod 的 Python/PyTorch/CUDA 環境。
 
-### 下載並落地資料
+### 下載資料並建立 bar store
 
 標準流程是依後文操作 RunPod CPU preparation Pod；不要在本機直接執行資料 CLI。以下
 命令只是已完成遠端環境設定後，在 RunPod CPU Pod 內除錯資料管線時使用的低階參考。
@@ -269,12 +285,12 @@ poetry run fin-ts-download \
   --output data/raw/market.parquet
 ```
 
-建立因果訓練視窗：
+建立或接續 lazy symbol bar store（不建立 window/label 檔）：
 
 ```bash
 poetry run fin-ts-prepare \
   --input data/raw/market.parquet \
-  --output data/processed/windows.parquet
+  --output data/prepared/bar-store
 ```
 
 每個 dataset request 會自動映射到
@@ -287,8 +303,8 @@ symbol limit 或處理契約變動時會使用新的根目錄，不需要手動�
 | 項目                        | Stage 1                                                          | Stage 2                |
 | --------------------------- | ---------------------------------------------------------------- | ---------------------- |
 | 目的                        | 驗證資料、模型、loss、checkpoint、評估與 RunPod 腳本             | 完整資料微調與正式評估 |
-| train 樣本                  | 依 market/asset strata 確定性配置的 15% target count             | 100% train split       |
-| validation / test           | 完整保留                                                         | 完整保留               |
+| train 樣本                  | O(1) blockwise sampler 精確取 15% valid train cutoffs             | 100% valid train cutoffs |
+| validation / test           | 完整 split 保留於 cutoff ranges；例行評估依 config 確定性限量     | 同左                   |
 | 架構                        | Kronos-base + 同一組 LoRA + resampler + conditioner + alpha head | 完全相同               |
 | 初始化                      | 原始 pretrained base                                             | 原始 pretrained base   |
 | 是否接續 Stage 1 checkpoint | 否                                                               | 否                     |
@@ -299,8 +315,9 @@ symbol limit 或處理契約變動時會使用新的根目錄，不需要手動�
 - `configs/stage2_kronos_base_lora.yaml`
 
 兩份設定的 `config.model_architecture_digest()` 必須一致；此 digest 同時綁定模型參數與
-`h_start`／輸出 horizon 契約。Stage 1 的 15% 是確定性、分層且精確的 train subset，
-不會縮小 validation/test，也不能用「前 15% 資料」取代。
+`h_start`／輸出 horizon 契約。Stage 1 的 15% 是 O(1) blockwise permutation 所選出的
+確定性且精確 target set；它不是最早 15%，不會縮小 validation/test，也不會配置全部
+window indices。
 
 ### RunPod 完整操作手冊
 
@@ -311,7 +328,7 @@ quant-only 設定。
 本專案目前**沒有部署 PostgreSQL、SQLite、向量資料庫或其他資料庫服務**。
 下文的「遠端資料層」是 RunPod persistent network volume 上的 Parquet、
 API raw cache、manifest 與模型 cache。CPU preparation Pod 負責建立這個
-離線資料層；GPU Pod 只讀已落地資料，不會在訓練迴圈呼叫外部 API。
+離線資料層；GPU Pod 只讀已準備完成的 bar store，不會在訓練迴圈呼叫外部 API。
 
 #### 1. 建立 RunPod 帳號資源與本機設定
 
@@ -526,7 +543,7 @@ mapping 也不能繞過此限制。這不保證涵蓋 provider 未回傳或帳�
 | `--dataset-revision` | 1～64 字元；英數開頭，之後可用英數、`.`、`_`、`-`；預設 `v1` | provider 修訂歷史資料時，用新 label 強制建立新的 immutable dataset namespace |
 | `--start` | `YYYY-MM-DD`；預設 `2005-01-01` | 所有選定市場共用的起始日，包含該日；省略時固定使用 `2005-01-01` |
 | `--end` | `YYYY-MM-DD`；無預設值 | 所有選定市場共用的結束邊界，不包含該日；互動與非互動模式都必須由使用者明確提供，避免不知情地改用本機當日 |
-| `--h-start` | `1`、`2`、`3`；預設 `3` | 在 `t` 收盤後同時預測從第幾個持有交易日起至第 14 日的累積 alpha；仍於 `t+1` raw open 評估進場。此值屬於 processed dataset 與模型輸出契約 |
+| `--h-start` | `1`、`2`、`3`；預設 `3` | 在 `t` 收盤後同時預測從第幾個持有交易日起至第 14 日的累積 alpha；仍於 `t+1` raw open 評估進場。此值只改變 DataLoader 動態 label 與模型輸出，不改變 raw/bar-store dataset identity |
 | `--universe` | `all`、`explicit` | 控制美國商品選取方式；對 `tw_only` 只能使用 `all`。非互動模式必填 |
 | `--stocks` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的美國普通股／ADR，例如 `"AAPL,BABA"`；會用 EODHD discovery 驗證型別，不影響台股 |
 | `--etfs` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的非槓桿股票型 ETF，例如 `"SPY,QQQ"`；必須在經稽核白名單內，不影響台股 |
@@ -638,12 +655,14 @@ profile、日期、universe、symbol limit、資料處理契約或 stage config 
 任一不同，都會得到不同 identity。QPS、API budget 與最大退避只記錄在 CPU launch
 metadata、download progress 與 download manifest，不會進入 selection identity。
 
-只修改 `h_start` 會產生新的 dataset request SHA，並重新建立 processed windows、labels、
-train-only robust scales 與 split audit；它不會改變日期、symbol、provider request 或
-`cache_revision`。CPU acquisition 會以唯讀方式掃描其他 dataset namespace 中相同
-`cache_revision=v1` 的 `api-cache`，所以既有相同 URL／參數 response 會記為 cache hit，
-不會再次送出網路 API call。只有舊快取原本缺少、失敗，或 request 參數本身改變的資料
-才需要呼叫 provider。
+只修改 `h_start` 會產生新的 training selection SHA，但 `h_start=1`、`2`、`3` 共用相同
+dataset request SHA、raw Parquet、symbol bar store、品質 cutoff ranges 與 split audit。
+DataLoader 在訓練時才選取對應的 `h_start...14` label，train-only robust scales 也在該次
+訓練啟動時由 train split 動態抽樣估計，並寫入每個 checkpoint 供續訓、評估與推論精確
+還原。因此切換 `h_start` 不會重建資料、不會掃描 API
+cache，更不會呼叫 provider；若新 selection 需要更新 readiness binding，CPU prepare
+只會驗證既有 `_SUCCESS.json` 與 artifacts 後重新綁定 marker。日期、symbol universe、provider request 或
+`dataset-revision` 改變時才會建立不同的 dataset namespace。
 
 若 provider 可能修訂歷史資料，且確實要為相同 profile/date/universe 建立新快照，
 請在 `configure` 明確加入新的 `--dataset-revision <label>`；CPU workflow 不會
@@ -695,7 +714,7 @@ artifact 不會上傳。`poetry.lock` 也不會上傳；它會依 approved RunPo
 CPU Pod 只能使用 active selection；如果尚未執行 `configure`、config SHA 已改變，
 或 selection JSON 不完整，建立前就會失敗。在本機不帶任何選項執行時會進入
 互動模式，依序詢問 workload 最長執行時間、這次 Pod 可新增的 EODHD network-attempt
-上限、EODHD QPS、TWSE／TPEx 每個 provider 的 QPS、data cleaning/window construction
+上限、EODHD QPS、TWSE／TPEx 每個 provider 的 QPS、data cleaning/bar-store construction
 保留時間、三個 provider 共用的最大單次退避、vCPU 數與 CPU flavor。
 `--max-api-calls` 沒有可直接按 Enter 接受的預設值，必須依帳戶當下剩餘額度明確輸入；
 其他項目按 Enter 分別
@@ -790,14 +809,14 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    再次呼叫 provider。腳本會同時讀取使用者要求的 vCPU 數、RunPod 提供的
    `RUNPOD_CPU_COUNT` 與容器實際可見核心數，採三者最小值作為 worker 數；
    EODHD、TWSE 與 TPEx 以三個獨立頂層迴圈平行抓取，迴圈內再依商品／官方 benchmark
-   所列實際交易日使用 thread pool；因果視窗依商品平行建立，pytest worker 也不會超過
+   所列實際交易日使用 thread pool；bar-store preparation 依固定 hash bucket 分段，pytest worker 也不會超過
    這個有效核心數。每個 provider 有自己的 QPS limiter。`--max-api-calls` 只限制 EODHD，
    TWSE／TPEx 沒有專案端 request-count ceiling；三個 provider 都由同一個
    `--maxBackoff` 值控制各自的退避邊界。
    任一 provider 先退出都不會取消另外兩個；完成的 provider 會先原子發布 durable
    Parquet/request-log checkpoint。主流程 join 全部迴圈後才合併已驗證的 checkpoints
    或發布續傳狀態。完整 request 估算只作資訊；workflow 自動保留 max runtime 的 25%（最多 2 小時；預設 6 小時即
-   90 分鐘）給 data cleaning/window construction，也可用 `--prepareReserve` 調整。
+   90 分鐘）給 data cleaning/bar-store construction，也可用 `--prepareReserve` 調整。
 4. 建立並驗證下列 persistent artifacts：
    | 遠端路徑                                                                  | 內容                                              |
    | ------------------------------------------------------------------------- | ------------------------------------------------- |
@@ -805,7 +824,10 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    | `/runpod-volume/datasets/<dataset-request-sha256>/download-progress.json` | 續傳 attempt、cache 數量與 provider／budget／runtime 等待狀態 |
    | `/runpod-volume/datasets/<dataset-request-sha256>/provider-checkpoints/` | 可驗證並跨 CPU Pod 重用的 provider materialization checkpoints |
    | `/runpod-volume/datasets/<dataset-request-sha256>/raw/market.parquet`    | durable `downloaded` checkpoint 的 canonical daily OHLCV |
-   | `/runpod-volume/datasets/<dataset-request-sha256>/processed/windows.parquet` | 因果訓練視窗                                  |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/shards/` | 依 symbol row group 壓縮且可隨機讀取的 OHLCV bars |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/symbol-index.parquet` | symbol → shard/row-group 索引 |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/cutoff-ranges.parquet` | train/validation/test 的連續有效 cutoff ranges |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/_SUCCESS.json` | bar store 完成與完整性 checkpoint |
    | `/runpod-volume/datasets/<dataset-request-sha256>/download-manifest.json` | 實際 provider、profile、symbols 與下載 provenance |
    | `/runpod-volume/datasets/<dataset-request-sha256>/dataset-manifest.json` | split counts、hash 與資料契約                     |
    | `/runpod-volume/datasets/<dataset-request-sha256>/manifests/api-request-log.jsonl` | 不含 token 的 request audit             |
@@ -814,7 +836,11 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
 5. raw Parquet、download manifest 與 request log 完整驗證後先發布 `downloaded`
    lifecycle。沒有 exit code 的 `downloaded` 是同一 Pod 內的中間 checkpoint，外部 guard
    不會誤判為終態；若剩餘時間少於 cleaning reserve，腳本才以 exit code 75 將它標記為
-   可續傳終態，下一個 CPU Pod 直接從 checkpoint 執行清理，不再呼叫 provider。其後才將
+   可續傳終態，下一個 CPU Pod 直接從 checkpoint 執行清理，不再呼叫 provider。bar-store
+   建置期間若剩餘時間到達安全截止點，則以 `waiting_for_preparation` 與 exit code 75
+   結束；下一個 CPU Pod 會完全跳過已完成的 raw Parquet row groups、scan segments 與
+   buckets。若中斷發生在單一 row group 內，最多只重新順序讀取該 row group 的已走過
+   部分，已原子完成的 segment 不會重寫。其後才將
    selection ID/SHA、dataset request SHA、stage/config SHA、requested
    profile/date/universe 與 resolved artifact hashes 綁入
    `/runpod-volume/lifecycle/stage1/dataset.json`；只有全部檢查成功才發布並
@@ -1433,13 +1459,26 @@ benchmark rows provide the actual trading sessions, so ordinary weekdays are
 not blindly treated as open sessions. This removes artificial corporate-action
 gaps while retaining the tradable next-day raw-open entry semantics.
 
-Raw OHLCV Parquet is written incrementally, but processed-window preparation
-and the training dataset currently load the selected dataset into memory. For
-the first PoC, validate capacity with explicit `--symbols`, `--etf-symbols`, or
-`--symbol-limit` settings before scaling up. API quota alone does not imply that
-CPU RAM can hold the complete US and Taiwan histories. A full-market,
-long-history Stage 2 first requires partitioned, lazy processed windows; that
-out-of-core change is outside the current PoC.
+Raw OHLCV is written incrementally as immutable compressed Parquet. CPU
+preparation never expands every 128-bar window and never persists labels. It
+uses 128 hash buckets to build a compressed, symbol-oriented bar store with one
+Parquet row group per symbol, plus small `symbol-index.parquet` and contiguous
+valid-cutoff ranges. Every scan, compaction, quality, and split bucket has an
+atomic checkpoint. At max runtime the Pod exits as `waiting_for_preparation`;
+the next CPU Pod in the same dataset namespace resumes only unfinished raw row
+groups, segments, or buckets and skips completed units. `.work` partitions are
+reclaimed only after `_SUCCESS.json` is published.
+
+The training DataLoader uses an O(1)-state sampler over valid cutoff ranges. It
+loads one symbol row group on demand, constructs aligned 128-bar asset and
+benchmark contexts, and computes alpha labels from `h_start` through holding
+day 14 in memory. No per-window or per-label dataset is written. Stage 1 uses
+exactly 15% of valid train cutoffs, Stage 2 uses all valid train cutoffs, and
+both use fixed-size batches. If the final batch is short, it is deterministically
+filled from the beginning of the same target set and the padding count is written
+to the training summary; no full index array is allocated. This out-of-core design
+handles long full-market history without loading all bars or all potential windows
+into RAM.
 
 ### Offline data pipeline
 
@@ -1455,13 +1494,16 @@ Immutable raw JSON cache
 Canonical daily OHLCV Parquet + download-manifest.json
   │
   ▼
-Quality checks, causal windows, purge/embargo
+Resumable symbol bar store + quality-approved cutoff ranges
   │
   ▼
-processed windows.parquet + dataset-manifest.json
+bar-store/index/ranges + dataset-manifest.json
   │
   ▼
-Stage 1 / Stage 2 training (fully offline)
+Lazy DataLoader builds contexts/labels on demand (fully offline)
+  │
+  ▼
+Stage 1 / Stage 2 training
 ```
 
 The `train`, `validation`, and `test` partitions use global market-calendar
@@ -1504,19 +1546,21 @@ The downloader provides:
   completed provider-materialization checkpoints remain durable.
   `download-progress.json` is updated, and a later CPU Pod reuses completed
   providers while only incomplete providers replay cache and request misses.
-- The CPU workflow reserves 25% of max runtime for canonical cleaning and causal
-  window construction by default, capped at 2 hours and explicitly configurable
+- The CPU workflow reserves 25% of max runtime for canonical cleaning and
+  symbol bar-store/index construction by default, capped at 2 hours and explicitly configurable
   through `--prepareReserve`. Once
   acquisition completes, raw Parquet, the request log, and the download manifest
   become a durable `downloaded` checkpoint. A later Pod can skip every API call;
-  only verified processed data and readiness can become `ready`.
+  it resumes durable bucket checkpoints; only a verified bar store, cutoff
+  ranges, and readiness can become `ready`.
 - Cache identities, request logs, and manifests that exclude API tokens.
 - A raw cache and direct download/preparation CLIs that refuse silent overwrite.
 - SHA-256, row-count, and provenance bindings for artifacts.
 
-Training accepts only materialized `.parquet` data and a dataset manifest whose
-state is `ready`. Training, evaluation, and inference never call EODHD, TWSE,
-TPEx, or Massive.
+Training accepts only a complete shard/index/range contract with `_SUCCESS.json`
+and a dataset manifest whose state is `ready`. CPU readiness and training
+preflight verify every shard's size and SHA-256, not only the small indexes.
+Training, evaluation, and inference never call EODHD, TWSE, TPEx, or Massive.
 
 ### Remote runtime and local boundary
 
@@ -1539,7 +1583,7 @@ work. After changing `pyproject.toml`, resync the source and let the next remote
 CPU-preparation run resolve the lock. Do not try to reproduce the RunPod
 Python/PyTorch/CUDA environment locally.
 
-### Download and materialize data
+### Download data and build the bar store
 
 The standard path is the RunPod CPU-preparation workflow documented below; do
 not execute the data CLI locally. The following commands are low-level
@@ -1569,12 +1613,12 @@ poetry run fin-ts-download \
   --output data/raw/market.parquet
 ```
 
-Create causal training windows:
+Build or resume the lazy symbol bar store (no window/label files):
 
 ```bash
 poetry run fin-ts-prepare \
   --input data/raw/market.parquet \
-  --output data/processed/windows.parquet
+  --output data/prepared/bar-store
 ```
 
 Each dataset request maps automatically to
@@ -1588,8 +1632,8 @@ for the same dataset.
 | Item                  | Stage 1                                                                 | Stage 2                                     |
 | --------------------- | ----------------------------------------------------------------------- | ------------------------------------------- |
 | Purpose               | Validate data, model, loss, checkpoints, evaluation, and RunPod scripts | Full-data fine-tuning and formal evaluation |
-| Train samples         | Deterministic 15% target count allocated by market/asset strata         | 100% of the train split                     |
-| Validation / test     | Fully retained                                                          | Fully retained                              |
+| Train samples         | Exact 15% of valid train cutoffs through the O(1) blockwise sampler      | 100% of valid train cutoffs                  |
+| Validation / test     | Full splits remain in cutoff ranges; routine evaluation is deterministically capped by config | Same                                         |
 | Architecture          | Kronos-base + the same LoRA + resampler + conditioner + alpha head      | Identical                                   |
 | Initialization        | Original pretrained base                                                | Original pretrained base                    |
 | Continue from Stage 1 | No                                                                      | No                                          |
@@ -1601,8 +1645,9 @@ Configs:
 
 The two configs must have identical `config.model_architecture_digest()` values;
 this digest binds model parameters and the `h_start`/output-horizon contract. Stage
-1 uses an exact, deterministic, stratified 15% train subset. It does not shrink
-validation/test and must not be approximated by taking the first 15% of data.
+1 uses an exact deterministic target set selected by an O(1)-state blockwise
+permutation. It is not the earliest 15%, does not shrink validation/test, and does
+not allocate all possible window indices.
 
 ### Complete RunPod operations guide
 
@@ -1613,8 +1658,8 @@ termination. Data preparation, training, and validation use quant-only configs.
 This project currently deploys **no PostgreSQL, SQLite, vector database, or
 other database service**. The "remote data layer" below means Parquet, raw API
 cache, manifests, and model cache on a persistent RunPod network volume. A CPU
-preparation Pod builds this offline data layer. The GPU Pod reads materialized
-data and never calls an external market-data API from the training loop.
+preparation Pod builds this offline data layer. The GPU Pod reads the completed
+bar store and never calls an external market-data API from the training loop.
 
 #### 1. Create RunPod account resources and local configuration
 
@@ -1859,7 +1904,7 @@ All user-facing `configure` options are:
 | `--dataset-revision` | 1-64 characters; start with an alphanumeric character, followed by alphanumerics, `.`, `_`, or `-`; default `v1` | Use a new label to force a new immutable dataset namespace after a provider revises historical data |
 | `--start` | `YYYY-MM-DD`; default `2005-01-01` | Inclusive start date shared by every selected market; omission always selects `2005-01-01` |
 | `--end` | `YYYY-MM-DD`; no default | Exclusive end boundary shared by every selected market; both interactive and non-interactive modes require an explicit user value instead of silently selecting the local current date |
-| `--h-start` | `1`, `2`, or `3`; default `3` | First cumulative holding-day alpha horizon predicted after the close at `t`, through the fixed day 14; entry is still evaluated at the raw open of `t+1`. This is part of the processed-dataset and model-output contract |
+| `--h-start` | `1`, `2`, or `3`; default `3` | First cumulative holding-day alpha horizon predicted after the close at `t`, through fixed day 14; entry remains the raw open of `t+1`. It changes only runtime DataLoader labels and model output, not raw/bar-store dataset identity |
 | `--universe` | `all`, `explicit` | Select the US-instrument strategy; `tw_only` accepts only `all`. Required in non-interactive mode |
 | `--stocks` | Comma- or space-separated US tickers; repeatable | US common stocks/ADRs in `explicit` mode, such as `"AAPL,BABA"`; provider type is verified against EODHD discovery and does not affect Taiwan data |
 | `--etfs` | Comma- or space-separated US tickers; repeatable | Unleveraged US equity ETFs in `explicit` mode, such as `"SPY,QQQ"`; each ticker must be in the audited allowlist and does not affect Taiwan data |
@@ -1979,13 +2024,17 @@ preparation contract, or stage-config SHA-256 produces a different identity.
 QPS, API budget, and maximum backoff are recorded only in CPU launch metadata,
 download progress, and the download manifest; they never enter selection identity.
 
-Changing only `h_start` creates a new dataset request SHA and rebuilds processed
-windows, labels, train-only robust scales, and split audit. It does not change
-dates, symbols, provider requests, or `cache_revision`. CPU acquisition scans
-other dataset namespaces with the same `cache_revision=v1` as read-only cache
-fallbacks, so an existing response with the same URL and parameters is recorded
-as a cache hit and sends no network API call. Only responses that were missing or
-failed previously, or whose request parameters changed, require provider access.
+Changing only `h_start` creates a new training selection SHA, while `h_start=1`,
+`2`, and `3` share the same dataset request SHA, raw Parquet, symbol bar store,
+quality cutoff ranges, and split audit. The DataLoader selects the corresponding
+`h_start...14` labels at training time, and train-only robust scales are sampled
+dynamically from the train split when that run starts, then persisted in every
+checkpoint for exact resume, evaluation, and inference restoration. Switching `h_start`
+therefore neither rebuilds data nor scans API caches and sends no provider
+request. If the new selection needs a readiness binding, CPU preparation only
+verifies the existing `_SUCCESS.json` and artifacts before rebinding the
+marker. A different date range, symbol universe, provider request, or
+`dataset-revision` creates a different dataset namespace.
 
 When provider history may have been revised and a new snapshot is intentional
 for the same profile/date/universe, pass a new explicit
@@ -2043,7 +2092,7 @@ compute is rented when `configure` has not run, the config SHA changed, or the
 selection JSON is incomplete. With no options, the local command is interactive:
 it prompts for maximum workload runtime, the maximum additional EODHD network
 attempts for this Pod, EODHD QPS, per-provider TWSE/TPEx QPS, time reserved for
-data cleaning/window construction, the maximum retry backoff shared by all three
+data cleaning/bar-store construction, the maximum retry backoff shared by all three
 providers, vCPU count, and CPU flavor. `--max-api-calls` has no Enter-to-accept
 default and must be
 entered explicitly from the account's current remaining quota. Pressing Enter
@@ -2151,7 +2200,7 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    then uses the minimum as its worker count. EODHD, TWSE, and TPEx run as three
    independent top-level acquisition loops; each loop uses a thread pool across
    instruments or actual sessions listed by official benchmark history.
-   Causal-window construction runs across symbols, and pytest workers never
+   Bar-store preparation advances through fixed hash buckets, and pytest workers never
    exceed the effective CPU count. Each provider has its own QPS limiter.
    `--max-api-calls` limits only EODHD; TWSE/TPEx have no project-side request
    counter ceiling. All three providers use the same `--maxBackoff` value for
@@ -2160,7 +2209,7 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    durable Parquet/request-log checkpoint. The process joins all loops before
    merging validated checkpoints or publishing a resume state. The
    complete-plan estimate is informational. The workflow automatically reserves
-   25% of max runtime for cleaning/window construction (90 minutes for the
+   25% of max runtime for cleaning/bar-store construction (90 minutes for the
    default six-hour runtime and capped at 2 hours), configurable with
    `--prepareReserve`.
 4. Creates and verifies these persistent artifacts:
@@ -2170,7 +2219,10 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    | `/runpod-volume/datasets/<dataset-request-sha256>/download-progress.json`          | Resume attempt, cache counts, and provider/budget/runtime wait state |
    | `/runpod-volume/datasets/<dataset-request-sha256>/provider-checkpoints/`          | Validated provider-materialization checkpoints reusable across CPU Pods |
    | `/runpod-volume/datasets/<dataset-request-sha256>/raw/market.parquet`             | Canonical daily OHLCV in the durable `downloaded` checkpoint |
-   | `/runpod-volume/datasets/<dataset-request-sha256>/processed/windows.parquet`      | Causal training windows                                     |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/shards/`    | Compressed OHLCV bars with one row group per symbol         |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/symbol-index.parquet` | Symbol-to-shard/row-group index                    |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/cutoff-ranges.parquet` | Contiguous valid train/validation/test cutoffs      |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/_SUCCESS.json` | Completed bar-store integrity checkpoint          |
    | `/runpod-volume/datasets/<dataset-request-sha256>/download-manifest.json`         | Actual providers, profile, symbols, and download provenance |
    | `/runpod-volume/datasets/<dataset-request-sha256>/dataset-manifest.json`          | Split counts, hashes, and data contract                     |
    | `/runpod-volume/datasets/<dataset-request-sha256>/manifests/api-request-log.jsonl` | Request audit without tokens                               |
@@ -2181,7 +2233,12 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    intermediate checkpoint in the same Pod, so the external guard does not treat it
    as terminal. Only when the remaining time is below the cleaning reserve does exit
    code 75 make it a resumable terminal state; the next CPU Pod then cleans directly
-   from the checkpoint without provider calls. It binds the selection ID/SHA,
+   from the checkpoint without provider calls. If bar-store construction reaches
+   its safe deadline, it exits with `waiting_for_preparation` and code 75; the next
+   Pod completely skips finished raw Parquet row groups, scan segments, and buckets.
+   If interruption occurs inside one row group, at most the already traversed part
+   of that row group is read again; atomically completed segments are never rewritten.
+   It then binds the selection ID/SHA,
    dataset request SHA, stage/config SHA, requested
    profile/date/universe, and resolved artifact hashes into
    `/runpod-volume/lifecycle/stage1/dataset.json`. It publishes the marker only

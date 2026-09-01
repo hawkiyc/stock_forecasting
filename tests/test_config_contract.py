@@ -59,7 +59,7 @@ def test_dataset_profiles_report_exact_selected_sources(
 ) -> None:
     config = DataConfig(
         raw_path=Path("raw.parquet"),
-        processed_path=Path("windows.parquet"),
+        bar_store_path=Path("prepared/bar-store"),
         dataset_profile=profile,
     )
     assert config.selected_datasets == selected

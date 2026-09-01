@@ -51,7 +51,7 @@ class DataConfig(StrictModel):
     """Offline paired-OHLCV dataset and next-open alpha contract."""
 
     raw_path: Path
-    processed_path: Path
+    bar_store_path: Path
     manifest_path: Path | None = None
     dataset_profile: DatasetProfile = "tw_only"
     input_length: int = Field(default=128, ge=32, le=512)
@@ -74,6 +74,7 @@ class DataConfig(StrictModel):
     validation_end: str | None = None
     test_end: str | None = None
     max_samples: int | None = Field(default=None, ge=1)
+    label_scale_calibration_samples: int = Field(default=50_000, ge=4)
     require_ready_manifest: bool = True
 
     @field_validator("h_start", mode="before")
@@ -260,6 +261,7 @@ class TrainingConfig(StrictModel):
     resume_checkpoint: Path | None = None
     mixed_precision: Literal["no", "bf16"] = "bf16"
     num_workers: int = Field(default=2, ge=0)
+    evaluation_max_samples: int = Field(default=20_000, ge=32)
 
     @model_validator(mode="after")
     def validate_training_contract(self) -> TrainingConfig:
@@ -334,6 +336,7 @@ class ValidationConfig(StrictModel):
     neural_learning_rate: float = Field(default=1e-3, gt=0.0)
     recompute_full_model: bool = False
     resume_completed_models: bool = True
+    baseline_max_samples_per_split: int = Field(default=20_000, ge=32)
 
     @model_validator(mode="after")
     def validate_benchmark_plan(self) -> ValidationConfig:

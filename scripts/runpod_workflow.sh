@@ -223,7 +223,7 @@ EOF
                 fi
             done
             while true; do
-                printf 'Time reserved for data cleaning/window construction [%s]: ' \
+                printf 'Time reserved for data cleaning/bar-store construction [%s]: ' \
                     "${cpu_prepare_reserve}" >&2
                 if ! IFS= read -r cpu_entered_prepare_reserve; then
                     echo "Input closed before CPU Pod creation" >&2

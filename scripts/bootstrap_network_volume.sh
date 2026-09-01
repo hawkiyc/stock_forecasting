@@ -69,7 +69,7 @@ done
 mkdir -p \
     "${PROJECT_ROOT}" \
     "${DATA_ROOT}/raw" \
-    "${DATA_ROOT}/processed" \
+    "${DATA_ROOT}/prepared" \
     "${CACHE_ROOT}" \
     "${LOG_ROOT}" \
     "${SAVED_MODEL_ROOT}" \

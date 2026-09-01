@@ -12,14 +12,15 @@ from stock_forecasting.data.manifest import load_dataset_manifest, sha256_file
 from stock_forecasting.models import MODEL_OUTPUT_SCHEMA_VERSION
 from stock_forecasting.run_paths import validate_run_id, validate_training_resume_path
 
-CHECKPOINT_ARTIFACT_SCHEMA_VERSION = "3.0"
+CHECKPOINT_ARTIFACT_SCHEMA_VERSION = "4.0"
 TRAINING_RESUME_CONTRACT_VERSION = "5.0"
 TRAINING_IMPLEMENTATION_PATHS = (
     "checkpointing.py",
     "config.py",
+    "data/adjustments.py",
+    "data/bar_store.py",
     "data/dataset.py",
     "data/horizons.py",
-    "data/io.py",
     "data/manifest.py",
     "factory.py",
     "metrics.py",

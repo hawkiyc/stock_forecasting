@@ -257,6 +257,7 @@ if state not in (
     "waiting_for_provider",
     "waiting_for_budget",
     "waiting_for_resume",
+    "waiting_for_preparation",
     "downloaded",
 ):
     raise SystemExit(2)
@@ -264,6 +265,7 @@ if state in (
     "waiting_for_provider",
     "waiting_for_budget",
     "waiting_for_resume",
+    "waiting_for_preparation",
     "downloaded",
 ) and expected_kind != "stage1-dataset":
     raise SystemExit(2)
@@ -274,6 +276,7 @@ if state in (
     "waiting_for_provider",
     "waiting_for_budget",
     "waiting_for_resume",
+    "waiting_for_preparation",
     "downloaded",
 ) and (type(payload.get("exit_code")) is not int or payload.get("exit_code") != 75):
     raise SystemExit(2)
@@ -315,6 +318,7 @@ print(state)' \
                     || "${marker_state}" == "waiting_for_provider" \
                     || "${marker_state}" == "waiting_for_budget" \
                     || "${marker_state}" == "waiting_for_resume" \
+                    || "${marker_state}" == "waiting_for_preparation" \
                     || "${marker_state}" == "downloaded" ]]; then
                     terminal_state="${marker_state}"
                     terminal_key="${lifecycle_candidate}"

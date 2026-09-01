@@ -239,8 +239,8 @@ def _dataset_contract(readiness_payload, dataset_payload, dataset_manifest_sha25
         raise ValueError("Dataset readiness manifest must contain a ready JSON object")
     if (
         not isinstance(dataset_payload, dict)
-        or dataset_payload.get("schema_version") != "2.0"
-        or dataset_payload.get("kind") != "ohlcv-dataset"
+        or dataset_payload.get("schema_version") != "3.0"
+        or dataset_payload.get("kind") != "ohlcv-bar-store-dataset"
         or dataset_payload.get("state") != "ready"
     ):
         raise ValueError("Numerical dataset manifest must contain a ready JSON object")
@@ -248,22 +248,29 @@ def _dataset_contract(readiness_payload, dataset_payload, dataset_manifest_sha25
     if readiness_dataset_manifest["sha256"] != dataset_manifest_sha256:
         raise ValueError("Dataset readiness marker and dataset manifest digest disagree")
     raw = _manifest_artifact(dataset_payload, "raw")
-    processed = _manifest_artifact(dataset_payload, "processed")
-    if (
-        raw["sha256"] != _dataset_artifact(readiness_payload, "raw")["sha256"]
-        or processed["sha256"] != _dataset_artifact(readiness_payload, "processed")["sha256"]
+    lazy_artifacts = {
+        name: _manifest_artifact(dataset_payload, name)
+        for name in ("bar_store_manifest", "symbol_index", "cutoff_ranges")
+    }
+    if raw["sha256"] != _dataset_artifact(readiness_payload, "raw")["sha256"] or any(
+        artifact["sha256"]
+        != _dataset_artifact(readiness_payload, name)["sha256"]
+        for name, artifact in lazy_artifacts.items()
     ):
         raise ValueError("Dataset readiness marker and numerical artifacts disagree")
     for key in (
         "dataset_profile",
         "selected_datasets",
         "data_pipeline_digest",
-        "preparation_spec_sha256",
         "universe_sha256",
         "split_counts",
     ):
         if readiness_payload.get(key) != dataset_payload.get(key):
             raise ValueError(f"Dataset readiness marker and dataset manifest disagree on {key}")
+    if readiness_payload.get("storage_preparation_spec_sha256") != dataset_payload.get(
+        "preparation_spec_sha256"
+    ):
+        raise ValueError("Dataset readiness marker and storage preparation contract disagree")
     return {
         "status": "ready",
         "path": f"/runpod-volume/{readiness_dataset_manifest['relative_path']}",
@@ -280,7 +287,7 @@ def _dataset_contract(readiness_payload, dataset_payload, dataset_manifest_sha25
         ),
         "universe_sha256": _required_sha256(dataset_payload, "universe_sha256"),
         "split_counts": dataset_payload["split_counts"],
-        "artifacts": {"raw": raw, "processed": processed},
+        "artifacts": {"raw": raw, **lazy_artifacts},
     }
 
 

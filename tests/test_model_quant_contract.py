@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 
 from stock_forecasting.checkpointing import (
     _load_trainable_model_state,
+    _restore_runtime_robust_scales,
     _validate_loaded_model_contract,
     trainable_state_dict,
 )
@@ -139,6 +140,42 @@ def test_checkpoint_restore_requires_the_exact_trainable_parameter_union() -> No
         _load_trainable_model_state(
             model,
             {**state, "legacy_text_head.weight": torch.ones(1)},
+        )
+
+
+@pytest.mark.parametrize("h_start", [1, 2, 3])
+def test_checkpoint_runtime_robust_scales_restore_exact_horizon_contract(
+    h_start: int,
+) -> None:
+    config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    config.data.h_start = h_start
+    model = build_model_bundle(config, torch.device("cpu")).model
+    expected = [0.01 * (index + 1) for index in range(len(config.data.alpha_horizons))]
+
+    _restore_runtime_robust_scales(
+        model,
+        {"runtime_robust_scales": expected},
+        require_match=False,
+    )
+
+    torch.testing.assert_close(
+        model.alpha_head.robust_scales,
+        torch.tensor(expected, dtype=torch.float32),
+    )
+    with pytest.raises(ValueError, match="differ from train calibration"):
+        _restore_runtime_robust_scales(
+            model,
+            {"runtime_robust_scales": [1.0] * len(expected)},
+            require_match=True,
+        )
+    with pytest.raises(ValueError, match="do not match model horizons"):
+        _restore_runtime_robust_scales(
+            model,
+            {
+                "runtime_robust_scales": [1.0]
+                * (13 if len(expected) == 12 else 12)
+            },
+            require_match=False,
         )
 
 
