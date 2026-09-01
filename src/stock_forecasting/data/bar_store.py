@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
+import shutil
 import time
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from multiprocessing import get_context
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
@@ -42,11 +43,12 @@ from stock_forecasting.data.splits import SPLIT_POLICY
 DEFAULT_BUCKET_COUNT = 128
 DEFAULT_BATCH_ROWS = 1_000_000
 DEFAULT_MAX_HORIZON = 14
-RAW_SCAN_ALGORITHM = "parquet-row-group-checkpoints-v2"
+RAW_SCAN_ALGORITHM = "partitioned-bucket-row-groups-v3"
 SPLIT_ASSIGNMENT_ALGORITHM = "vectorized-bucket-checkpoints-v1"
 MULTIPROCESS_BACKEND = "process_pool_spawn"
 NATIVE_THREADS_PER_WORKER = 1
-RAW_SCAN_WORKER_CAP = 4
+SOURCE_PARTITION_BATCH_MULTIPLIER = 4
+RAW_BATCH_BYTES_PER_ROW_ESTIMATE = 1024
 MIB = 1024**2
 GIB = 1024**3
 WORKER_BASE_MEMORY_BYTES = 512 * MIB
@@ -119,24 +121,32 @@ class _PhasePlan:
 
 
 @dataclass(frozen=True)
-class _ScanRowGroupTask:
+class _ScanPartitionTask:
     raw_path: str
     work_root: str
-    row_group: int
-    row_group_rows: int
-    segment_start: int
-    segment_count: int
+    partition: int
+    source_row_groups: tuple[int, ...]
+    row_count: int
     bucket_count: int
     batch_rows: int
     deadline_epoch_seconds: float | None
 
 
 @dataclass(frozen=True)
+class _BucketSource:
+    partition: int
+    path: str
+    row_group: int
+    rows: int
+    compressed_bytes: int
+
+
+@dataclass(frozen=True)
 class _CompactBucketTask:
     output_root: str
-    work_root: str
     bucket: int
     bucket_count: int
+    sources: tuple[_BucketSource, ...]
     benchmark_mapping: dict[str, str]
     max_abs_log_return: float
     deadline_epoch_seconds: float | None
@@ -398,6 +408,7 @@ def _run_phase_tasks(
     tasks: Sequence[Any],
     runner: Callable[[Any], Any],
     deadline: _Deadline,
+    on_result: Callable[[Any], None] | None = None,
 ) -> None:
     """Run bounded spawn workers while allowing only one in-flight task per worker."""
 
@@ -412,7 +423,9 @@ def _run_phase_tasks(
         ):
             for task_index, task in enumerate(tasks):
                 deadline.check(f"{plan.phase} task {task_index}")
-                runner(task)
+                result = runner(task)
+                if on_result is not None:
+                    on_result(result)
         return
 
     task_iterator = iter(tasks)
@@ -435,7 +448,9 @@ def _run_phase_tasks(
                 done, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for future in done:
                     futures.pop(future)
-                    future.result()
+                    result = future.result()
+                    if on_result is not None:
+                        on_result(result)
                     try:
                         next_task = next(task_iterator)
                     except StopIteration:
@@ -486,6 +501,29 @@ def _record_phase_plan(work_root: Path, plan: _PhasePlan) -> None:
         raise ValueError("Bar-store execution plan has invalid phase metadata")
     phases[plan.phase] = plan.as_dict()
     atomic_write_json(path, payload)
+
+
+def _emit_phase_progress(
+    *,
+    phase: str,
+    state: str,
+    completed_tasks: int,
+    total_tasks: int,
+    effective_workers: int,
+) -> None:
+    print(
+        json.dumps(
+            {
+                "bar_store_phase": phase,
+                "completed_tasks": completed_tasks,
+                "effective_workers": effective_workers,
+                "state": state,
+                "total_tasks": total_tasks,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
 
 
 def _require_pyarrow() -> tuple[Any, Any]:
@@ -556,6 +594,7 @@ def _cleanup_completed_work(work_root: Path) -> None:
 
     _load_planning_symbol_index.cache_clear()
     generated_names = (
+        "scan-partitions",
         "segments",
         "compaction-staging",
         "candidate-staging",
@@ -568,6 +607,41 @@ def _cleanup_completed_work(work_root: Path) -> None:
         _remove_generated_tree(work_root / name)
     (work_root / "build-state.json").unlink(missing_ok=True)
     (work_root / "execution-plan.json").unlink(missing_ok=True)
+    (work_root / "scan-index.json").unlink(missing_ok=True)
+
+
+def _is_scan_execution_upgrade(
+    previous_identity: Mapping[str, Any],
+    current_identity: Mapping[str, Any],
+) -> bool:
+    """Allow checkpoint-layout upgrades only when the data contract is unchanged."""
+
+    ignored = {"raw_scan_algorithm", "raw_scan_target_partition_rows"}
+    previous = {key: value for key, value in previous_identity.items() if key not in ignored}
+    current = {key: value for key, value in current_identity.items() if key not in ignored}
+    return previous == current and previous_identity.get("raw_scan_algorithm") != RAW_SCAN_ALGORITHM
+
+
+def _quarantine_obsolete_scan_work(
+    *,
+    root: Path,
+    work_root: Path,
+    previous_state: Mapping[str, Any],
+) -> Path:
+    """Move obsolete derived checkpoints aside without traversing the Network Volume."""
+
+    shards_root = root / "shards"
+    if work_root.is_symlink() or shards_root.is_symlink():
+        raise ValueError("Bar-store checkpoint roots must not be symbolic links")
+    previous_sha256 = str(previous_state.get("identity_sha256", "unknown"))[:12]
+    quarantine = root.parent / (
+        f".{root.name}-obsolete-scan-{previous_sha256}-{uuid.uuid4().hex[:8]}"
+    )
+    quarantine.mkdir(parents=False, exist_ok=False)
+    work_root.replace(quarantine / "work")
+    if shards_root.exists():
+        shards_root.replace(quarantine / "shards")
+    return quarantine
 
 
 def _metadata_value(frame: pd.DataFrame, column: str) -> Any:
@@ -598,206 +672,289 @@ def _true_ranges(mask: np.ndarray, *, offset: int = 0) -> list[tuple[int, int]]:
     return [(int(group[0]) + offset, int(group[-1]) + offset + 1) for group in groups]
 
 
-def _validated_scan_segment(
-    segment_root: Path,
+def _source_partition_layouts(
+    parquet: Any,
     *,
-    segment_index: int,
-    row_group: int,
-    batch_in_row_group: int,
-    expected_rows: int,
-    bucket_count: int,
-) -> bool:
-    checkpoint_path = segment_root / "checkpoint.json"
-    if not segment_root.is_dir() or not checkpoint_path.is_file():
-        return False
-    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    populated = checkpoint.get("populated_buckets")
-    if (
-        checkpoint.get("schema_version") != BAR_STORE_SCHEMA_VERSION
-        or checkpoint.get("kind") != "bar-store-scan-segment"
-        or checkpoint.get("algorithm") != RAW_SCAN_ALGORITHM
-        or checkpoint.get("segment") != segment_index
-        or checkpoint.get("row_group") != row_group
-        or checkpoint.get("batch_in_row_group") != batch_in_row_group
-        or checkpoint.get("rows") != expected_rows
-        or not isinstance(populated, list)
-        or any(
-            not isinstance(bucket, int)
-            or isinstance(bucket, bool)
-            or bucket < 0
-            or bucket >= bucket_count
-            for bucket in populated
-        )
-        or len(populated) != len(set(populated))
-    ):
-        raise ValueError(f"Raw-scan segment checkpoint is invalid: {checkpoint_path}")
-    actual_parts = sorted(
-        int(path.stem.removeprefix("bucket-"))
-        for path in segment_root.glob("bucket-*.parquet")
-        if path.is_file()
-    )
-    if actual_parts != sorted(populated):
-        raise ValueError(f"Raw-scan segment parts are incomplete: {segment_root}")
-    return True
+    target_rows: int,
+) -> list[tuple[int, tuple[int, ...], int]]:
+    """Group tiny source row groups into a small number of stable scan partitions."""
+
+    layouts: list[tuple[int, tuple[int, ...], int]] = []
+    pending_row_groups: list[int] = []
+    pending_rows = 0
+    for row_group in range(parquet.num_row_groups):
+        row_group_rows = int(parquet.metadata.row_group(row_group).num_rows)
+        if pending_row_groups and pending_rows + row_group_rows > target_rows:
+            layouts.append((len(layouts), tuple(pending_row_groups), pending_rows))
+            pending_row_groups = []
+            pending_rows = 0
+        pending_row_groups.append(row_group)
+        pending_rows += row_group_rows
+    if pending_row_groups:
+        layouts.append((len(layouts), tuple(pending_row_groups), pending_rows))
+    if not layouts:
+        raise ValueError("Raw Parquet contains no source row groups")
+    return layouts
 
 
-def _completed_scan_row_group(
-    segments_root: Path,
+def _iter_partition_tables(
+    parquet: Any,
     *,
-    row_group: int,
-    row_group_rows: int,
-    segment_start: int,
+    row_groups: tuple[int, ...],
     batch_rows: int,
-    bucket_count: int,
-) -> int | None:
-    checkpoint_path = segments_root / f"row-group-{row_group:06d}.json"
-    if not checkpoint_path.is_file():
-        return None
-    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    segment_count = checkpoint.get("segments")
-    if (
-        checkpoint.get("schema_version") != BAR_STORE_SCHEMA_VERSION
-        or checkpoint.get("kind") != "bar-store-scan-row-group"
-        or checkpoint.get("algorithm") != RAW_SCAN_ALGORITHM
-        or checkpoint.get("row_group") != row_group
-        or checkpoint.get("rows") != row_group_rows
-        or checkpoint.get("segment_start") != segment_start
-        or checkpoint.get("batch_rows") != batch_rows
-        or not isinstance(segment_count, int)
-        or isinstance(segment_count, bool)
-        or segment_count < 0
-    ):
-        raise ValueError(f"Raw-scan row-group checkpoint is invalid: {checkpoint_path}")
-    validated_rows = 0
-    for batch_in_row_group in range(segment_count):
-        segment_index = segment_start + batch_in_row_group
-        segment_root = segments_root / f"segment-{segment_index:06d}"
-        segment_checkpoint = json.loads(
-            (segment_root / "checkpoint.json").read_text(encoding="utf-8")
-        )
-        segment_rows = segment_checkpoint.get("rows")
-        if (
-            not isinstance(segment_rows, int)
-            or isinstance(segment_rows, bool)
-            or segment_rows < 1
-            or segment_rows > batch_rows
-            or not _validated_scan_segment(
-                segment_root,
-                segment_index=segment_index,
-                row_group=row_group,
-                batch_in_row_group=batch_in_row_group,
-                expected_rows=segment_rows,
-                bucket_count=bucket_count,
-            )
-        ):
-            raise ValueError(f"Raw-scan row group is incomplete: {checkpoint_path}")
-        validated_rows += segment_rows
-    if validated_rows != row_group_rows:
-        raise ValueError(f"Raw-scan row-group row count is invalid: {checkpoint_path}")
-    return segment_count
+) -> Any:
+    """Yield bounded Arrow tables even when the source contains tiny row groups."""
+
+    pa, _ = _require_pyarrow()
+    pending: list[Any] = []
+    pending_rows = 0
+    for batch in parquet.iter_batches(batch_size=batch_rows, row_groups=list(row_groups)):
+        offset = 0
+        while offset < batch.num_rows:
+            take = min(batch_rows - pending_rows, batch.num_rows - offset)
+            pending.append(batch.slice(offset, take))
+            pending_rows += take
+            offset += take
+            if pending_rows == batch_rows:
+                yield pa.Table.from_batches(pending)
+                pending = []
+                pending_rows = 0
+    if pending:
+        yield pa.Table.from_batches(pending)
 
 
-def _scan_row_group_task(task: _ScanRowGroupTask) -> dict[str, int]:
-    """Scan one Parquet row group into uniquely owned durable segment paths."""
+def _scan_partition_name(partition: int) -> str:
+    return f"partition-{partition:04d}"
+
+
+def _validated_scan_partition(
+    task: _ScanPartitionTask,
+) -> dict[str, Any] | None:
+    """Validate one atomic partition with one footer read and no directory glob."""
 
     _, pq = _require_pyarrow()
-    deadline = _Deadline(task.deadline_epoch_seconds)
-    segments_root = Path(task.work_root) / "segments"
-    completed = _completed_scan_row_group(
-        segments_root,
-        row_group=task.row_group,
-        row_group_rows=task.row_group_rows,
-        segment_start=task.segment_start,
-        batch_rows=task.batch_rows,
-        bucket_count=task.bucket_count,
-    )
-    if completed is not None:
-        return {"rows": task.row_group_rows, "segments": completed}
+    partition_name = _scan_partition_name(task.partition)
+    partition_root = Path(task.work_root) / "scan-partitions" / partition_name
+    checkpoint_path = partition_root / "checkpoint.json"
+    artifact_path = partition_root / "partition.parquet"
+    if not checkpoint_path.is_file() or not artifact_path.is_file():
+        return None
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    artifact = checkpoint.get("artifact")
+    buckets = checkpoint.get("buckets")
+    if (
+        checkpoint.get("schema_version") != BAR_STORE_SCHEMA_VERSION
+        or checkpoint.get("kind") != "bar-store-scan-partition"
+        or checkpoint.get("algorithm") != RAW_SCAN_ALGORITHM
+        or checkpoint.get("partition") != task.partition
+        or checkpoint.get("source_row_groups") != list(task.source_row_groups)
+        or checkpoint.get("rows") != task.row_count
+        or checkpoint.get("batch_rows") != task.batch_rows
+        or checkpoint.get("bucket_count") != task.bucket_count
+        or not isinstance(artifact, dict)
+        or artifact.get("relative_path")
+        != (Path("scan-partitions") / partition_name / "partition.parquet").as_posix()
+        or not isinstance(artifact.get("sha256"), str)
+        or len(artifact["sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in artifact["sha256"])
+        or not isinstance(artifact.get("size_bytes"), int)
+        or isinstance(artifact.get("size_bytes"), bool)
+        or artifact["size_bytes"] < 1
+        or artifact_path.stat().st_size != artifact["size_bytes"]
+        or not isinstance(buckets, dict)
+        or not buckets
+    ):
+        raise ValueError(f"Raw-scan partition checkpoint is invalid: {checkpoint_path}")
 
-    parquet = pq.ParquetFile(task.raw_path)
-    observed_rows = 0
-    observed_batches = 0
-    batches = parquet.iter_batches(
-        batch_size=task.batch_rows,
-        row_groups=[task.row_group],
-    )
-    for batch_in_row_group, batch in enumerate(batches):
-        segment_index = task.segment_start + batch_in_row_group
-        deadline.check(f"raw segment {segment_index}")
-        segment_name = f"segment-{segment_index:06d}"
-        segment_root = segments_root / segment_name
-        observed_rows += batch.num_rows
-        observed_batches += 1
-        if _validated_scan_segment(
-            segment_root,
-            segment_index=segment_index,
-            row_group=task.row_group,
-            batch_in_row_group=batch_in_row_group,
-            expected_rows=batch.num_rows,
-            bucket_count=task.bucket_count,
-        ):
-            continue
-        if segment_root.exists() or segment_root.is_symlink():
-            _remove_generated_tree(segment_root)
-        _discard_stale_staging(segments_root, segment_name)
-        staging = _staging_directory(segments_root, segment_name)
+    row_groups: list[int] = []
+    bucket_rows = 0
+    parsed_buckets: dict[int, dict[str, int]] = {}
+    for bucket_text, metadata in buckets.items():
         try:
-            frame = ensure_adjustment_columns(normalize_ohlcv_frame(batch.to_pandas()))
-            unique_symbols = [str(value) for value in frame["symbol"].unique()]
-            buckets = {
-                symbol: _symbol_bucket(symbol, task.bucket_count) for symbol in unique_symbols
+            bucket = int(bucket_text)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Raw-scan partition bucket is invalid: {checkpoint_path}") from error
+        if (
+            str(bucket) != bucket_text
+            or bucket < 0
+            or bucket >= task.bucket_count
+            or not isinstance(metadata, dict)
+            or not isinstance(metadata.get("row_group"), int)
+            or isinstance(metadata.get("row_group"), bool)
+            or metadata["row_group"] < 0
+            or not isinstance(metadata.get("rows"), int)
+            or isinstance(metadata.get("rows"), bool)
+            or metadata["rows"] < 1
+            or not isinstance(metadata.get("compressed_bytes"), int)
+            or isinstance(metadata.get("compressed_bytes"), bool)
+            or metadata["compressed_bytes"] < 1
+        ):
+            raise ValueError(f"Raw-scan partition bucket is invalid: {checkpoint_path}")
+        row_groups.append(metadata["row_group"])
+        bucket_rows += metadata["rows"]
+        parsed_buckets[bucket] = metadata
+    if sorted(row_groups) != list(range(len(row_groups))) or bucket_rows != task.row_count:
+        raise ValueError(f"Raw-scan partition totals are invalid: {checkpoint_path}")
+
+    parquet = pq.ParquetFile(artifact_path)
+    if parquet.num_row_groups != len(parsed_buckets) or parquet.metadata.num_rows != task.row_count:
+        raise ValueError(f"Raw-scan partition Parquet is invalid: {artifact_path}")
+    for metadata in parsed_buckets.values():
+        if parquet.metadata.row_group(metadata["row_group"]).num_rows != metadata["rows"]:
+            raise ValueError(f"Raw-scan partition row group is invalid: {artifact_path}")
+    return checkpoint
+
+
+def _scan_partition_task(task: _ScanPartitionTask) -> dict[str, Any]:
+    """Stream one coarse source partition and publish one bucket-indexed Parquet."""
+
+    pa, pq = _require_pyarrow()
+    completed = _validated_scan_partition(task)
+    if completed is not None:
+        return completed
+
+    deadline = _Deadline(task.deadline_epoch_seconds)
+    work_root = Path(task.work_root)
+    partitions_root = work_root / "scan-partitions"
+    partitions_root.mkdir(parents=True, exist_ok=True)
+    partition_name = _scan_partition_name(task.partition)
+    destination = partitions_root / partition_name
+    if destination.exists() or destination.is_symlink():
+        _remove_generated_tree(destination)
+    _discard_stale_staging(partitions_root, partition_name)
+
+    with TemporaryDirectory(prefix=f"fin-ts-{partition_name}-", dir="/tmp") as local_text:
+        local_root = Path(local_text)
+        parquet = pq.ParquetFile(task.raw_path)
+        bucket_parts: dict[int, list[Path]] = defaultdict(list)
+        observed_rows = 0
+        for batch_index, table in enumerate(
+            _iter_partition_tables(
+                parquet,
+                row_groups=task.source_row_groups,
+                batch_rows=task.batch_rows,
+            )
+        ):
+            deadline.check(f"raw scan partition {task.partition} batch {batch_index}")
+            frame = ensure_adjustment_columns(normalize_ohlcv_frame(table.to_pandas()))
+            observed_rows += len(frame)
+            symbol_buckets = {
+                str(symbol): _symbol_bucket(str(symbol), task.bucket_count)
+                for symbol in frame["symbol"].unique()
             }
-            bucket_ids = frame["symbol"].map(buckets).to_numpy(dtype=np.int64)
-            populated: list[int] = []
+            bucket_ids = frame["symbol"].map(symbol_buckets).to_numpy(dtype=np.int64)
             for bucket in sorted(set(int(value) for value in bucket_ids)):
                 selected = frame.loc[bucket_ids == bucket].reset_index(drop=True)
-                _atomic_parquet(
-                    selected,
-                    staging / f"bucket-{bucket:04d}.parquet",
-                )
-                populated.append(bucket)
-            atomic_write_json(
-                staging / "checkpoint.json",
-                {
-                    "schema_version": BAR_STORE_SCHEMA_VERSION,
-                    "kind": "bar-store-scan-segment",
-                    "algorithm": RAW_SCAN_ALGORITHM,
-                    "segment": segment_index,
-                    "row_group": task.row_group,
-                    "batch_in_row_group": batch_in_row_group,
-                    "rows": len(frame),
-                    "populated_buckets": populated,
-                },
+                part_path = local_root / f"batch-{batch_index:04d}-bucket-{bucket:04d}.parquet"
+                _atomic_parquet(selected, part_path)
+                bucket_parts[bucket].append(part_path)
+        if observed_rows != task.row_count:
+            raise RuntimeError(
+                f"Raw scan partition {task.partition} yielded {observed_rows} rows; "
+                f"expected {task.row_count}"
             )
-            _atomic_directory(staging, segment_root)
+
+        local_artifact = local_root / "partition.parquet"
+        writer: Any = None
+        bucket_metadata: dict[str, dict[str, int]] = {}
+        try:
+            for output_row_group, bucket in enumerate(sorted(bucket_parts)):
+                tables = [pq.read_table(path) for path in bucket_parts[bucket]]
+                bucket_table = pa.concat_tables(tables, promote_options="default")
+                if writer is None:
+                    writer = pq.ParquetWriter(
+                        local_artifact,
+                        bucket_table.schema,
+                        compression="zstd",
+                        use_dictionary=True,
+                        write_statistics=True,
+                    )
+                elif bucket_table.schema != writer.schema:
+                    bucket_table = bucket_table.cast(writer.schema)
+                writer.write_table(bucket_table, row_group_size=bucket_table.num_rows)
+                bucket_metadata[str(bucket)] = {
+                    "row_group": output_row_group,
+                    "rows": bucket_table.num_rows,
+                    "compressed_bytes": 0,
+                }
+        finally:
+            if writer is not None:
+                writer.close()
+        if writer is None:
+            raise RuntimeError(f"Raw scan partition {task.partition} produced no buckets")
+
+        local_parquet = pq.ParquetFile(local_artifact)
+        for metadata in bucket_metadata.values():
+            row_group_metadata = local_parquet.metadata.row_group(metadata["row_group"])
+            metadata["compressed_bytes"] = max(
+                sum(
+                    int(row_group_metadata.column(column).total_compressed_size)
+                    for column in range(row_group_metadata.num_columns)
+                ),
+                1,
+            )
+        artifact_sha256 = sha256_file(local_artifact)
+        artifact_size = local_artifact.stat().st_size
+        deadline.check(f"raw scan partition {task.partition} publication")
+        staging = _staging_directory(partitions_root, partition_name)
+        try:
+            published_artifact = staging / "partition.parquet"
+            shutil.copyfile(local_artifact, published_artifact)
+            if published_artifact.stat().st_size != artifact_size:
+                raise RuntimeError("Raw-scan partition copy changed artifact size")
+            checkpoint = {
+                "schema_version": BAR_STORE_SCHEMA_VERSION,
+                "kind": "bar-store-scan-partition",
+                "algorithm": RAW_SCAN_ALGORITHM,
+                "partition": task.partition,
+                "source_row_groups": list(task.source_row_groups),
+                "rows": task.row_count,
+                "batch_rows": task.batch_rows,
+                "bucket_count": task.bucket_count,
+                "artifact": {
+                    "relative_path": (
+                        Path("scan-partitions") / partition_name / "partition.parquet"
+                    ).as_posix(),
+                    "sha256": artifact_sha256,
+                    "size_bytes": artifact_size,
+                },
+                "buckets": bucket_metadata,
+            }
+            atomic_write_json(staging / "checkpoint.json", checkpoint)
+            _atomic_directory(staging, destination)
         except Exception:
             _remove_generated_tree(staging)
             raise
-
-    if observed_rows != task.row_group_rows or observed_batches != task.segment_count:
-        raise RuntimeError(
-            f"Raw row group {task.row_group} yielded {observed_rows} rows and "
-            f"{observed_batches} segments; expected {task.row_group_rows} rows and "
-            f"{task.segment_count} segments"
-        )
-    deadline.check(f"raw row group {task.row_group} checkpoint publication")
-    atomic_write_json(
-        segments_root / f"row-group-{task.row_group:06d}.json",
-        {
-            "schema_version": BAR_STORE_SCHEMA_VERSION,
-            "kind": "bar-store-scan-row-group",
-            "algorithm": RAW_SCAN_ALGORITHM,
-            "row_group": task.row_group,
-            "rows": task.row_group_rows,
-            "segment_start": task.segment_start,
-            "segments": observed_batches,
-            "batch_rows": task.batch_rows,
-        },
-    )
-    return {"rows": observed_rows, "segments": observed_batches}
+    return checkpoint
 
 
-def _write_scan_segments(
+def _scan_index_payload(
+    *,
+    state: str,
+    raw_rows: int,
+    source_row_groups: int,
+    target_partition_rows: int,
+    bucket_count: int,
+    batch_rows: int,
+    partition_count: int,
+    completed: Mapping[int, dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": BAR_STORE_SCHEMA_VERSION,
+        "kind": "bar-store-scan-index",
+        "state": state,
+        "algorithm": RAW_SCAN_ALGORITHM,
+        "raw_rows": raw_rows,
+        "source_row_groups": source_row_groups,
+        "target_partition_rows": target_partition_rows,
+        "bucket_count": bucket_count,
+        "batch_rows": batch_rows,
+        "partition_count": partition_count,
+        "completed_partitions": [completed[index] for index in sorted(completed)],
+    }
+
+
+def _write_scan_partitions(
     *,
     raw_path: Path,
     work_root: Path,
@@ -808,188 +965,244 @@ def _write_scan_segments(
     detected_cpu_count: int,
     available_memory_bytes: int,
     worker_memory_budget_bytes: int,
-) -> tuple[dict[str, int], _PhasePlan]:
-    """Partition raw row groups with memory-bounded, resumable processes."""
+) -> tuple[dict[str, Any], _PhasePlan]:
+    """Build a few resumable bucket-indexed partitions instead of tiny segments."""
 
     _, pq = _require_pyarrow()
-    segments_root = work_root / "segments"
-    segments_root.mkdir(parents=True, exist_ok=True)
+    partitions_root = work_root / "scan-partitions"
+    partitions_root.mkdir(parents=True, exist_ok=True)
     parquet = pq.ParquetFile(raw_path)
-    scan_success = segments_root / "_SUCCESS.json"
-
-    layouts: list[tuple[int, int, int, int]] = []
-    segment_count = 0
-    for row_group in range(parquet.num_row_groups):
-        row_group_rows = parquet.metadata.row_group(row_group).num_rows
-        row_group_segments = math.ceil(row_group_rows / batch_rows)
-        layouts.append((row_group, row_group_rows, segment_count, row_group_segments))
-        segment_count += row_group_segments
-
-    if scan_success.is_file():
-        payload = json.loads(scan_success.read_text(encoding="utf-8"))
-        completed_segments = sorted(
-            path
-            for path in segments_root.glob("segment-*")
-            if path.is_dir() and (path / "checkpoint.json").is_file()
-        )
-        completed_row_groups = sorted(segments_root.glob("row-group-*.json"))
-        expected_segment_names = [
-            f"segment-{index:06d}" for index in range(len(completed_segments))
-        ]
-        if (
-            payload.get("kind") != "bar-store-raw-scan-success"
-            or payload.get("algorithm") != RAW_SCAN_ALGORITHM
-            or payload.get("row_groups") != parquet.num_row_groups
-            or payload.get("batch_rows") != batch_rows
-            or payload.get("rows") != parquet.metadata.num_rows
-            or payload.get("segments") != segment_count
-            or len(completed_segments) != segment_count
-            or len(completed_row_groups) != parquet.num_row_groups
-            or [path.name for path in completed_segments] != expected_segment_names
-            or [path.name for path in completed_row_groups]
-            != [f"row-group-{index:06d}.json" for index in range(parquet.num_row_groups)]
-        ):
-            raise ValueError("Completed raw-scan checkpoint is inconsistent")
-        validated_rows = 0
-        for row_group, row_group_rows, segment_start, expected_segments in layouts:
-            completed_batches = _completed_scan_row_group(
-                segments_root,
-                row_group=row_group,
-                row_group_rows=row_group_rows,
-                segment_start=segment_start,
-                batch_rows=batch_rows,
-                bucket_count=bucket_count,
-            )
-            if completed_batches != expected_segments:
-                raise ValueError("Completed raw scan lost a row-group checkpoint")
-            validated_rows += row_group_rows
-        if validated_rows != payload.get("rows"):
-            raise ValueError("Completed raw-scan totals are inconsistent")
-        plan = _plan_phase_workers(
-            phase="raw_scan",
-            requested_workers=requested_workers,
-            detected_cpu_count=detected_cpu_count,
-            task_memory_bytes=[],
-            task_count=parquet.num_row_groups,
-            reused_tasks=parquet.num_row_groups,
-            available_memory_bytes=available_memory_bytes,
-            worker_memory_budget_bytes=worker_memory_budget_bytes,
-            worker_cap=RAW_SCAN_WORKER_CAP,
-        )
-        _record_phase_plan(work_root, plan)
-        return {
-            "segments": int(payload["segments"]),
-            "rows": int(payload["rows"]),
-        }, plan
-
-    pending_tasks: list[_ScanRowGroupTask] = []
-    task_memory_bytes: list[int] = []
-    reused_row_groups = 0
-    for row_group, row_group_rows, segment_start, row_group_segments in layouts:
-        completed_batches = _completed_scan_row_group(
-            segments_root,
-            row_group=row_group,
-            row_group_rows=row_group_rows,
-            segment_start=segment_start,
-            batch_rows=batch_rows,
+    target_partition_rows = batch_rows * SOURCE_PARTITION_BATCH_MULTIPLIER
+    layouts = _source_partition_layouts(parquet, target_rows=target_partition_rows)
+    tasks = [
+        _ScanPartitionTask(
+            raw_path=str(raw_path),
+            work_root=str(work_root),
+            partition=partition,
+            source_row_groups=row_groups,
+            row_count=rows,
             bucket_count=bucket_count,
+            batch_rows=batch_rows,
+            deadline_epoch_seconds=deadline.epoch_seconds,
         )
-        if completed_batches is not None:
-            if completed_batches != row_group_segments:
-                raise ValueError(f"Raw row group {row_group} has an inconsistent segment count")
-            reused_row_groups += 1
-            continue
-        pending_tasks.append(
-            _ScanRowGroupTask(
-                raw_path=str(raw_path),
-                work_root=str(work_root),
-                row_group=row_group,
-                row_group_rows=row_group_rows,
-                segment_start=segment_start,
-                segment_count=row_group_segments,
-                bucket_count=bucket_count,
-                batch_rows=batch_rows,
-                deadline_epoch_seconds=deadline.epoch_seconds,
-            )
-        )
-        metadata_bytes = max(
-            int(parquet.metadata.row_group(row_group).total_byte_size),
-            row_group_rows,
-        )
-        largest_batch_rows = min(batch_rows, row_group_rows)
-        batch_fraction_bytes = math.ceil(
-            metadata_bytes * largest_batch_rows / max(row_group_rows, 1)
-        )
-        task_memory_bytes.append(
-            WORKER_BASE_MEMORY_BYTES + max(batch_fraction_bytes * 6, largest_batch_rows * 256)
-        )
+        for partition, row_groups, rows in layouts
+    ]
+    completed: dict[int, dict[str, Any]] = {}
+    pending: list[_ScanPartitionTask] = []
+    for task in tasks:
+        checkpoint = _validated_scan_partition(task)
+        if checkpoint is None:
+            pending.append(task)
+        else:
+            completed[task.partition] = checkpoint
 
+    index_path = work_root / "scan-index.json"
+
+    def publish_index(state: str) -> dict[str, Any]:
+        payload = _scan_index_payload(
+            state=state,
+            raw_rows=int(parquet.metadata.num_rows),
+            source_row_groups=parquet.num_row_groups,
+            target_partition_rows=target_partition_rows,
+            bucket_count=bucket_count,
+            batch_rows=batch_rows,
+            partition_count=len(tasks),
+            completed=completed,
+        )
+        atomic_write_json(index_path, payload)
+        return payload
+
+    publish_index("building")
+    maximum_batch_memory = WORKER_BASE_MEMORY_BYTES + max(
+        batch_rows * RAW_BATCH_BYTES_PER_ROW_ESTIMATE,
+        max(
+            int(parquet.metadata.row_group(row_group).total_byte_size) * 6
+            for task in pending
+            for row_group in task.source_row_groups
+        )
+        if pending
+        else 1,
+    )
     plan = _plan_phase_workers(
         phase="raw_scan",
         requested_workers=requested_workers,
         detected_cpu_count=detected_cpu_count,
-        task_memory_bytes=task_memory_bytes,
-        task_count=parquet.num_row_groups,
-        reused_tasks=reused_row_groups,
+        task_memory_bytes=[maximum_batch_memory] * len(pending),
+        task_count=len(tasks),
+        reused_tasks=len(completed),
         available_memory_bytes=available_memory_bytes,
         worker_memory_budget_bytes=worker_memory_budget_bytes,
-        worker_cap=RAW_SCAN_WORKER_CAP,
     )
     _record_phase_plan(work_root, plan)
-    _run_phase_tasks(
-        plan=plan,
-        tasks=pending_tasks,
-        runner=_scan_row_group_task,
-        deadline=deadline,
+    _emit_phase_progress(
+        phase=plan.phase,
+        state="running" if pending else "complete",
+        completed_tasks=len(completed),
+        total_tasks=len(tasks),
+        effective_workers=plan.effective_workers,
     )
 
-    validated_rows = 0
-    for row_group, row_group_rows, segment_start, row_group_segments in layouts:
-        completed_batches = _completed_scan_row_group(
-            segments_root,
-            row_group=row_group,
-            row_group_rows=row_group_rows,
-            segment_start=segment_start,
-            batch_rows=batch_rows,
-            bucket_count=bucket_count,
+    def record_completed(checkpoint: dict[str, Any]) -> None:
+        partition = int(checkpoint["partition"])
+        completed[partition] = checkpoint
+        publish_index("building")
+        _emit_phase_progress(
+            phase=plan.phase,
+            state="running" if len(completed) < len(tasks) else "complete",
+            completed_tasks=len(completed),
+            total_tasks=len(tasks),
+            effective_workers=plan.effective_workers,
         )
-        if completed_batches != row_group_segments:
-            raise RuntimeError(f"Raw row group {row_group} was not completed")
-        validated_rows += row_group_rows
+
+    _run_phase_tasks(
+        plan=plan,
+        tasks=pending,
+        runner=_scan_partition_task,
+        deadline=deadline,
+        on_result=record_completed,
+    )
+    if len(completed) != len(tasks):
+        raise RuntimeError("Raw scan did not complete every source partition")
+    validated_rows = sum(int(checkpoint["rows"]) for checkpoint in completed.values())
     if validated_rows != parquet.metadata.num_rows:
         raise RuntimeError(
             f"Raw scan observed {validated_rows} rows; expected {parquet.metadata.num_rows}"
         )
-    deadline.check("raw scan checkpoint publication")
-    atomic_write_json(
-        scan_success,
-        {
-            "schema_version": BAR_STORE_SCHEMA_VERSION,
-            "kind": "bar-store-raw-scan-success",
-            "algorithm": RAW_SCAN_ALGORITHM,
-            "row_groups": parquet.num_row_groups,
-            "batch_rows": batch_rows,
-            "segments": segment_count,
-            "rows": validated_rows,
-        },
-    )
-    return {"segments": segment_count, "rows": validated_rows}, plan
+    deadline.check("raw scan index publication")
+    return publish_index("complete"), plan
 
 
-def _bucket_part_paths(work_root: Path, bucket: int) -> list[Path]:
-    return sorted(
-        path
-        for path in (work_root / "segments").glob(f"segment-*/bucket-{bucket:04d}.parquet")
-        if path.is_file()
-    )
+def _bucket_sources_from_scan_index(
+    *,
+    work_root: Path,
+    scan_index: Mapping[str, Any],
+    bucket_count: int,
+) -> dict[int, tuple[_BucketSource, ...]]:
+    """Resolve exact Parquet row groups without listing partition directories."""
+
+    completed = scan_index.get("completed_partitions")
+    if (
+        scan_index.get("schema_version") != BAR_STORE_SCHEMA_VERSION
+        or scan_index.get("kind") != "bar-store-scan-index"
+        or scan_index.get("state") != "complete"
+        or scan_index.get("algorithm") != RAW_SCAN_ALGORITHM
+        or scan_index.get("bucket_count") != bucket_count
+        or not isinstance(scan_index.get("partition_count"), int)
+        or isinstance(scan_index.get("partition_count"), bool)
+        or not isinstance(completed, list)
+        or len(completed) != scan_index["partition_count"]
+    ):
+        raise ValueError("Raw-scan index is incomplete or incompatible")
+
+    sources: dict[int, list[_BucketSource]] = defaultdict(list)
+    observed_partitions: set[int] = set()
+    for checkpoint in completed:
+        if not isinstance(checkpoint, dict):
+            raise ValueError("Raw-scan index contains an invalid partition checkpoint")
+        partition = checkpoint.get("partition")
+        buckets = checkpoint.get("buckets")
+        if (
+            not isinstance(partition, int)
+            or isinstance(partition, bool)
+            or partition < 0
+            or partition in observed_partitions
+            or not isinstance(buckets, dict)
+        ):
+            raise ValueError("Raw-scan index contains an invalid partition checkpoint")
+        observed_partitions.add(partition)
+        artifact_path = (
+            work_root / "scan-partitions" / _scan_partition_name(partition) / "partition.parquet"
+        )
+        if not artifact_path.is_file():
+            raise ValueError(f"Raw-scan partition artifact is missing: {artifact_path}")
+        for bucket_text, metadata in buckets.items():
+            if not isinstance(metadata, dict):
+                raise ValueError("Raw-scan index contains invalid bucket metadata")
+            try:
+                bucket = int(bucket_text)
+            except (TypeError, ValueError) as error:
+                raise ValueError("Raw-scan index contains invalid bucket metadata") from error
+            row_group = metadata.get("row_group")
+            rows = metadata.get("rows")
+            compressed_bytes = metadata.get("compressed_bytes")
+            if (
+                str(bucket) != bucket_text
+                or bucket < 0
+                or bucket >= bucket_count
+                or not isinstance(row_group, int)
+                or isinstance(row_group, bool)
+                or row_group < 0
+                or not isinstance(rows, int)
+                or isinstance(rows, bool)
+                or rows < 1
+                or not isinstance(compressed_bytes, int)
+                or isinstance(compressed_bytes, bool)
+                or compressed_bytes < 1
+            ):
+                raise ValueError("Raw-scan index contains invalid bucket metadata")
+            sources[bucket].append(
+                _BucketSource(
+                    partition=partition,
+                    path=str(artifact_path),
+                    row_group=row_group,
+                    rows=rows,
+                    compressed_bytes=compressed_bytes,
+                )
+            )
+    if observed_partitions != set(range(scan_index["partition_count"])):
+        raise ValueError("Raw-scan index partition sequence is incomplete")
+    return {
+        bucket: tuple(sorted(bucket_sources, key=lambda source: source.partition))
+        for bucket, bucket_sources in sources.items()
+    }
+
+
+def _validated_compacted_bucket(
+    destination: Path,
+    *,
+    bucket: int,
+    bucket_count: int,
+    sources: tuple[_BucketSource, ...],
+) -> bool:
+    checkpoint_path = destination / "checkpoint.json"
+    if not destination.exists() and not destination.is_symlink():
+        return False
+    if not checkpoint_path.is_file():
+        _remove_generated_tree(destination)
+        return False
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    source_partitions = [source.partition for source in sources]
+    expected_rows = sum(source.rows for source in sources)
+    shard_path = destination / "shard.parquet"
+    if (
+        checkpoint.get("schema_version") != BAR_STORE_SCHEMA_VERSION
+        or checkpoint.get("kind") != "bar-store-compacted-bucket"
+        or checkpoint.get("source_scan_algorithm") != RAW_SCAN_ALGORITHM
+        or checkpoint.get("source_partitions") != source_partitions
+        or checkpoint.get("bucket") != bucket
+        or checkpoint.get("bucket_count") != bucket_count
+        or checkpoint.get("rows") != expected_rows
+        or not isinstance(checkpoint.get("symbols"), int)
+        or isinstance(checkpoint.get("symbols"), bool)
+        or checkpoint["symbols"] < 1
+        or not isinstance(checkpoint.get("shard_size_bytes"), int)
+        or isinstance(checkpoint.get("shard_size_bytes"), bool)
+        or checkpoint["shard_size_bytes"] < 1
+        or not shard_path.is_file()
+        or shard_path.stat().st_size != checkpoint["shard_size_bytes"]
+        or not (destination / "symbol-index.parquet").is_file()
+        or not (destination / "observed-dates.parquet").is_file()
+    ):
+        raise ValueError(f"Compaction checkpoint is invalid: {checkpoint_path}")
+    return True
 
 
 def _compact_bucket(
     *,
     output_root: Path,
-    work_root: Path,
     bucket: int,
     bucket_count: int,
+    sources: tuple[_BucketSource, ...],
     benchmark_mapping: Mapping[str, str],
     max_abs_log_return: float,
     deadline: _Deadline,
@@ -999,13 +1212,26 @@ def _compact_bucket(
     deadline.check(f"bucket {bucket} compaction")
     bucket_name = f"bucket-{bucket:04d}"
     destination = output_root / "shards" / bucket_name
-    if destination.is_dir() and (destination / "checkpoint.json").is_file():
+    if _validated_compacted_bucket(
+        destination,
+        bucket=bucket,
+        bucket_count=bucket_count,
+        sources=sources,
+    ):
         return
-    parts = _bucket_part_paths(work_root, bucket)
-    if not parts:
+    if not sources:
         return
     pa, pq = _require_pyarrow()
-    tables = [pq.read_table(path) for path in parts]
+    tables = []
+    for source in sources:
+        deadline.check(f"bucket {bucket} partition {source.partition} read")
+        parquet = pq.ParquetFile(source.path)
+        table = parquet.read_row_group(source.row_group)
+        if table.num_rows != source.rows:
+            raise ValueError(
+                f"Raw-scan row group changed for bucket {bucket}, partition {source.partition}"
+            )
+        tables.append(table)
     table = pa.concat_tables(tables, promote_options="default")
     frame = ensure_adjustment_columns(normalize_ohlcv_frame(table.to_pandas()))
     adjusted_close = frame["adjusted_close"].to_numpy(dtype=np.float64)
@@ -1027,6 +1253,7 @@ def _compact_bucket(
     frame["adjusted_transition_extreme"] = transitions
     frame["calendar_gap_days"] = calendar_gap_days
 
+    work_root = output_root / ".work"
     staging_parent = work_root / "compaction-staging"
     staging_parent.mkdir(parents=True, exist_ok=True)
     _discard_stale_staging(staging_parent, bucket_name)
@@ -1111,32 +1338,37 @@ def _compact_bucket(
         {
             "schema_version": BAR_STORE_SCHEMA_VERSION,
             "kind": "bar-store-compacted-bucket",
+            "source_scan_algorithm": RAW_SCAN_ALGORITHM,
+            "source_partitions": [source.partition for source in sources],
             "bucket": bucket,
             "bucket_count": bucket_count,
             "rows": len(frame),
             "symbols": len(index_rows),
             "shard_sha256": sha256_file(shard_path),
+            "shard_size_bytes": shard_path.stat().st_size,
         },
     )
     _atomic_directory(staging, destination)
 
 
-def _compact_bucket_task(task: _CompactBucketTask) -> None:
+def _compact_bucket_task(task: _CompactBucketTask) -> int:
     _compact_bucket(
         output_root=Path(task.output_root),
-        work_root=Path(task.work_root),
         bucket=task.bucket,
         bucket_count=task.bucket_count,
+        sources=task.sources,
         benchmark_mapping=task.benchmark_mapping,
         max_abs_log_return=task.max_abs_log_return,
         deadline=_Deadline(task.deadline_epoch_seconds),
     )
+    return task.bucket
 
 
 def _run_bucket_compaction(
     *,
     output_root: Path,
     work_root: Path,
+    scan_index: Mapping[str, Any],
     bucket_count: int,
     benchmark_mapping: dict[str, str],
     max_abs_log_return: float,
@@ -1148,19 +1380,25 @@ def _run_bucket_compaction(
 ) -> _PhasePlan:
     """Compact independent hash buckets with a conservative expansion estimate."""
 
+    sources_by_bucket = _bucket_sources_from_scan_index(
+        work_root=work_root,
+        scan_index=scan_index,
+        bucket_count=bucket_count,
+    )
     pending: list[tuple[int, _CompactBucketTask]] = []
     reused_tasks = 0
-    task_count = 0
-    for bucket in range(bucket_count):
-        parts = _bucket_part_paths(work_root, bucket)
-        if not parts:
-            continue
-        task_count += 1
+    task_count = len(sources_by_bucket)
+    for bucket, sources in sorted(sources_by_bucket.items()):
         destination = output_root / "shards" / f"bucket-{bucket:04d}"
-        if destination.is_dir() and (destination / "checkpoint.json").is_file():
+        if _validated_compacted_bucket(
+            destination,
+            bucket=bucket,
+            bucket_count=bucket_count,
+            sources=sources,
+        ):
             reused_tasks += 1
             continue
-        compressed_bytes = sum(path.stat().st_size for path in parts)
+        compressed_bytes = sum(source.compressed_bytes for source in sources)
         estimated_bytes = WORKER_BASE_MEMORY_BYTES + max(
             compressed_bytes * 48,
             compressed_bytes + 128 * MIB,
@@ -1170,9 +1408,9 @@ def _run_bucket_compaction(
                 estimated_bytes,
                 _CompactBucketTask(
                     output_root=str(output_root),
-                    work_root=str(work_root),
                     bucket=bucket,
                     bucket_count=bucket_count,
+                    sources=sources,
                     benchmark_mapping=benchmark_mapping,
                     max_abs_log_return=max_abs_log_return,
                     deadline_epoch_seconds=deadline.epoch_seconds,
@@ -1191,11 +1429,32 @@ def _run_bucket_compaction(
         worker_memory_budget_bytes=worker_memory_budget_bytes,
     )
     _record_phase_plan(work_root, plan)
+    completed_tasks = reused_tasks
+    _emit_phase_progress(
+        phase=plan.phase,
+        state="running" if pending else "complete",
+        completed_tasks=completed_tasks,
+        total_tasks=task_count,
+        effective_workers=plan.effective_workers,
+    )
+
+    def record_completed(_: int) -> None:
+        nonlocal completed_tasks
+        completed_tasks += 1
+        _emit_phase_progress(
+            phase=plan.phase,
+            state="running" if completed_tasks < task_count else "complete",
+            completed_tasks=completed_tasks,
+            total_tasks=task_count,
+            effective_workers=plan.effective_workers,
+        )
+
     _run_phase_tasks(
         plan=plan,
         tasks=[item[1] for item in pending],
         runner=_compact_bucket_task,
         deadline=deadline,
+        on_result=record_completed,
     )
     return plan
 
@@ -1811,7 +2070,13 @@ def build_symbol_bar_store(
         raise ValueError("Bar-store root must not be a symlink")
     root.mkdir(parents=True, exist_ok=True)
     work_root = root / ".work"
+    if work_root.is_symlink():
+        raise ValueError("Bar-store work root must not be a symlink")
     work_root.mkdir(parents=True, exist_ok=True)
+    success_path = root / "_SUCCESS.json"
+    manifest_path = root / "bar-store.json"
+    index_path = root / "symbol-index.parquet"
+    ranges_path = root / "cutoff-ranges.parquet"
     deadline = _Deadline(deadline_epoch_seconds)
     mapping = {
         str(key).upper(): str(value).upper() for key, value in (benchmark_mapping or {}).items()
@@ -1845,6 +2110,7 @@ def build_symbol_bar_store(
         "bucket_count": bucket_count,
         "batch_rows": batch_rows,
         "raw_scan_algorithm": RAW_SCAN_ALGORITHM,
+        "raw_scan_target_partition_rows": (batch_rows * SOURCE_PARTITION_BATCH_MULTIPLIER),
         "split_assignment_algorithm": SPLIT_ASSIGNMENT_ALGORITHM,
         "benchmark_mapping_sha256": canonical_json_sha256(mapping),
         "training_security_scope": TRAINING_SECURITY_SCOPE,
@@ -1855,19 +2121,44 @@ def build_symbol_bar_store(
     if state_path.is_file():
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if state.get("identity_sha256") != identity_sha256:
-            raise ValueError(
-                "Existing bar-store checkpoints belong to a different raw or preparation contract"
-            )
+            previous_identity = state.get("identity")
+            finalized_paths = (success_path, manifest_path, index_path, ranges_path)
+            if (
+                isinstance(previous_identity, Mapping)
+                and not any(path.exists() or path.is_symlink() for path in finalized_paths)
+                and _is_scan_execution_upgrade(previous_identity, identity)
+            ):
+                quarantine = _quarantine_obsolete_scan_work(
+                    root=root,
+                    work_root=work_root,
+                    previous_state=state,
+                )
+                work_root.mkdir(parents=False, exist_ok=False)
+                state_path = work_root / "build-state.json"
+                atomic_write_json(
+                    state_path,
+                    {
+                        "identity": identity,
+                        "identity_sha256": identity_sha256,
+                        "checkpoint_upgrade": {
+                            "previous_raw_scan_algorithm": previous_identity.get(
+                                "raw_scan_algorithm"
+                            ),
+                            "quarantined_path": str(quarantine),
+                        },
+                    },
+                )
+            else:
+                raise ValueError(
+                    "Existing bar-store checkpoints belong to a different raw or "
+                    "preparation contract"
+                )
     else:
         atomic_write_json(
             state_path,
             {"identity": identity, "identity_sha256": identity_sha256},
         )
 
-    success_path = root / "_SUCCESS.json"
-    manifest_path = root / "bar-store.json"
-    index_path = root / "symbol-index.parquet"
-    ranges_path = root / "cutoff-ranges.parquet"
     if not success_path.exists() and all(
         path.is_file() for path in (manifest_path, index_path, ranges_path)
     ):
@@ -1937,7 +2228,7 @@ def build_symbol_bar_store(
         worker_memory_budget_bytes=worker_memory_budget_bytes,
         memory_budget_override_bytes=memory_budget_bytes,
     )
-    scan, scan_plan = _write_scan_segments(
+    scan, scan_plan = _write_scan_partitions(
         raw_path=source,
         work_root=work_root,
         bucket_count=bucket_count,
@@ -1948,11 +2239,12 @@ def build_symbol_bar_store(
         available_memory_bytes=available_memory_bytes,
         worker_memory_budget_bytes=worker_memory_budget_bytes,
     )
-    if scan["rows"] != raw_rows:
+    if scan["raw_rows"] != raw_rows:
         raise ValueError("Raw Parquet row count differs from the download manifest")
     compaction_plan = _run_bucket_compaction(
         output_root=root,
         work_root=work_root,
+        scan_index=scan,
         bucket_count=bucket_count,
         benchmark_mapping=mapping,
         max_abs_log_return=max_abs_log_return,
@@ -2053,7 +2345,9 @@ def build_symbol_bar_store(
         "bucket_count": bucket_count,
         "raw_scan_algorithm": RAW_SCAN_ALGORITHM,
         "raw_scan_batch_rows": batch_rows,
-        "raw_scan_segments": scan["segments"],
+        "raw_scan_source_row_groups": scan["source_row_groups"],
+        "raw_scan_partitions": scan["partition_count"],
+        "raw_scan_target_partition_rows": scan["target_partition_rows"],
         "parallelism": {
             "backend": MULTIPROCESS_BACKEND,
             "requested_workers": workers,
@@ -2075,7 +2369,7 @@ def build_symbol_bar_store(
             },
         },
         "resumable_checkpoints": [
-            "raw_segments",
+            "raw_scan_partitions",
             "compacted_buckets",
             "candidate_ranges",
             "split_ranges",

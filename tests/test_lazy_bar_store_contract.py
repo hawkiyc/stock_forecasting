@@ -284,26 +284,30 @@ def test_expired_deadline_preserves_identity_and_next_attempt_resumes(
 
     original_check = bar_store_module._Deadline.check
 
-    def pause_after_first_row_group(
+    def pause_after_first_partition(
         deadline: bar_store_module._Deadline,
         operation: str,
     ) -> None:
-        if operation == "raw segment 2":
+        if operation == "raw scan partition 1 batch 0":
             raise PreparationPaused("test pause; durable checkpoints remain")
         original_check(deadline, operation)
 
     monkeypatch.setattr(
         bar_store_module._Deadline,
         "check",
-        pause_after_first_row_group,
+        pause_after_first_partition,
     )
     with pytest.raises(PreparationPaused, match="durable checkpoints remain"):
         build_symbol_bar_store(**arguments)
 
     assert (store / ".work" / "build-state.json").is_file()
-    assert (store / ".work" / "segments" / "row-group-000000.json").is_file()
-    assert (store / ".work" / "segments" / "segment-000000").is_dir()
-    assert (store / ".work" / "segments" / "segment-000001").is_dir()
+    scan_index = json.loads((store / ".work" / "scan-index.json").read_text(encoding="utf-8"))
+    assert scan_index["state"] == "building"
+    assert len(scan_index["completed_partitions"]) == 1
+    first_partition = store / ".work" / "scan-partitions" / "partition-0000"
+    assert (first_partition / "checkpoint.json").is_file()
+    assert (first_partition / "partition.parquet").is_file()
+    assert not (store / ".work" / "segments").exists()
     execution_plan = json.loads(
         (store / ".work" / "execution-plan.json").read_text(encoding="utf-8")
     )
@@ -312,6 +316,98 @@ def test_expired_deadline_preserves_identity_and_next_attempt_resumes(
     monkeypatch.setattr(bar_store_module._Deadline, "check", original_check)
     resumed = build_symbol_bar_store(**arguments)
     assert resumed.success_path.is_file()
+    assert not list((store / ".work").iterdir())
+
+
+def test_fragmented_raw_row_groups_are_coalesced_without_materializing_windows(
+    tmp_path: Path,
+    market_frame: pd.DataFrame,
+) -> None:
+    raw = tmp_path / "raw" / "market.parquet"
+    raw.parent.mkdir()
+    market_frame.to_parquet(
+        raw,
+        compression="zstd",
+        index=False,
+        row_group_size=5,
+    )
+    result = build_symbol_bar_store(
+        raw_path=raw,
+        output_root=tmp_path / "prepared" / "bar-store",
+        download_manifest=_download_contract(raw, tmp_path, len(market_frame)),
+        window_size=32,
+        bucket_count=4,
+        batch_rows=100,
+        purge_bars=20,
+        embargo_bars=14,
+    )
+
+    execution = result.execution
+    assert execution["raw_scan_source_row_groups"] == 288
+    assert execution["raw_scan_partitions"] == 4
+    assert execution["raw_scan_partitions"] < execution["raw_scan_source_row_groups"]
+    assert execution["raw_scan_target_partition_rows"] == 400
+    assert execution["window_materialized"] is False
+    assert execution["labels_materialized"] is False
+    assert not list(tmp_path.rglob("windows.parquet"))
+    assert not list((tmp_path / "prepared" / "bar-store").rglob("*label*.parquet"))
+
+
+def test_scan_layout_upgrade_quarantines_only_incomplete_derived_work(
+    tmp_path: Path,
+    market_frame: pd.DataFrame,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = tmp_path / "raw" / "market.parquet"
+    raw.parent.mkdir()
+    market_frame.to_parquet(raw, compression="zstd", index=False, row_group_size=200)
+    store = tmp_path / "prepared" / "bar-store"
+    arguments = {
+        "raw_path": raw,
+        "output_root": store,
+        "download_manifest": _download_contract(raw, tmp_path, len(market_frame)),
+        "window_size": 32,
+        "bucket_count": 4,
+        "batch_rows": 100,
+        "purge_bars": 20,
+        "embargo_bars": 14,
+    }
+    original_check = bar_store_module._Deadline.check
+
+    def pause_immediately(
+        deadline: bar_store_module._Deadline,
+        operation: str,
+    ) -> None:
+        if operation == "raw scan partition 0 batch 0":
+            raise PreparationPaused("create incomplete work")
+        original_check(deadline, operation)
+
+    monkeypatch.setattr(bar_store_module._Deadline, "check", pause_immediately)
+    with pytest.raises(PreparationPaused, match="create incomplete work"):
+        build_symbol_bar_store(**arguments)
+
+    state_path = store / ".work" / "build-state.json"
+    previous_state = json.loads(state_path.read_text(encoding="utf-8"))
+    previous_state["identity"]["raw_scan_algorithm"] = "parquet-row-group-checkpoints-v2"
+    previous_state["identity"].pop("raw_scan_target_partition_rows")
+    previous_state["identity_sha256"] = bar_store_module.canonical_json_sha256(
+        previous_state["identity"]
+    )
+    state_path.write_text(
+        json.dumps(previous_state, sort_keys=True),
+        encoding="utf-8",
+    )
+    legacy_sentinel = store / ".work" / "segments" / "segment-000000" / "checkpoint.json"
+    legacy_sentinel.parent.mkdir(parents=True)
+    legacy_sentinel.write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(bar_store_module._Deadline, "check", original_check)
+    result = build_symbol_bar_store(**arguments)
+
+    assert result.success_path.is_file()
+    quarantines = list((tmp_path / "prepared").glob(".bar-store-obsolete-scan-*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / "work" / "segments" / "segment-000000").is_dir()
     assert not list((store / ".work").iterdir())
 
 

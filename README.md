@@ -813,8 +813,11 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    candidate ranges 與 split ranges 使用 `spawn` process pool，pytest worker 也不會超過
    這個有效核心數。process 數不是直接照搬 vCPU 數：程式會取 cgroup 與作業系統可用
    記憶體的較小值、保留 parent process headroom，最多只把 60% 的當下可用記憶體列入
-   worker 預算，再依該階段最重 task 的保守膨脹估算降低 worker 數；raw scan 另限制最多
-   4 個 process。每個 child 的 Arrow／BLAS native thread 固定為 1，避免 process 與 native
+   worker 預算，再依該階段最重 task 的保守膨脹估算降低 worker 數。raw scan 會先把來源
+   Parquet 的細碎 row groups 合併為約 `4 * batch_rows` 的粗粒度來源分區；每個 process
+   仍只以 `batch_rows` 為上限串流讀取，在 Pod 本機 `/tmp` 建立 bucket 暫存，最後只向
+   Network Volume 原子發布一個分區 Parquet 與 checkpoint。每個 child 的 Arrow／BLAS
+   native thread 固定為 1，避免 process 與 native
    thread 相乘。若單一 bucket 的估算已超過安全預算，process pool 不會啟動，已完成的
    checkpoint 仍可由較大記憶體的後續 Pod 接續。每個 provider 有自己的 QPS limiter。
    `--max-api-calls` 只限制 EODHD，
@@ -836,6 +839,8 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/cutoff-ranges.parquet` | train/validation/test 的連續有效 cutoff ranges |
    | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/_SUCCESS.json` | bar store 完成與完整性 checkpoint |
    | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/.work/execution-plan.json` | 建置中各階段的記憶體預算、有效 process 數與續用 task 數；成功後回收 |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/.work/scan-index.json` | 建置中來源分區至 bucket row group 的精確索引；成功後回收 |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/.work/scan-partitions/` | 粗粒度、可續傳的 raw scan 分區；成功後回收 |
    | `/runpod-volume/datasets/<dataset-request-sha256>/download-manifest.json` | 實際 provider、profile、symbols 與下載 provenance |
    | `/runpod-volume/datasets/<dataset-request-sha256>/dataset-manifest.json` | split counts、hash 與資料契約                     |
    | `/runpod-volume/datasets/<dataset-request-sha256>/manifests/api-request-log.jsonl` | 不含 token 的 request audit             |
@@ -846,9 +851,11 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    不會誤判為終態；若剩餘時間少於 cleaning reserve，腳本才以 exit code 75 將它標記為
    可續傳終態，下一個 CPU Pod 直接從 checkpoint 執行清理，不再呼叫 provider。bar-store
    建置期間若剩餘時間到達安全截止點，則以 `waiting_for_preparation` 與 exit code 75
-   結束；下一個 CPU Pod 會完全跳過已完成的 raw Parquet row groups、scan segments 與
-   buckets。若中斷發生在單一 row group 內，最多只重新順序讀取該 row group 的已走過
-   部分，已原子完成的 segment 不會重寫。worker 數與執行時記憶體規劃只影響排程，
+   結束；下一個 CPU Pod 會依 `scan-index.json` 完全跳過已完成的來源分區與 compacted
+   buckets。若中斷發生在單一來源分區內，最多只重做該分區；已原子發布的分區不會
+   重寫，也不需要列舉數萬個 segment 目錄。舊版未完成的 segment checkpoint 若與目前
+   差異僅為 scan 執行演算法，會以目錄 rename 隔離，不會變更 raw Parquet 或重新呼叫
+   provider。worker 數與執行時記憶體規劃只影響排程，
    不屬於 dataset identity；改用不同 vCPU／RAM 的 CPU Pod 不會重新下載 provider 資料，
    也不會使既有 bucket checkpoint 失效。其後才將
    selection ID/SHA、dataset request SHA、stage/config SHA、requested
@@ -1471,13 +1478,18 @@ gaps while retaining the tradable next-day raw-open entry semantics.
 
 Raw OHLCV is written incrementally as immutable compressed Parquet. CPU
 preparation never expands every 128-bar window and never persists labels. It
-uses 128 hash buckets to build a compressed, symbol-oriented bar store with one
-Parquet row group per symbol, plus small `symbol-index.parquet` and contiguous
-valid-cutoff ranges. Every scan, compaction, quality, and split bucket has an
-atomic checkpoint. At max runtime the Pod exits as `waiting_for_preparation`;
-the next CPU Pod in the same dataset namespace resumes only unfinished raw row
-groups, segments, or buckets and skips completed units. `.work` partitions are
-reclaimed only after `_SUCCESS.json` is published.
+coalesces fragmented source row groups into coarse scan partitions of roughly
+`4 * batch_rows`, streams at most `batch_rows` at a time, builds temporary bucket
+parts on Pod-local `/tmp`, and atomically publishes only one indexed Parquet per
+source partition to the Network Volume. Compaction reads exact bucket row groups
+from `scan-index.json`, without listing tens of thousands of segment directories.
+It then uses 128 hash buckets to build a compressed, symbol-oriented bar store
+with one Parquet row group per symbol, plus small `symbol-index.parquet` and
+contiguous valid-cutoff ranges. Every partition, compaction, quality, and split
+bucket has an atomic checkpoint. At max runtime the Pod exits as
+`waiting_for_preparation`; the next CPU Pod in the same dataset namespace skips
+completed scan partitions and buckets. `.work` partitions are reclaimed only
+after `_SUCCESS.json` is published.
 
 The training DataLoader uses an O(1)-state sampler over valid cutoff ranges. It
 loads one symbol row group on demand, constructs aligned 128-bar asset and
@@ -2216,7 +2228,10 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    the lower cgroup/OS available-memory estimate, reserves parent-process
    headroom, assigns at most 60% of currently available memory to workers, and
    lowers each phase's process count using a conservative estimate for its
-   largest task. Raw scan has an additional four-process cap. Each child limits
+   largest task. Raw scan coalesces fragmented source row groups into coarse
+   partitions of roughly `4 * batch_rows`; each process streams at most
+   `batch_rows`, uses Pod-local `/tmp` for bucket intermediates, and atomically
+   publishes one indexed partition Parquet to the Network Volume. Each child limits
    Arrow/BLAS native threads to one so process and native-thread counts cannot
    multiply. If one bucket alone exceeds the safe estimate, no process pool is
    started and completed checkpoints remain available for a later Pod with more
@@ -2243,6 +2258,8 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/cutoff-ranges.parquet` | Contiguous valid train/validation/test cutoffs      |
    | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/_SUCCESS.json` | Completed bar-store integrity checkpoint          |
    | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/.work/execution-plan.json` | In-progress memory budget, effective processes, and reused-task counts by phase; reclaimed after success |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/.work/scan-index.json` | Exact in-progress source-partition to bucket-row-group index; reclaimed after success |
+   | `/runpod-volume/datasets/<dataset-request-sha256>/prepared/bar-store/.work/scan-partitions/` | Coarse resumable raw-scan partitions; reclaimed after success |
    | `/runpod-volume/datasets/<dataset-request-sha256>/download-manifest.json`         | Actual providers, profile, symbols, and download provenance |
    | `/runpod-volume/datasets/<dataset-request-sha256>/dataset-manifest.json`          | Split counts, hashes, and data contract                     |
    | `/runpod-volume/datasets/<dataset-request-sha256>/manifests/api-request-log.jsonl` | Request audit without tokens                               |
@@ -2255,9 +2272,12 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    code 75 make it a resumable terminal state; the next CPU Pod then cleans directly
    from the checkpoint without provider calls. If bar-store construction reaches
    its safe deadline, it exits with `waiting_for_preparation` and code 75; the next
-   Pod completely skips finished raw Parquet row groups, scan segments, and buckets.
-   If interruption occurs inside one row group, at most the already traversed part
-   of that row group is read again; atomically completed segments are never rewritten.
+   Pod uses `scan-index.json` to skip completed source partitions and compacted
+   buckets. If interruption occurs inside one source partition, only that partition
+   is redone; atomically published partitions are never rewritten, and the workflow
+   does not list tens of thousands of segment directories. Incomplete checkpoints
+   from the prior segment layout are directory-renamed aside when the raw and semantic
+   preparation contract is unchanged; raw Parquet and provider caches are untouched.
    Worker count and runtime memory planning affect scheduling only and are not part
    of dataset identity, so resuming on a CPU Pod with different vCPU/RAM does not
    repeat provider downloads or invalidate finished bucket checkpoints.

@@ -203,11 +203,13 @@ bar store 的 raw scan、bucket compaction、quality candidates 與 chronologica
 各自以固定 hash 分區，透過 `spawn` process pool 執行並原子發布 checkpoint。worker
 數是 vCPU 設定的上限，不是強制平行度：排程器取 cgroup 與系統可用記憶體的較小值，
 保留 parent process headroom，最多配置當下可用記憶體的 60%，再以該階段最重 task
-的保守記憶體估算降低 process 數；raw scan 最多使用 4 個 process，且每個 child 的
-Arrow／BLAS native threads 固定為 1。單一 task 若已超過安全預算，會在啟動 pool 前
+的保守記憶體估算降低 process 數。raw scan 將細碎來源 row groups 合併為約
+`4 * batch_rows` 的來源分區，每個 process 最多串流 `batch_rows`，在 Pod 本機 `/tmp`
+建立 bucket 暫存，最後只向 Network Volume 原子發布一個具 row-group 索引的分區
+Parquet；每個 child 的 Arrow／BLAS native threads 固定為 1。單一 task 若已超過安全預算，會在啟動 pool 前
 停止並保留 checkpoint，避免由 OOM killer 非預期中止。後續 Pod 可不呼叫 provider，
-並完全跳過已完成的 raw Parquet row groups、scan segments 與 buckets。若中斷位於某個
-row group 內，最多只重讀該 row group 已走過的部分，已完成 segment 不會重寫。到達安全
+並透過 `scan-index.json` 完全跳過已完成的來源分區與 compacted buckets，不再列舉數萬個
+segment 目錄。若中斷位於某個來源分區內，最多只重做該分區，已完成分區不會重寫。到達安全
 截止時間時 lifecycle 為 `waiting_for_preparation`，成功發布 `_SUCCESS.json` 後才回收
 `.work` 暫存分區。manifest 儲存 SHA-256、
 size、row count、profile、providers、symbols、date range、quality summary 與 request-log
@@ -508,18 +510,21 @@ exits if it reaches `--max-api-calls` first. The workflow
 publishes raw Parquet, the request log, and download manifest as a durable
 `downloaded` checkpoint before preparation. Raw scan, bucket compaction,
 quality candidates, and chronological split ranges use fixed hash partitions,
-run in `spawn` process pools, and each publish atomic checkpoints. The configured
+run in `spawn` process pools, and each publish atomic checkpoints. Fragmented
+source row groups are coalesced into partitions of roughly `4 * batch_rows`;
+each worker streams no more than `batch_rows`, uses Pod-local `/tmp` for bucket
+intermediates, and atomically publishes one row-group-indexed partition Parquet
+to the Network Volume. The configured
 vCPU count is a ceiling rather than mandatory parallelism: the planner uses the
 lower cgroup/OS available-memory value, reserves parent-process headroom, assigns
 at most 60% of currently available memory to workers, and lowers each phase's
-process count using a conservative estimate for its largest task. Raw scan is
-additionally capped at four processes, and every child limits Arrow/BLAS native
-threads to one. If one task exceeds the safe budget, the workflow stops before
+process count using a conservative estimate for its largest task. Every child
+limits Arrow/BLAS native threads to one. If one task exceeds the safe budget, the workflow stops before
 starting the pool and preserves existing checkpoints instead of risking an OOM
-kill. A later Pod skips provider calls and completely skips finished raw
-Parquet row groups, scan segments, and buckets. If interruption occurs inside a
-row group, at most its already traversed portion is read again; completed
-segments are never rewritten. Reaching the safe deadline produces `waiting_for_preparation`;
+kill. A later Pod skips provider calls and uses `scan-index.json` to skip finished
+source partitions and compacted buckets without listing per-segment directories.
+If interruption occurs inside a source partition, only that partition is redone;
+completed partitions are never rewritten. Reaching the safe deadline produces `waiting_for_preparation`;
 `.work` is reclaimed only after `_SUCCESS.json` is published.
 Manifests bind SHA-256, size, row count, profile, providers,
 symbols, dates, quality, and the request log. Worker count and memory planning are
