@@ -36,6 +36,24 @@ DATASET_RESUMABLE_STATES = frozenset(
         "downloaded",
     }
 )
+GUARD_LIFECYCLE_KINDS = frozenset(
+    {
+        "stage1-dataset",
+        "stage1-mixed-finalization",
+        "stage1-training",
+        "stage1-validation",
+    }
+)
+GUARD_LIFECYCLE_STATES = frozenset(
+    {
+        "preparing",
+        "finalizing",
+        "ready",
+        "failed",
+        "timed_out",
+        *DATASET_RESUMABLE_STATES,
+    }
+)
 
 
 StageContract = namedtuple(
@@ -864,6 +882,84 @@ def _validate_quant_dataset_payload(
     ):
         raise ValueError("Dataset was prepared from a different code release")
     return payload
+
+
+def _guard_lifecycle_state(
+    payload,
+    *,
+    expected_kind,
+    expected_pod_id,
+    active_run_id="",
+):
+    """Validate one lifecycle marker before an external guard may terminate a Pod."""
+
+    if expected_kind not in GUARD_LIFECYCLE_KINDS:
+        raise ValueError("Guard lifecycle kind is unsupported")
+    if not isinstance(expected_pod_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]+", expected_pod_id
+    ):
+        raise ValueError("Guard expected Pod ID is invalid")
+    if active_run_id and (
+        not isinstance(active_run_id, str)
+        or RUN_ID_PATTERN.fullmatch(active_run_id) is None
+        or "--" in active_run_id
+    ):
+        raise ValueError("Guard active run ID is invalid")
+    if not isinstance(payload, dict):
+        raise ValueError("Guard lifecycle marker must contain a JSON object")
+    if payload.get("kind") != expected_kind or payload.get("pod_id") != expected_pod_id:
+        raise ValueError("Guard lifecycle identity does not match the monitored Pod")
+
+    state = payload.get("state")
+    if state not in GUARD_LIFECYCLE_STATES:
+        raise ValueError("Guard lifecycle state is unsupported")
+
+    if expected_kind == "stage1-dataset" and state == "ready":
+        # A successful numerical dataset is the immutable readiness schema. All
+        # in-progress, resumable, and failure states use the lifecycle schema.
+        _validate_quant_dataset_payload(payload)
+    elif payload.get("schema_version") != LIFECYCLE_SCHEMA_VERSION:
+        raise ValueError("Guard lifecycle marker has an unsupported schema")
+
+    if state in DATASET_RESUMABLE_STATES and expected_kind != "stage1-dataset":
+        raise ValueError("Resumable acquisition states are valid only for the dataset")
+    if state == "downloaded" and payload.get("exit_code") is None:
+        return "downloaded_active"
+    if state in DATASET_RESUMABLE_STATES and (
+        type(payload.get("exit_code")) is not int or payload.get("exit_code") != 75
+    ):
+        raise ValueError("Terminal resumable dataset state requires exit_code=75")
+    if state == "ready":
+        if expected_kind == "stage1-training" and payload.get("training_completed") is not True:
+            raise ValueError("Ready training lifecycle is incomplete")
+        if expected_kind == "stage1-validation" and payload.get("validation_completed") is not True:
+            raise ValueError("Ready validation lifecycle is incomplete")
+
+    run_id = payload.get("wandb_run_id", "")
+    if expected_kind in {"stage1-training", "stage1-validation"} and (
+        not isinstance(run_id, str)
+        or RUN_ID_PATTERN.fullmatch(run_id) is None
+        or "--" in run_id
+    ):
+        raise ValueError("Guard lifecycle run ID is invalid")
+    if active_run_id and run_id != active_run_id:
+        raise ValueError("Guard lifecycle run ID does not match the active run")
+    return state
+
+
+def command_guard_lifecycle_state(arguments):
+    try:
+        payload = json.load(sys.stdin)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Guard lifecycle input is not valid JSON") from error
+    state = _guard_lifecycle_state(
+        payload,
+        expected_kind=arguments.expected_kind,
+        expected_pod_id=arguments.expected_pod_id,
+        active_run_id=arguments.active_run_id,
+    )
+    print(state)
+    return 0
 
 
 def _verify_dataset_artifacts(payload, network_volume_root):
@@ -1897,6 +1993,16 @@ def build_parser():
     resumable_dataset.add_argument("--network-volume-root", type=Path, required=True)
     resumable_dataset.add_argument("--launch-id", required=True)
     resumable_dataset.set_defaults(handler=command_resumable_dataset_lifecycle)
+
+    guard_lifecycle = subparsers.add_parser("guard-lifecycle-state")
+    guard_lifecycle.add_argument(
+        "--expected-kind",
+        choices=tuple(sorted(GUARD_LIFECYCLE_KINDS)),
+        required=True,
+    )
+    guard_lifecycle.add_argument("--expected-pod-id", required=True)
+    guard_lifecycle.add_argument("--active-run-id", default="")
+    guard_lifecycle.set_defaults(handler=command_guard_lifecycle_state)
 
     best_checkpoint = subparsers.add_parser("best-checkpoint-name")
     best_checkpoint.add_argument("--pointer", required=True)

@@ -484,8 +484,10 @@ def test_cpu_acquisition_budget_is_resumable_and_reserves_preparation_time() -> 
         "downloaded",
     ):
         assert state in guard
-    assert 'print("downloaded_active")' in guard
-    assert 'payload.get("exit_code") != 75' in guard
+    assert 'return "downloaded_active"' in readiness
+    assert 'payload.get("exit_code") != 75' in readiness
+    assert 'python3 "${RUNPOD_READINESS_HELPER}" guard-lifecycle-state' in guard
+    assert 'expected_kind == "stage1-dataset" and state == "ready"' in readiness
 
 
 def test_gpu_gate_verifies_lazy_bar_store_artifacts() -> None:

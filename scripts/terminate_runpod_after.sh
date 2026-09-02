@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RUNPODCTL_WRAPPER="${SCRIPT_DIR}/runpodctl_project.sh"
 RUNPOD_S3_WRAPPER="${SCRIPT_DIR}/runpod_s3_project.sh"
+RUNPOD_READINESS_HELPER="${SCRIPT_DIR}/runpod_readiness.py"
 # shellcheck source=lib/runpod_project_env.sh
 source "${SCRIPT_DIR}/lib/runpod_project_env.sh"
 
@@ -103,8 +104,9 @@ if ! command -v runpodctl >/dev/null 2>&1; then
     echo "runpodctl is required on the external guard host" >&2
     exit 127
 fi
-if [[ ! -f "${RUNPODCTL_WRAPPER}" || ! -r "${RUNPODCTL_WRAPPER}" ]]; then
-    echo "Project runpodctl wrapper is unavailable: ${RUNPODCTL_WRAPPER}" >&2
+if [[ ! -f "${RUNPODCTL_WRAPPER}" || ! -r "${RUNPODCTL_WRAPPER}" \
+    || ! -f "${RUNPOD_READINESS_HELPER}" || ! -r "${RUNPOD_READINESS_HELPER}" ]]; then
+    echo "Project guard dependencies are unavailable" >&2
     exit 127
 fi
 runpod_assert_project_env_file "${LOCAL_PROJECT_ROOT}"
@@ -233,69 +235,12 @@ raise SystemExit(0 if valid else 2)' \
                         continue
                         ;;
                 esac
-                if ! marker_state="$(printf '%s' "${marker_json}" | python3 -c \
-                    'import json, re, sys
-try:
-    payload = json.load(sys.stdin)
-except (TypeError, ValueError):
-    raise SystemExit(2)
-expected_kind, expected_pod_id, active_run_id = sys.argv[1:4]
-if not isinstance(payload, dict):
-    raise SystemExit(2)
-schema_version = payload.get("schema_version")
-if type(schema_version) is not int or schema_version != 1:
-    raise SystemExit(2)
-if payload.get("kind") != expected_kind or payload.get("pod_id") != expected_pod_id:
-    raise SystemExit(2)
-state = payload.get("state")
-if state not in (
-    "preparing",
-    "finalizing",
-    "ready",
-    "failed",
-    "timed_out",
-    "waiting_for_provider",
-    "waiting_for_budget",
-    "waiting_for_resume",
-    "waiting_for_preparation",
-    "downloaded",
-):
-    raise SystemExit(2)
-if state in (
-    "waiting_for_provider",
-    "waiting_for_budget",
-    "waiting_for_resume",
-    "waiting_for_preparation",
-    "downloaded",
-) and expected_kind != "stage1-dataset":
-    raise SystemExit(2)
-if state == "downloaded" and payload.get("exit_code") is None:
-    print("downloaded_active")
-    raise SystemExit(0)
-if state in (
-    "waiting_for_provider",
-    "waiting_for_budget",
-    "waiting_for_resume",
-    "waiting_for_preparation",
-    "downloaded",
-) and (type(payload.get("exit_code")) is not int or payload.get("exit_code") != 75):
-    raise SystemExit(2)
-if state == "ready":
-    if expected_kind == "stage1-training" and payload.get("training_completed") is not True:
-        raise SystemExit(2)
-    if expected_kind == "stage1-validation" and payload.get("validation_completed") is not True:
-        raise SystemExit(2)
-run_id = payload.get("wandb_run_id", "")
-if expected_kind in ("stage1-training", "stage1-validation"):
-    if not isinstance(run_id, str) or re.fullmatch(
-        r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", run_id
-    ) is None or "--" in run_id:
-        raise SystemExit(2)
-if active_run_id and run_id != active_run_id:
-    raise SystemExit(2)
-print(state)' \
-                    "${expected_lifecycle_kind}" "${POD_ID}" \
-                    "${RUNPOD_GUARD_RUN_ID}" 2>/dev/null)"; then
+                if ! marker_state="$(printf '%s' "${marker_json}" | \
+                    python3 "${RUNPOD_READINESS_HELPER}" guard-lifecycle-state \
+                        --expected-kind "${expected_lifecycle_kind}" \
+                        --expected-pod-id "${POD_ID}" \
+                        --active-run-id "${RUNPOD_GUARD_RUN_ID}" \
+                        2>/dev/null)"; then
                     case ",${rejected_lifecycle_keys}," in
                         *",${lifecycle_candidate},"*) ;;
                         *)

@@ -1063,7 +1063,10 @@ manifest 與 run identity，再寫入
 Pod 會自動終止；CPU prepare 正確完成，以及 CPU/GPU 工作失敗或超時時，也會先
 發布 terminal lifecycle／tmux status，再自動終止。若 Pod 端 API 呼叫失敗，
 本機 guard 會根據同一 Pod ID、run ID 與 lifecycle 接手；掛載 network volume 的
-Pod 一律使用 terminate，而不是 stop。
+Pod 一律使用 terminate，而不是 stop。Guard 依 marker 類型驗證版本：完整且為
+`ready` 的 numerical dataset 必須是 readiness schema v2，CPU 的進行中／續傳／失敗
+狀態與 GPU lifecycle 則維持 schema v1；錯誤 Pod ID、run ID 或跨狀態版本都不會觸發
+終止。
 
 ##### W&B 記錄與離線補傳
 
@@ -2515,6 +2518,10 @@ CPU preparation and any CPU/GPU workflow failure or timeout likewise publish
 terminal lifecycle/tmux status before terminating. If the Pod-side API call
 fails, the local guard takes over using the same Pod ID, run ID, and lifecycle.
 Pods with network volumes are always terminated, never stopped.
+The guard validates schema by marker type: a complete numerical dataset in
+`ready` state must use readiness schema v2, while in-progress, resumable, and
+failed CPU states plus GPU lifecycle markers remain on schema v1. A mismatched
+Pod ID, run ID, or state/schema combination never triggers termination.
 
 ##### W&B logging and offline recovery
 
