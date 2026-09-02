@@ -12,6 +12,8 @@ CODE_MARKER_KEY="lifecycle/stage1/code.json"
 
 # shellcheck source=lib/runpod_project_env.sh
 source "${SCRIPT_DIR}/lib/runpod_project_env.sh"
+# shellcheck source=lib/runpod_s3_retry.sh
+source "${SCRIPT_DIR}/lib/runpod_s3_retry.sh"
 runpod_load_s3_env "${LOCAL_PROJECT_ROOT}"
 
 MODE=dry-run
@@ -180,13 +182,16 @@ if [[ "${MODE}" == "dry-run" ]]; then
     exit 0
 fi
 
-bash "${S3_WRAPPER}" s3api head-bucket \
+runpod_s3_retry_command "${S3_WRAPPER}" "verify network volume access" \
+    s3api head-bucket \
     --bucket "${RUNPOD_NETWORK_VOLUME_ID}" \
     >/dev/null
 
 # Invalidate any older ready marker before changing remote source files.
-render_code_manifest syncing | bash "${S3_WRAPPER}" s3 cp \
-    - "s3://${RUNPOD_NETWORK_VOLUME_ID}/${CODE_MARKER_KEY}" \
+SYNCING_CODE_MANIFEST="$(render_code_manifest syncing)"
+runpod_s3_retry_stdin \
+    "${S3_WRAPPER}" "publish syncing code marker" "${SYNCING_CODE_MANIFEST}" \
+    s3 cp - "s3://${RUNPOD_NETWORK_VOLUME_ID}/${CODE_MARKER_KEY}" \
     --only-show-errors
 
 for manifest_index in "${!MANIFEST_ABSOLUTE[@]}"; do
@@ -194,7 +199,7 @@ for manifest_index in "${!MANIFEST_ABSOLUTE[@]}"; do
     manifest_relative="${MANIFEST_RELATIVE[${manifest_index}]}"
     printf '[%d/%d] Uploading %s\n' \
         "$((manifest_index + 1))" "${#MANIFEST_RELATIVE[@]}" "${manifest_relative}"
-    bash "${S3_WRAPPER}" s3 cp \
+    runpod_s3_retry_command "${S3_WRAPPER}" "upload ${manifest_relative}" s3 cp \
         "${manifest_path}" \
         "s3://${RUNPOD_NETWORK_VOLUME_ID}/${REMOTE_PROJECT_DIR}/${manifest_relative}" \
         --only-show-errors
@@ -202,7 +207,9 @@ done
 
 for manifest_index in "${!MANIFEST_ABSOLUTE[@]}"; do
     manifest_relative="${MANIFEST_RELATIVE[${manifest_index}]}"
-    remote_size="$(bash "${S3_WRAPPER}" s3api head-object \
+    remote_size="$(runpod_s3_retry_capture \
+        "${S3_WRAPPER}" "verify uploaded size for ${manifest_relative}" \
+        s3api head-object \
         --bucket "${RUNPOD_NETWORK_VOLUME_ID}" \
         --key "${REMOTE_PROJECT_DIR}/${manifest_relative}" \
         --query ContentLength \
@@ -234,7 +241,9 @@ scan_remote_prefix() {
     local entry_type=""
     local entry_value=""
 
-    listing="$(bash "${S3_WRAPPER}" s3api list-objects-v2 \
+    listing="$(runpod_s3_retry_capture \
+        "${S3_WRAPPER}" "scan remote prefix ${prefix}" \
+        s3api list-objects-v2 \
         --bucket "${RUNPOD_NETWORK_VOLUME_ID}" \
         --prefix "${prefix}" \
         --delimiter / \
@@ -291,13 +300,17 @@ for item in payload.get("CommonPrefixes", []):
 scan_remote_prefix "${REMOTE_PROJECT_DIR}/"
 
 # Publish ready only after every source object and safety check has passed.
-render_code_manifest ready | bash "${S3_WRAPPER}" s3 cp \
-    - "s3://${RUNPOD_NETWORK_VOLUME_ID}/${CODE_MARKER_KEY}" \
+READY_CODE_MANIFEST="$(render_code_manifest ready)"
+runpod_s3_retry_stdin \
+    "${S3_WRAPPER}" "publish ready code marker" "${READY_CODE_MANIFEST}" \
+    s3 cp - "s3://${RUNPOD_NETWORK_VOLUME_ID}/${CODE_MARKER_KEY}" \
     --only-show-errors
 
-bash "${S3_WRAPPER}" s3 cp \
-    "s3://${RUNPOD_NETWORK_VOLUME_ID}/${CODE_MARKER_KEY}" - \
-    --only-show-errors \
+REMOTE_CODE_MANIFEST="$(runpod_s3_retry_capture \
+    "${S3_WRAPPER}" "read published ready code marker" \
+    s3 cp "s3://${RUNPOD_NETWORK_VOLUME_ID}/${CODE_MARKER_KEY}" - \
+    --only-show-errors)"
+printf '%s\n' "${REMOTE_CODE_MANIFEST}" \
     | python3 "${READINESS_HELPER}" check-code \
         --marker - \
         --project-root "${LOCAL_PROJECT_ROOT}" \

@@ -48,6 +48,105 @@ def test_runpod_stage_contract_reports_stage1_five_percent_cap() -> None:
     assert payload["max_samples"] == 500_000
 
 
+def test_runpod_s3_capture_retry_discards_failed_partial_output(tmp_path: Path) -> None:
+    counter_path = tmp_path / "capture-attempts.txt"
+    fake_wrapper = tmp_path / "fake-s3-capture.sh"
+    fake_wrapper.write_text(
+        """#!/usr/bin/env bash
+set -eu
+attempt=0
+if [[ -f \"${COUNTER_PATH}\" ]]; then
+    attempt=\"$(cat \"${COUNTER_PATH}\")\"
+fi
+attempt=$((attempt + 1))
+printf '%s\\n' \"${attempt}\" > \"${COUNTER_PATH}\"
+if [[ ${attempt} -lt 3 ]]; then
+    printf 'partial-%s' \"${attempt}\"
+    exit 41
+fi
+printf '{\"state\":\"ready\"}'
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; runpod_s3_retry_capture "$2" "read marker" ignored',
+            "bash",
+            str(ROOT / "scripts/lib/runpod_s3_retry.sh"),
+            str(fake_wrapper),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "COUNTER_PATH": str(counter_path),
+            "RUNPOD_S3_RETRY_MAX_ATTEMPTS": "3",
+            "RUNPOD_S3_RETRY_INITIAL_BACKOFF_SECONDS": "0",
+            "RUNPOD_S3_RETRY_MAX_BACKOFF_SECONDS": "0",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == '{"state":"ready"}'
+    assert counter_path.read_text(encoding="utf-8").strip() == "3"
+    assert result.stderr.count("retrying in 0s") == 2
+
+
+def test_runpod_s3_stdin_retry_replays_the_complete_payload(tmp_path: Path) -> None:
+    counter_path = tmp_path / "stdin-attempts.txt"
+    payloads_path = tmp_path / "payloads.txt"
+    fake_wrapper = tmp_path / "fake-s3-stdin.sh"
+    fake_wrapper.write_text(
+        """#!/usr/bin/env bash
+set -eu
+payload=\"$(cat)\"
+attempt=0
+if [[ -f \"${COUNTER_PATH}\" ]]; then
+    attempt=\"$(cat \"${COUNTER_PATH}\")\"
+fi
+attempt=$((attempt + 1))
+printf '%s\\n' \"${attempt}\" > \"${COUNTER_PATH}\"
+printf '%s\\n' \"${payload}\" >> \"${PAYLOADS_PATH}\"
+if [[ ${attempt} -lt 2 ]]; then
+    exit 42
+fi
+""",
+        encoding="utf-8",
+    )
+    payload = '{"state":"ready"}'
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; runpod_s3_retry_stdin "$2" "publish marker" "$3" ignored',
+            "bash",
+            str(ROOT / "scripts/lib/runpod_s3_retry.sh"),
+            str(fake_wrapper),
+            payload,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "COUNTER_PATH": str(counter_path),
+            "PAYLOADS_PATH": str(payloads_path),
+            "RUNPOD_S3_RETRY_MAX_ATTEMPTS": "2",
+            "RUNPOD_S3_RETRY_INITIAL_BACKOFF_SECONDS": "0",
+            "RUNPOD_S3_RETRY_MAX_BACKOFF_SECONDS": "0",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert payloads_path.read_text(encoding="utf-8").splitlines() == [payload, payload]
+    assert result.stderr.count("retrying in 0s") == 1
+
+
 def test_runpod_stage_contract_rejects_wrong_stage1_sample_cap(
     tmp_path: Path,
 ) -> None:
@@ -467,6 +566,14 @@ def test_stable_runpod_lifecycle_and_synchronization_boundaries_remain() -> None
     assert "--dry-run" in sync
     assert "--apply" in sync
     assert 'CODE_MARKER_KEY="lifecycle/stage1/code.json"' in sync
+    assert 'source "${SCRIPT_DIR}/lib/runpod_s3_retry.sh"' in sync
+    assert 'bash "${S3_WRAPPER}"' not in sync
+    for retry_helper in (
+        "runpod_s3_retry_command",
+        "runpod_s3_retry_capture",
+        "runpod_s3_retry_stdin",
+    ):
+        assert retry_helper in sync
     syncing_index = sync.index("render_code_manifest syncing")
     ready_index = sync.rindex("render_code_manifest ready")
     verification_index = sync.rindex('python3 "${READINESS_HELPER}" check-code')
