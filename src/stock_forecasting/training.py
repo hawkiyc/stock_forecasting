@@ -46,6 +46,10 @@ from stock_forecasting.metrics import (
     postprocess_alpha_signal,
 )
 from stock_forecasting.preflight import run_preflight
+from stock_forecasting.runtime_resources import (
+    AvailableMemoryEstimate,
+    detect_available_memory,
+)
 from stock_forecasting.tracking import (
     TrackingRun,
     start_tracking,
@@ -83,6 +87,8 @@ class DataLoaderWorkerPlan:
     requested_workers: int
     visible_cpu_count: int
     available_memory_bytes: int
+    available_memory_source: str
+    available_memory_observations: tuple[tuple[str, int], ...]
     worker_memory_budget_bytes: int
     effective_workers: int
     active_persistent_pools: int
@@ -95,6 +101,10 @@ class DataLoaderWorkerPlan:
             "requested_workers": self.requested_workers,
             "visible_cpu_count": self.visible_cpu_count,
             "available_memory_bytes": self.available_memory_bytes,
+            "available_memory_source": self.available_memory_source,
+            "available_memory_observations_bytes": dict(
+                self.available_memory_observations
+            ),
             "worker_memory_budget_bytes": self.worker_memory_budget_bytes,
             "effective_workers": self.effective_workers,
             "active_persistent_pools": self.active_persistent_pools,
@@ -145,57 +155,10 @@ def _visible_cpu_count() -> int:
     return max(1, min(reported, affinity_count or reported))
 
 
-def _read_positive_integer(path: Path) -> int | None:
-    try:
-        value = path.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return None
-    if not value or value == "max":
-        return None
-    try:
-        parsed = int(value)
-    except ValueError:
-        return None
-    return parsed if parsed > 0 else None
-
-
 def _available_memory_bytes() -> int:
-    """Return the strictest available-memory estimate exposed by Linux or POSIX."""
+    """Return scope-compatible available memory for compatibility callers."""
 
-    candidates: list[int] = []
-    for limit_path, usage_path in (
-        (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")),
-        (
-            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
-            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
-        ),
-    ):
-        limit = _read_positive_integer(limit_path)
-        usage = _read_positive_integer(usage_path) or 0
-        if limit is not None and limit > usage:
-            candidates.append(limit - usage)
-
-    try:
-        meminfo = Path("/proc/meminfo").read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        meminfo = ""
-    for line in meminfo.splitlines():
-        fields = line.split()
-        if line.startswith("MemAvailable:") and len(fields) >= 2 and fields[1].isdigit():
-            candidates.append(int(fields[1]) * 1024)
-            break
-
-    try:
-        page_size = int(os.sysconf("SC_PAGE_SIZE"))
-        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
-    except (OSError, ValueError, TypeError, AttributeError):
-        pass
-    else:
-        if page_size > 0 and available_pages > 0:
-            candidates.append(page_size * available_pages)
-    if not candidates:
-        raise RuntimeError("Unable to determine memory available for DataLoader workers")
-    return min(candidates)
+    return detect_available_memory().available_bytes
 
 
 def _requested_dataloader_workers(config: ExperimentConfig) -> tuple[int, str]:
@@ -221,9 +184,16 @@ def plan_dataloader_workers(
     if isinstance(requested_workers, bool) or requested_workers < 0 or requested_workers > 32:
         raise ValueError("requested_workers must be between 0 and 32")
     cpu_count = _visible_cpu_count() if visible_cpu_count is None else visible_cpu_count
-    memory_bytes = (
-        _available_memory_bytes() if available_memory_bytes is None else available_memory_bytes
+    memory_estimate = (
+        detect_available_memory()
+        if available_memory_bytes is None
+        else AvailableMemoryEstimate(
+            available_bytes=available_memory_bytes,
+            source="explicit_argument",
+            observations=(("explicit_argument", available_memory_bytes),),
+        )
     )
+    memory_bytes = memory_estimate.available_bytes
     if (
         isinstance(cpu_count, bool)
         or isinstance(memory_bytes, bool)
@@ -262,6 +232,8 @@ def plan_dataloader_workers(
         requested_workers=requested_workers,
         visible_cpu_count=cpu_count,
         available_memory_bytes=memory_bytes,
+        available_memory_source=memory_estimate.source,
+        available_memory_observations=memory_estimate.observations,
         worker_memory_budget_bytes=memory_budget,
         effective_workers=effective_workers,
         active_persistent_pools=DATALOADER_ACTIVE_PERSISTENT_POOLS,
