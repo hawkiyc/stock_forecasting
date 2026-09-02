@@ -31,7 +31,10 @@ STAGING_ROOT="${NETWORK_VOLUME_ROOT}/tmp/stage1-prep/${LAUNCH_ID}"
 DATA_STAGING_ROOT="${STAGING_ROOT}/data"
 RAW_STAGING="${DATA_STAGING_ROOT}/raw/market.parquet"
 DOWNLOAD_MANIFEST_STAGING="${DATA_STAGING_ROOT}/download-manifest.json"
-DATASET_MANIFEST_STAGING="${DATA_STAGING_ROOT}/dataset-manifest.json"
+# Dataset artifact paths are relative to the manifest's parent. Keep the
+# launch-specific staging manifest beside the immutable dataset artifacts so
+# verification and the final same-filesystem rename use the same root.
+DATASET_MANIFEST_STAGING="${DATA_ROOT}/.dataset-manifest-${LAUNCH_ID}.staging.json"
 REQUEST_LOG_STAGING="${DATA_STAGING_ROOT}/manifests/api-request-log.jsonl"
 RAW_FINAL="${DATA_ROOT}/raw/market.parquet"
 BAR_STORE_FINAL="${DATA_ROOT}/prepared/bar-store"

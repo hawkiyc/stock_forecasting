@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from stock_forecasting.baselines import baseline_arrays
+from stock_forecasting.cli.prepare_data import _validate_dataset_manifest_destination
 from stock_forecasting.data.adjustments import asof_adjusted_window
 from stock_forecasting.data.bar_store import bar_store_preparation_spec
 from stock_forecasting.data.benchmarks import resolve_benchmark
@@ -32,6 +33,18 @@ from stock_forecasting.data.schema import (
 )
 from stock_forecasting.data.splits import SPLIT_POLICY, chronological_split
 from stock_forecasting.data.windows import DEFAULT_ALPHA_HORIZONS, build_causal_windows
+
+
+def test_dataset_manifest_staging_must_share_the_artifact_root(tmp_path: Path) -> None:
+    staging_manifest = tmp_path / ".dataset-manifest-launch.staging.json"
+    _validate_dataset_manifest_destination(staging_manifest, tmp_path)
+
+    unrelated_staging_root = tmp_path / "tmp" / "launch" / "data"
+    with pytest.raises(ValueError, match="directly under the dataset root"):
+        _validate_dataset_manifest_destination(
+            unrelated_staging_root / "dataset-manifest.json",
+            tmp_path,
+        )
 
 
 def test_causal_records_have_paired_historical_inputs_and_future_labels_only(

@@ -89,6 +89,15 @@ def _manifest_root(input_path: Path) -> Path:
     return input_path.parent.parent if input_path.parent.name == "raw" else input_path.parent
 
 
+def _validate_dataset_manifest_destination(path: Path, manifest_root: Path) -> None:
+    """Require relative artifact paths to remain valid before and after publication."""
+
+    expected_parent = manifest_root.resolve(strict=True)
+    actual_parent = path.parent.resolve(strict=False)
+    if actual_parent != expected_parent:
+        raise ValueError("--dataset-manifest must be written directly under the dataset root")
+
+
 def _pipeline_digest() -> str:
     package_root = Path(__file__).resolve().parents[1]
     files = [
@@ -243,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest_root = _manifest_root(arguments.input)
     download_manifest_path = arguments.download_manifest or manifest_root / "download-manifest.json"
     dataset_manifest_path = arguments.dataset_manifest or manifest_root / "dataset-manifest.json"
+    _validate_dataset_manifest_destination(dataset_manifest_path, manifest_root)
     if dataset_manifest_path.exists():
         raise FileExistsError(
             f"Refusing to overwrite ready dataset manifest: {dataset_manifest_path}"

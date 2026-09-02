@@ -459,6 +459,12 @@ def test_cpu_acquisition_budget_is_resumable_and_reserves_preparation_time() -> 
     assert '--deadline-epoch-seconds "$((WORKFLOW_DEADLINE_EPOCH - 120))"' in prepare
     assert 'PREP_RESUMABLE_STATE=waiting_for_preparation' in prepare
     assert 'BAR_STORE_SUCCESS="${BAR_STORE_FINAL}/_SUCCESS.json"' in prepare
+    assert (
+        'DATASET_MANIFEST_STAGING="${DATA_ROOT}/.dataset-manifest-'
+        '${LAUNCH_ID}.staging.json"' in prepare
+    )
+    assert 'DATASET_MANIFEST_STAGING="${DATA_STAGING_ROOT}' not in prepare
+    assert 'mv "${DATASET_MANIFEST_STAGING}" "${DATASET_MANIFEST_FINAL}"' in prepare
     assert "PROCESSED_FINAL" not in prepare
     acquisition_branch = prepare.index("if [[ ${REUSE_DOWNLOADED_DATASET} -eq 0 ]]")
     eodhd_secret_check = prepare.index(

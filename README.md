@@ -858,6 +858,9 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    provider。worker 數與執行時記憶體規劃只影響排程，
    不屬於 dataset identity；改用不同 vCPU／RAM 的 CPU Pod 不會重新下載 provider 資料，
    也不會使既有 bucket checkpoint 失效。其後才將
+   launch 專屬的隱藏 dataset-manifest 暫存檔直接寫在同一個 dataset root，確保其中的
+   artifact 相對路徑在發布前驗證與發布後都指向相同檔案；驗證通過後才以同檔案系統
+   rename 原子發布為 `dataset-manifest.json`。接著將
    selection ID/SHA、dataset request SHA、stage/config SHA、requested
    profile/date/universe 與 resolved artifact hashes 綁入
    `/runpod-volume/lifecycle/stage1/dataset.json`；只有全部檢查成功才發布並
@@ -2281,7 +2284,11 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    Worker count and runtime memory planning affect scheduling only and are not part
    of dataset identity, so resuming on a CPU Pod with different vCPU/RAM does not
    repeat provider downloads or invalidate finished bucket checkpoints.
-   It then binds the selection ID/SHA,
+   A launch-specific hidden dataset-manifest staging file is written directly in
+   the same dataset root, so every relative artifact path resolves to the same file
+   both before and after publication. After verification, a same-filesystem rename
+   atomically publishes it as `dataset-manifest.json`. The workflow then binds the
+   selection ID/SHA,
    dataset request SHA, stage/config SHA, requested
    profile/date/universe, and resolved artifact hashes into
    `/runpod-volume/lifecycle/stage1/dataset.json`. It publishes the marker only
