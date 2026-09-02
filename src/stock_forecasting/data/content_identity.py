@@ -420,6 +420,34 @@ def _canonical_json_sha256(payload: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _canonical_ast_dump(node: ast.AST) -> str:
+    """Serialize an AST without runtime-dependent empty sequence fields."""
+
+    if not isinstance(node, ast.AST):
+        raise TypeError(f"expected AST, got {node.__class__.__name__!r}")
+
+    def _format(value: Any) -> str:
+        if isinstance(value, ast.AST):
+            node_type = type(value)
+            fields = []
+            for name in value._fields:
+                try:
+                    field_value = getattr(value, name)
+                except AttributeError:
+                    continue
+                if field_value is None and getattr(node_type, name, ...) is None:
+                    continue
+                if isinstance(field_value, list) and not field_value:
+                    continue
+                fields.append(f"{name}={_format(field_value)}")
+            return f"{value.__class__.__name__}({', '.join(fields)})"
+        if isinstance(value, list):
+            return f"[{', '.join(_format(item) for item in value)}]"
+        return repr(value)
+
+    return _format(node)
+
+
 def _definition_name(node: ast.AST) -> str | None:
     if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
         return node.name
@@ -523,11 +551,7 @@ def semantic_definitions_digest(
     normalized = [
         {
             "name": name,
-            "ast": ast.dump(
-                node,
-                annotate_fields=True,
-                include_attributes=False,
-            ),
+            "ast": _canonical_ast_dump(node),
         }
         for name, node in zip(names, normalized_nodes, strict=True)
     ]

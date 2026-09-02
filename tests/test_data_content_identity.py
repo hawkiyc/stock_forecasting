@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import shutil
 from pathlib import Path
 
 import pytest
 
 from stock_forecasting.data.content_identity import (
+    _canonical_ast_dump,
     bar_store_materialization_digest,
     code_content_identity,
     content_identity_digest,
@@ -26,6 +28,18 @@ def _copy_package(tmp_path: Path) -> Path:
     destination = tmp_path / "stock_forecasting"
     shutil.copytree(PACKAGE_ROOT, destination)
     return destination
+
+
+def test_canonical_ast_dump_omits_runtime_dependent_empty_fields() -> None:
+    syntax = ast.parse(
+        "def clean():\n    return None\n",
+        feature_version=(3, 12),
+    )
+
+    assert _canonical_ast_dump(syntax) == (
+        "Module(body=[FunctionDef(name='clean', args=arguments(), "
+        "body=[Return(value=Constant(value=None))])])"
+    )
 
 
 def test_semantic_digest_ignores_docs_types_and_error_messages(tmp_path: Path) -> None:
