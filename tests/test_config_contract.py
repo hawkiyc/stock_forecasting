@@ -191,7 +191,7 @@ def test_training_config_rejects_obsolete_step_caps_and_cadence(
     obsolete_field: str,
 ) -> None:
     path = ROOT / "configs/stage1_kronos_base_lora.yaml"
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload = ExperimentConfig.from_yaml(path).as_dict()
     payload["training"][obsolete_field] = 200
 
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
@@ -230,7 +230,7 @@ def test_stage1_training_control_contract_fails_closed(
     message: str,
 ) -> None:
     path = ROOT / "configs/stage1_kronos_base_lora.yaml"
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload = ExperimentConfig.from_yaml(path).as_dict()
     payload["training"][field] = value
     if field == "epochs":
         payload["training"]["early_stopping_start_epoch"] = 1
@@ -252,7 +252,7 @@ def test_model_config_has_no_language_or_fact_branch() -> None:
 
 def test_kronos_production_config_requires_a_pinned_source_revision() -> None:
     path = ROOT / "configs/stage1_kronos_base_lora.yaml"
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload = ExperimentConfig.from_yaml(path).as_dict()
     payload["model"]["kronos_source_revision"] = "main"
 
     with pytest.raises(ValidationError, match="pinned 40-character"):
@@ -265,7 +265,7 @@ def test_kronos_production_config_requires_a_pinned_source_revision() -> None:
 )
 def test_kronos_production_config_requires_pinned_weight_revisions(field: str) -> None:
     path = ROOT / "configs/stage1_kronos_base_lora.yaml"
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload = ExperimentConfig.from_yaml(path).as_dict()
     payload["model"][field] = "main"
 
     with pytest.raises(ValidationError, match="pinned 40-character"):

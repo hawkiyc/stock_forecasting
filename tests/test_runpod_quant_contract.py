@@ -855,7 +855,8 @@ def test_wandb_contract_logs_every_optimizer_step_and_validation_metrics() -> No
     assert "log_every_steps: Literal[1] = 1" in config
     assert '"train/loss": optimizer_step_loss' in training
     assert "step=global_step" in training
-    assert '_flatten_metrics(validation_metrics, "validation")' in training
+    assert "last_validation_flat_metrics = _flatten_metrics(validation_metrics)" in training
+    assert 'f"validation/{key}": value' in training
     assert 'run.define_metric("trainer/global_step")' in tracking
     assert 'run.define_metric("train/*", step_metric="trainer/global_step")' in tracking
     assert 'run.define_metric("validation/*", step_metric="trainer/global_step")' in tracking
