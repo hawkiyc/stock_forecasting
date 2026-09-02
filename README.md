@@ -51,8 +51,9 @@ Adjusted benchmark OHLCV through close t ─┘              │
 `NeoQuasar/Kronos-Tokenizer-base`。Kronos predictor 的基礎權重凍結，只在
 `q_proj`、`k_proj`、`v_proj`、`out_proj`、`w1`、`w2`、`w3`
 注入 LoRA；resampler、benchmark conditioner 與 alpha head 可訓練。官方 source 固定為 commit
-`67b630e67f6a18c9e9be918d9b4337c960db1e9a`，preflight 與建模都會驗證實際
-checkout，不只依賴 setup script 的宣告。模型與 tokenizer 權重另分別固定為
+`67b630e67f6a18c9e9be918d9b4337c960db1e9a`，必要的 source snapshot 與 MIT license
+隨專案一併同步；preflight 與建模會逐檔驗證 SHA-256，不會在 RunPod 執行 Git。
+模型與 tokenizer 權重另分別固定為
 Hugging Face commits `2b554741eca47781b64468546e77fef3e85130e6` 與
 `0e0117387f39004a9016484a186a908917e22426`，下載、離線 smoke test、config 與
 checkpoint 都會綁定 revisions。
@@ -817,7 +818,8 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
 
 1. 建立 persistent directory layout、Poetry 2.4.0 與 remote Python 3.12
    `.venv`，並在 RunPod image 內產生 canonical `poetry.lock`。
-2. 固定 Kronos source/model/tokenizer revisions，執行完整 pytest。
+2. 驗證專案內固定的 Kronos source SHA-256，從 Hugging Face cache 驗證固定的
+   model/tokenizer revisions，執行完整 pytest；遠端流程不會 clone Git repository。
 3. 從 mounted immutable selection 重新驗證 stage、profile、日期、universe、
    config SHA-256 與 Pod environment，再依該 selection 下載資料；cache hit 不會
    再次呼叫 provider。腳本會同時讀取使用者要求的 vCPU 數、RunPod 提供的
@@ -1385,9 +1387,10 @@ Production configs use `NeoQuasar/Kronos-base` and
 `NeoQuasar/Kronos-Tokenizer-base`. Kronos base weights are frozen. LoRA is
 injected into `q_proj`, `k_proj`, `v_proj`, `out_proj`, `w1`, `w2`, and `w3`;
 the resampler, benchmark conditioner, and alpha head remain trainable. The official source is pinned to
-commit `67b630e67f6a18c9e9be918d9b4337c960db1e9a`. Preflight and model
-construction verify the actual checkout instead of trusting the setup-script
-declaration alone. Model and tokenizer weights are separately pinned to
+commit `67b630e67f6a18c9e9be918d9b4337c960db1e9a`; the required source snapshot
+and MIT license are synchronized with the project. Preflight and model
+construction verify each source file by SHA-256 and never invoke Git on RunPod.
+Model and tokenizer weights are separately pinned to
 Hugging Face commits `2b554741eca47781b64468546e77fef3e85130e6` and
 `0e0117387f39004a9016484a186a908917e22426`; downloads, offline smoke tests,
 configs, and checkpoints bind those revisions.
@@ -2271,8 +2274,9 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
 1. Creates the persistent directory layout, Poetry 2.4.0, and the remote Python
    3.12 `.venv`, then generates the canonical `poetry.lock` inside the RunPod
    image.
-2. Pins the Kronos source/model/tokenizer revisions and runs the complete pytest
-   suite.
+2. Verifies the bundled Kronos source SHA-256 values, verifies the pinned
+   model/tokenizer revisions from the Hugging Face cache, and runs the complete
+   pytest suite. The remote workflow never clones a Git repository.
 3. Revalidates the stage, profile, dates, universe, config SHA-256, and Pod
    environment from the mounted immutable selection before downloading. Cache
    hits do not call the provider again. The script reads the requested vCPU

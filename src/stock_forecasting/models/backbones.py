@@ -1,7 +1,7 @@
 """Causal time-series backbones.
 
 The Kronos integration is deliberately lazy. Importing this package never imports
-the upstream Kronos repository and never downloads model weights.
+the bundled upstream source snapshot and never downloads model weights.
 """
 
 from __future__ import annotations
@@ -114,8 +114,8 @@ class DeterministicTimeSeriesBackbone(nn.Module):
 class KronosBackbone(nn.Module):
     """Adapter exposing causal hidden states from the official Kronos implementation.
 
-    The upstream Kronos repository must be installed or placed on ``PYTHONPATH`` so
-    that its top-level ``model`` package is importable. The adapter uses the public
+    The pinned Kronos source bundled with this project is placed on ``PYTHONPATH``
+    before construction. The adapter uses the public
     ``KronosTokenizer.encode`` and ``Kronos.decode_s1`` methods. It intentionally
     does not fall back to forecast values when hidden states are unavailable.
     """
@@ -184,8 +184,8 @@ class KronosBackbone(nn.Module):
             upstream = importlib.import_module(model_module)
         except ImportError as error:
             raise OptionalDependencyError(
-                "The official Kronos repository is not importable. Clone/install "
-                "shiyu-coder/Kronos and expose its top-level 'model' package."
+                "The bundled Kronos source is not importable; run the project from "
+                "a complete verified source upload."
             ) from error
 
         kronos_class = getattr(upstream, "Kronos", None)

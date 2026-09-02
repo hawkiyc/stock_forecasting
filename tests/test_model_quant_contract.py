@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,7 +23,12 @@ from stock_forecasting.checkpointing import (
 from stock_forecasting.cli.prefetch_models import prefetch_repositories
 from stock_forecasting.config import ExperimentConfig
 from stock_forecasting.data import FinancialBatchCollator, FinancialWindowDataset
-from stock_forecasting.factory import _promote_trainable_parameters_to_fp32, build_model_bundle
+from stock_forecasting.factory import (
+    PINNED_KRONOS_SOURCE_REVISION,
+    _promote_trainable_parameters_to_fp32,
+    build_model_bundle,
+    verify_kronos_source_revision,
+)
 from stock_forecasting.models.backbones import (
     DeterministicTimeSeriesBackbone,
     KronosBackbone,
@@ -38,6 +44,25 @@ from stock_forecasting.training import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_bundled_kronos_source_matches_pinned_revision(tmp_path: Path) -> None:
+    source_root = ROOT / "src/stock_forecasting/_vendor/kronos"
+
+    assert (
+        verify_kronos_source_revision(source_root, PINNED_KRONOS_SOURCE_REVISION)
+        == PINNED_KRONOS_SOURCE_REVISION
+    )
+
+    tampered_root = tmp_path / "kronos"
+    shutil.copytree(source_root, tampered_root)
+    module_path = tampered_root / "model/module.py"
+    module_path.write_text(
+        module_path.read_text(encoding="utf-8") + "# tampered\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="source digest mismatch"):
+        verify_kronos_source_revision(tampered_root, PINNED_KRONOS_SOURCE_REVISION)
 
 
 def test_dataloader_worker_plan_is_cpu_and_memory_bounded() -> None:

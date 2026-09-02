@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Install reproducible tooling and source dependencies onto the network volume.
+# Install reproducible tooling onto the network volume.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,9 +18,8 @@ RUNPOD_EXPECTED_TORCH_VERSION="${RUNPOD_EXPECTED_TORCH_VERSION:-2.9.1+cu128}"
 RUNPOD_EXPECTED_CUDA_PREFIX="${RUNPOD_EXPECTED_CUDA_PREFIX:-12.8}"
 RUNPOD_EXPECTED_UBUNTU_VERSION="${RUNPOD_EXPECTED_UBUNTU_VERSION:-24.04}"
 RUNPOD_ROLE="${RUNPOD_ROLE:-gpu-train}"
-KRONOS_REPOSITORY="https://github.com/shiyu-coder/Kronos.git"
-KRONOS_COMMIT="67b630e67f6a18c9e9be918d9b4337c960db1e9a"
-KRONOS_ROOT="${KRONOS_ROOT:-${NETWORK_VOLUME_ROOT}/third_party/Kronos}"
+KRONOS_ROOT="${NETWORK_VOLUME_ROOT}/third_party/Kronos"
+BUNDLED_KRONOS_ROOT="${PROJECT_ROOT}/src/stock_forecasting/_vendor/kronos"
 PROJECT_VENV="${PROJECT_ROOT}/.venv"
 RUNTIME_VERIFIER="${PROJECT_ROOT}/scripts/verify_runpod_runtime.py"
 POETRY_OWNERSHIP_VERIFIER="${PROJECT_ROOT}/scripts/verify_poetry_runtime_ownership.py"
@@ -57,7 +56,8 @@ case "${NETWORK_VOLUME_ROOT}" in
         ;;
 esac
 for path_name in \
-    PROJECT_ROOT POETRY_ROOT POETRY_BIN KRONOS_ROOT PROJECT_VENV RUNTIME_VERIFIER \
+    PROJECT_ROOT POETRY_ROOT POETRY_BIN KRONOS_ROOT BUNDLED_KRONOS_ROOT \
+    PROJECT_VENV RUNTIME_VERIFIER \
     POETRY_OWNERSHIP_VERIFIER POETRY_LOCK_FILTER IMAGE_RUNTIME_METADATA \
     VENV_RUNTIME_METADATA POETRY_LOCK_WORK_ROOT POETRY_LOCK_INSTALL POETRY_LOCK_BACKUP \
     PIP_CACHE_DIR TMPDIR; do
@@ -84,10 +84,6 @@ if ! "${RUNPOD_PYTHON_BIN}" -c \
     echo "The approved RunPod image environment requires Python 3.12" >&2
     exit 2
 fi
-if ! command -v git >/dev/null 2>&1; then
-    echo "git is required to provision Kronos" >&2
-    exit 127
-fi
 mkdir -p "${PIP_CACHE_DIR}" "${TMPDIR}"
 
 if [[ "${RUNPOD_SETUP_DRY_RUN:-0}" == "1" ]]; then
@@ -98,7 +94,8 @@ if [[ "${RUNPOD_SETUP_DRY_RUN:-0}" == "1" ]]; then
     printf 'RunPod role: %s; physical CUDA device required: %s\n' \
         "${RUNPOD_ROLE}" "$([[ "${RUNPOD_ROLE}" == "gpu-train" ]] && printf yes || printf no)"
     printf 'Would create a Python 3.12 system-site-packages venv at %s\n' "${PROJECT_VENV}"
-    printf 'Would provision Kronos %s at commit %s\n' "${KRONOS_REPOSITORY}" "${KRONOS_COMMIT}"
+    printf 'Would install the pinned bundled Kronos source at %s without Git\n' \
+        "${KRONOS_ROOT}"
     printf 'Would install locked project and dev dependencies for %s without replacing image PyTorch\n' \
         "${PROJECT_ROOT}"
     printf 'Would reject any PyTorch or CUDA package managed by Poetry\n'
@@ -126,25 +123,31 @@ fi
     "${CUDA_DEVICE_ARGUMENTS[@]}" \
     --output "${IMAGE_RUNTIME_METADATA}"
 
-if [[ -d "${KRONOS_ROOT}/.git" ]]; then
-    CURRENT_COMMIT="$(git -C "${KRONOS_ROOT}" rev-parse HEAD)"
-    CURRENT_ORIGIN="$(git -C "${KRONOS_ROOT}" remote get-url origin)"
-    if [[ "${CURRENT_COMMIT}" != "${KRONOS_COMMIT}" ]]; then
-        echo "Existing Kronos checkout is at ${CURRENT_COMMIT}; refusing to overwrite it" >&2
-        exit 3
-    fi
-    if [[ "${CURRENT_ORIGIN}" != "${KRONOS_REPOSITORY}" ]]; then
-        echo "Existing Kronos checkout has an unexpected origin; refusing to use it" >&2
-        exit 3
-    fi
-elif [[ -e "${KRONOS_ROOT}" ]]; then
-    echo "KRONOS_ROOT exists but is not the pinned Git checkout; refusing to overwrite it" >&2
+if [[ ! -d "${BUNDLED_KRONOS_ROOT}/model" \
+    || -L "${BUNDLED_KRONOS_ROOT}" \
+    || -L "${BUNDLED_KRONOS_ROOT}/model" ]]; then
+    echo "Bundled Kronos source is missing or unsafe: ${BUNDLED_KRONOS_ROOT}" >&2
     exit 3
-else
-    mkdir -p "$(dirname "${KRONOS_ROOT}")"
-    git clone --no-checkout "${KRONOS_REPOSITORY}" "${KRONOS_ROOT}"
-    git -C "${KRONOS_ROOT}" checkout --detach "${KRONOS_COMMIT}"
 fi
+if [[ -L "${KRONOS_ROOT}" || ( -e "${KRONOS_ROOT}" && ! -d "${KRONOS_ROOT}" ) ]]; then
+    echo "Kronos destination is not a safe directory: ${KRONOS_ROOT}" >&2
+    exit 3
+fi
+if [[ -L "${KRONOS_ROOT}/model" \
+    || ( -e "${KRONOS_ROOT}/model" && ! -d "${KRONOS_ROOT}/model" ) ]]; then
+    echo "Kronos model destination is not a safe directory: ${KRONOS_ROOT}/model" >&2
+    exit 3
+fi
+mkdir -p "${KRONOS_ROOT}/model"
+for relative_path in LICENSE model/__init__.py model/kronos.py model/module.py; do
+    bundled_path="${BUNDLED_KRONOS_ROOT}/${relative_path}"
+    installed_path="${KRONOS_ROOT}/${relative_path}"
+    if [[ ! -f "${bundled_path}" || -L "${bundled_path}" || -L "${installed_path}" ]]; then
+        echo "Bundled Kronos source file is missing or unsafe: ${bundled_path}" >&2
+        exit 3
+    fi
+    cp -p -- "${bundled_path}" "${installed_path}"
+done
 
 if [[ ! -x "${POETRY_BIN}" ]]; then
     if [[ -x "${POETRY_ROOT}/bin/python" ]]; then
@@ -164,7 +167,6 @@ export POETRY_CACHE_DIR="${NETWORK_VOLUME_ROOT}/cache/pypoetry"
 # Install from the lock view without resolving omitted image packages back in.
 export POETRY_INSTALLER_RE_RESOLVE=false
 export HF_HOME="${NETWORK_VOLUME_ROOT}/cache/huggingface"
-export KRONOS_ROOT
 export RUNPOD_VOLUME_ROOT="${NETWORK_VOLUME_ROOT}"
 for path_name in POETRY_CACHE_DIR HF_HOME; do
     runpod_validate_path_in_root \

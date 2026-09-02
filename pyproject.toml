@@ -60,6 +60,7 @@ pythonpath = ["src"]
 [tool.ruff]
 target-version = "py312"
 line-length = 100
+exclude = ["src/stock_forecasting/_vendor/kronos"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

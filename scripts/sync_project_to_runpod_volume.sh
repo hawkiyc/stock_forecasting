@@ -90,6 +90,7 @@ append_manifest_file() {
 for root_file in README.md pyproject.toml; do
     append_manifest_file "${root_file}"
 done
+append_manifest_file "src/stock_forecasting/_vendor/kronos/LICENSE"
 for relay_file in \
     cloudrun/tpex-relay/package.json \
     cloudrun/tpex-relay/src/relay.mjs \

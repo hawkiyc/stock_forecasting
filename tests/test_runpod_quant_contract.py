@@ -77,6 +77,29 @@ def test_all_shell_scripts_remain_syntax_valid() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_runpod_runtime_never_executes_git() -> None:
+    shell_runtime = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((ROOT / "scripts").rglob("*.sh"))
+    )
+    python_runtime = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((ROOT / "src/stock_forecasting").rglob("*.py"))
+        if "_vendor/kronos" not in path.as_posix()
+    )
+
+    for forbidden in (
+        "git clone",
+        "git checkout",
+        "git rev-parse",
+        "git remote",
+        '["git",',
+        "['git',",
+    ):
+        assert forbidden not in shell_runtime
+        assert forbidden not in python_runtime
+
+
 def test_runpod_entrypoint_scripts_declare_explicit_interpreters() -> None:
     entrypoints = (
         ROOT / "scripts/create_runpod_cpu_pod.sh",
@@ -1122,15 +1145,30 @@ def test_stage_configs_have_identical_architecture_digest() -> None:
     assert stage1.model_architecture_digest() == stage2.model_architecture_digest()
 
 
-def test_runpod_setup_and_stage_configs_pin_the_same_kronos_revision() -> None:
+def test_runpod_setup_uses_bundled_kronos_source_without_remote_git() -> None:
     stage1 = ExperimentConfig.from_yaml(ROOT / "configs/stage1_kronos_base_lora.yaml")
     stage2 = ExperimentConfig.from_yaml(ROOT / "configs/stage2_kronos_base_lora.yaml")
     setup = (ROOT / "scripts/setup_runpod_environment.sh").read_text(encoding="utf-8")
+    sync = (ROOT / "scripts/sync_project_to_runpod_volume.sh").read_text(
+        encoding="utf-8"
+    )
+    factory = (ROOT / "src/stock_forecasting/factory.py").read_text(encoding="utf-8")
     revision = stage1.model.kronos_source_revision
 
     assert revision is not None
     assert stage2.model.kronos_source_revision == revision
-    assert f'KRONOS_COMMIT="{revision}"' in setup
+    assert stage1.model.kronos_source_root == stage2.model.kronos_source_root
+    assert stage1.model.kronos_source_root.as_posix().endswith(
+        "/third_party/Kronos"
+    )
+    assert "BUNDLED_KRONOS_ROOT" in setup
+    assert "Would install the pinned bundled Kronos source" in setup
+    assert "model/kronos.py" in setup
+    assert 'append_manifest_file "src/stock_forecasting/_vendor/kronos/LICENSE"' in sync
+    assert "git clone" not in setup
+    assert "git -C" not in setup
+    assert "command -v git" not in setup
+    assert '["git",' not in factory
 
 
 def test_stage_configs_pin_identical_hugging_face_weight_revisions() -> None:

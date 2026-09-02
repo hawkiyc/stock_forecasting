@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import subprocess
+import hashlib
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -21,6 +21,14 @@ from stock_forecasting.models import (
     lora_parameter_names,
 )
 
+PINNED_KRONOS_SOURCE_REVISION = "67b630e67f6a18c9e9be918d9b4337c960db1e9a"
+PINNED_KRONOS_SOURCE_FILES = {
+    "LICENSE": "acb2d194d378204e5f2be4dcd24d39ecac437903620c790c3315a96dab388fdc",
+    "model/__init__.py": "7bada2fa83c8c3df045caf06a92050a3ab631964fee8ffadcad218f81c3e696e",
+    "model/kronos.py": "107abe371db5d17f80bb1342ae1c381935d53db65e217778f7afb917b39a4c2f",
+    "model/module.py": "8b0c1d535b07e667295ee2daba6e04474dfefef898d0581ba8105d3143d7f312",
+}
+
 
 @dataclass(frozen=True)
 class ModelBundle:
@@ -36,31 +44,33 @@ def _dtype(name: str) -> torch.dtype:
 
 
 def verify_kronos_source_revision(source_root: Path, expected_revision: str) -> str:
-    """Require the configured Kronos source tree to be the exact approved commit."""
+    """Verify the bundled Kronos source without invoking a remote Git client."""
 
     if not source_root.is_dir():
-        raise FileNotFoundError(f"Pinned Kronos source is missing: {source_root}")
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(source_root), "rev-parse", "HEAD"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except FileNotFoundError as error:
-        raise RuntimeError("git is required to verify the pinned Kronos source") from error
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError("Timed out while verifying the pinned Kronos source") from error
-    actual_revision = result.stdout.strip()
-    if result.returncode != 0 or len(actual_revision) != 40:
-        raise ValueError(f"Kronos source is not a readable Git checkout: {source_root}")
-    if actual_revision != expected_revision:
+        raise FileNotFoundError(f"Bundled Kronos source is missing: {source_root}")
+    if source_root.is_symlink():
+        raise ValueError(f"Bundled Kronos source must not be a symlink: {source_root}")
+    if expected_revision != PINNED_KRONOS_SOURCE_REVISION:
         raise ValueError(
             "Kronos source revision mismatch: "
-            f"expected {expected_revision}, found {actual_revision}"
+            f"config requests {expected_revision}, bundled source is "
+            f"{PINNED_KRONOS_SOURCE_REVISION}"
         )
-    return actual_revision
+    resolved_root = source_root.resolve(strict=True)
+    for relative_path, expected_sha256 in PINNED_KRONOS_SOURCE_FILES.items():
+        source_path = source_root / relative_path
+        if not source_path.is_file() or source_path.is_symlink():
+            raise FileNotFoundError(f"Bundled Kronos source file is missing: {source_path}")
+        resolved_path = source_path.resolve(strict=True)
+        if not resolved_path.is_relative_to(resolved_root):
+            raise ValueError(f"Bundled Kronos source escapes its root: {source_path}")
+        actual_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ValueError(
+                "Bundled Kronos source digest mismatch: "
+                f"{relative_path} expected {expected_sha256}, found {actual_sha256}"
+            )
+    return PINNED_KRONOS_SOURCE_REVISION
 
 
 def _prepare_kronos_import(source_root: Path, expected_revision: str) -> None:
