@@ -10,11 +10,12 @@ import torch
 
 from stock_forecasting.config import ExperimentConfig
 from stock_forecasting.data.manifest import (
-    validate_dataset_preparation_contract,
+    validate_dataset_storage_contract,
     validate_training_dataset_manifest,
 )
 from stock_forecasting.factory import verify_kronos_source_revision
 from stock_forecasting.training_paths import resolve_bar_store_path
+from stock_forecasting.training_stage_contract import PRODUCTION_STAGE_SAMPLE_CONTRACTS
 
 
 @dataclass
@@ -66,6 +67,11 @@ def run_preflight(
             "environment": "runpod" if on_runpod else "local",
             "training_stage": config.training.stage,
             "training_fraction": str(config.data.train_fraction),
+            "training_max_samples": (
+                "unbounded"
+                if config.data.max_samples is None
+                else str(config.data.max_samples)
+            ),
             "dataset_profile": config.data.dataset_profile,
             "selected_datasets": ",".join(config.data.selected_datasets),
             "model_architecture_sha256": config.model_architecture_digest(),
@@ -96,23 +102,15 @@ def run_preflight(
                 report.errors.append(str(error))
             else:
                 try:
-                    preparation_spec = validate_dataset_preparation_contract(
+                    storage_spec = validate_dataset_storage_contract(
                         manifest,
                         input_length=config.data.input_length,
-                        h_start=config.data.h_start,
                         max_horizon=config.data.max_horizon,
-                        alpha_horizons=config.data.alpha_horizons,
                         benchmark_mapping_path=config.data.benchmark_mapping_path,
-                        sample_stride=config.data.sample_stride,
                         effective_embargo_trading_days=(
                             config.data.effective_embargo_trading_days
                         ),
-                        forecast_horizon=config.data.forecast_horizon,
-                        diagnostic_horizons=config.data.diagnostic_horizons,
-                        stride=config.data.stride,
-                        flat_volatility_multiplier=config.data.flat_volatility_multiplier,
                         max_abs_log_return=config.data.max_abs_log_return,
-                        embargo_trading_days=config.data.embargo_trading_days,
                     )
                 except ValueError as error:
                     report.errors.append(str(error))
@@ -123,10 +121,10 @@ def run_preflight(
                     report.facts["valid_cutoffs"] = str(
                         sum(manifest["split_counts"].values())
                     )
-                    report.facts["preparation_spec_sha256"] = str(
-                        manifest["preparation_spec_sha256"]
+                    report.facts["storage_preparation_spec_sha256"] = str(
+                        manifest["storage_preparation_spec_sha256"]
                     )
-                    report.facts["input_length"] = str(preparation_spec["window_size"])
+                    report.facts["input_length"] = str(storage_spec["window_size"])
         elif not config.data.raw_path.is_file():
             report.errors.append(f"Raw Parquet is missing: {config.data.raw_path}")
 
@@ -165,8 +163,18 @@ def run_preflight(
     elif config.model.time_series_backend == "kronos":
         report.warnings.append("Kronos will run on CPU outside RunPod and may be slow")
 
-    if config.training.stage == "stage1" and config.data.train_fraction != 0.03:
-        report.errors.append("Stage 1 must use exactly 3% of the training split")
-    if config.training.stage == "stage2" and config.data.train_fraction != 1.0:
-        report.errors.append("Stage 2 must use the complete training split")
+    sample_contract = PRODUCTION_STAGE_SAMPLE_CONTRACTS[config.training.stage]
+    if config.data.train_fraction != sample_contract["train_fraction"]:
+        report.errors.append(
+            f"{config.training.stage} must use train_fraction="
+            f"{sample_contract['train_fraction']}"
+        )
+    if (
+        config.model.time_series_backend == "kronos"
+        and config.data.max_samples != sample_contract["max_samples"]
+    ):
+        report.errors.append(
+            f"{config.training.stage} must use max_samples="
+            f"{sample_contract['max_samples']}"
+        )
     return report

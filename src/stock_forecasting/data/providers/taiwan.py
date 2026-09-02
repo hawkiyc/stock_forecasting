@@ -9,7 +9,8 @@ from typing import Any, ClassVar
 import numpy as np
 import pandas as pd
 
-from stock_forecasting.data.benchmarks import is_allowlisted_unleveraged_equity_etf
+from stock_forecasting.data.adjustments import apply_cumulative_adjustments
+from stock_forecasting.data.benchmarks import is_allowlisted_taiwan_equity_etf
 from stock_forecasting.data.schema import normalize_ohlcv_frame
 
 from .base import Instrument, ProviderFetch, RequestRecord
@@ -201,7 +202,7 @@ def _asset_type(code: str, *, market: str) -> str | None:
         suffix = "TW" if market == "TWSE" else "TWO"
         return (
             "etf"
-            if is_allowlisted_unleveraged_equity_etf(
+            if is_allowlisted_taiwan_equity_etf(
                 symbol=f"{code}.{suffix}",
                 market=market,
             )
@@ -286,6 +287,7 @@ class _TaiwanMarketProvider:
     market: str
     suffix: str
     endpoint: str
+    action_adjustment_source: str
     aliases: dict[str, set[str]]
 
     def __init__(self, client: CachedJsonClient) -> None:
@@ -328,6 +330,25 @@ class _TaiwanMarketProvider:
             metadata={"dropped_rows": dropped, "date": date},
         )
 
+    def fetch_adjusted_date(
+        self,
+        *,
+        date: str,
+        dataset_profile: str,
+        action_frame: pd.DataFrame,
+    ) -> tuple[ProviderFetch, pd.DataFrame]:
+        """Fetch one session and apply the provider's durable action factors."""
+
+        fetched = self.fetch_date(
+            date=date,
+            dataset_profile=dataset_profile,
+        )
+        if fetched.frame.empty:
+            return fetched, fetched.frame
+        adjusted = apply_cumulative_adjustments(fetched.frame, action_frame)
+        adjusted["adjustment_source"] = self.action_adjustment_source
+        return fetched, adjusted
+
     def fetch_instrument(
         self,
         instrument: Instrument,
@@ -345,6 +366,7 @@ class TWSEProvider(_TaiwanMarketProvider):
     market = "TWSE"
     suffix = "TW"
     endpoint = "https://www.twse.com.tw/exchangeReport/MI_INDEX"
+    action_adjustment_source = "twse_twt49u"
     aliases: ClassVar[dict[str, set[str]]] = {
         "symbol": {"證券代號"},
         "open": {"開盤價"},
@@ -510,6 +532,7 @@ class TPExProvider(_TaiwanMarketProvider):
     market = "TPEX"
     suffix = "TWO"
     endpoint = "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes"
+    action_adjustment_source = "tpex_exdailyq"
     aliases: ClassVar[dict[str, set[str]]] = {
         "symbol": {"代號", "證券代號"},
         "open": {"開盤", "開盤價"},

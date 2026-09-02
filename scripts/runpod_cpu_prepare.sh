@@ -26,6 +26,7 @@ PREP_DIR="${LOG_ROOT}/cpu-prep/${LAUNCH_ID}"
 PREP_LOG="${RUNPOD_TMUX_LOG_FILE:-${PREP_DIR}/combined.log}"
 CODE_MARKER="${LIFECYCLE_ROOT}/stage1/code.json"
 DATASET_MARKER="${LIFECYCLE_ROOT}/stage1/dataset.json"
+CPU_PREPARATION_MARKER="${LIFECYCLE_ROOT}/stage1/cpu-preparation.json"
 MODEL_MANIFEST="${NETWORK_VOLUME_ROOT}/cache/hf-models.json"
 STAGING_ROOT="${NETWORK_VOLUME_ROOT}/tmp/stage1-prep/${LAUNCH_ID}"
 DATA_STAGING_ROOT="${STAGING_ROOT}/data"
@@ -208,7 +209,8 @@ else
 fi
 for path_name in \
     PROJECT_ROOT DATA_ROOT LOG_ROOT LIFECYCLE_ROOT POETRY_BIN CONFIG_PATH \
-    PREP_DIR PREP_LOG CODE_MARKER DATASET_MARKER MODEL_MANIFEST STAGING_ROOT \
+    PREP_DIR PREP_LOG CODE_MARKER DATASET_MARKER CPU_PREPARATION_MARKER \
+    MODEL_MANIFEST STAGING_ROOT \
     DATA_STAGING_ROOT RAW_STAGING DOWNLOAD_MANIFEST_STAGING \
     DATASET_MANIFEST_STAGING REQUEST_LOG_STAGING RAW_FINAL BAR_STORE_FINAL \
     BAR_STORE_SUCCESS \
@@ -283,11 +285,44 @@ for final_data_file in "${FINAL_DATA_FILES[@]}"; do
     fi
 done
 
+archive_dataset_readiness() {
+    local reason="$1"
+    local history_root="${LIFECYCLE_ROOT}/stage1/history"
+    local history_path="${history_root}/dataset-${LAUNCH_ID}-${reason}.json"
+
+    if [[ ! -e "${DATASET_MARKER}" && ! -L "${DATASET_MARKER}" ]]; then
+        return 0
+    fi
+    runpod_validate_path_in_root \
+        "${history_path}" "${LIFECYCLE_ROOT}" history_path LIFECYCLE_ROOT
+    mkdir -p "${history_root}"
+    mv "${DATASET_MARKER}" "${history_path}"
+    printf 'Archived invalidated dataset readiness marker: %s\n' \
+        "${history_path}" >&2
+}
+
+archive_stale_dataset_readiness() {
+    if [[ ! -e "${DATASET_MARKER}" && ! -L "${DATASET_MARKER}" ]]; then
+        return 0
+    fi
+    if [[ ! -L "${DATASET_MARKER}" ]] \
+        && "${RUNPOD_PYTHON_BIN}" "${RUNPOD_SELECTION_HELPER}" verify-marker \
+            --project-root "${PROJECT_ROOT}" \
+            --selection "${RUNPOD_REMOTE_SELECTION_PATH}" \
+            --marker "${DATASET_MARKER}" >/dev/null 2>&1; then
+        return 0
+    fi
+    # dataset.json is the canonical pointer for the active selection. Preserve
+    # an older immutable marker in history instead of reporting it as current.
+    archive_dataset_readiness stale-selection
+}
+
 quarantine_known_files() {
     local reason="$1"
     shift
     local quarantine_root="${DATA_ROOT}/quarantine/${reason}-${LAUNCH_ID}"
     local source relative destination
+    archive_dataset_readiness "${reason}"
     runpod_validate_path_in_root \
         "${quarantine_root}" "${DATA_ROOT}" quarantine_root DATA_ROOT
     for source in "$@"; do
@@ -350,9 +385,9 @@ write_lifecycle_state() {
     local exit_code="${2:-}"
     local command=(
         "${RUNPOD_PYTHON_BIN}" "${SCRIPT_DIR}/runpod_readiness.py" write-state
-        --output "${DATASET_MARKER}"
+        --output "${CPU_PREPARATION_MARKER}"
         --network-volume-root "${NETWORK_VOLUME_ROOT}"
-        --kind stage1-dataset
+        --kind stage1-cpu-preparation
         --state "${state}"
         --launch-id "${LAUNCH_ID}"
         --log-path "${PREP_LOG}"
@@ -377,9 +412,7 @@ finish_cpu_prep() {
     elif [[ ${prep_exit_code} -eq 124 ]]; then
         prep_state=timed_out
     fi
-    if [[ ${PREP_SUCCEEDED} -ne 1 ]]; then
-        write_lifecycle_state "${prep_state}" "${prep_exit_code}" || true
-    fi
+    write_lifecycle_state "${prep_state}" "${prep_exit_code}" || true
     printf '{"started_at":"%s","ended_at":"%s","exit_code":%d,"state":"%s","log_path":"%s","requested_cpu_count":%d,"detected_cpu_count":%d,"effective_workers":%d,"max_runtime_seconds":%d,"preparation_reserve_seconds":%d,"max_api_calls":%s,"eodhd_qps":"%s","taiwan_qps":"%s","provider_max_backoff_seconds":%d,"acquisition_deadline_epoch_seconds":%d}\n' \
         "${STARTED_AT}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${prep_exit_code}" \
         "${prep_state}" \
@@ -414,6 +447,7 @@ fi
 "${RUNPOD_PYTHON_BIN}" "${RUNPOD_SELECTION_HELPER}" verify-environment \
     --project-root "${PROJECT_ROOT}" \
     --selection "${RUNPOD_REMOTE_SELECTION_PATH}"
+archive_stale_dataset_readiness
 
 bash "${SCRIPT_DIR}/bootstrap_network_volume.sh"
 RUNPOD_ROLE=cpu-prep bash "${SCRIPT_DIR}/setup_runpod_environment.sh"
@@ -452,16 +486,33 @@ if [[ ${REUSE_READY_DATASET} -eq 1 ]]; then
     if ! "${POETRY_BIN}" run fin-ts-verify-download \
         --manifest "${DOWNLOAD_MANIFEST_FINAL}" \
         --raw "${RAW_FINAL}"; then
-        quarantine_known_files obsolete-security-scope "${FINAL_DATA_FILES[@]}"
+        quarantine_known_files incompatible-acquisition "${FINAL_DATA_FILES[@]}"
         REUSE_READY_DATASET=0
         REUSE_DOWNLOADED_DATASET=0
-        printf 'The immutable dataset uses an obsolete acquisition security scope; rebuilding from verified provider cache entries.\n' >&2
+        printf 'The immutable acquisition checkpoint has an obsolete content contract; rebuilding from verified provider cache entries without deleting API cache.\n' >&2
     fi
 fi
 if [[ ${REUSE_READY_DATASET} -eq 1 ]]; then
     "${RUNPOD_PYTHON_BIN}" "${SCRIPT_DIR}/runpod_readiness.py" check-code \
         --marker "${CODE_MARKER}" \
         --project-root "${PROJECT_ROOT}"
+    if ! "${POETRY_BIN}" run fin-ts-verify-stage1-data \
+        --dataset-manifest "${DATASET_MANIFEST_FINAL}" \
+        --code-manifest "${CODE_MARKER}" \
+        --model-manifest "${MODEL_MANIFEST}" \
+        --config "${CONFIG_PATH}" \
+        --volume-root "${NETWORK_VOLUME_ROOT}" \
+        --launch-id "${LAUNCH_ID}" \
+        --verify-only; then
+        quarantine_known_files incompatible-dataset-manifest \
+            "${DATASET_MANIFEST_FINAL}"
+        REUSE_READY_DATASET=0
+        REUSE_DOWNLOADED_DATASET=1
+        printf '%s\n' \
+            'Provider materialization remains valid. The dataset manifest will be regenerated; fin-ts-prepare will reuse a content-compatible bar store or quarantine and rebuild only that derived store when its content identity changed.' >&2
+    fi
+fi
+if [[ ${REUSE_READY_DATASET} -eq 1 ]]; then
     "${POETRY_BIN}" run fin-ts-verify-stage1-data \
         --dataset-manifest "${DATASET_MANIFEST_FINAL}" \
         --code-manifest "${CODE_MARKER}" \
@@ -611,19 +662,13 @@ set +e
     --output "${BAR_STORE_FINAL}" \
     --download-manifest "${DOWNLOAD_MANIFEST_FINAL}" \
     --dataset-manifest "${DATASET_MANIFEST_STAGING}" \
-    --window-size 128 \
     --stride 5 \
     --sample-stride 1 \
     --h-start "${FIN_TS_H_START}" \
     --target-horizon 5 \
     --diagnostic-horizons 1 20 \
     --flat-volatility-multiplier 0.25 \
-    --max-abs-log-return 0.5 \
-    --train-fraction 0.70 \
-    --validation-fraction 0.15 \
-    --purge-bars 20 \
     --embargo-bars 5 \
-    --effective-embargo-bars 14 \
     --deadline-epoch-seconds "$((WORKFLOW_DEADLINE_EPOCH - 120))" \
     --workers "${FIN_TS_CPU_WORKERS}"
 PREPARE_EXIT_CODE=$?

@@ -12,26 +12,22 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.data.content_identity import (
+    code_content_identity,
+    content_identity_digest,
+    dataset_content_identity,
+    semantic_source_paths,
+)
 from stock_forecasting.data.manifest import (
-    canonical_json_sha256,
     load_dataset_manifest,
     sha256_file,
-    validate_dataset_preparation_contract,
+    validate_dataset_storage_contract,
     validate_training_dataset_manifest,
 )
 from stock_forecasting.training_paths import resolve_bar_store_path
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-_PIPELINE_PATHS = (
-    "src/stock_forecasting/cli/prepare_data.py",
-    "src/stock_forecasting/data/bar_store.py",
-    "src/stock_forecasting/data/adjustments.py",
-    "src/stock_forecasting/data/benchmarks.py",
-    "src/stock_forecasting/data/horizons.py",
-    "src/stock_forecasting/data/manifest.py",
-    "src/stock_forecasting/data/schema.py",
-    "src/stock_forecasting/data/splits.py",
-)
+_PIPELINE_PATHS = tuple(semantic_source_paths())
 
 
 def _load_json_object(path: Path, label: str) -> dict[str, Any]:
@@ -98,11 +94,16 @@ def _validate_code_manifest(path: Path) -> dict[str, Any]:
     missing = sorted(set(_PIPELINE_PATHS).difference(by_path))
     if missing:
         raise ValueError("Code manifest omits numerical pipeline files: " + ", ".join(missing))
-    pipeline_payload = {
-        relative.removeprefix("src/stock_forecasting/"): by_path[relative]["sha256"]
-        for relative in _PIPELINE_PATHS
-    }
-    payload["quant_pipeline_digest"] = canonical_json_sha256(pipeline_payload)
+    declared_paths = payload.get("data_pipeline_paths")
+    content_identity = payload.get("data_content_identity")
+    expected_content_identity = code_content_identity()
+    if declared_paths != list(_PIPELINE_PATHS):
+        raise ValueError("Code manifest numerical pipeline scope is invalid")
+    if content_identity != expected_content_identity:
+        raise ValueError("Code manifest data content identity differs from mounted source")
+    if payload.get("data_pipeline_digest") != content_identity_digest(content_identity):
+        raise ValueError("Code manifest data content digest is inconsistent")
+    payload["quant_content_identity"] = content_identity
     return payload
 
 
@@ -223,30 +224,16 @@ def build_readiness_manifest(
         raw_path=raw_path,
         bar_store_path=bar_store_manifest_path.parent,
     )
-    storage_preparation_spec = validate_dataset_preparation_contract(
+    storage_preparation_spec = validate_dataset_storage_contract(
         dataset,
         input_length=config.data.input_length,
-        h_start=config.data.h_start,
         max_horizon=config.data.max_horizon,
-        alpha_horizons=config.data.alpha_horizons,
         benchmark_mapping_path=config.data.benchmark_mapping_path,
-        sample_stride=config.data.sample_stride,
         effective_embargo_trading_days=config.data.effective_embargo_trading_days,
-        forecast_horizon=config.data.forecast_horizon,
-        diagnostic_horizons=config.data.diagnostic_horizons,
-        stride=config.data.stride,
-        flat_volatility_multiplier=config.data.flat_volatility_multiplier,
         max_abs_log_return=config.data.max_abs_log_return,
-        embargo_trading_days=config.data.embargo_trading_days,
     )
     if dataset.get("selected_datasets") != sorted(config.data.selected_datasets):
         raise ValueError("Dataset providers differ from the selected data profile")
-    resolved_preparation_spec = {
-        **storage_preparation_spec,
-        "h_start": config.data.h_start,
-        "alpha_horizons": config.data.alpha_horizons,
-    }
-
     download_manifest = dataset.get("download_manifest")
     download_path = _manifest_artifact_path(
         dataset_manifest_path,
@@ -274,7 +261,17 @@ def build_readiness_manifest(
     )
 
     code = _validate_code_manifest(code_manifest_path)
-    if dataset.get("data_pipeline_digest") != code["quant_pipeline_digest"]:
+    code_identity = code["quant_content_identity"]
+    expected_dataset_identity = dataset_content_identity(
+        dataset["selected_datasets"],
+        provider_digests=code_identity["provider_materialization_digests"],
+        raw_digest=code_identity["raw_materialization_digest"],
+    )
+    if (
+        dataset.get("data_content_identity") != expected_dataset_identity
+        or dataset.get("data_pipeline_digest")
+        != content_identity_digest(expected_dataset_identity)
+    ):
         raise ValueError("Dataset was prepared with a different numerical pipeline revision")
     model = _validate_model_manifest(
         model_manifest_path,
@@ -321,10 +318,13 @@ def build_readiness_manifest(
         "split_counts": split_counts,
         "valid_cutoff_count": sum(split_counts.values()),
         "split_audit": dataset["split_audit"],
-        "preparation_spec": resolved_preparation_spec,
-        "preparation_spec_sha256": canonical_json_sha256(resolved_preparation_spec),
-        "storage_preparation_spec_sha256": dataset["preparation_spec_sha256"],
+        "preparation_provenance": dataset["preparation_provenance"],
+        "storage_preparation_spec": storage_preparation_spec,
+        "storage_preparation_spec_sha256": dataset[
+            "storage_preparation_spec_sha256"
+        ],
         "data_pipeline_digest": dataset["data_pipeline_digest"],
+        "data_content_identity": dataset["data_content_identity"],
         "code_release_digest": code.get("release_digest"),
         "models_local_files_only_verified": True,
         "model_repositories": sorted(model["repositories"]),

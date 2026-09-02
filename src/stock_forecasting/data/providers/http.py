@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -542,13 +544,80 @@ class CachedJsonClient:
     def _cache_path(self, request_sha256: str) -> Path:
         return self.raw_cache_root / self.provider / request_sha256[:2] / f"{request_sha256}.json"
 
-    def _cached_path(self, request_sha256: str) -> Path | None:
+    def _cache_candidates(self, request_sha256: str) -> tuple[Path, ...]:
         relative = Path(self.provider) / request_sha256[:2] / f"{request_sha256}.json"
-        for root in (self.raw_cache_root, *self.read_cache_roots):
-            candidate = root / relative
-            if candidate.is_file() and not candidate.is_symlink():
-                return candidate
+        return tuple(root / relative for root in (self.raw_cache_root, *self.read_cache_roots))
+
+    @staticmethod
+    def _read_cache_entry(path: Path) -> tuple[Any, bytes]:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Provider cache entry must be a regular file")
+        body = path.read_bytes()
+        return json.loads(body), body
+
+    def _quarantine_corrupt_primary_cache(self, path: Path) -> None:
+        """Move a corrupt writable entry aside without touching fallback caches."""
+
+        if path.parent.parent.parent != self.raw_cache_root:
+            return
+        quarantine = path.with_name(f"{path.name}.corrupt-{uuid.uuid4().hex}")
+        try:
+            path.replace(quarantine)
+        except FileNotFoundError:
+            # Another process may already have repaired the same immutable key.
+            return
+
+    def _load_cached_response(
+        self,
+        request_sha256: str,
+    ) -> tuple[Any, bytes, Path] | None:
+        for index, candidate in enumerate(self._cache_candidates(request_sha256)):
+            if not candidate.exists() and not candidate.is_symlink():
+                continue
+            try:
+                payload, body = self._read_cache_entry(candidate)
+            except (OSError, ValueError):
+                if index == 0 and not candidate.is_symlink():
+                    self._quarantine_corrupt_primary_cache(candidate)
+                # Read-only fallback namespaces are never mutated. A later valid
+                # fallback or a fresh network response may repair the primary.
+                continue
+            return payload, body, candidate
         return None
+
+    def _publish_cache_entry(
+        self,
+        path: Path,
+        *,
+        body: bytes,
+        payload: Any,
+    ) -> tuple[Any, bytes]:
+        """Publish validated JSON with create-if-absent atomicity across processes."""
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(body)
+                stream.flush()
+                os.fsync(stream.fileno())
+            while True:
+                try:
+                    os.link(temporary, path, follow_symlinks=False)
+                    return payload, body
+                except FileExistsError as error:
+                    if path.is_symlink():
+                        raise ValueError(
+                            "Provider cache entry must not be a symbolic link"
+                        ) from error
+                    try:
+                        existing_payload, existing_body = self._read_cache_entry(path)
+                    except (OSError, ValueError):
+                        self._quarantine_corrupt_primary_cache(path)
+                        continue
+                    return existing_payload, existing_body
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _record(
         self,
@@ -581,11 +650,11 @@ class CachedJsonClient:
             self.request_budget.check_time()
         request_sha256, _identity = self._identity(endpoint=endpoint, params=params)
         cache_path = self._cache_path(request_sha256)
-        cached_path = self._cached_path(request_sha256)
-        if cached_path is not None:
-            body = cached_path.read_bytes()
+        cached = self._load_cached_response(request_sha256)
+        if cached is not None:
+            payload, body, cached_path = cached
             return (
-                json.loads(body),
+                payload,
                 self._record(
                     request_sha256=request_sha256,
                     body=body,
@@ -629,13 +698,11 @@ class CachedJsonClient:
                 response.raise_for_status()
                 body = response.content
                 payload = json.loads(body)
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    with cache_path.open("xb") as stream:
-                        stream.write(body)
-                except FileExistsError:
-                    body = cache_path.read_bytes()
-                    payload = json.loads(body)
+                payload, body = self._publish_cache_entry(
+                    cache_path,
+                    body=body,
+                    payload=payload,
+                )
                 return (
                     payload,
                     self._record(

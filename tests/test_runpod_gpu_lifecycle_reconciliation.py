@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import importlib.util
 import json
 import os
@@ -11,6 +10,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+
+from stock_forecasting.data.content_identity import (
+    code_content_identity,
+    dataset_content_identity,
+    semantic_source_paths,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 READINESS_PATH = ROOT / "scripts/runpod_readiness.py"
@@ -154,8 +159,16 @@ def test_orphaned_finalization_preserves_completed_training() -> None:
 
 
 def test_dataset_compatibility_ignores_release_only_changes() -> None:
-    pipeline_digest = "a" * 64
+    selected_datasets = ["eodhd_us"]
+    code_identity = code_content_identity()
+    content_identity = dataset_content_identity(
+        selected_datasets,
+        provider_digests=code_identity["provider_materialization_digests"],
+    )
+    pipeline_digest = READINESS._payload_sha256(content_identity)
     dataset = {
+        "selected_datasets": selected_datasets,
+        "data_content_identity": content_identity,
         "data_pipeline_digest": pipeline_digest,
         "code_release_digest": "b" * 64,
     }
@@ -164,11 +177,11 @@ def test_dataset_compatibility_ignores_release_only_changes() -> None:
         dataset,
         expected_numerical_pipeline_digest=pipeline_digest,
     )
-    with pytest.raises(ValueError, match="different code release"):
-        READINESS._validate_dataset_code_compatibility(
-            dataset,
-            expected_code_release_digest="c" * 64,
-        )
+    dataset["code_release_digest"] = "c" * 64
+    READINESS._validate_dataset_code_compatibility(
+        dataset,
+        expected_numerical_pipeline_digest=pipeline_digest,
+    )
 
     with pytest.raises(ValueError, match="different numerical pipeline"):
         READINESS._validate_dataset_code_compatibility(
@@ -178,31 +191,24 @@ def test_dataset_compatibility_ignores_release_only_changes() -> None:
 
 
 def test_control_plane_uses_the_dataset_builders_exact_numerical_scope() -> None:
-    verifier_path = ROOT / "src/stock_forecasting/cli/verify_stage1_data.py"
-    syntax = ast.parse(verifier_path.read_text(encoding="utf-8"))
-    declared_paths: tuple[str, ...] | None = None
-    for node in syntax.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        if any(
-            isinstance(target, ast.Name) and target.id == "_PIPELINE_PATHS"
-            for target in node.targets
-        ):
-            declared_paths = ast.literal_eval(node.value)
+    identity, paths = READINESS._project_content_identity(ROOT)
 
-    assert declared_paths is not None
-    assert set(declared_paths) == set(READINESS.NUMERICAL_PIPELINE_PATHS)
-    records = [
-        {"path": path, "sha256": f"{index:064x}", "size_bytes": index}
-        for index, path in enumerate(READINESS.NUMERICAL_PIPELINE_PATHS, 1)
-    ]
-    expected_payload = {
-        record["path"].removeprefix("src/stock_forecasting/"): record["sha256"]
-        for record in records
-    }
+    assert identity == code_content_identity()
+    assert paths == semantic_source_paths()
+    assert "src/stock_forecasting/data/providers/http.py" not in paths
+    assert not any(path.startswith("scripts/") for path in paths)
+    code_payload = {"data_content_identity": identity}
     assert READINESS._numerical_pipeline_digest_from_code_payload(
-        {"files": records}
-    ) == READINESS._payload_sha256(expected_payload)
+        code_payload
+    ) == READINESS._payload_sha256(identity)
+    selected_identity = dataset_content_identity(
+        ["eodhd_us"],
+        provider_digests=identity["provider_materialization_digests"],
+    )
+    assert READINESS._numerical_pipeline_digest_from_code_payload(
+        code_payload,
+        ["eodhd_us"],
+    ) == READINESS._payload_sha256(selected_identity)
 
 
 def _write_mock_wrappers(tmp_path: Path) -> tuple[Path, Path]:

@@ -16,6 +16,55 @@ from stock_forecasting.config import ExperimentConfig
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_runpod_stage_contract_reports_stage1_five_percent_cap() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/runpod_readiness.py"),
+            "stage-contract",
+            "--config",
+            str(ROOT / "configs/stage1_kronos_base_lora.yaml"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["training_stage"] == "stage1"
+    assert payload["train_fraction"] == pytest.approx(0.05)
+    assert payload["max_samples"] == 500_000
+
+
+def test_runpod_stage_contract_rejects_wrong_stage1_sample_cap(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "stage1.yaml"
+    config.write_text(
+        (ROOT / "configs/stage1_kronos_base_lora.yaml")
+        .read_text(encoding="utf-8")
+        .replace("max_samples: 500000", "max_samples: null"),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/runpod_readiness.py"),
+            "stage-contract",
+            "--config",
+            str(config),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "stage and max_samples disagree" in result.stderr
+
+
 def test_all_shell_scripts_remain_syntax_valid() -> None:
     scripts = sorted((ROOT / "scripts").rglob("*.sh"))
     assert scripts
@@ -51,7 +100,7 @@ def test_runpod_entrypoint_scripts_declare_explicit_interpreters() -> None:
         assert path.read_text(encoding="utf-8").splitlines()[0] == expected_shebang, path
 
 
-def test_dataset_lifecycle_accepts_matching_resumable_progress(
+def test_cpu_preparation_lifecycle_accepts_matching_resumable_progress(
     tmp_path: Path,
 ) -> None:
     volume_root = tmp_path / "runpod-volume"
@@ -67,7 +116,7 @@ def test_dataset_lifecycle_accepts_matching_resumable_progress(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    marker = volume_root / "lifecycle" / "stage1" / "dataset.json"
+    marker = volume_root / "lifecycle" / "stage1" / "cpu-preparation.json"
     for state in (
         "waiting_for_provider",
         "waiting_for_budget",
@@ -83,6 +132,7 @@ def test_dataset_lifecycle_accepts_matching_resumable_progress(
                     "state": "downloaded" if state == "waiting_for_preparation" else state,
                     "identity": identity,
                     "identity_sha256": identity_sha256,
+                    "context": {"dataset_request_sha256": digest},
                 }
             ),
             encoding="utf-8",
@@ -97,7 +147,7 @@ def test_dataset_lifecycle_accepts_matching_resumable_progress(
                 "--network-volume-root",
                 str(volume_root),
                 "--kind",
-                "stage1-dataset",
+                "stage1-cpu-preparation",
                 "--state",
                 state,
                 "--launch-id",
@@ -133,6 +183,7 @@ def test_downloaded_lifecycle_can_be_an_active_intermediate_checkpoint(
                 "kind": "ohlcv-download-progress",
                 "state": "downloaded",
                 "identity": identity,
+                "context": {"dataset_request_sha256": digest},
                 "identity_sha256": hashlib.sha256(
                     json.dumps(
                         identity,
@@ -145,7 +196,7 @@ def test_downloaded_lifecycle_can_be_an_active_intermediate_checkpoint(
         ),
         encoding="utf-8",
     )
-    marker = volume_root / "lifecycle" / "stage1" / "dataset.json"
+    marker = volume_root / "lifecycle" / "stage1" / "cpu-preparation.json"
 
     result = subprocess.run(
         [
@@ -157,7 +208,7 @@ def test_downloaded_lifecycle_can_be_an_active_intermediate_checkpoint(
             "--network-volume-root",
             str(volume_root),
             "--kind",
-            "stage1-dataset",
+            "stage1-cpu-preparation",
             "--state",
             "downloaded",
             "--launch-id",
@@ -191,6 +242,7 @@ def test_same_launch_terminal_finalizer_preserves_download_progress(
                 "kind": "ohlcv-download-progress",
                 "state": "failed",
                 "identity": identity,
+                "context": {"dataset_request_sha256": digest},
                 "identity_sha256": hashlib.sha256(
                     json.dumps(
                         identity,
@@ -203,7 +255,7 @@ def test_same_launch_terminal_finalizer_preserves_download_progress(
         ),
         encoding="utf-8",
     )
-    marker = volume_root / "lifecycle" / "stage1" / "dataset.json"
+    marker = volume_root / "lifecycle" / "stage1" / "cpu-preparation.json"
     environment = {**os.environ, "RUNPOD_POD_ID": "test-pod"}
     base_command = [
         sys.executable,
@@ -214,7 +266,7 @@ def test_same_launch_terminal_finalizer_preserves_download_progress(
         "--network-volume-root",
         str(volume_root),
         "--kind",
-        "stage1-dataset",
+        "stage1-cpu-preparation",
         "--state",
         "failed",
         "--launch-id",
@@ -252,7 +304,7 @@ def test_same_launch_terminal_finalizer_preserves_download_progress(
         ("waiting_for_preparation", "downloaded"),
     ),
 )
-def test_tmux_resumable_dataset_validator_requires_matching_progress(
+def test_tmux_resumable_cpu_preparation_validator_requires_matching_progress(
     tmp_path: Path,
     lifecycle_state: str,
     progress_state: str,
@@ -269,6 +321,7 @@ def test_tmux_resumable_dataset_validator_requires_matching_progress(
                 "kind": "ohlcv-download-progress",
                 "state": progress_state,
                 "identity": identity,
+                "context": {"dataset_request_sha256": digest},
                 "identity_sha256": hashlib.sha256(
                     json.dumps(
                         identity,
@@ -281,7 +334,7 @@ def test_tmux_resumable_dataset_validator_requires_matching_progress(
         ),
         encoding="utf-8",
     )
-    marker = volume_root / "lifecycle" / "stage1" / "dataset.json"
+    marker = volume_root / "lifecycle" / "stage1" / "cpu-preparation.json"
     environment = {**os.environ, "RUNPOD_POD_ID": "test-pod"}
     write_result = subprocess.run(
         [
@@ -293,7 +346,7 @@ def test_tmux_resumable_dataset_validator_requires_matching_progress(
             "--network-volume-root",
             str(volume_root),
             "--kind",
-            "stage1-dataset",
+            "stage1-cpu-preparation",
             "--state",
             lifecycle_state,
             "--launch-id",
@@ -312,7 +365,7 @@ def test_tmux_resumable_dataset_validator_requires_matching_progress(
         [
             sys.executable,
             str(ROOT / "scripts/runpod_readiness.py"),
-            "resumable-dataset-lifecycle",
+            "resumable-cpu-preparation-lifecycle",
             "--marker",
             str(marker),
             "--network-volume-root",
@@ -407,6 +460,11 @@ def test_cpu_log_lifecycle_and_downloader_share_canonical_paths() -> None:
 
     lifecycle_writer = tmux.split("publish_lifecycle() {", maxsplit=1)[1]
     assert '"${NETWORK_VOLUME_ROOT}" "${LAUNCH_ID}" "${JOB_LOG}"' in lifecycle_writer
+    assert 'CPU_PREPARATION_KEY="lifecycle/stage1/cpu-preparation.json"' in download
+    assert '"${LOCAL_CPU_ROOT}/cpu-preparation.json"' in download
+    assert 'LIFECYCLE_FIELDS="$(python3 - "${LOCAL_CPU_ROOT}/cpu-preparation.json"' in download
+    assert 'DATASET_KEY="lifecycle/stage1/dataset.json"' in download
+    assert "The immutable dataset marker is useful context" in download
     assert "expected_log_dir = expected_prefix + launch_id" in download
     assert 'expected_log_file = expected_log_dir + "/combined.log"' in download
     assert "log_path == expected_log_dir" in download
@@ -471,9 +529,9 @@ def test_cpu_acquisition_budget_is_resumable_and_reserves_preparation_time() -> 
         "EODHD_API_TOKEN RunPod Secret is missing or was not resolved"
     )
     assert acquisition_branch < eodhd_secret_check < prepare.index("DOWNLOAD_ARGUMENTS=(")
-    assert "obsolete-security-scope" in prepare
+    assert "incompatible-acquisition" in prepare
     assert "rebuilding from verified provider cache entries" in prepare
-    assert "resumable-dataset-lifecycle" in tmux
+    assert "resumable-cpu-preparation-lifecycle" in tmux
     assert "${cpu_resumable_lifecycle_valid} -ne 1" in tmux
     assert "The CPU worker publishes the precise waiting state" in tmux
     assert "same_launch" in readiness
@@ -487,7 +545,39 @@ def test_cpu_acquisition_budget_is_resumable_and_reserves_preparation_time() -> 
     assert 'return "downloaded_active"' in readiness
     assert 'payload.get("exit_code") != 75' in readiness
     assert 'python3 "${RUNPOD_READINESS_HELPER}" guard-lifecycle-state' in guard
-    assert 'expected_kind == "stage1-dataset" and state == "ready"' in readiness
+    assert 'expected_kind == "stage1-dataset" and state == "ready"' not in readiness
+
+
+def test_cpu_execution_lifecycle_cannot_overwrite_immutable_dataset_readiness() -> None:
+    prepare = (ROOT / "scripts/runpod_cpu_prepare.sh").read_text(encoding="utf-8")
+    tmux = (ROOT / "scripts/runpod_tmux_launch.sh").read_text(encoding="utf-8")
+    create_cpu = (ROOT / "scripts/create_runpod_cpu_pod.sh").read_text(
+        encoding="utf-8"
+    )
+    status = (ROOT / "scripts/show_runpod_status.sh").read_text(encoding="utf-8")
+
+    assert (
+        'CPU_PREPARATION_MARKER="${LIFECYCLE_ROOT}/stage1/cpu-preparation.json"'
+        in prepare
+    )
+    lifecycle_writer = prepare.split("write_lifecycle_state() {", maxsplit=1)[1].split(
+        "finish_cpu_prep() {", maxsplit=1
+    )[0]
+    assert '--output "${CPU_PREPARATION_MARKER}"' in lifecycle_writer
+    assert "--kind stage1-cpu-preparation" in lifecycle_writer
+    assert "DATASET_MARKER" not in lifecycle_writer
+    assert 'archive_dataset_readiness "${reason}"' in prepare
+    assert "archive_stale_dataset_readiness" in prepare
+    assert "archive_dataset_readiness stale-selection" in prepare
+    assert "fin-ts-verify-stage1-data" in prepare
+    assert '--output "${DATASET_MARKER}"' in prepare
+    assert "lifecycle/stage1/cpu-preparation.json" in tmux
+    assert "stage1-cpu-preparation" in tmux
+    assert (
+        "RUNPOD_CPU_GUARD_LIFECYCLE_KEY=lifecycle/stage1/cpu-preparation.json"
+        in create_cpu
+    )
+    assert "lifecycle/stage1/cpu-preparation.json cpu_prepare" in status
 
 
 def test_gpu_gate_verifies_lazy_bar_store_artifacts() -> None:

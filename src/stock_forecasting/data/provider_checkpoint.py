@@ -154,7 +154,8 @@ def load_provider_checkpoint(
         or payload.get("kind") != "ohlcv-provider-materialization"
         or payload.get("state") != "complete"
         or payload.get("provider") != provider
-        or payload.get("training_security_scope") != TRAINING_SECURITY_SCOPE
+        or not isinstance(payload.get("training_security_scope"), str)
+        or not payload["training_security_scope"]
         or payload.get("identity") != identity
         or payload.get("identity_sha256") != identity_sha256
         or not isinstance(payload.get("created_at"), str)

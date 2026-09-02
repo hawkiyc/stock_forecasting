@@ -163,7 +163,8 @@ raw row group、segment 或 bucket 接續，已完成項目直接跳過。只有
 訓練 DataLoader 以 O(1) sampler 狀態從有效 cutoff ranges 取樣，按需讀取一個 symbol
 row group、建立 128-bar asset/benchmark context，並在記憶體中計算從 `h_start` 到第
 14 個持有交易日的 alpha label。磁碟上不會出現逐-window 或逐-label 資料集；Stage 1
-使用固定且可重現的精確 3% valid train cutoffs，每個 epoch 僅改變遍歷順序；Stage 2
+使用固定且可重現的 `min(valid train cutoffs × 5%, 500,000)` target set，每個 epoch
+僅改變遍歷順序；Stage 2
 使用全部 valid train cutoffs，兩者都用固定大小 batch。最後不足一個 batch 時，只從同一個
 target set 開頭確定性補齊，補齊
 數量會寫入 training summary；不會因此配置全量 index。這個 out-of-core 設計可直接處理
@@ -304,7 +305,7 @@ symbol limit 或處理契約變動時會使用新的根目錄，不需要手動�
 | 項目                        | Stage 1                                                          | Stage 2                |
 | --------------------------- | ---------------------------------------------------------------- | ---------------------- |
 | 目的                        | 驗證資料、模型、loss、checkpoint、評估與 RunPod 腳本             | 完整資料微調與正式評估 |
-| train 樣本                  | O(1) blockwise sampler 固定取精確 3%，每個 epoch 僅改變順序       | 100% valid train cutoffs |
+| train 樣本                  | O(1) blockwise sampler 固定取 5%，最多 500,000 個；每個 epoch 僅改變順序 | 100% valid train cutoffs |
 | epoch 上限                  | 2；至少進入第 2 個 epoch 才允許 early stop                        | 5                        |
 | validation cadence         | 每個 epoch 的 20%／40%／60%／80%／100%，共 5 次                  | 同左                     |
 | early stopping             | validation normalized pinball loss 連續 5 次未改善；第 2 epoch 起生效 | 同一 loss 與 patience；第 1 epoch 起生效 |
@@ -320,9 +321,10 @@ symbol limit 或處理契約變動時會使用新的根目錄，不需要手動�
 - `configs/stage2_kronos_base_lora.yaml`
 
 兩份設定的 `config.model_architecture_digest()` 必須一致；此 digest 同時綁定模型參數與
-`h_start`／輸出 horizon 契約。Stage 1 的 3% 是 O(1) blockwise permutation 所選出的
-確定性且精確 target set；它不是最早 3%，不會縮小 validation/test，也不會配置全部
-window indices。
+`h_start`／輸出 horizon 契約。Stage 1 先由 O(1) blockwise permutation 選出 5%，
+再將 target set 限制為最多 500,000 個，因此每個 epoch 的樣本數固定為
+`min(valid train cutoffs × 5%, 500,000)`；它不是最早 5%，不會縮小
+validation/test，也不會配置全部 window indices。
 
 Production Stage 1/2 不接受 `max_steps`、固定 step validation cadence 或獨立的固定
 step checkpoint cadence。optimizer budget 完全由 target set、batch size、gradient
@@ -858,8 +860,9 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    | `/runpod-volume/datasets/<dataset-request-sha256>/manifests/api-request-log.jsonl` | 不含 token 的 request audit             |
    | `/runpod-volume/cache/huggingface/`                                      | 離線 Kronos model/tokenizer cache                 |
    | `/runpod-volume/cache/hf-models.json`                                    | 固定 model revisions 與 cache manifest            |
-5. raw Parquet、download manifest 與 request log 完整驗證後先發布 `downloaded`
-   lifecycle。沒有 exit code 的 `downloaded` 是同一 Pod 內的中間 checkpoint，外部 guard
+5. raw Parquet、download manifest 與 request log 完整驗證後，先在
+   `/runpod-volume/lifecycle/stage1/cpu-preparation.json` 發布 `downloaded`
+   執行狀態。沒有 exit code 的 `downloaded` 是同一 Pod 內的中間 checkpoint，外部 guard
    不會誤判為終態；若剩餘時間少於 cleaning reserve，腳本才以 exit code 75 將它標記為
    可續傳終態，下一個 CPU Pod 直接從 checkpoint 執行清理，不再呼叫 provider。bar-store
    建置期間若剩餘時間到達安全截止點，則以 `waiting_for_preparation` 與 exit code 75
@@ -873,10 +876,26 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    launch 專屬的隱藏 dataset-manifest 暫存檔直接寫在同一個 dataset root，確保其中的
    artifact 相對路徑在發布前驗證與發布後都指向相同檔案；驗證通過後才以同檔案系統
    rename 原子發布為 `dataset-manifest.json`。接著將
-   selection ID/SHA、dataset request SHA、stage/config SHA、requested
-   profile/date/universe 與 resolved artifact hashes 綁入
-   `/runpod-volume/lifecycle/stage1/dataset.json`；只有全部檢查成功才發布並
-   自動終止 Pod。
+   dataset request、storage preparation、所選 provider 與 bar-store 的 data-content
+   identity、resolved artifact hashes，以及建立時的 selection/stage/config provenance
+   寫入 `/runpod-volume/lifecycle/stage1/dataset.json`。這個檔案只表示不可變資料已
+   `ready`，不承載 `preparing`、失敗或續傳狀態；CPU 工作的所有執行狀態只寫入
+   `cpu-preparation.json`，因此 lint、setup 或下載失敗不會覆寫已完成的 dataset
+   readiness。若新的 active selection 改變資料請求，舊 selection 的 marker 會先移入
+   `lifecycle/stage1/history/`，只移動 canonical pointer，不刪除舊資料集。只有全部檢查
+   成功才發布新的 dataset marker，CPU guard 再依獨立的
+   `cpu-preparation.json` 終態自動終止 Pod。
+
+資料身分分成三層，避免修改非資料程式就重建整份資料：dataset request SHA 只包含
+profile、日期、universe、明確的 dataset revision，以及會改變持久化 bar/cutoff 的
+storage preparation 欄位；provider materialization digest 只包含該 provider 的 endpoint
+參數、商品篩選、日期邊界、解析、調整與數值驗證；bar-store digest 只包含清理、benchmark
+資格、cutoff 與時間切分的數值語意。QPS、API 次數上限、retry/backoff、Cloud Run relay、
+worker/process 數、記憶體估算、checkpoint 目錄布局、logging、錯誤文字、lifecycle、CLI
+wrapper、訓練與驗證程式都不屬於資料內容身分。完整 code release hash 仍保留作 provenance
+與上傳完整性檢查，但不會單獨讓已驗證資料失效。若 provider 語意真的改變，只隔離並重建
+相應 provider materialization 與其下游資料，既有 request-key 相同的 raw API cache 可重用；
+若只有 bar-store 語意改變，只隔離並重建衍生 bar-store，不重新呼叫 provider。
 
 任何 CPU 或 GPU 工作在讀寫 volume 前，都會先證明 `/runpod-volume` 是**精確的
 mount point**：優先使用 `mountpoint`，否則使用 `findmnt`，最後才檢查
@@ -922,7 +941,7 @@ request-count 上限。共同 acquisition deadline 仍可讓任何迴圈進入
    operation、symbol/date/month 與 exception type，不記錄 token 或 response body。
    `complete` outcome 另記 materialization checkpoint identity，以及該 checkpoint
    是本次新發布或直接重用。
-4. 若任一迴圈仍未完成，dataset lifecycle 依整體 outcome 進入
+4. 若任一迴圈仍未完成，CPU preparation lifecycle 依整體 outcome 進入
    `waiting_for_budget`、`waiting_for_provider` 或 `waiting_for_resume`，GPU readiness
    維持不通過，CPU Pod 才自動終止；已完成 provider 的 durable checkpoints 仍會保留。
    若三者都完成，則以固定 provider 順序合併通過驗證的 checkpoints，繼續 data
@@ -939,8 +958,8 @@ request-count 上限。共同 acquisition deadline 仍可讓任何迴圈進入
    bash scripts/runpod_tmux_launch.sh cpu-prepare
    ```
 
-6. 新 attempt 會先驗證並重用具有相同 dataset request identity、training security
-   scope 與 materialization revision 的 provider checkpoints。只有未完成的 provider
+6. 新 attempt 會先驗證並重用具有相同 provider materialization request 與 data-content
+   digest 的 provider checkpoints。只有未完成或內容身分不相容的 provider
    才重新播放已快取 responses 並對缺少的 request 呼叫 provider。只有全部資料、
    manifest 與 selection gate 都通過後，lifecycle 才會變成 `ready`。`all` 模式的
    discovery response 也屬於同一份 immutable cache，因此跨日續傳不會重新取得一份
@@ -954,7 +973,7 @@ price factor，share multiplier 使用 identity `1.0`，並在
 `missing_share_multiplier_details_by_provider` 明確記錄 volume-adjustment coverage gap，
 不把未知比例偽造成完整資料。
 
-`bash scripts/runpod_workflow.sh status` 會在 dataset lifecycle 下方顯示 download
+`bash scripts/runpod_workflow.sh status` 會在 `cpu_prepare` lifecycle 下方顯示 download
 attempt、已快取 response 數、此次 network request 數、可用的完整 request 估算與
 安全的 provider error 摘要，不需要手動開啟 JSON。
 
@@ -968,8 +987,9 @@ attempt、已快取 response 數、此次 network request 數、可用的完整 
 設定錯誤才標記為 `failed`，應先修正 Secret。只有確實要建立新的
 provider 資料快照時才改 `--dataset-revision`，新 revision 不會沿用舊 snapshot cache。
 
-若狀態是 `waiting_for_budget`、`waiting_for_provider`、`waiting_for_resume`、`failed`
-或 `timed_out`，先從 lifecycle 讀取
+若狀態是 `waiting_for_budget`、`waiting_for_provider`、`waiting_for_resume`、
+`waiting_for_preparation`、`failed` 或 `timed_out`，先從
+`lifecycle/stage1/cpu-preparation.json` 讀取
 `launch_id`、`log_path` 與可用的 `progress_path`。tmux log 目錄固定為
 `logs/tmux/fin-ts-cpu-prepare/<launch-id>/`；由腳本解析並下載到本機診斷目錄：
 
@@ -986,8 +1006,9 @@ bash scripts/runpod_workflow.sh readiness --gpu
 Stage 2 使用相同 dataset request 時會得到相同 data namespace，但以 100%
 train split 重新從相同 pretrained base 開始，不接續 Stage 1 checkpoint。
 必須重新執行 `configure --stage stage2` 並明確提供與原 CPU dataset 相同的
-profile/date/universe/dataset revision/`h_start`；stage/config identity 不同時，舊 Stage 1 marker 會被 GPU
-gate 拒絕。範例：
+profile/date/universe/dataset revision/`h_start`。stage/config identity 由 active selection
+另行驗證；只要 dataset request 與 storage/content identity 相同，純訓練設定變更不會使
+既有 dataset marker 失效。範例：
 
 ```bash
 bash scripts/runpod_workflow.sh configure \
@@ -1271,7 +1292,7 @@ poetry run fin-ts-infer \
 
 PoC 最低驗收條件：
 
-1. Stage 1 固定選取精確 3% train samples，規劃 2 epochs，每個 epoch 僅改變順序，且至少進入第 2 epoch 才能 early stop；完整 validation/test 保留不變，並能完成 forward/backward、checkpoint reload 與 inference smoke test。
+1. Stage 1 固定選取 `min(full train samples × 5%, 500,000)` 個 train samples，規劃 2 epochs，每個 epoch 僅改變順序，且至少進入第 2 epoch 才能 early stop；完整 validation/test 保留不變，並能完成 forward/backward、checkpoint reload 與 inference smoke test。
 2. Stage 2 與 Stage 1 architecture digest 相同，且由相同 pretrained base 重新開始。
 3. 所有 run 都可追溯到 immutable Parquet、dataset profile、provider、symbols、日期範圍與 split counts。
 4. CPU marker 與 active training selection 必須在 stage、config SHA、profile、日期、requested universe 與 dataset request SHA 完全一致；例如 CPU `tw_only` 對 GPU `us_tw_eodhd` 必須在 Pod 建立前 fail closed。
@@ -1516,8 +1537,9 @@ The training DataLoader uses an O(1)-state sampler over valid cutoff ranges. It
 loads one symbol row group on demand, constructs aligned 128-bar asset and
 benchmark contexts, and computes alpha labels from `h_start` through holding
 day 14 in memory. No per-window or per-label dataset is written. Stage 1 uses one
-fixed, reproducible set containing exactly 3% of valid train cutoffs and changes
-only its traversal order between epochs. Stage 2 uses all valid train cutoffs,
+fixed, reproducible target set containing 5% of valid train cutoffs, capped at
+500,000 samples, and changes only its traversal order between epochs. Stage 2
+uses all valid train cutoffs,
 and both use fixed-size batches. If the final batch is short, it is deterministically
 filled from the beginning of the same target set and the padding count is written
 to the training summary; no full index array is allocated. This out-of-core design
@@ -1676,7 +1698,7 @@ for the same dataset.
 | Item                  | Stage 1                                                                 | Stage 2                                     |
 | --------------------- | ----------------------------------------------------------------------- | ------------------------------------------- |
 | Purpose               | Validate data, model, loss, checkpoints, evaluation, and RunPod scripts | Full-data fine-tuning and formal evaluation |
-| Train samples         | One fixed exact 3% set; only traversal order changes between epochs | 100% of valid train cutoffs                  |
+| Train samples         | One fixed 5% set capped at 500,000; only traversal order changes between epochs | 100% of valid train cutoffs                  |
 | Epoch limit           | 2; early stopping is disabled until epoch 2 begins                       | 5                                            |
 | Validation cadence    | Five times per epoch at 20%/40%/60%/80%/100%                             | Same                                         |
 | Early stopping        | Five consecutive non-improving normalized-pinball validations; active from epoch 2 | Same loss and patience; active from epoch 1 |
@@ -1693,9 +1715,10 @@ Configs:
 
 The two configs must have identical `config.model_architecture_digest()` values;
 this digest binds model parameters and the `h_start`/output-horizon contract. Stage
-1 uses an exact deterministic target set selected by an O(1)-state blockwise
-permutation. It is not the earliest 3%, does not shrink validation/test, and does
-not allocate all possible window indices.
+1 uses a deterministic target set selected by an O(1)-state blockwise
+permutation. Its size is `min(valid train cutoffs * 5%, 500,000)`. It is not the
+earliest 5%, does not shrink validation/test, and does not allocate all possible
+window indices.
 
 Production Stage 1/2 rejects `max_steps`, fixed-step validation cadence, and a
 separate fixed-step checkpoint cadence. The optimizer budget is derived only
@@ -2300,8 +2323,10 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    | `/runpod-volume/datasets/<dataset-request-sha256>/manifests/api-request-log.jsonl` | Request audit without tokens                               |
    | `/runpod-volume/cache/huggingface/`                                             | Offline Kronos model/tokenizer cache                        |
    | `/runpod-volume/cache/hf-models.json`                                           | Pinned model revisions and cache manifest                   |
-5. Publishes a `downloaded` lifecycle after validating raw Parquet, the download
-   manifest, and the request log. A `downloaded` marker without an exit code is an
+5. After validating raw Parquet, the download manifest, and the request log,
+   publishes a `downloaded` execution state to
+   `/runpod-volume/lifecycle/stage1/cpu-preparation.json`. A `downloaded` marker
+   without an exit code is an
    intermediate checkpoint in the same Pod, so the external guard does not treat it
    as terminal. Only when the remaining time is below the cleaning reserve does exit
    code 75 make it a resumable terminal state; the next CPU Pod then cleans directly
@@ -2320,11 +2345,35 @@ tmux -L fin-ts-cpu-prepare attach -t fin-ts-cpu-prepare
    the same dataset root, so every relative artifact path resolves to the same file
    both before and after publication. After verification, a same-filesystem rename
    atomically publishes it as `dataset-manifest.json`. The workflow then binds the
-   selection ID/SHA,
-   dataset request SHA, stage/config SHA, requested
-   profile/date/universe, and resolved artifact hashes into
-   `/runpod-volume/lifecycle/stage1/dataset.json`. It publishes the marker only
-   after every check passes, then terminates automatically.
+   dataset request, storage-preparation contract, selected-provider and bar-store
+   data-content identities, resolved artifact hashes, and creation-time
+   selection/stage/config provenance to
+   `/runpod-volume/lifecycle/stage1/dataset.json`. That file represents only
+   immutable `ready` data; it never carries preparing, failure, or resumable
+   execution states. Every CPU execution state goes to `cpu-preparation.json`, so
+   a lint, setup, or acquisition failure cannot overwrite completed dataset
+   readiness. If a new active selection changes the dataset request, the old
+   selection marker moves to `lifecycle/stage1/history/`; this moves only the
+   canonical pointer and does not delete the old dataset. The new dataset marker
+   is published only after every check passes, and the CPU guard then terminates
+   the Pod from the independent terminal state in `cpu-preparation.json`.
+
+Data identity has three layers so unrelated code changes do not rebuild the
+dataset. The dataset-request SHA contains only profile, dates, universe, the
+explicit dataset revision, and storage-preparation fields that alter persisted
+bars or cutoff ranges. A provider-materialization digest contains only that
+provider's endpoint parameters, universe filtering, date boundaries, parsing,
+adjustment, and numerical validation. The bar-store digest contains only
+cleaning, benchmark eligibility, cutoff, and chronological split semantics. QPS,
+API-call ceilings, retry/backoff, the Cloud Run relay, worker/process counts,
+memory estimation, checkpoint-directory layout, logging, error prose, lifecycle
+code, CLI wrappers, training, and validation are outside data-content identity.
+The complete code-release hash remains provenance and upload-integrity evidence,
+but cannot invalidate verified data by itself. A real provider-semantic change
+quarantines and rebuilds only the affected provider materialization and its
+downstream artifacts while raw API cache entries with identical request keys
+remain reusable. A bar-store-only semantic change quarantines and rebuilds only
+the derived bar store without calling a provider again.
 
 Before any CPU or GPU workflow reads or writes persistent data, it proves that
 `/runpod-volume` is the **exact mount point**: use `mountpoint` first, then
@@ -2379,7 +2428,7 @@ workflow follows this contract:
    operation, symbol/date/month, and exception type. Tokens and response bodies
    are not stored. A `complete` outcome also records its materialization
    checkpoint identity and whether that checkpoint was published or reused.
-4. If any loop is incomplete, the aggregate lifecycle becomes
+4. If any loop is incomplete, the CPU-preparation lifecycle becomes
    `waiting_for_budget`, `waiting_for_provider`, or `waiting_for_resume`; GPU
    readiness stays blocked, while durable checkpoints from completed providers
    remain available. If all loops complete, validated provider checkpoints are
@@ -2398,8 +2447,8 @@ workflow follows this contract:
    ```
 
 6. The new attempt first validates and reuses provider checkpoints with the same
-   dataset request identity, training security scope, and materialization
-   revision. It replays cached responses only for incomplete providers and calls
+   provider-materialization request and data-content digest. It replays cached
+   responses only for incomplete or content-incompatible providers and calls
    them only for missing requests. The lifecycle becomes `ready` only
    after all data, manifests, and selection gates pass. The `all`-mode discovery
    response is part of the same immutable cache, so a cross-day resume does not
@@ -2417,7 +2466,7 @@ volume-adjustment coverage gap instead of inventing a ratio.
 
 `bash scripts/runpod_workflow.sh status` prints the download attempt, cached
 response count, network requests in that attempt, the full request estimate when
-available, and a safe provider-error summary below the dataset lifecycle, so no
+available, and a safe provider-error summary below the `cpu_prepare` lifecycle, so no
 JSON file needs to be opened manually.
 
 This provides both request-level and provider-materialization-level resume, not
@@ -2433,8 +2482,9 @@ requires correcting the Secret. Change
 revision does not reuse the old snapshot cache.
 
 If the state is `waiting_for_budget`, `waiting_for_provider`,
-`waiting_for_resume`, `failed`, or `timed_out`, first read
-`launch_id`, `log_path`, and any `progress_path` from the lifecycle. The tmux log directory is
+`waiting_for_resume`, `waiting_for_preparation`, `failed`, or `timed_out`, first
+read `launch_id`, `log_path`, and any `progress_path` from
+`lifecycle/stage1/cpu-preparation.json`. The tmux log directory is
 `logs/tmux/fin-ts-cpu-prepare/<launch-id>/`; let the script resolve and download
 it into the local diagnostic directory:
 
@@ -2452,9 +2502,10 @@ Stage 2 uses the same data namespace when its dataset request is identical, but
 trains on 100% of the train split from the same pretrained base. It does not
 continue from a Stage 1 checkpoint. Run `configure --stage stage2` again and
 explicitly supply the same profile/date/universe/dataset revision/`h_start` as
-the intended CPU dataset.
-The GPU gate rejects an old Stage 1 marker when the stage/config identity has
-changed. For example:
+the intended CPU dataset. The active selection validates stage/config identity
+separately; a training-only configuration change does not invalidate an existing
+dataset marker when dataset request and storage/content identities still match.
+For example:
 
 ```bash
 bash scripts/runpod_workflow.sh configure \
@@ -2763,10 +2814,11 @@ checkpoint metadata. It produces no natural-language explanation.
 
 Minimum PoC acceptance:
 
-1. Stage 1 selects one fixed exact 3% train set for up to two epochs and changes
-   only its traversal order between epochs. Early stopping cannot activate before
-   epoch 2 begins. Full validation/test remain intact, and forward/backward,
-   checkpoint reload, and inference smoke tests complete.
+1. Stage 1 selects one fixed `min(full train samples * 5%, 500,000)` train set
+   for up to two epochs and changes only its traversal order between epochs.
+   Early stopping cannot activate before epoch 2 begins. Full validation/test
+   remain intact, and forward/backward, checkpoint reload, and inference smoke
+   tests complete.
 2. Stage 2 has the same architecture digest and starts again from the same
    pretrained base.
 3. Every run is traceable to immutable Parquet, dataset profile, providers,

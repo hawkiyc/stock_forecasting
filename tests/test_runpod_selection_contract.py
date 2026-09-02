@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import shutil
 from pathlib import Path
@@ -53,6 +54,9 @@ def _marker(selection: dict[str, object]) -> dict[str, object]:
     assert isinstance(request, dict)
     stage = selection["stage"]
     assert isinstance(stage, dict)
+    storage_preparation = SELECTION.dataset_request_identity_payload(request)[
+        "storage_preparation"
+    ]
     root = f"datasets/{digest}"
     return {
         "schema_version": 2,
@@ -68,6 +72,10 @@ def _marker(selection: dict[str, object]) -> dict[str, object]:
         "selected_datasets": request["selected_datasets"],
         "date_range": request["date_range"],
         "requested_dataset": request,
+        "storage_preparation_spec": storage_preparation,
+        "storage_preparation_spec_sha256": SELECTION._payload_sha256(
+            storage_preparation
+        ),
         "data_root_relative": root,
         "raw": {"relative_path": f"{root}/raw/market.parquet"},
         "bar_store_manifest": {
@@ -101,6 +109,51 @@ def test_exact_cpu_marker_matches_active_training_selection(tmp_path: Path) -> N
     selection = SELECTION._build_selection(_arguments(), project_root)
 
     SELECTION._verify_marker(_marker(selection), selection)
+
+
+def test_training_only_selection_revision_reuses_identical_dataset_marker(
+    tmp_path: Path,
+) -> None:
+    project_root = _project_root(tmp_path)
+    prepared = SELECTION._build_selection(_arguments(), project_root)
+    marker = _marker(prepared)
+    config = project_root / "configs" / "stage1_kronos_base_lora.yaml"
+    config.write_text(
+        config.read_text(encoding="utf-8") + "\n# Training-only fixture revision.\n",
+        encoding="utf-8",
+    )
+    current = SELECTION._build_selection(_arguments(), project_root)
+
+    assert current["dataset_request_sha256"] == prepared["dataset_request_sha256"]
+    assert current["selection_sha256"] != prepared["selection_sha256"]
+    SELECTION._verify_marker(marker, current)
+
+
+def test_dataset_request_envelope_schema_is_not_a_data_identity_input(
+    tmp_path: Path,
+) -> None:
+    request = SELECTION._build_selection(_arguments(), _project_root(tmp_path))[
+        "dataset_request"
+    ]
+    changed = copy.deepcopy(request)
+    changed["schema_version"] = 999
+
+    assert SELECTION._payload_sha256(SELECTION._dataset_request_core(request)) == (
+        SELECTION._payload_sha256(SELECTION._dataset_request_core(changed))
+    )
+
+
+def test_date_range_change_creates_a_new_dataset_namespace(tmp_path: Path) -> None:
+    project_root = _project_root(tmp_path)
+    baseline = SELECTION._build_selection(_arguments(), project_root)
+    extended = SELECTION._build_selection(
+        _arguments(end="2026-08-01"),
+        project_root,
+    )
+
+    assert baseline["dataset_request_sha256"] != extended[
+        "dataset_request_sha256"
+    ]
 
 
 def test_cpu_tw_only_marker_rejects_us_tw_training_selection(tmp_path: Path) -> None:
@@ -206,10 +259,110 @@ def test_h_start_changes_training_selection_but_reuses_the_same_bar_store_namesp
     )
     exports = SELECTION._selection_exports(tmp_path / "selection.json", first_day)
     assert exports["FIN_TS_H_START"] == "1"
+    SELECTION._verify_marker(_marker(first_day), third_day)
+
+
+def test_marker_rejects_a_tampered_storage_contract(tmp_path: Path) -> None:
+    selection = SELECTION._build_selection(_arguments(), _project_root(tmp_path))
+    marker = _marker(selection)
+    storage = marker["storage_preparation_spec"]
+    assert isinstance(storage, dict)
+    storage["window_size"] = 256
+    marker["storage_preparation_spec_sha256"] = SELECTION._payload_sha256(storage)
+
+    with pytest.raises(SELECTION.SelectionError, match="dataset storage contract"):
+        SELECTION._verify_marker(marker, selection)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("schema_version", 999),
+        ("processed_schema_version", "renamed-only"),
+        ("stride", 999),
+        ("effective_sample_stride", 999),
+        ("label_kind", "renamed-label"),
+        ("signal_timing", "renamed-timing"),
+        ("entry_timing", "renamed-entry"),
+        ("entry_day_counts_as_holding_day_one", False),
+        ("exit_timing", "renamed-exit"),
+        ("input_adjustment", "renamed-adjustment"),
+        ("training_security_scope", "renamed-audit-scope"),
+        ("split_policy", "renamed-split-policy"),
+        ("eodhd_split_policy", "renamed-provider-policy"),
+        ("us_symbol_limit_policy", "renamed-symbol-policy"),
+        ("target_horizon", 13),
+        ("diagnostic_horizons", [2, 7]),
+        ("flat_volatility_multiplier", 9.0),
+        ("embargo_bars", 999),
+        ("h_start", 2),
+        ("alpha_horizons", [2, 3]),
+    ),
+)
+def test_non_storage_preparation_values_do_not_change_dataset_namespace(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+) -> None:
+    request = SELECTION._build_selection(_arguments(), _project_root(tmp_path))[
+        "dataset_request"
+    ]
+    changed = copy.deepcopy(request)
+    changed["preparation"][field] = replacement
+
+    assert SELECTION._payload_sha256(SELECTION._dataset_request_core(request)) == (
+        SELECTION._payload_sha256(SELECTION._dataset_request_core(changed))
+    )
+
+
+def test_provider_order_does_not_change_dataset_namespace(tmp_path: Path) -> None:
+    request = SELECTION._build_selection(
+        _arguments(data_profile="us_tw_eodhd"),
+        _project_root(tmp_path),
+    )["dataset_request"]
+    reordered = copy.deepcopy(request)
+    reordered["selected_datasets"] = list(reversed(request["selected_datasets"]))
+
+    assert SELECTION._payload_sha256(SELECTION._dataset_request_core(request)) == (
+        SELECTION._payload_sha256(SELECTION._dataset_request_core(reordered))
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("bar_store_schema_version", "2.0"),
+        ("storage_kind", "different-storage-layout"),
+        ("window_size", 256),
+        ("max_horizon", 15),
+        ("window_materialized", True),
+        ("labels_materialized", True),
+        ("benchmark_mapping_sha256", "f" * 64),
+        ("max_abs_log_return", 0.25),
+        ("train_fraction", 0.60),
+        ("validation_fraction", 0.20),
+        ("purge_bars", 30),
+        ("effective_embargo_bars", 20),
+    ),
+)
+def test_storage_preparation_values_change_dataset_namespace(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+) -> None:
+    request = SELECTION._build_selection(_arguments(), _project_root(tmp_path))[
+        "dataset_request"
+    ]
+    changed = copy.deepcopy(request)
+    changed["preparation"][field] = replacement
+
+    assert SELECTION._payload_sha256(SELECTION._dataset_request_core(request)) != (
+        SELECTION._payload_sha256(SELECTION._dataset_request_core(changed))
+    )
 
 
 def test_eodhd_volume_semantics_are_part_of_the_immutable_dataset_contract() -> None:
-    assert SELECTION.PREPARATION_CONTRACT["schema_version"] == 4
+    assert SELECTION.PREPARATION_CONTRACT["schema_version"] == 5
     assert SELECTION.PREPARATION_CONTRACT["eodhd_split_policy"] == (
         "per_symbol_full_historical_splits_reconstruct_unadjusted_volume_v2"
     )
@@ -245,7 +398,7 @@ def test_provider_acquisition_values_cannot_change_selection_identity(tmp_path: 
     )
     assert baseline["selection_sha256"] == with_transient_values["selection_sha256"]
     assert baseline["schema_version"] == SELECTION.SELECTION_SCHEMA_VERSION == 3
-    assert baseline["dataset_request"]["schema_version"] == 1
+    assert baseline["dataset_request"]["schema_version"] == 3
     assert "acquisition_policy" not in baseline
     exports = SELECTION._selection_exports(tmp_path / "selection.json", baseline)
     for key in (
@@ -286,6 +439,24 @@ def test_selection_defaults_only_cover_dataset_semantics(tmp_path: Path) -> None
     assert arguments.h_start == 3
     for name in ("max_api_calls", "eodhd_qps", "taiwan_qps", "max_backoff_seconds"):
         assert not hasattr(arguments, name)
+
+
+def test_selection_storage_defaults_have_one_dependency_free_source() -> None:
+    assert {
+        field: SELECTION._BASE_PREPARATION_CONTRACT[field]
+        for field in SELECTION.DATASET_STORAGE_PREPARATION_FIELDS
+    } == SELECTION.DEFAULT_DATASET_STORAGE_PREPARATION
+
+    cpu_prepare = (ROOT / "scripts/runpod_cpu_prepare.sh").read_text(encoding="utf-8")
+    for duplicated_option in (
+        "--window-size",
+        "--max-abs-log-return",
+        "--train-fraction",
+        "--validation-fraction",
+        "--purge-bars",
+        "--effective-embargo-bars",
+    ):
+        assert duplicated_option not in cpu_prepare
 
 
 def test_selection_requires_an_explicit_end_date(tmp_path: Path) -> None:

@@ -66,16 +66,16 @@ print("{:<12} {}".format(label, " ".join(fields)))
 }
 
 summarize_download_progress() {
-    local dataset_payload=""
+    local preparation_payload=""
     local progress_key=""
     local progress_payload=""
 
-    if ! dataset_payload="$(bash "${S3_WRAPPER}" s3 cp \
-        "s3://${RUNPOD_NETWORK_VOLUME_ID}/lifecycle/stage1/dataset.json" - \
+    if ! preparation_payload="$(bash "${S3_WRAPPER}" s3 cp \
+        "s3://${RUNPOD_NETWORK_VOLUME_ID}/lifecycle/stage1/cpu-preparation.json" - \
         --only-show-errors 2>/dev/null)"; then
         return 0
     fi
-    progress_key="$(printf '%s' "${dataset_payload}" | python3 -c '
+    progress_key="$(printf '%s' "${preparation_payload}" | python3 -c '
 import json
 import re
 import sys
@@ -203,6 +203,7 @@ print("{:<12} {}".format("wandb", " ".join(fields)))
 }
 
 summarize_marker lifecycle/stage1/code.json code
+summarize_marker lifecycle/stage1/cpu-preparation.json cpu_prepare
 summarize_marker lifecycle/stage1/dataset.json dataset
 summarize_download_progress
 summarize_marker lifecycle/stage1/training.json training

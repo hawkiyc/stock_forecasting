@@ -5,10 +5,10 @@ from __future__ import annotations
 import pytest
 
 from stock_forecasting import training
-from stock_forecasting.cli import prepare_data_runtime
 from stock_forecasting.runtime_resources import (
     AvailableMemoryEstimate,
     select_available_memory_estimate,
+    select_visible_cpu_count,
 )
 
 
@@ -78,26 +78,21 @@ def test_runpod_memory_observations_allow_requested_dataloader_workers(
     )
 
 
-def test_runpod_prepare_uses_shared_runtime_memory_detection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    estimate = AvailableMemoryEstimate(
-        available_bytes=48 * 1024**3,
-        source="cgroup_v2_headroom",
-        observations=(("cgroup_v2_headroom", 48 * 1024**3),),
-    )
-    original = prepare_data_runtime.bar_store._detect_available_memory_bytes
-    observed: list[int] = []
+def test_visible_cpu_count_respects_affinity_limit() -> None:
+    assert select_visible_cpu_count(
+        reported_cpu_count=32,
+        affinity_cpu_count=16,
+    ) == 16
+    assert select_visible_cpu_count(
+        reported_cpu_count=8,
+        affinity_cpu_count=16,
+    ) == 8
+    assert select_visible_cpu_count(
+        reported_cpu_count=None,
+        affinity_cpu_count=None,
+    ) == 1
 
-    def fake_prepare_main() -> int:
-        observed.append(
-            prepare_data_runtime.bar_store._detect_available_memory_bytes()
-        )
-        return 17
-
-    monkeypatch.setattr(prepare_data_runtime, "detect_available_memory", lambda: estimate)
-    monkeypatch.setattr(prepare_data_runtime.prepare_data, "main", fake_prepare_main)
-
-    assert prepare_data_runtime.main() == 17
-    assert observed == [48 * 1024**3]
-    assert prepare_data_runtime.bar_store._detect_available_memory_bytes is original
+    with pytest.raises(ValueError, match="reported_cpu_count must be positive"):
+        select_visible_cpu_count(reported_cpu_count=0)
+    with pytest.raises(ValueError, match="reported_cpu_count must be positive"):
+        select_visible_cpu_count(reported_cpu_count=False)

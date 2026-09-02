@@ -244,6 +244,31 @@ class EODHDProvider:
             metadata={"empty": False, **row_metadata},
         )
 
+    def fetch_materialized_instrument(
+        self,
+        instrument: Instrument,
+        *,
+        start: str,
+        end: str,
+        dataset_profile: str,
+    ) -> tuple[ProviderFetch, ProviderFetch]:
+        """Fetch the action history and apply it to one durable EOD series."""
+
+        split_fetch = self.fetch_historical_split_events(
+            instrument,
+            start=start,
+            end=end,
+        )
+        daily_fetch = self.fetch_instrument(
+            instrument,
+            start=start,
+            end=end,
+            dataset_profile=dataset_profile,
+            split_events=split_fetch.frame,
+            split_adjustment_source="historical_splits",
+        )
+        return split_fetch, daily_fetch
+
     def fetch_historical_split_events(
         self,
         instrument: Instrument,

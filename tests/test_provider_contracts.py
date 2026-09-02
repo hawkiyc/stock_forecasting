@@ -125,6 +125,111 @@ def test_raw_cache_identity_omits_api_token_and_reuses_response(tmp_path: Path) 
     assert "first-secret" not in next(tmp_path.rglob("*.json")).read_text(encoding="utf-8")
 
 
+def test_corrupt_primary_cache_is_quarantined_and_refetched(tmp_path: Path) -> None:
+    session = _FakeSession({"state": "recovered"})
+    client = CachedJsonClient(
+        provider="fixture",
+        raw_cache_root=tmp_path / "primary",
+        max_requests_per_second=10.0,
+        session=session,
+        clock=lambda: 1.0,
+        sleeper=lambda _seconds: None,
+    )
+    endpoint = "https://example.invalid/data"
+    params = {"date": "2026-01-02"}
+    request_sha256, _identity = client._identity(endpoint=endpoint, params=params)
+    cache_path = client._cache_path(request_sha256)
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_bytes(b'{"truncated":')
+
+    payload, record = client.get_json(endpoint, params=params)
+
+    assert payload == {"state": "recovered"}
+    assert record.cache_hit is False
+    assert len(session.calls) == 1
+    assert json.loads(cache_path.read_text(encoding="utf-8")) == payload
+    quarantined = list(cache_path.parent.glob(f"{cache_path.name}.corrupt-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == b'{"truncated":'
+
+
+def test_corrupt_read_only_fallback_is_skipped_without_mutation(tmp_path: Path) -> None:
+    primary = tmp_path / "primary"
+    fallback = tmp_path / "fallback"
+    session = _FakeSession({"state": "network"})
+    client = CachedJsonClient(
+        provider="fixture",
+        raw_cache_root=primary,
+        read_cache_roots=(fallback,),
+        max_requests_per_second=10.0,
+        session=session,
+        clock=lambda: 1.0,
+        sleeper=lambda _seconds: None,
+    )
+    endpoint = "https://example.invalid/data"
+    params = {"date": "2026-01-02"}
+    request_sha256, _identity = client._identity(endpoint=endpoint, params=params)
+    relative = Path("fixture") / request_sha256[:2] / f"{request_sha256}.json"
+    fallback_path = fallback / relative
+    fallback_path.parent.mkdir(parents=True)
+    fallback_path.write_bytes(b"not-json")
+
+    payload, record = client.get_json(endpoint, params=params)
+
+    assert payload == {"state": "network"}
+    assert record.cache_hit is False
+    assert fallback_path.read_bytes() == b"not-json"
+    assert not list(fallback_path.parent.glob(f"{fallback_path.name}.corrupt-*"))
+    assert json.loads((primary / relative).read_text(encoding="utf-8")) == payload
+
+
+def test_concurrent_cache_publication_never_exposes_partial_json(tmp_path: Path) -> None:
+    barrier = threading.Barrier(2)
+
+    class RacingSession(_FakeSession):
+        def get(self, endpoint: str, **kwargs: Any) -> requests.Response:
+            response = super().get(endpoint, **kwargs)
+            barrier.wait(timeout=5)
+            return response
+
+    endpoint = "https://example.invalid/data"
+    params = {"date": "2026-01-02"}
+    clients = [
+        CachedJsonClient(
+            provider="fixture",
+            raw_cache_root=tmp_path,
+            max_requests_per_second=10.0,
+            session=RacingSession({"writer": writer}),
+            clock=lambda: 1.0,
+            sleeper=lambda _seconds: None,
+        )
+        for writer in (1, 2)
+    ]
+    results: list[tuple[Any, RequestRecord]] = []
+    failures: list[BaseException] = []
+
+    def fetch(client: CachedJsonClient) -> None:
+        try:
+            results.append(client.get_json(endpoint, params=params))
+        except BaseException as error:  # pragma: no cover - assertion reports the race
+            failures.append(error)
+
+    threads = [threading.Thread(target=fetch, args=(client,)) for client in clients]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not failures
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(results) == 2
+    request_sha256, _identity = clients[0]._identity(endpoint=endpoint, params=params)
+    cache_path = clients[0]._cache_path(request_sha256)
+    published = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert [payload for payload, _record in results] == [published, published]
+    assert not list(cache_path.parent.glob(f".{cache_path.name}.tmp-*"))
+
+
 def test_tpex_relay_transport_preserves_upstream_cache_identity(tmp_path: Path) -> None:
     token = "fixture-token-that-is-longer-than-thirty-two-characters"
     session = _FakeSession({"tables": []})
@@ -1711,6 +1816,7 @@ def test_launch_acquisition_policy_is_context_not_dataset_identity(tmp_path: Pat
     )
     second = replace(
         first,
+        dataset_request_sha256="b" * 64,
         max_api_calls=25,
         eodhd_requests_per_second=8.0,
         taiwan_requests_per_second=0.25,
@@ -1719,6 +1825,8 @@ def test_launch_acquisition_policy_is_context_not_dataset_identity(tmp_path: Pat
     )
 
     assert _progress_identity(first) == _progress_identity(second)
+    assert "dataset_request_sha256" not in _progress_identity(first)
+    assert "symbol_limit_policy" not in _progress_identity(first)["universe"]
     first_policy = _progress_context(first)["acquisition_policy"]
     second_policy = _progress_context(second)["acquisition_policy"]
     assert first_policy != second_policy

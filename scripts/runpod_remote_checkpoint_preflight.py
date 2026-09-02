@@ -239,7 +239,7 @@ def _dataset_contract(readiness_payload, dataset_payload, dataset_manifest_sha25
         raise ValueError("Dataset readiness manifest must contain a ready JSON object")
     if (
         not isinstance(dataset_payload, dict)
-        or dataset_payload.get("schema_version") != "3.0"
+        or dataset_payload.get("schema_version") != "4.0"
         or dataset_payload.get("kind") != "ohlcv-bar-store-dataset"
         or dataset_payload.get("state") != "ready"
     ):
@@ -268,7 +268,7 @@ def _dataset_contract(readiness_payload, dataset_payload, dataset_manifest_sha25
         if readiness_payload.get(key) != dataset_payload.get(key):
             raise ValueError(f"Dataset readiness marker and dataset manifest disagree on {key}")
     if readiness_payload.get("storage_preparation_spec_sha256") != dataset_payload.get(
-        "preparation_spec_sha256"
+        "storage_preparation_spec_sha256"
     ):
         raise ValueError("Dataset readiness marker and storage preparation contract disagree")
     return {
@@ -281,9 +281,9 @@ def _dataset_contract(readiness_payload, dataset_payload, dataset_manifest_sha25
             dataset_payload,
             "data_pipeline_digest",
         ),
-        "preparation_spec_sha256": _required_sha256(
+        "storage_preparation_spec_sha256": _required_sha256(
             dataset_payload,
-            "preparation_spec_sha256",
+            "storage_preparation_spec_sha256",
         ),
         "universe_sha256": _required_sha256(dataset_payload, "universe_sha256"),
         "split_counts": dataset_payload["split_counts"],

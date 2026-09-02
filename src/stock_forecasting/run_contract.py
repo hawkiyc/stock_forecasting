@@ -36,6 +36,7 @@ TRAINING_IMPLEMENTATION_PATHS = (
     "tracking.py",
     "training.py",
     "training_paths.py",
+    "training_stage_contract.py",
 )
 
 
@@ -78,7 +79,9 @@ def _dataset_resume_contract(config: ExperimentConfig) -> dict[str, Any]:
         "dataset_profile": payload["dataset_profile"],
         "selected_datasets": payload["selected_datasets"],
         "data_pipeline_digest": payload["data_pipeline_digest"],
-        "preparation_spec_sha256": payload["preparation_spec_sha256"],
+        "storage_preparation_spec_sha256": payload[
+            "storage_preparation_spec_sha256"
+        ],
         "universe_sha256": payload["universe_sha256"],
         "split_counts": payload["split_counts"],
         "artifacts": payload["artifacts"],

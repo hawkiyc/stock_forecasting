@@ -19,6 +19,7 @@ from stock_forecasting.data.dataset import (
 )
 from stock_forecasting.data.manifest import artifact_metadata, sha256_file
 from stock_forecasting.data.windows import CONTEXT_FIELDS, build_causal_windows
+from stock_forecasting.runtime_resources import AvailableMemoryEstimate
 from stock_forecasting.training import (
     plan_dataloader_workers,
     resolve_runtime_robust_scales,
@@ -193,7 +194,7 @@ def test_runtime_robust_scales_are_cached_without_materializing_labels(
     assert not list(store.rglob("*label*.parquet"))
 
 
-def test_bar_store_resume_reuses_completed_outputs(
+def test_bar_store_resume_reuses_completed_outputs_across_execution_layouts(
     tmp_path: Path,
     market_frame: pd.DataFrame,
 ) -> None:
@@ -213,10 +214,218 @@ def test_bar_store_resume_reuses_completed_outputs(
     }
     first = build_symbol_bar_store(**arguments)
     before = sha256_file(first.bar_store_manifest_path)
-    second = build_symbol_bar_store(**arguments, workers=4)
+    second = build_symbol_bar_store(
+        **{
+            **arguments,
+            "bucket_count": 8,
+            "batch_rows": 100,
+        },
+        workers=4,
+    )
 
     assert sha256_file(second.bar_store_manifest_path) == before
     assert second.split_counts == first.split_counts
+    manifest = json.loads(second.bar_store_manifest_path.read_text(encoding="utf-8"))
+    assert "bucket_count" not in manifest["identity"]
+    assert "batch_rows" not in manifest["identity"]
+    assert "raw_scan_algorithm" not in manifest["identity"]
+    assert manifest["identity"]["effective_embargo_bars"] == 14
+    assert "embargo_bars" not in manifest["identity"]
+
+
+def test_completed_bar_store_ignores_stale_execution_checkpoint(
+    tmp_path: Path,
+    market_frame: pd.DataFrame,
+) -> None:
+    raw = tmp_path / "raw" / "market.parquet"
+    raw.parent.mkdir()
+    market_frame.to_parquet(raw, compression="zstd", index=False)
+    store = tmp_path / "prepared" / "bar-store"
+    arguments = {
+        "raw_path": raw,
+        "output_root": store,
+        "download_manifest": _download_contract(raw, tmp_path, len(market_frame)),
+        "window_size": 32,
+        "bucket_count": 4,
+        "batch_rows": 200,
+        "purge_bars": 20,
+        "embargo_bars": 14,
+    }
+    first = build_symbol_bar_store(**arguments)
+    manifest_sha256 = sha256_file(first.bar_store_manifest_path)
+    manifest = json.loads(first.bar_store_manifest_path.read_text(encoding="utf-8"))
+    stale_state = {
+        "identity_sha256": manifest["identity_sha256"],
+        "checkpoint_identity_sha256": "f" * 64,
+    }
+    (store / ".work" / "build-state.json").write_text(
+        json.dumps(stale_state, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    second = build_symbol_bar_store(
+        **{
+            **arguments,
+            "bucket_count": 8,
+            "batch_rows": 100,
+        },
+        workers=4,
+    )
+
+    assert sha256_file(second.bar_store_manifest_path) == manifest_sha256
+    assert not list((tmp_path / "prepared").glob(".bar-store-obsolete-*"))
+    assert not list((store / ".work").iterdir())
+
+
+def test_incomplete_finalized_store_rebuilds_only_derived_outputs(
+    tmp_path: Path,
+    market_frame: pd.DataFrame,
+) -> None:
+    raw = tmp_path / "raw" / "market.parquet"
+    raw.parent.mkdir()
+    market_frame.to_parquet(raw, compression="zstd", index=False)
+    raw_sha256 = sha256_file(raw)
+    store = tmp_path / "prepared" / "bar-store"
+    arguments = {
+        "raw_path": raw,
+        "output_root": store,
+        "download_manifest": _download_contract(raw, tmp_path, len(market_frame)),
+        "window_size": 32,
+        "bucket_count": 4,
+        "batch_rows": 200,
+        "purge_bars": 20,
+        "embargo_bars": 14,
+    }
+    first = build_symbol_bar_store(**arguments)
+    displaced_manifest = tmp_path / "interrupted-bar-store.json"
+    first.bar_store_manifest_path.replace(displaced_manifest)
+
+    rebuilt = build_symbol_bar_store(**arguments)
+
+    assert rebuilt.success_path.is_file()
+    assert rebuilt.bar_store_manifest_path.is_file()
+    assert sha256_file(raw) == raw_sha256
+    quarantines = list((tmp_path / "prepared").glob(".bar-store-obsolete-*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / "_SUCCESS.json").is_file()
+    assert not (quarantines[0] / "bar-store.json").exists()
+
+
+def test_partial_final_metadata_without_success_rebuilds_only_derived_outputs(
+    tmp_path: Path,
+    market_frame: pd.DataFrame,
+) -> None:
+    raw = tmp_path / "raw" / "market.parquet"
+    raw.parent.mkdir()
+    market_frame.to_parquet(raw, compression="zstd", index=False)
+    raw_sha256 = sha256_file(raw)
+    store = tmp_path / "prepared" / "bar-store"
+    arguments = {
+        "raw_path": raw,
+        "output_root": store,
+        "download_manifest": _download_contract(raw, tmp_path, len(market_frame)),
+        "window_size": 32,
+        "bucket_count": 4,
+        "batch_rows": 200,
+        "purge_bars": 20,
+        "embargo_bars": 14,
+    }
+    first = build_symbol_bar_store(**arguments)
+    displaced = tmp_path / "interrupted-publication"
+    displaced.mkdir()
+    first.success_path.replace(displaced / "_SUCCESS.json")
+    first.bar_store_manifest_path.replace(displaced / "bar-store.json")
+
+    rebuilt = build_symbol_bar_store(**arguments)
+
+    assert rebuilt.success_path.is_file()
+    assert rebuilt.bar_store_manifest_path.is_file()
+    assert sha256_file(raw) == raw_sha256
+    quarantines = list((tmp_path / "prepared").glob(".bar-store-obsolete-*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / "symbol-index.parquet").is_file()
+    assert (quarantines[0] / "cutoff-ranges.parquet").is_file()
+
+
+def test_corrupt_completed_shard_rebuilds_only_derived_outputs(
+    tmp_path: Path,
+    market_frame: pd.DataFrame,
+) -> None:
+    raw = tmp_path / "raw" / "market.parquet"
+    raw.parent.mkdir()
+    market_frame.to_parquet(raw, compression="zstd", index=False)
+    raw_sha256 = sha256_file(raw)
+    store = tmp_path / "prepared" / "bar-store"
+    arguments = {
+        "raw_path": raw,
+        "output_root": store,
+        "download_manifest": _download_contract(raw, tmp_path, len(market_frame)),
+        "window_size": 32,
+        "bucket_count": 4,
+        "batch_rows": 200,
+        "purge_bars": 20,
+        "embargo_bars": 14,
+    }
+    build_symbol_bar_store(**arguments)
+    corrupted_shard = next((store / "shards").glob("bucket-*/shard.parquet"))
+    corrupted_relative = corrupted_shard.relative_to(store)
+    original_size = corrupted_shard.stat().st_size
+    with corrupted_shard.open("r+b") as stream:
+        original = stream.read(1)
+        stream.seek(0)
+        stream.write(bytes([original[0] ^ 0x01]))
+    assert corrupted_shard.stat().st_size == original_size
+
+    rebuilt = build_symbol_bar_store(**arguments)
+
+    assert resolve_bar_store_path(store) == store.resolve()
+    assert rebuilt.success_path.is_file()
+    assert sha256_file(raw) == raw_sha256
+    quarantines = list((tmp_path / "prepared").glob(".bar-store-obsolete-*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / corrupted_relative).is_file()
+
+
+def test_changed_content_identity_rebuilds_only_the_derived_bar_store(
+    tmp_path: Path,
+    market_frame: pd.DataFrame,
+) -> None:
+    raw = tmp_path / "raw" / "market.parquet"
+    raw.parent.mkdir()
+    market_frame.to_parquet(raw, compression="zstd", index=False)
+    raw_sha256 = sha256_file(raw)
+    store = tmp_path / "prepared" / "bar-store"
+    arguments = {
+        "raw_path": raw,
+        "output_root": store,
+        "download_manifest": _download_contract(raw, tmp_path, len(market_frame)),
+        "window_size": 32,
+        "bucket_count": 4,
+        "batch_rows": 200,
+        "purge_bars": 20,
+        "embargo_bars": 14,
+    }
+    first = build_symbol_bar_store(
+        **arguments,
+        materialization_digest="a" * 64,
+    )
+    first_manifest = json.loads(
+        first.bar_store_manifest_path.read_text(encoding="utf-8")
+    )
+
+    second = build_symbol_bar_store(
+        **arguments,
+        materialization_digest="b" * 64,
+    )
+    second_manifest = json.loads(
+        second.bar_store_manifest_path.read_text(encoding="utf-8")
+    )
+
+    assert first_manifest["identity"]["materialization_digest"] == "a" * 64
+    assert second_manifest["identity"]["materialization_digest"] == "b" * 64
+    assert second.success_path.is_file()
+    assert sha256_file(raw) == raw_sha256
+    assert len(list((tmp_path / "prepared").glob(".bar-store-obsolete-*"))) == 1
 
 
 def test_memory_planner_reduces_workers_and_rejects_unsafe_single_task() -> None:
@@ -279,11 +488,19 @@ def test_parallel_bar_store_matches_serial_output(
         "embargo_bars": 14,
         "memory_budget_bytes": 8 * bar_store_module.GIB,
     }
-    monkeypatch.setattr(bar_store_module, "_visible_cpu_count", lambda: 4)
     monkeypatch.setattr(
         bar_store_module,
-        "_detect_available_memory_bytes",
-        lambda: 16 * bar_store_module.GIB,
+        "detect_visible_cpu_count",
+        lambda: 4,
+    )
+    monkeypatch.setattr(
+        bar_store_module,
+        "detect_available_memory",
+        lambda: AvailableMemoryEstimate(
+            available_bytes=16 * bar_store_module.GIB,
+            source="test",
+            observations=(("test", 16 * bar_store_module.GIB),),
+        ),
     )
 
     serial = build_symbol_bar_store(
@@ -414,7 +631,7 @@ def test_fragmented_raw_row_groups_are_coalesced_without_materializing_windows(
     assert not list((tmp_path / "prepared" / "bar-store").rglob("*label*.parquet"))
 
 
-def test_scan_layout_upgrade_quarantines_only_incomplete_derived_work(
+def test_checkpoint_identity_change_quarantines_only_derived_bar_store(
     tmp_path: Path,
     market_frame: pd.DataFrame,
     monkeypatch: pytest.MonkeyPatch,
@@ -449,10 +666,11 @@ def test_scan_layout_upgrade_quarantines_only_incomplete_derived_work(
 
     state_path = store / ".work" / "build-state.json"
     previous_state = json.loads(state_path.read_text(encoding="utf-8"))
-    previous_state["identity"]["raw_scan_algorithm"] = "parquet-row-group-checkpoints-v2"
-    previous_state["identity"].pop("raw_scan_target_partition_rows")
-    previous_state["identity_sha256"] = bar_store_module.canonical_json_sha256(
-        previous_state["identity"]
+    previous_state["checkpoint_identity"]["schema_version"] = "obsolete-test-version"
+    previous_state["checkpoint_identity_sha256"] = (
+        bar_store_module.canonical_json_sha256(
+            previous_state["checkpoint_identity"]
+        )
     )
     state_path.write_text(
         json.dumps(previous_state, sort_keys=True),
@@ -466,9 +684,10 @@ def test_scan_layout_upgrade_quarantines_only_incomplete_derived_work(
     result = build_symbol_bar_store(**arguments)
 
     assert result.success_path.is_file()
-    quarantines = list((tmp_path / "prepared").glob(".bar-store-obsolete-scan-*"))
+    quarantines = list((tmp_path / "prepared").glob(".bar-store-obsolete-*"))
     assert len(quarantines) == 1
-    assert (quarantines[0] / "work" / "segments" / "segment-000000").is_dir()
+    assert (quarantines[0] / ".work" / "segments" / "segment-000000").is_dir()
+    assert raw.is_file()
     assert not list((store / ".work").iterdir())
 
 
@@ -491,7 +710,7 @@ def test_blockwise_sampler_is_exact_deterministic_and_does_not_store_window_indi
 
     fractional = BlockwisePermutationSampler(
         10_003,
-        fraction=0.03,
+        fraction=0.05,
         seed=29,
         block_size=64,
     )
@@ -501,10 +720,19 @@ def test_blockwise_sampler_is_exact_deterministic_and_does_not_store_window_indi
     assert (
         len(fractional_first_epoch)
         == len(set(fractional_first_epoch))
-        == int(10_003 * 0.03)
+        == int(10_003 * 0.05)
     )
     assert fractional_second_epoch != fractional_first_epoch
     assert set(fractional_second_epoch) == set(fractional_first_epoch)
+
+    capped = BlockwisePermutationSampler(
+        12_000_003,
+        fraction=0.05,
+        max_samples=500_000,
+        seed=31,
+        block_size=64,
+    )
+    assert len(capped) == min(int(12_000_003 * 0.05), 500_000) == 500_000
 
     fixed_batches = list(FixedSizeBatchSampler(complete, batch_size=128))
     assert all(len(batch) == 128 for batch in fixed_batches)

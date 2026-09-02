@@ -1,5 +1,5 @@
 experiment_name: kronos-base-lora-stage1
-description: Quant-only Stage 1 training on an exact deterministic 3% training subset for two epochs.
+description: Quant-only Stage 1 training on a deterministic 5% training subset capped at 500000 samples for two epochs.
 
 data:
   raw_path: ${DATA_ROOT:-/runpod-volume/data}/raw/market.parquet
@@ -13,12 +13,12 @@ data:
   diagnostic_horizons: [1, 20]
   stride: 5
   sample_stride: 1
-  train_fraction: 0.03
+  train_fraction: 0.05
   flat_volatility_multiplier: 0.25
   max_abs_log_return: 0.5
   embargo_trading_days: 5
   effective_embargo_trading_days: 14
-  max_samples: null
+  max_samples: 500000
   label_scale_calibration_samples: 50000
   require_ready_manifest: true
 
@@ -84,7 +84,7 @@ wandb:
   project: ${WANDB_PROJECT:-fin-ts-quant}
   entity: ${WANDB_ENTITY:-}
   group: kronos-base-lora
-  name: stage1-3pct-2epoch
+  name: stage1-5pct-cap500k-2epoch
   tags: [quant-only, kronos-base, lora, stage1]
   directory: ${WANDB_DIR:-/runpod-volume}
   mode: online

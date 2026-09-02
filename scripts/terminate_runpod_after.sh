@@ -86,9 +86,9 @@ if [[ -n "${READY_FILE}" ]]; then
     fi
 fi
 case "${LIFECYCLE_KEY}" in
-    ""|lifecycle/stage1/dataset.json|lifecycle/stage1/training.json|\
-        lifecycle/stage1/validation.json|\
-        lifecycle/stage1/dataset.json,lifecycle/stage1/mixed-finalization.json) ;;
+    ""|lifecycle/stage1/cpu-preparation.json|\
+        lifecycle/stage1/mixed-finalization.json|\
+        lifecycle/stage1/training.json|lifecycle/stage1/validation.json) ;;
     *)
         echo "Unsupported lifecycle marker key" >&2
         exit 2
@@ -219,8 +219,8 @@ raise SystemExit(0 if valid else 2)' \
                     continue
                 fi
                 case "${lifecycle_candidate}" in
-                    lifecycle/stage1/dataset.json)
-                        expected_lifecycle_kind="stage1-dataset"
+                    lifecycle/stage1/cpu-preparation.json)
+                        expected_lifecycle_kind="stage1-cpu-preparation"
                         ;;
                     lifecycle/stage1/mixed-finalization.json)
                         expected_lifecycle_kind="stage1-mixed-finalization"

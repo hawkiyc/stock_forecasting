@@ -50,9 +50,9 @@ if [[ -n "${RUNPOD_GUARD_RUN_ID}" \
     exit 2
 fi
 case "${LIFECYCLE_KEY}" in
-    lifecycle/stage1/dataset.json|lifecycle/stage1/training.json|\
-        lifecycle/stage1/validation.json|\
-        lifecycle/stage1/dataset.json,lifecycle/stage1/mixed-finalization.json) ;;
+    lifecycle/stage1/cpu-preparation.json|\
+        lifecycle/stage1/mixed-finalization.json|\
+        lifecycle/stage1/training.json|lifecycle/stage1/validation.json) ;;
     *)
         echo "Unsupported lifecycle marker key" >&2
         exit 2

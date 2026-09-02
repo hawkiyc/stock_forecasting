@@ -3,10 +3,12 @@
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
 import os
 import re
+import runpy
 import sys
 import uuid
 from collections import namedtuple
@@ -28,7 +30,7 @@ ISO_TIMESTAMP_PATTERN = re.compile(
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
 POD_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 CHECKPOINT_NAME_PATTERN = re.compile(r"^checkpoint-[0-9]{6,}$")
-DATASET_RESUMABLE_STATES = frozenset(
+CPU_PREPARATION_RESUMABLE_STATES = frozenset(
     {
         "waiting_for_provider",
         "waiting_for_budget",
@@ -39,7 +41,7 @@ DATASET_RESUMABLE_STATES = frozenset(
 )
 GUARD_LIFECYCLE_KINDS = frozenset(
     {
-        "stage1-dataset",
+        "stage1-cpu-preparation",
         "stage1-mixed-finalization",
         "stage1-training",
         "stage1-validation",
@@ -52,22 +54,71 @@ GUARD_LIFECYCLE_STATES = frozenset(
         "ready",
         "failed",
         "timed_out",
-        *DATASET_RESUMABLE_STATES,
+        *CPU_PREPARATION_RESUMABLE_STATES,
     }
 )
 GPU_WORKFLOW_ACTIVE_STATES = frozenset({"preparing", "finalizing"})
 GPU_WORKFLOW_TERMINAL_STATES = frozenset({"ready", "failed", "timed_out"})
 ORPHANED_GPU_WORKFLOW_REASON = "runpod_pod_not_found"
-NUMERICAL_PIPELINE_PATHS = (
-    "src/stock_forecasting/cli/prepare_data.py",
-    "src/stock_forecasting/data/adjustments.py",
-    "src/stock_forecasting/data/bar_store.py",
-    "src/stock_forecasting/data/benchmarks.py",
-    "src/stock_forecasting/data/horizons.py",
-    "src/stock_forecasting/data/manifest.py",
-    "src/stock_forecasting/data/schema.py",
-    "src/stock_forecasting/data/splits.py",
+
+_CONTENT_IDENTITY_CONTRACT = runpy.run_path(
+    str(
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "stock_forecasting"
+        / "data"
+        / "content_identity.py"
+    )
 )
+CONTENT_IDENTITY_SCHEMA_VERSION = _CONTENT_IDENTITY_CONTRACT[
+    "CONTENT_IDENTITY_SCHEMA_VERSION"
+]
+
+_DATASET_IDENTITY_CONTRACT = runpy.run_path(
+    str(
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "stock_forecasting"
+        / "dataset_identity.py"
+    )
+)
+_DATASET_PROFILE_CONTRACT = runpy.run_path(
+    str(
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "stock_forecasting"
+        / "dataset_profiles.py"
+    )
+)
+_TRAINING_STAGE_CONTRACT = runpy.run_path(
+    str(
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "stock_forecasting"
+        / "training_stage_contract.py"
+    )
+)
+DATASET_REQUEST_SCHEMA_VERSION = _DATASET_IDENTITY_CONTRACT[
+    "DATASET_REQUEST_SCHEMA_VERSION"
+]
+DATASET_STORAGE_PREPARATION_FIELDS = _DATASET_IDENTITY_CONTRACT[
+    "DATASET_STORAGE_PREPARATION_FIELDS"
+]
+DEFAULT_DATASET_STORAGE_PREPARATION = _DATASET_IDENTITY_CONTRACT[
+    "DEFAULT_DATASET_STORAGE_PREPARATION"
+]
+BAR_STORE_SCHEMA_VERSION = _DATASET_IDENTITY_CONTRACT["BAR_STORE_SCHEMA_VERSION"]
+BAR_STORE_KIND = _DATASET_IDENTITY_CONTRACT["BAR_STORE_KIND"]
+dataset_request_identity_payload = _DATASET_IDENTITY_CONTRACT[
+    "dataset_request_identity_payload"
+]
+PROFILE_DATASETS = {
+    profile: sorted(datasets)
+    for profile, datasets in _DATASET_PROFILE_CONTRACT["PROFILE_DATASETS"].items()
+}
+PRODUCTION_STAGE_SAMPLE_CONTRACTS = _TRAINING_STAGE_CONTRACT[
+    "PRODUCTION_STAGE_SAMPLE_CONTRACTS"
+]
 
 
 StageContract = namedtuple(
@@ -76,6 +127,7 @@ StageContract = namedtuple(
         "dataset_profile",
         "training_stage",
         "train_fraction",
+        "max_samples",
         "embargo_trading_days",
         "required_model_repositories",
     ),
@@ -130,21 +182,30 @@ def _load_stage_contract(config_path):
             raise ValueError(f"Training config repeats a readiness key at line {line_number}")
         active_values[key] = _resolve_environment_default(_strip_yaml_scalar(value))
 
-    required = {"dataset_profile", "train_fraction", "embargo_trading_days"}
+    required = {
+        "dataset_profile",
+        "train_fraction",
+        "max_samples",
+        "embargo_trading_days",
+    }
     missing = sorted(required.difference(data_values))
     if missing:
         raise ValueError("Training config has no readiness values: " + ", ".join(missing))
     dataset_profile = data_values["dataset_profile"]
-    if dataset_profile not in {
-        "tw_only",
-        "us_only_eodhd",
-        "us_tw_eodhd",
-        "us_tw_massive",
-    }:
+    if dataset_profile not in PROFILE_DATASETS:
         raise ValueError("Training config data.dataset_profile is unsupported")
     if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", data_values["train_fraction"]):
         raise ValueError("Training config data.train_fraction must be numeric")
     train_fraction = float(data_values["train_fraction"])
+    raw_max_samples = data_values["max_samples"].lower()
+    if raw_max_samples in {"", "null", "~"}:
+        max_samples = None
+    elif re.fullmatch(r"[1-9][0-9]*", raw_max_samples):
+        max_samples = int(raw_max_samples)
+    else:
+        raise ValueError(
+            "Training config data.max_samples must be null or a positive integer"
+        )
     if not re.fullmatch(r"[0-9]+", data_values["embargo_trading_days"]):
         raise ValueError("Training config data.embargo_trading_days must be an integer")
     embargo_trading_days = int(data_values["embargo_trading_days"])
@@ -173,13 +234,20 @@ def _load_stage_contract(config_path):
     training_stage = training_values.get("stage")
     if training_stage not in {"stage1", "stage2"}:
         raise ValueError("Training config training.stage must be stage1 or stage2")
-    expected_fraction = 0.03 if training_stage == "stage1" else 1.0
+    sample_contract = PRODUCTION_STAGE_SAMPLE_CONTRACTS[training_stage]
+    expected_fraction = float(sample_contract["train_fraction"])
     if abs(train_fraction - expected_fraction) > 1e-12:
         raise ValueError("Training config stage and train_fraction disagree")
+    if (
+        model_values["time_series_backend"] == "kronos"
+        and max_samples != sample_contract["max_samples"]
+    ):
+        raise ValueError("Training config stage and max_samples disagree")
     return StageContract(
         dataset_profile=dataset_profile,
         training_stage=training_stage,
         train_fraction=train_fraction,
+        max_samples=max_samples,
         embargo_trading_days=embargo_trading_days,
         required_model_repositories=tuple(dict.fromkeys(repositories)),
     )
@@ -229,6 +297,101 @@ def _records_digest(records):
         line = "{sha256} {size_bytes} {path}\n".format(**record)
         digest.update(line.encode("utf-8"))
     return digest.hexdigest()
+
+
+def _content_identity_module(project_root):
+    source = (
+        Path(project_root)
+        / "src"
+        / "stock_forecasting"
+        / "data"
+        / "content_identity.py"
+    )
+    if not source.is_file() or source.is_symlink():
+        raise ValueError("Data content identity helper is missing or is a symlink")
+    specification = importlib.util.spec_from_file_location(
+        "runpod_data_content_identity",
+        source,
+    )
+    if specification is None or specification.loader is None:
+        raise ValueError("Data content identity helper cannot be loaded")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+def _project_content_identity(project_root):
+    module = _content_identity_module(project_root)
+    package_root = Path(project_root) / "src" / "stock_forecasting"
+    return (
+        module.code_content_identity(package_root=package_root),
+        module.semantic_source_paths(),
+    )
+
+
+def _validate_content_identity_digest(value, label):
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _validate_code_content_identity(identity):
+    if (
+        not isinstance(identity, dict)
+        or set(identity)
+        != {
+            "schema_version",
+            "provider_materialization_digests",
+            "raw_materialization_digest",
+            "bar_store_materialization_digest",
+        }
+        or identity.get("schema_version") != CONTENT_IDENTITY_SCHEMA_VERSION
+    ):
+        raise ValueError("Code manifest data content identity is invalid")
+    providers = identity.get("provider_materialization_digests")
+    expected_providers = {
+        "eodhd_us",
+        "massive_us",
+        "tpex_official",
+        "twse_official",
+    }
+    if not isinstance(providers, dict) or set(providers) != expected_providers:
+        raise ValueError("Code manifest provider content identities are invalid")
+    for provider, digest in providers.items():
+        _validate_content_identity_digest(digest, f"Code {provider} content identity")
+    _validate_content_identity_digest(
+        identity.get("raw_materialization_digest"),
+        "Code raw materialization identity",
+    )
+    _validate_content_identity_digest(
+        identity.get("bar_store_materialization_digest"),
+        "Code bar-store content identity",
+    )
+    return identity
+
+
+def _dataset_content_identity_from_code(code_payload, selected_datasets):
+    code_identity = _validate_code_content_identity(code_payload.get("data_content_identity"))
+    if (
+        not isinstance(selected_datasets, list)
+        or selected_datasets != sorted(set(selected_datasets))
+    ):
+        raise ValueError("Selected datasets for content identity are invalid")
+    providers = code_identity["provider_materialization_digests"]
+    missing = sorted(set(selected_datasets).difference(providers))
+    if missing:
+        raise ValueError("Code has no provider content identity for: " + ", ".join(missing))
+    return {
+        "schema_version": CONTENT_IDENTITY_SCHEMA_VERSION,
+        "selected_datasets": selected_datasets,
+        "provider_materialization_digests": {
+            provider: providers[provider] for provider in selected_datasets
+        },
+        "raw_materialization_digest": code_identity["raw_materialization_digest"],
+        "bar_store_materialization_digest": code_identity[
+            "bar_store_materialization_digest"
+        ],
+    }
 
 
 def _load_json(source):
@@ -300,13 +463,18 @@ def _validate_code_payload(payload, project_root=None):
         raise ValueError("Code manifest release digest is inconsistent")
 
     pipeline_paths = payload.get("data_pipeline_paths")
-    if not isinstance(pipeline_paths, list) or not pipeline_paths:
+    if (
+        not isinstance(pipeline_paths, list)
+        or not pipeline_paths
+        or pipeline_paths != sorted(set(pipeline_paths))
+    ):
         raise ValueError("Code manifest has no data pipeline scope")
     pipeline_set = set(pipeline_paths)
     pipeline_records = [record for record in records if record["path"] in pipeline_set]
     if len(pipeline_records) != len(pipeline_set):
         raise ValueError("Code manifest data pipeline scope is incomplete")
-    if _records_digest(pipeline_records) != payload.get("data_pipeline_digest"):
+    content_identity = _validate_code_content_identity(payload.get("data_content_identity"))
+    if _payload_sha256(content_identity) != payload.get("data_pipeline_digest"):
         raise ValueError("Code manifest data pipeline digest is inconsistent")
     removed_fields = {
         "compatible_data_pipeline_digests",
@@ -317,6 +485,11 @@ def _validate_code_payload(payload, project_root=None):
 
     if project_root is not None:
         manifest_paths = _validate_manifest_project_files(payload, project_root)
+        expected_identity, expected_paths = _project_content_identity(project_root)
+        if content_identity != expected_identity or pipeline_paths != expected_paths:
+            raise ValueError(
+                "Code manifest data content identity differs from mounted source"
+            )
         extra_sources = [
             relative
             for relative, _candidate in _find_unlisted_sources(project_root, manifest_paths)
@@ -528,14 +701,18 @@ def command_code_manifest(arguments):
     )
     if len({record["path"] for record in records}) != len(records):
         raise ValueError("Code manifest contains duplicate paths")
-    pipeline_paths = sorted(
+    content_identity, pipeline_paths = _project_content_identity(project_root)
+    requested_pipeline_paths = sorted(
         {_safe_relative_path(path).as_posix() for path in arguments.pipeline_path}
     )
+    if requested_pipeline_paths and requested_pipeline_paths != pipeline_paths:
+        raise ValueError(
+            "Explicit data pipeline paths differ from the content identity boundary"
+        )
     record_paths = {record["path"] for record in records}
     if not set(pipeline_paths).issubset(record_paths):
         raise ValueError("Every data pipeline path must also be in the upload manifest")
-    pipeline_records = [record for record in records if record["path"] in set(pipeline_paths)]
-    pipeline_digest = _records_digest(pipeline_records)
+    pipeline_digest = _payload_sha256(content_identity)
     payload = {
         "schema_version": SCHEMA_VERSION,
         "kind": "code",
@@ -547,6 +724,7 @@ def command_code_manifest(arguments):
         "release_digest": _records_digest(records),
         "data_pipeline_digest": pipeline_digest,
         "data_pipeline_paths": pipeline_paths,
+        "data_content_identity": content_identity,
         "files": records,
     }
     json.dump(payload, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True)
@@ -590,15 +768,7 @@ def _payload_sha256(payload):
 def _dataset_request_sha256(payload):
     if not isinstance(payload, dict):
         return ""
-    normalized = dict(payload)
-    preparation = payload.get("preparation")
-    if isinstance(preparation, dict):
-        normalized["preparation"] = {
-            **preparation,
-            "h_start": 1,
-            "alpha_horizons": list(range(1, 15)),
-        }
-    return _payload_sha256(normalized)
+    return _payload_sha256(dataset_request_identity_payload(payload))
 
 
 def _parse_utc_timestamp(value, label):
@@ -673,28 +843,25 @@ def _validate_causal_split_audit(audit, split_counts, label):
             raise ValueError(f"{label} {split} label crosses the next split boundary")
 
 
-def _numerical_pipeline_digest_from_code_payload(code_payload):
-    records = code_payload.get("files")
-    if not isinstance(records, list):
-        raise ValueError("Code manifest has no files")
-    by_path = {
-        record.get("path"): record
-        for record in records
-        if isinstance(record, dict) and isinstance(record.get("path"), str)
-    }
-    missing = sorted(set(NUMERICAL_PIPELINE_PATHS).difference(by_path))
-    if missing:
-        raise ValueError("Code manifest omits numerical pipeline files: " + ", ".join(missing))
-    pipeline_payload = {
-        relative.removeprefix("src/stock_forecasting/"): by_path[relative]["sha256"]
-        for relative in NUMERICAL_PIPELINE_PATHS
-    }
-    return _payload_sha256(pipeline_payload)
+def _numerical_pipeline_digest_from_code_payload(code_payload, selected_datasets=None):
+    identity = _validate_code_content_identity(code_payload.get("data_content_identity"))
+    if selected_datasets is None:
+        return _payload_sha256(identity)
+    return _payload_sha256(
+        _dataset_content_identity_from_code(code_payload, selected_datasets)
+    )
 
 
 def command_code_numerical_pipeline_digest(arguments):
     payload = _validate_code_payload(_load_json(arguments.marker))
-    sys.stdout.write(_numerical_pipeline_digest_from_code_payload(payload) + "\n")
+    selected_datasets = (
+        PROFILE_DATASETS[arguments.dataset_profile]
+        if arguments.dataset_profile is not None
+        else None
+    )
+    sys.stdout.write(
+        _numerical_pipeline_digest_from_code_payload(payload, selected_datasets) + "\n"
+    )
     return 0
 
 
@@ -703,7 +870,6 @@ def _validate_dataset_code_compatibility(
     *,
     code_payload=None,
     expected_numerical_pipeline_digest=None,
-    expected_code_release_digest=None,
 ):
     """Validate data semantics separately from full source-release provenance."""
 
@@ -712,11 +878,52 @@ def _validate_dataset_code_compatibility(
         r"[0-9a-f]{64}", pipeline_digest
     ):
         raise ValueError("Dataset readiness numerical pipeline digest is invalid")
+    content_identity = payload.get("data_content_identity")
+    selected_datasets = payload.get("selected_datasets")
     if (
-        code_payload is not None
-        and pipeline_digest != _numerical_pipeline_digest_from_code_payload(code_payload)
+        not isinstance(content_identity, dict)
+        or set(content_identity)
+        != {
+            "schema_version",
+            "selected_datasets",
+            "provider_materialization_digests",
+            "raw_materialization_digest",
+            "bar_store_materialization_digest",
+        }
+        or content_identity.get("schema_version")
+        != CONTENT_IDENTITY_SCHEMA_VERSION
+        or content_identity.get("selected_datasets") != selected_datasets
+        or _payload_sha256(content_identity) != pipeline_digest
     ):
-        raise ValueError("Dataset was prepared with a different numerical pipeline revision")
+        raise ValueError("Dataset readiness data content identity is invalid")
+    providers = content_identity.get("provider_materialization_digests")
+    if (
+        not isinstance(providers, dict)
+        or not isinstance(selected_datasets, list)
+        or set(providers) != set(selected_datasets)
+        or any(
+            not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in providers.values()
+        )
+    ):
+        raise ValueError("Dataset readiness provider content identities are invalid")
+    _validate_content_identity_digest(
+        content_identity.get("raw_materialization_digest"),
+        "Dataset raw materialization identity",
+    )
+    _validate_content_identity_digest(
+        content_identity.get("bar_store_materialization_digest"),
+        "Dataset bar-store content identity",
+    )
+    if code_payload is not None:
+        expected_identity = _dataset_content_identity_from_code(
+            code_payload,
+            selected_datasets,
+        )
+        if content_identity != expected_identity:
+            raise ValueError(
+                "Dataset was prepared with a different numerical pipeline revision"
+            )
     if expected_numerical_pipeline_digest is not None and (
         not isinstance(expected_numerical_pipeline_digest, str)
         or re.fullmatch(r"[0-9a-f]{64}", expected_numerical_pipeline_digest) is None
@@ -733,18 +940,12 @@ def _validate_dataset_code_compatibility(
         r"[0-9a-f]{64}", code_release_digest
     ):
         raise ValueError("Dataset readiness code release digest is invalid")
-    if (
-        expected_code_release_digest is not None
-        and code_release_digest != expected_code_release_digest
-    ):
-        raise ValueError("Dataset was prepared from a different code release")
 
 
 def _validate_quant_dataset_payload(
     payload,
     code_payload=None,
     expected_numerical_pipeline_digest=None,
-    expected_code_release_digest=None,
     stage_contract=None,
 ):
     if payload.get("schema_version") != 2 or payload.get("kind") != "stage1-dataset":
@@ -812,15 +1013,9 @@ def _validate_quant_dataset_payload(
         artifacts[name] = artifact
 
     profile = payload.get("dataset_profile")
-    selected_by_profile = {
-        "tw_only": ["tpex_official", "twse_official"],
-        "us_only_eodhd": ["eodhd_us"],
-        "us_tw_eodhd": ["eodhd_us", "tpex_official", "twse_official"],
-        "us_tw_massive": ["massive_us", "tpex_official", "twse_official"],
-    }
-    if profile not in selected_by_profile:
+    if profile not in PROFILE_DATASETS:
         raise ValueError("Dataset readiness profile is unsupported")
-    if payload.get("selected_datasets") != selected_by_profile[profile]:
+    if payload.get("selected_datasets") != PROFILE_DATASETS[profile]:
         raise ValueError("Dataset readiness providers disagree with its profile")
     if requested_dataset.get("profile") != profile:
         raise ValueError("Dataset readiness requested profile disagrees with prepared data")
@@ -835,8 +1030,6 @@ def _validate_quant_dataset_payload(
             stage_contract.required_model_repositories
         ):
             raise ValueError("Offline model cache does not cover the selected model config")
-        if selected_stage != stage_contract.training_stage:
-            raise ValueError("Dataset selected stage differs from the selected training config")
 
     symbols = payload.get("symbols")
     if (
@@ -856,33 +1049,19 @@ def _validate_quant_dataset_payload(
     if payload.get("universe_sha256") != _payload_sha256(symbols):
         raise ValueError("Dataset readiness universe digest is inconsistent")
 
-    preparation_spec = payload.get("preparation_spec")
-    if not isinstance(preparation_spec, dict) or payload.get(
-        "preparation_spec_sha256"
-    ) != _payload_sha256(preparation_spec):
-        raise ValueError("Dataset readiness preparation spec is invalid")
-    if preparation_spec.get("target_horizon") != 5:
-        raise ValueError("Quant target horizon must remain five trading days")
-    if sorted(preparation_spec.get("diagnostic_horizons", [])) != [1, 20]:
-        raise ValueError("Numerical diagnostic horizons must remain 1 and 20 days")
-    h_start = preparation_spec.get("h_start")
-    if isinstance(h_start, bool) or h_start not in (1, 2, 3):
-        raise ValueError("Quant h_start must be 1, 2, or 3")
-    if preparation_spec.get("max_horizon") != 14:
-        raise ValueError("Quant maximum alpha horizon must remain 14 trading days")
-    if preparation_spec.get("alpha_horizons") != list(range(h_start, 15)):
-        raise ValueError("Quant alpha horizons must be contiguous from h_start through day 14")
+    preparation_provenance = payload.get("preparation_provenance")
+    if not isinstance(preparation_provenance, dict):
+        raise ValueError("Dataset readiness preparation provenance is invalid")
+    storage_preparation = payload.get("storage_preparation_spec")
     if (
-        preparation_spec.get("storage_kind")
-        != "symbol-oriented-ohlcv-bar-store"
-        or preparation_spec.get("window_materialized") is not False
-        or preparation_spec.get("labels_materialized") is not False
-        or preparation_spec.get("supported_h_start") != [1, 2, 3]
+        not isinstance(storage_preparation, dict)
+        or set(storage_preparation) != set(DATASET_STORAGE_PREPARATION_FIELDS)
+        or any(
+            preparation_provenance.get(field) != storage_preparation.get(field)
+            for field in DATASET_STORAGE_PREPARATION_FIELDS
+        )
     ):
-        raise ValueError("Quant dataset must use lazy bar storage and runtime labels")
-    storage_preparation = dict(preparation_spec)
-    storage_preparation.pop("h_start", None)
-    storage_preparation.pop("alpha_horizons", None)
+        raise ValueError("Dataset readiness storage preparation provenance is invalid")
     storage_preparation_sha256 = payload.get("storage_preparation_spec_sha256")
     if (
         not isinstance(storage_preparation_sha256, str)
@@ -890,29 +1069,72 @@ def _validate_quant_dataset_payload(
         or storage_preparation_sha256 != _payload_sha256(storage_preparation)
     ):
         raise ValueError("Dataset readiness storage preparation spec is invalid")
+    if (
+        storage_preparation.get("bar_store_schema_version")
+        != BAR_STORE_SCHEMA_VERSION
+        or storage_preparation.get("storage_kind") != BAR_STORE_KIND
+        or storage_preparation.get("window_materialized") is not False
+        or storage_preparation.get("labels_materialized") is not False
+        or storage_preparation.get("max_horizon")
+        != DEFAULT_DATASET_STORAGE_PREPARATION["max_horizon"]
+    ):
+        raise ValueError("Quant dataset must use the supported lazy bar-store contract")
+    window_size = storage_preparation.get("window_size")
+    purge_bars = storage_preparation.get("purge_bars")
+    effective_embargo_bars = storage_preparation.get("effective_embargo_bars")
+    if (
+        not isinstance(window_size, int)
+        or isinstance(window_size, bool)
+        or window_size < 2
+        or not isinstance(purge_bars, int)
+        or isinstance(purge_bars, bool)
+        or purge_bars < 0
+        or not isinstance(effective_embargo_bars, int)
+        or isinstance(effective_embargo_bars, bool)
+        or effective_embargo_bars
+        < DEFAULT_DATASET_STORAGE_PREPARATION["max_horizon"]
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(storage_preparation.get("benchmark_mapping_sha256", "")),
+        )
+        is None
+    ):
+        raise ValueError("Dataset readiness storage preparation values are invalid")
+    numeric_storage_values = (
+        storage_preparation.get("max_abs_log_return"),
+        storage_preparation.get("train_fraction"),
+        storage_preparation.get("validation_fraction"),
+    )
+    if any(
+        not isinstance(value, int | float)
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) <= 0.0
+        for value in numeric_storage_values
+    ):
+        raise ValueError("Dataset readiness numeric storage values are invalid")
+    if (
+        float(storage_preparation["train_fraction"])
+        + float(storage_preparation["validation_fraction"])
+        >= 1.0
+    ):
+        raise ValueError("Dataset readiness split fractions are invalid")
     requested_preparation = requested_dataset.get("preparation")
     if not isinstance(requested_preparation, dict):
         raise ValueError("Dataset readiness requested preparation contract is invalid")
-    for field in (
-        "h_start",
-        "max_horizon",
-        "alpha_horizons",
-        "training_security_scope",
-        "split_policy",
-    ):
-        if preparation_spec.get(field) != requested_preparation.get(field):
+    for field in DATASET_STORAGE_PREPARATION_FIELDS:
+        if storage_preparation.get(field) != requested_preparation.get(field):
             raise ValueError(
-                f"Dataset readiness {field} disagrees with its requested dataset"
+                f"Dataset readiness storage field {field} disagrees with its request"
             )
-    if payload.get("training_security_scope") != preparation_spec.get(
-        "training_security_scope"
+    training_security_scope = payload.get("training_security_scope")
+    if (
+        not isinstance(training_security_scope, str)
+        or not training_security_scope
+        or preparation_provenance.get("training_security_scope")
+        != training_security_scope
     ):
         raise ValueError("Dataset readiness training security scope is inconsistent")
-    if (
-        stage_contract is not None
-        and preparation_spec.get("embargo_bars") != stage_contract.embargo_trading_days
-    ):
-        raise ValueError("Dataset embargo differs from the selected training config")
     split_counts = payload.get("split_counts")
     if (
         not isinstance(split_counts, dict)
@@ -951,7 +1173,6 @@ def _validate_quant_dataset_payload(
         payload,
         code_payload=code_payload,
         expected_numerical_pipeline_digest=expected_numerical_pipeline_digest,
-        expected_code_release_digest=expected_code_release_digest,
     )
     return payload
 
@@ -986,21 +1207,26 @@ def _guard_lifecycle_state(
     if state not in GUARD_LIFECYCLE_STATES:
         raise ValueError("Guard lifecycle state is unsupported")
 
-    if expected_kind == "stage1-dataset" and state == "ready":
-        # A successful numerical dataset is the immutable readiness schema. All
-        # in-progress, resumable, and failure states use the lifecycle schema.
-        _validate_quant_dataset_payload(payload)
-    elif payload.get("schema_version") != LIFECYCLE_SCHEMA_VERSION:
+    if payload.get("schema_version") != LIFECYCLE_SCHEMA_VERSION:
         raise ValueError("Guard lifecycle marker has an unsupported schema")
 
-    if state in DATASET_RESUMABLE_STATES and expected_kind != "stage1-dataset":
-        raise ValueError("Resumable acquisition states are valid only for the dataset")
-    if state == "downloaded" and payload.get("exit_code") is None:
+    if (
+        state in CPU_PREPARATION_RESUMABLE_STATES
+        and expected_kind != "stage1-cpu-preparation"
+    ):
+        raise ValueError(
+            "Resumable acquisition states are valid only for CPU preparation"
+        )
+    if (
+        expected_kind == "stage1-cpu-preparation"
+        and state == "downloaded"
+        and payload.get("exit_code") is None
+    ):
         return "downloaded_active"
-    if state in DATASET_RESUMABLE_STATES and (
+    if state in CPU_PREPARATION_RESUMABLE_STATES and (
         type(payload.get("exit_code")) is not int or payload.get("exit_code") != 75
     ):
-        raise ValueError("Terminal resumable dataset state requires exit_code=75")
+        raise ValueError("Terminal resumable CPU preparation state requires exit_code=75")
     if state == "ready":
         if expected_kind == "stage1-training" and payload.get("training_completed") is not True:
             raise ValueError("Ready training lifecycle is incomplete")
@@ -1062,15 +1288,19 @@ def _verify_dataset_artifacts(payload, network_volume_root):
 
     dataset_payload = _load_json(str(paths["dataset_manifest"]))
     if (
-        dataset_payload.get("schema_version") != "3.0"
+        dataset_payload.get("schema_version") != "4.0"
         or dataset_payload.get("kind") != "ohlcv-bar-store-dataset"
         or dataset_payload.get("state") != "ready"
         or dataset_payload.get("dataset_profile") != payload.get("dataset_profile")
         or dataset_payload.get("selected_datasets") != payload.get("selected_datasets")
         or dataset_payload.get("training_security_scope")
         != payload.get("training_security_scope")
+        or dataset_payload.get("data_content_identity")
+        != payload.get("data_content_identity")
         or dataset_payload.get("data_pipeline_digest") != payload.get("data_pipeline_digest")
-        or dataset_payload.get("preparation_spec_sha256")
+        or dataset_payload.get("storage_preparation_spec")
+        != payload.get("storage_preparation_spec")
+        or dataset_payload.get("storage_preparation_spec_sha256")
         != payload.get("storage_preparation_spec_sha256")
         or dataset_payload.get("universe_sha256") != payload.get("universe_sha256")
         or dataset_payload.get("split_counts") != payload.get("split_counts")
@@ -1124,13 +1354,8 @@ def command_check_dataset(arguments):
         expected_numerical_pipeline_digest=(
             arguments.expected_numerical_pipeline_digest
         ),
-        expected_code_release_digest=arguments.expected_code_release_digest,
         stage_contract=stage_contract,
     )
-    if arguments.stage_config is not None and payload.get("stage_config_sha256") != _sha256(
-        arguments.stage_config
-    ):
-        raise ValueError("Dataset was prepared for a different stage config revision")
     if arguments.network_volume_root is not None:
         _verify_dataset_artifacts(payload, arguments.network_volume_root)
     print(
@@ -1148,6 +1373,7 @@ def command_stage_contract(arguments):
             "dataset_profile": contract.dataset_profile,
             "training_stage": contract.training_stage,
             "train_fraction": contract.train_fraction,
+            "max_samples": contract.max_samples,
             "embargo_trading_days": contract.embargo_trading_days,
             "required_model_repositories": list(contract.required_model_repositories),
         },
@@ -1611,25 +1837,25 @@ def command_active_run_lifecycle(arguments):
     return _validate_active_run_lifecycle(arguments, {"preparing", "finalizing"})
 
 
-def command_resumable_dataset_lifecycle(arguments):
-    """Validate a worker-published resumable dataset marker before tmux preserves it."""
+def command_resumable_cpu_preparation_lifecycle(arguments):
+    """Validate a worker-published resumable CPU marker before tmux preserves it."""
 
     payload = _load_json(arguments.marker)
     state = payload.get("state")
     if (
         payload.get("schema_version") != LIFECYCLE_SCHEMA_VERSION
-        or payload.get("kind") != "stage1-dataset"
-        or state not in DATASET_RESUMABLE_STATES
+        or payload.get("kind") != "stage1-cpu-preparation"
+        or state not in CPU_PREPARATION_RESUMABLE_STATES
         or payload.get("exit_code") != 75
     ):
-        raise ValueError("Dataset lifecycle is not a resumable terminal state")
+        raise ValueError("CPU preparation lifecycle is not a resumable terminal state")
     volume_root = arguments.network_volume_root.resolve(strict=False)
     _validate_run_lifecycle_paths(payload, volume_root)
     pod_id = os.environ.get("RUNPOD_POD_ID", "")
     if not pod_id or payload.get("pod_id") != pod_id:
-        raise ValueError("Dataset lifecycle belongs to a different Pod")
+        raise ValueError("CPU preparation lifecycle belongs to a different Pod")
     if payload.get("launch_id") != arguments.launch_id:
-        raise ValueError("Dataset lifecycle belongs to a different launch")
+        raise ValueError("CPU preparation lifecycle belongs to a different launch")
 
     progress_path = Path(str(payload.get("progress_path", ""))).resolve(strict=False)
     datasets_root = (volume_root / "datasets").resolve(strict=False)
@@ -1647,6 +1873,7 @@ def command_resumable_dataset_lifecycle(arguments):
         raise ValueError("Dataset progress path is not canonical")
     progress = _load_json(progress_path)
     identity = progress.get("identity")
+    context = progress.get("context")
     expected_progress_state = (
         "downloaded" if state == "waiting_for_preparation" else state
     )
@@ -1655,8 +1882,9 @@ def command_resumable_dataset_lifecycle(arguments):
         or progress.get("kind") != "ohlcv-download-progress"
         or progress.get("state") != expected_progress_state
         or not isinstance(identity, dict)
+        or not isinstance(context, dict)
         or progress.get("identity_sha256") != _payload_sha256(identity)
-        or identity.get("dataset_request_sha256") != relative.parts[0]
+        or context.get("dataset_request_sha256") != relative.parts[0]
     ):
         raise ValueError("Dataset progress does not match the resumable lifecycle")
     sys.stdout.write(str(state) + "\n")
@@ -1939,7 +2167,9 @@ def command_write_state(arguments):
     if output == Path("/workspace") or Path("/workspace") in output.parents:
         raise ValueError("Lifecycle state must never use /workspace")
     canonical_outputs = {
-        "stage1-dataset": volume_root / "lifecycle" / "stage1" / "dataset.json",
+        "stage1-cpu-preparation": (
+            volume_root / "lifecycle" / "stage1" / "cpu-preparation.json"
+        ),
         "stage1-mixed-finalization": (
             volume_root / "lifecycle" / "stage1" / "mixed-finalization.json"
         ),
@@ -1951,16 +2181,26 @@ def command_write_state(arguments):
         raise ValueError("Lifecycle kind is unsupported")
     if output != expected_output.resolve(strict=False):
         raise ValueError(f"{arguments.kind} lifecycle must equal {expected_output}")
-    if arguments.state in DATASET_RESUMABLE_STATES and arguments.kind != "stage1-dataset":
-        raise ValueError(f"{arguments.state} is valid only for stage1-dataset")
-    if arguments.state in DATASET_RESUMABLE_STATES - {"downloaded"} and arguments.exit_code != 75:
+    if (
+        arguments.state in CPU_PREPARATION_RESUMABLE_STATES
+        and arguments.kind != "stage1-cpu-preparation"
+    ):
+        raise ValueError(
+            f"{arguments.state} is valid only for stage1-cpu-preparation"
+        )
+    if (
+        arguments.state in CPU_PREPARATION_RESUMABLE_STATES - {"downloaded"}
+        and arguments.exit_code != 75
+    ):
         raise ValueError(f"{arguments.state} lifecycle requires exit_code=75")
     if arguments.state == "downloaded" and arguments.exit_code not in {None, 75}:
         raise ValueError("downloaded lifecycle accepts only no exit code or exit_code=75")
     resolved_progress_path = None
     if arguments.progress_path:
-        if arguments.kind != "stage1-dataset":
-            raise ValueError("Only stage1-dataset lifecycle may reference download progress")
+        if arguments.kind != "stage1-cpu-preparation":
+            raise ValueError(
+                "Only stage1-cpu-preparation lifecycle may reference download progress"
+            )
         progress_path = Path(arguments.progress_path)
         if not progress_path.is_file() or progress_path.is_symlink():
             raise ValueError("Download progress must be a regular file")
@@ -1983,12 +2223,15 @@ def command_write_state(arguments):
         if not isinstance(progress_payload, dict):
             raise ValueError("Download progress must contain a JSON object")
         progress_identity = progress_payload.get("identity")
+        progress_context = progress_payload.get("context")
         if (
             progress_payload.get("schema_version") != 1
             or progress_payload.get("kind") != "ohlcv-download-progress"
             or not isinstance(progress_identity, dict)
+            or not isinstance(progress_context, dict)
             or progress_payload.get("identity_sha256") != _payload_sha256(progress_identity)
-            or progress_identity.get("dataset_request_sha256") != progress_relative.parts[0]
+            or progress_context.get("dataset_request_sha256")
+            != progress_relative.parts[0]
         ):
             raise ValueError("Download progress identity does not match its dataset namespace")
         expected_progress_state = (
@@ -1997,11 +2240,11 @@ def command_write_state(arguments):
             else arguments.state
         )
         if (
-            arguments.state in DATASET_RESUMABLE_STATES
+            arguments.state in CPU_PREPARATION_RESUMABLE_STATES
             and progress_payload.get("state") != expected_progress_state
         ):
             raise ValueError(f"{arguments.state} lifecycle requires matching download progress")
-    elif arguments.state in DATASET_RESUMABLE_STATES:
+    elif arguments.state in CPU_PREPARATION_RESUMABLE_STATES:
         raise ValueError(f"{arguments.state} lifecycle requires --progress-path")
     inherited = {}
     if arguments.inherit_existing and output.is_file():
@@ -2118,6 +2361,10 @@ def build_parser():
 
     numerical_pipeline = subparsers.add_parser("code-numerical-pipeline-digest")
     numerical_pipeline.add_argument("--marker", required=True)
+    numerical_pipeline.add_argument(
+        "--dataset-profile",
+        choices=tuple(PROFILE_DATASETS),
+    )
     numerical_pipeline.set_defaults(handler=command_code_numerical_pipeline_digest)
 
     quarantine = subparsers.add_parser("quarantine-stale-code")
@@ -2131,7 +2378,6 @@ def build_parser():
     check_dataset.add_argument("--marker", required=True)
     check_dataset.add_argument("--code-marker")
     check_dataset.add_argument("--expected-numerical-pipeline-digest")
-    check_dataset.add_argument("--expected-code-release-digest")
     check_dataset.add_argument("--network-volume-root", type=Path)
     check_dataset.add_argument("--stage-config", type=Path)
     check_dataset.set_defaults(handler=command_check_dataset)
@@ -2242,11 +2488,17 @@ def build_parser():
     active_lifecycle.add_argument("--launch-id", required=True)
     active_lifecycle.set_defaults(handler=command_active_run_lifecycle)
 
-    resumable_dataset = subparsers.add_parser("resumable-dataset-lifecycle")
-    resumable_dataset.add_argument("--marker", type=Path, required=True)
-    resumable_dataset.add_argument("--network-volume-root", type=Path, required=True)
-    resumable_dataset.add_argument("--launch-id", required=True)
-    resumable_dataset.set_defaults(handler=command_resumable_dataset_lifecycle)
+    resumable_cpu_preparation = subparsers.add_parser(
+        "resumable-cpu-preparation-lifecycle"
+    )
+    resumable_cpu_preparation.add_argument("--marker", type=Path, required=True)
+    resumable_cpu_preparation.add_argument(
+        "--network-volume-root", type=Path, required=True
+    )
+    resumable_cpu_preparation.add_argument("--launch-id", required=True)
+    resumable_cpu_preparation.set_defaults(
+        handler=command_resumable_cpu_preparation_lifecycle
+    )
 
     guard_lifecycle = subparsers.add_parser("guard-lifecycle-state")
     guard_lifecycle.add_argument(

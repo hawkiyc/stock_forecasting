@@ -17,14 +17,11 @@ from stock_forecasting.data.horizons import (
     MAX_ALPHA_HORIZON,
     alpha_horizons_from_start,
 )
+from stock_forecasting.dataset_identity import DEFAULT_DATASET_STORAGE_PREPARATION
+from stock_forecasting.dataset_profiles import DatasetProfile, selected_datasets
+from stock_forecasting.training_stage_contract import PRODUCTION_STAGE_SAMPLE_CONTRACTS
 
 _ENV_DEFAULT_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-([^}]*)}")
-DatasetProfile = Literal[
-    "tw_only",
-    "us_only_eodhd",
-    "us_tw_eodhd",
-    "us_tw_massive",
-]
 TrainingStage = Literal["stage1", "stage2"]
 
 
@@ -54,7 +51,11 @@ class DataConfig(StrictModel):
     bar_store_path: Path
     manifest_path: Path | None = None
     dataset_profile: DatasetProfile = "tw_only"
-    input_length: int = Field(default=128, ge=32, le=512)
+    input_length: int = Field(
+        default=DEFAULT_DATASET_STORAGE_PREPARATION["window_size"],
+        ge=32,
+        le=512,
+    )
     h_start: int = Field(default=DEFAULT_H_START, ge=1, le=3)
     benchmark_mapping_path: Path | None = None
     # These two fields are retained only because the stable RunPod readiness
@@ -67,9 +68,15 @@ class DataConfig(StrictModel):
     sample_stride: int = Field(default=1, ge=1)
     train_fraction: float = Field(default=1.0, gt=0.0, le=1.0)
     flat_volatility_multiplier: float = Field(default=0.25, gt=0.0)
-    max_abs_log_return: float = Field(default=0.5, gt=0.0)
+    max_abs_log_return: float = Field(
+        default=DEFAULT_DATASET_STORAGE_PREPARATION["max_abs_log_return"],
+        gt=0.0,
+    )
     embargo_trading_days: int = 5
-    effective_embargo_trading_days: int = Field(default=14, ge=14)
+    effective_embargo_trading_days: int = Field(
+        default=DEFAULT_DATASET_STORAGE_PREPARATION["effective_embargo_bars"],
+        ge=DEFAULT_DATASET_STORAGE_PREPARATION["max_horizon"],
+    )
     train_end: str | None = None
     validation_end: str | None = None
     test_end: str | None = None
@@ -112,13 +119,7 @@ class DataConfig(StrictModel):
     def selected_datasets(self) -> list[str]:
         """Return stable human-readable dataset identifiers for reports."""
 
-        profiles = {
-            "tw_only": ["twse_official", "tpex_official"],
-            "us_only_eodhd": ["eodhd_us"],
-            "us_tw_eodhd": ["eodhd_us", "twse_official", "tpex_official"],
-            "us_tw_massive": ["massive_us", "twse_official", "tpex_official"],
-        }
-        return sorted(profiles[self.dataset_profile])
+        return selected_datasets(self.dataset_profile)
 
     @property
     def resolved_manifest_path(self) -> Path:
@@ -371,16 +372,19 @@ class ExperimentConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_stage_contract(self) -> ExperimentConfig:
-        expected_fraction = 0.03 if self.training.stage == "stage1" else 1.0
+        sample_contract = PRODUCTION_STAGE_SAMPLE_CONTRACTS[self.training.stage]
+        expected_fraction = float(sample_contract["train_fraction"])
         if abs(self.data.train_fraction - expected_fraction) > 1e-12:
             raise ValueError(
                 f"{self.training.stage} requires data.train_fraction={expected_fraction}"
             )
-        if self.model.time_series_backend == "kronos" and self.data.max_samples is not None:
-            raise ValueError(
-                "Production Stage 1/2 cannot cap max_samples; use the exact 3% or full train split"
-            )
         if self.model.time_series_backend == "kronos":
+            expected_max_samples = sample_contract["max_samples"]
+            if self.data.max_samples != expected_max_samples:
+                raise ValueError(
+                    f"{self.training.stage} requires "
+                    f"data.max_samples={expected_max_samples}"
+                )
             expected_epochs = 2 if self.training.stage == "stage1" else 5
             expected_early_stopping_epoch = 2 if self.training.stage == "stage1" else 1
             if self.training.epochs != expected_epochs:

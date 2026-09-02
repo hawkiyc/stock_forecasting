@@ -12,16 +12,32 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from stock_forecasting.config import DatasetProfile
-from stock_forecasting.data.horizons import MAX_ALPHA_HORIZON, alpha_horizons_from_start
-from stock_forecasting.data.schema import TRAINING_SECURITY_SCOPE
-from stock_forecasting.data.splits import SPLIT_POLICY
+from stock_forecasting.data.content_identity import (
+    CONTENT_IDENTITY_SCHEMA_VERSION,
+    content_identity_digest,
+    dataset_content_identity,
+    provider_materialization_digest,
+    raw_dataset_materialization_digest,
+)
+from stock_forecasting.data.horizons import MAX_ALPHA_HORIZON
+from stock_forecasting.dataset_identity import (
+    BAR_STORE_KIND,
+    BAR_STORE_SCHEMA_VERSION,
+    DATASET_STORAGE_PREPARATION_FIELDS,
+    DEFAULT_DATASET_STORAGE_PREPARATION,
+)
+from stock_forecasting.dataset_identity import (
+    storage_preparation_spec as _storage_preparation_spec,
+)
+from stock_forecasting.dataset_profiles import (
+    DatasetProfile,
+    runtime_providers,
+    selected_datasets,
+)
 
 DOWNLOAD_MANIFEST_SCHEMA_VERSION = "2.0"
-DATASET_MANIFEST_SCHEMA_VERSION = "3.0"
+DATASET_MANIFEST_SCHEMA_VERSION = "4.0"
 DATASET_MANIFEST_KIND = "ohlcv-bar-store-dataset"
-BAR_STORE_SCHEMA_VERSION = "1.0"
-BAR_STORE_KIND = "symbol-oriented-ohlcv-bar-store"
 SUPPORTED_H_START = (1, 2, 3)
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _SECRET_KEY_PATTERN = re.compile(r"(?i)(api[_-]?key|api[_-]?token|password|secret)")
@@ -44,6 +60,35 @@ def canonical_json_sha256(payload: Any) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def storage_preparation_spec(payload: Any) -> dict[str, Any]:
+    """Select only values that change persisted bars or cutoff ranges."""
+
+    if not isinstance(payload, dict):
+        raise ValueError("Dataset preparation provenance must be a JSON object")
+    return _storage_preparation_spec(payload)
+
+
+def _validated_storage_preparation_spec(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate the hashed subset without treating audit prose as data identity."""
+
+    provenance = payload.get("preparation_provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("Dataset manifest has no preparation provenance")
+    stored = payload.get("storage_preparation_spec")
+    if not isinstance(stored, dict) or set(stored) != set(
+        DATASET_STORAGE_PREPARATION_FIELDS
+    ):
+        raise ValueError("Dataset manifest storage_preparation_spec is invalid")
+    if stored != storage_preparation_spec(provenance):
+        raise ValueError(
+            "Dataset storage preparation contract disagrees with its provenance"
+        )
+    digest = payload.get("storage_preparation_spec_sha256")
+    if digest != canonical_json_sha256(stored):
+        raise ValueError("Dataset storage preparation digest is invalid")
+    return stored
 
 
 def _assert_no_secrets(value: Any, path: str = "manifest") -> None:
@@ -185,9 +230,65 @@ def validate_download_manifest(
 
     manifest_path = Path(path).resolve(strict=True)
     payload = load_dataset_manifest(manifest_path, required_state="downloaded")
-    if payload.get("training_security_scope") != TRAINING_SECURITY_SCOPE:
+    recorded_security_scope = payload.get("training_security_scope")
+    if not isinstance(recorded_security_scope, str) or not recorded_security_scope:
+        raise ValueError("Download manifest training security scope is invalid")
+    profile = payload.get("dataset_profile")
+    try:
+        expected_datasets = selected_datasets(profile)
+        expected_providers = runtime_providers(profile)
+    except (KeyError, TypeError) as error:
+        raise ValueError("Download manifest dataset profile is unsupported") from error
+    selected_dataset_ids = payload.get("selected_datasets")
+    recorded_providers = payload.get("providers")
+    api_policy = payload.get("api_policy")
+    provider_checkpoints = (
+        api_policy.get("provider_materialization_checkpoints")
+        if isinstance(api_policy, dict)
+        else None
+    )
+    content_identity = payload.get("data_content_identity")
+    if (
+        selected_dataset_ids != expected_datasets
+        or recorded_providers != expected_providers
+        or not isinstance(provider_checkpoints, dict)
+        or sorted(provider_checkpoints) != expected_providers
+        or not isinstance(content_identity, dict)
+        or set(content_identity)
+        != {
+            "schema_version",
+            "selected_datasets",
+            "provider_materialization_digests",
+            "raw_materialization_digest",
+        }
+        or content_identity.get("schema_version")
+        != CONTENT_IDENTITY_SCHEMA_VERSION
+        or content_identity.get("selected_datasets") != selected_dataset_ids
+    ):
+        raise ValueError("Download manifest data content identity is invalid")
+    provider_digests = content_identity.get("provider_materialization_digests")
+    if (
+        not isinstance(provider_digests, dict)
+        or set(provider_digests) != set(selected_dataset_ids)
+        or any(
+            not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None
+            for value in provider_digests.values()
+        )
+    ):
+        raise ValueError("Download manifest provider content identities are invalid")
+    expected_provider_digests = {
+        provider: provider_materialization_digest(provider)
+        for provider in selected_dataset_ids
+    }
+    if provider_digests != expected_provider_digests:
         raise ValueError(
-            "Download manifest training security scope is missing or obsolete"
+            "Download manifest was materialized with different provider data semantics"
+        )
+    if content_identity.get(
+        "raw_materialization_digest"
+    ) != raw_dataset_materialization_digest():
+        raise ValueError(
+            "Download manifest was composed with different raw data semantics"
         )
     artifacts = payload.get("artifacts")
     if not isinstance(artifacts, dict) or set(artifacts) != {"raw", "request_log"}:
@@ -220,19 +321,33 @@ def validate_training_dataset_manifest(
     payload = load_dataset_manifest(manifest_path, required_state="ready")
     if payload.get("dataset_profile") != profile:
         raise ValueError("Dataset manifest profile does not match the experiment config")
-    if payload.get("training_security_scope") != TRAINING_SECURITY_SCOPE:
-        raise ValueError(
-            "Dataset manifest training security scope is missing or obsolete"
-        )
+    recorded_security_scope = payload.get("training_security_scope")
+    if not isinstance(recorded_security_scope, str) or not recorded_security_scope:
+        raise ValueError("Dataset manifest training security scope is invalid")
     selected = payload.get("selected_datasets")
-    expected_selected = {
-        "tw_only": ["tpex_official", "twse_official"],
-        "us_only_eodhd": ["eodhd_us"],
-        "us_tw_eodhd": ["eodhd_us", "tpex_official", "twse_official"],
-        "us_tw_massive": ["massive_us", "tpex_official", "twse_official"],
-    }[profile]
+    expected_selected = selected_datasets(profile)
     if selected != expected_selected:
         raise ValueError("Dataset manifest selected_datasets do not match its profile")
+    content_identity = payload.get("data_content_identity")
+    if (
+        not isinstance(content_identity, dict)
+        or set(content_identity)
+        != {
+            "schema_version",
+            "selected_datasets",
+            "provider_materialization_digests",
+            "raw_materialization_digest",
+            "bar_store_materialization_digest",
+        }
+        or content_identity.get("schema_version")
+        != CONTENT_IDENTITY_SCHEMA_VERSION
+        or content_identity.get("selected_datasets") != selected
+        or payload.get("data_pipeline_digest")
+        != content_identity_digest(content_identity)
+    ):
+        raise ValueError("Dataset manifest data content identity is invalid")
+    if content_identity != dataset_content_identity(selected):
+        raise ValueError("Dataset was prepared with different data semantics")
     artifacts = payload.get("artifacts")
     expected_artifacts = {
         "raw",
@@ -281,12 +396,16 @@ def validate_training_dataset_manifest(
         store_payload = json.loads(bar_store_manifest.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
         raise ValueError("Bar-store manifest is not valid JSON") from error
+    store_identity = store_payload.get("identity") if isinstance(store_payload, dict) else None
     if (
         not isinstance(store_payload, dict)
         or store_payload.get("schema_version") != BAR_STORE_SCHEMA_VERSION
         or store_payload.get("kind") != BAR_STORE_KIND
         or store_payload.get("state") != "ready"
         or store_payload.get("split_counts") != payload.get("split_counts")
+        or not isinstance(store_identity, dict)
+        or store_identity.get("materialization_digest")
+        != content_identity["bar_store_materialization_digest"]
     ):
         raise ValueError("Bar-store manifest contract is invalid")
     split_counts = payload.get("split_counts")
@@ -299,81 +418,46 @@ def validate_training_dataset_manifest(
         )
     ):
         raise ValueError("Dataset manifest has invalid split counts")
+    _validated_storage_preparation_spec(payload)
     return payload
 
 
-def validate_dataset_preparation_contract(
+def validate_dataset_storage_contract(
     payload: dict[str, Any],
     *,
     input_length: int,
-    h_start: int,
     max_horizon: int,
-    alpha_horizons: list[int],
     benchmark_mapping_path: str | Path | None,
-    sample_stride: int,
     effective_embargo_trading_days: int,
-    forecast_horizon: int,
-    diagnostic_horizons: list[int],
-    stride: int,
-    flat_volatility_multiplier: float,
     max_abs_log_return: float,
-    embargo_trading_days: int,
 ) -> dict[str, Any]:
-    """Bind model-facing window semantics to the ready dataset manifest."""
+    """Bind only persisted bar and cutoff semantics to the current config."""
 
-    expected_horizons = list(alpha_horizons_from_start(h_start))
-    if max_horizon != MAX_ALPHA_HORIZON or alpha_horizons != expected_horizons:
-        raise ValueError(
-            "Configured alpha horizons must be contiguous from h_start through day 14"
-        )
-
-    preparation_spec = payload.get("preparation_spec")
-    if not isinstance(preparation_spec, dict):
-        raise ValueError("Dataset manifest has no preparation_spec")
-    digest = payload.get("preparation_spec_sha256")
-    if digest != canonical_json_sha256(preparation_spec):
-        raise ValueError("Dataset manifest preparation_spec digest is invalid")
-
-    if h_start not in SUPPORTED_H_START:
-        raise ValueError("Configured h_start is not supported by the lazy bar store")
+    if max_horizon != MAX_ALPHA_HORIZON:
+        raise ValueError("Configured maximum alpha horizon must remain day 14")
+    storage_spec = _validated_storage_preparation_spec(payload)
     expected_integers = {
         "window_size": input_length,
         "max_horizon": max_horizon,
-        "target_horizon": forecast_horizon,
-        "stride": stride,
-        "purge_bars": 20,
-        "embargo_bars": embargo_trading_days,
+        "purge_bars": DEFAULT_DATASET_STORAGE_PREPARATION["purge_bars"],
+        "effective_embargo_bars": effective_embargo_trading_days,
     }
     for key, expected in expected_integers.items():
-        if preparation_spec.get(key) != expected:
+        if storage_spec.get(key) != expected:
             raise ValueError(
-                f"Dataset preparation {key}={preparation_spec.get(key)!r} "
+                f"Dataset storage preparation {key}={storage_spec.get(key)!r} "
                 f"does not match config value {expected!r}"
             )
     expected_exact = {
-        "processed_schema_version": "4.0",
         "bar_store_schema_version": BAR_STORE_SCHEMA_VERSION,
         "storage_kind": BAR_STORE_KIND,
-        "supported_h_start": list(SUPPORTED_H_START),
-        "alpha_horizons_available": list(range(1, MAX_ALPHA_HORIZON + 1)),
         "window_materialized": False,
         "labels_materialized": False,
-        "label_computation": "lazy_in_dataloader_from_raw_adjusted_execution_bars",
-        "label_kind": "benchmark_relative_adjusted_log_return",
-        "signal_timing": "after_close_t",
-        "entry_timing": "regular_session_open_t_plus_1",
-        "entry_day_counts_as_holding_day_one": True,
-        "exit_timing": "regular_session_close_t_plus_h",
-        "input_adjustment": "point_in_time_total_return_ohlc_split_adjusted_volume",
-        "training_security_scope": TRAINING_SECURITY_SCOPE,
-        "split_policy": SPLIT_POLICY,
-        "effective_sample_stride": sample_stride,
-        "effective_embargo_bars": effective_embargo_trading_days,
     }
     for key, expected in expected_exact.items():
-        if preparation_spec.get(key) != expected:
+        if storage_spec.get(key) != expected:
             raise ValueError(
-                f"Dataset preparation {key}={preparation_spec.get(key)!r} "
+                f"Dataset storage preparation {key}={storage_spec.get(key)!r} "
                 f"does not match config contract {expected!r}"
             )
     if benchmark_mapping_path is None:
@@ -386,21 +470,17 @@ def validate_dataset_preparation_contract(
             str(symbol).strip().upper(): str(benchmark).strip().upper()
             for symbol, benchmark in mapping_payload.items()
         }
-    if preparation_spec.get("benchmark_mapping_sha256") != canonical_json_sha256(benchmark_mapping):
+    if storage_spec.get("benchmark_mapping_sha256") != canonical_json_sha256(benchmark_mapping):
         raise ValueError("Dataset benchmark mapping does not match the experiment config")
-    actual_diagnostics = preparation_spec.get("diagnostic_horizons")
-    if not isinstance(actual_diagnostics, list) or sorted(actual_diagnostics) != sorted(
-        diagnostic_horizons
-    ):
-        raise ValueError("Dataset diagnostic_horizons do not match the experiment config")
     expected_floats = {
-        "flat_volatility_multiplier": flat_volatility_multiplier,
         "max_abs_log_return": max_abs_log_return,
-        "train_fraction": 0.70,
-        "validation_fraction": 0.15,
+        "train_fraction": DEFAULT_DATASET_STORAGE_PREPARATION["train_fraction"],
+        "validation_fraction": DEFAULT_DATASET_STORAGE_PREPARATION[
+            "validation_fraction"
+        ],
     }
     for key, expected in expected_floats.items():
-        actual = preparation_spec.get(key)
+        actual = storage_spec.get(key)
         if (
             not isinstance(actual, int | float)
             or isinstance(actual, bool)
@@ -413,7 +493,8 @@ def validate_dataset_preparation_contract(
     if (
         not isinstance(split_audit, dict)
         or split_audit.get("schema_version") != "causal-split-audit-v1"
-        or split_audit.get("policy") != SPLIT_POLICY
+        or not isinstance(split_audit.get("policy"), str)
+        or not split_audit.get("policy")
         or split_audit.get("comparison") != "label.end_at < next_split_start"
         or split_audit.get("violations") != 0
     ):
@@ -496,7 +577,7 @@ def validate_dataset_preparation_contract(
         or "robust_scales" in statistics
     ):
         raise ValueError("Dataset manifest label_statistics are invalid")
-    return preparation_spec
+    return storage_spec
 
 
 def provenance_summary(path: str | Path) -> dict[str, Any]:
@@ -515,7 +596,11 @@ def provenance_summary(path: str | Path) -> dict[str, Any]:
         "symbols": payload.get("symbols", {}),
         "date_range": payload.get("date_range", {}),
         "split_counts": payload.get("split_counts", {}),
-        "preparation_spec": payload.get("preparation_spec", {}),
+        "preparation_provenance": payload.get("preparation_provenance", {}),
+        "storage_preparation_spec": payload.get("storage_preparation_spec", {}),
+        "storage_preparation_spec_sha256": payload.get(
+            "storage_preparation_spec_sha256"
+        ),
         "label_statistics": payload.get("label_statistics", {}),
         "window_audit": payload.get("window_audit", {}),
         "split_audit": payload.get("split_audit", {}),

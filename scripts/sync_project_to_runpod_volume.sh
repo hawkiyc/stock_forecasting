@@ -109,23 +109,6 @@ done < <(
     } | LC_ALL=C sort
 )
 
-DATA_PIPELINE_PATHS=(
-    src/stock_forecasting/cli/download_market_data.py
-    src/stock_forecasting/cli/verify_download.py
-    src/stock_forecasting/cli/prepare_data.py
-    src/stock_forecasting/cli/prefetch_models.py
-    src/stock_forecasting/cli/verify_stage1_data.py
-    scripts/lib/runpod_paths.sh
-    scripts/lib/runpod_selection.sh
-    scripts/prefetch_hf_models.sh
-    scripts/runpod_cpu_finalize.sh
-    scripts/runpod_cpu_prepare.sh
-    scripts/runpod_selection.py
-)
-while IFS= read -r absolute_path; do
-    DATA_PIPELINE_PATHS+=("${absolute_path#${LOCAL_PROJECT_ROOT}/}")
-done < <(find "${LOCAL_PROJECT_ROOT}/src/stock_forecasting/data" -type f -name '*.py' -print | LC_ALL=C sort)
-
 render_code_manifest() {
     local marker_state="$1"
     local manifest_command=(
@@ -134,11 +117,6 @@ render_code_manifest() {
         --remote-project-dir "${REMOTE_PROJECT_DIR}"
         --state "${marker_state}"
     )
-    local pipeline_path
-
-    for pipeline_path in "${DATA_PIPELINE_PATHS[@]}"; do
-        manifest_command+=(--pipeline-path "${pipeline_path}")
-    done
     manifest_command+=("${MANIFEST_RELATIVE[@]}")
     "${manifest_command[@]}"
 }

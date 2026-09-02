@@ -81,8 +81,8 @@ case "$1" in
         JOB_ROLE=cpu-prep
         MAX_RUNTIME_SECONDS="${RUNPOD_CPU_MAX_RUNTIME_SECONDS:-21600}"
         JOB_TIMEOUT_GRACE_SECONDS=0
-        FAILURE_LIFECYCLE_MARKER="${NETWORK_VOLUME_ROOT}/lifecycle/stage1/dataset.json"
-        FAILURE_LIFECYCLE_KIND=stage1-dataset
+        FAILURE_LIFECYCLE_MARKER="${NETWORK_VOLUME_ROOT}/lifecycle/stage1/cpu-preparation.json"
+        FAILURE_LIFECYCLE_KIND=stage1-cpu-preparation
         PROVIDER_WAIT_EXIT_ALLOWED=1
         ;;
     cpu-finalize)
@@ -370,7 +370,7 @@ mkdir -p "${JOB_DIR}"
     fi
     printf 'cpu_resumable_lifecycle_valid=0\n'
     if [[ ${PROVIDER_WAIT_EXIT_ALLOWED} -eq 1 ]]; then
-        printf 'if [[ ${job_exit_code} -eq 75 ]] && %q %q resumable-dataset-lifecycle --marker %q --network-volume-root %q --launch-id %q >/dev/null 2>&1; then\n' \
+        printf 'if [[ ${job_exit_code} -eq 75 ]] && %q %q resumable-cpu-preparation-lifecycle --marker %q --network-volume-root %q --launch-id %q >/dev/null 2>&1; then\n' \
             "${RUNPOD_IMAGE_PYTHON}" "${READINESS_HELPER}" \
             "${FAILURE_LIFECYCLE_MARKER}" "${NETWORK_VOLUME_ROOT}" "${LAUNCH_ID}"
         printf '  cpu_resumable_lifecycle_valid=1\n'

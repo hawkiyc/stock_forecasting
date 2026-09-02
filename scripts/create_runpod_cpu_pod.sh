@@ -43,8 +43,10 @@ RUNPOD_CPU_HARD_LIMIT_SECONDS="${RUNPOD_CPU_HARD_LIMIT_SECONDS:-25200}"
 RUNPOD_GUARD_LOG_DIR="${RUNPOD_GUARD_LOG_DIR:-${HOME:-/tmp}/.local/state/runpod-guards}"
 RUNPOD_GUARD_LAUNCHER="${SCRIPT_DIR}/launch_runpod_guard.sh"
 RUNPOD_CPU_TMUX_WORKFLOW=cpu-prepare
+RUNPOD_CPU_GUARD_LIFECYCLE_KEY=lifecycle/stage1/cpu-preparation.json
 if [[ "${RUNPOD_STAGE}" == "stage2" ]]; then
     RUNPOD_CPU_TMUX_WORKFLOW=cpu-finalize
+    RUNPOD_CPU_GUARD_LIFECYCLE_KEY=lifecycle/stage1/mixed-finalization.json
 fi
 
 if [[ -n "${RUNPOD_POD_ID:-}" && "${RUNPOD_TEST_MODE:-0}" != "1" ]]; then
@@ -360,7 +362,7 @@ GUARD_LOG="${RUNPOD_GUARD_LOG_DIR}/${POD_ID}.log"
 GUARD_PID="$(RUNPOD_GUARD_VOLUME_ROOT="${RUNPOD_VOLUME_MOUNT_PATH}" \
     bash "${RUNPOD_GUARD_LAUNCHER}" \
     "${POD_ID}" "${RUNPOD_CPU_HARD_LIMIT_SECONDS}" \
-    lifecycle/stage1/dataset.json,lifecycle/stage1/mixed-finalization.json \
+    "${RUNPOD_CPU_GUARD_LIFECYCLE_KEY}" \
     "${GUARD_LOG}")"
 
 printf 'Created CPU preparation Pod: %s\n' "${POD_ID}"

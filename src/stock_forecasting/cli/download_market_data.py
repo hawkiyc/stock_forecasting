@@ -17,6 +17,7 @@ from stock_forecasting.data.providers import (
     ProviderAcquisitionError,
     ProviderRequestError,
 )
+from stock_forecasting.dataset_profiles import PROFILE_DATASETS
 
 TEMPORARY_PROVIDER_EXIT_CODE = 75
 
@@ -25,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--profile",
-        choices=("tw_only", "us_only_eodhd", "us_tw_eodhd", "us_tw_massive"),
+        choices=tuple(PROFILE_DATASETS),
         default=os.environ.get("FIN_TS_DATASET_PROFILE", "us_tw_eodhd"),
     )
     parser.add_argument(

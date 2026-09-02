@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import runpy
 import sys
 import tempfile
 from contextlib import suppress
@@ -13,8 +14,36 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple, Union
 
+_DATASET_IDENTITY_CONTRACT = runpy.run_path(
+    str(
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "stock_forecasting"
+        / "dataset_identity.py"
+    )
+)
+_DATASET_PROFILE_CONTRACT = runpy.run_path(
+    str(
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "stock_forecasting"
+        / "dataset_profiles.py"
+    )
+)
+
 SELECTION_SCHEMA_VERSION = 3
-DATASET_REQUEST_SCHEMA_VERSION = 1
+DATASET_REQUEST_SCHEMA_VERSION = _DATASET_IDENTITY_CONTRACT[
+    "DATASET_REQUEST_SCHEMA_VERSION"
+]
+DATASET_STORAGE_PREPARATION_FIELDS = _DATASET_IDENTITY_CONTRACT[
+    "DATASET_STORAGE_PREPARATION_FIELDS"
+]
+dataset_request_identity_payload = _DATASET_IDENTITY_CONTRACT[
+    "dataset_request_identity_payload"
+]
+DEFAULT_DATASET_STORAGE_PREPARATION = _DATASET_IDENTITY_CONTRACT[
+    "DEFAULT_DATASET_STORAGE_PREPARATION"
+]
 ACTIVE_POINTER_SCHEMA_VERSION = 1
 SELECTION_ID_PATTERN = re.compile(r"selection-[0-9a-f]{16}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -22,9 +51,8 @@ SYMBOL_PATTERN = re.compile(r"[A-Z0-9.^_-]+")
 SAFE_RELATIVE_PATH_PATTERN = re.compile(r"[A-Za-z0-9._/-]+")
 REVISION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 PROFILE_DATASETS = {
-    "tw_only": ["tpex_official", "twse_official"],
-    "us_only_eodhd": ["eodhd_us"],
-    "us_tw_eodhd": ["eodhd_us", "tpex_official", "twse_official"],
+    profile: sorted(datasets)
+    for profile, datasets in _DATASET_PROFILE_CONTRACT["PROFILE_DATASETS"].items()
 }
 STAGE_CONFIGS = {
     "stage1": "configs/stage1_kronos_base_lora.yaml",
@@ -43,11 +71,15 @@ STAGE_RUNTIME = {
     },
 }
 
-# These settings define dataset semantics and must change the dataset request digest.
+# This is the complete selection provenance contract. Only the explicit storage
+# subset defined in dataset_identity.py participates in the durable dataset
+# namespace.
 _BASE_PREPARATION_CONTRACT = {
-    "schema_version": 4,
+    "schema_version": _DATASET_IDENTITY_CONTRACT[
+        "PREPARATION_PROVENANCE_SCHEMA_VERSION"
+    ],
     "processed_schema_version": "4.0",
-    "window_size": 128,
+    **DEFAULT_DATASET_STORAGE_PREPARATION,
     "stride": 5,
     "effective_sample_stride": 1,
     "label_kind": "benchmark_relative_adjusted_log_return",
@@ -65,18 +97,10 @@ _BASE_PREPARATION_CONTRACT = {
         "up_to_n_allowlisted_unleveraged_equity_etfs_and_n_stocks_"
         "active_then_delisted_ticker_plus_vti"
     ),
-    "benchmark_mapping_sha256": (
-        "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
-    ),
     "target_horizon": 5,
     "diagnostic_horizons": [1, 20],
     "flat_volatility_multiplier": 0.25,
-    "max_abs_log_return": 0.5,
-    "train_fraction": 0.70,
-    "validation_fraction": 0.15,
-    "purge_bars": 20,
     "embargo_bars": 5,
-    "effective_embargo_bars": 14,
 }
 
 
@@ -86,13 +110,21 @@ def _preparation_contract(h_start: int) -> Dict[str, Any]:
     return {
         **_BASE_PREPARATION_CONTRACT,
         "h_start": h_start,
-        "max_horizon": 14,
-        "alpha_horizons": list(range(h_start, 15)),
+        "alpha_horizons": list(
+            range(
+                h_start,
+                int(DEFAULT_DATASET_STORAGE_PREPARATION["max_horizon"]) + 1,
+            )
+        ),
     }
 
 
 PREPARATION_CONTRACT = _preparation_contract(3)
 
+# Training targets, descriptive policy labels, provenance schema labels,
+# compatibility-only fields, and runtime execution settings are validated in
+# their own contracts without forcing a new dataset directory. The physical
+# bar-store schema and layout remain part of the storage identity.
 EXPORT_KEYS = (
     "RUNPOD_SELECTION_ID",
     "RUNPOD_SELECTION_SHA256",
@@ -215,26 +247,7 @@ def _selection_core(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _dataset_request_core(payload: Dict[str, Any]) -> Dict[str, Any]:
-    preparation = payload.get("preparation")
-    normalized_preparation = preparation
-    if isinstance(preparation, dict):
-        # The compressed bars and valid cutoff ranges support h_start 1-3.
-        # Normalize only the runtime label subset so the existing h_start=1
-        # namespace remains reusable and changing h_start never re-fetches data.
-        normalized_preparation = {
-            **preparation,
-            "h_start": 1,
-            "alpha_horizons": list(range(1, 15)),
-        }
-    return {
-        "schema_version": payload.get("schema_version"),
-        "profile": payload.get("profile"),
-        "revision": payload.get("revision"),
-        "selected_datasets": payload.get("selected_datasets"),
-        "date_range": payload.get("date_range"),
-        "universe": payload.get("universe"),
-        "preparation": normalized_preparation,
-    }
+    return dataset_request_identity_payload(payload)
 
 
 def _selection_dir(project_root: Path) -> Path:
@@ -462,7 +475,7 @@ def _build_selection(arguments: argparse.Namespace, project_root: Path) -> Dict[
     if stage_name not in STAGE_CONFIGS:
         _fail("stage must be stage1 or stage2")
     if profile not in PROFILE_DATASETS:
-        _fail("data profile must be tw_only, us_only_eodhd, or us_tw_eodhd")
+        _fail("data profile must be one of: " + ", ".join(PROFILE_DATASETS))
 
     start = _parse_date(arguments.start, "start")
     end = _parse_date(arguments.end, "end")
@@ -698,27 +711,35 @@ def _verify_marker(marker: Dict[str, Any], selection: Dict[str, Any]) -> None:
         marker.get("selected_datasets"), request["selected_datasets"], "dataset providers"
     )
     _assert_equal(marker.get("date_range"), request["date_range"], "dataset date range")
-    _assert_equal(marker.get("requested_dataset"), request, "requested dataset contract")
-    _assert_equal(marker.get("selected_stage"), selection["stage"]["name"], "stage")
+    prepared_request = marker.get("requested_dataset")
+    if not isinstance(prepared_request, dict):
+        _fail("Readiness marker requested dataset contract is invalid")
     _assert_equal(
-        marker.get("stage_config_path"), selection["stage"]["config_path"], "stage config path"
-    )
-    _assert_equal(
-        marker.get("stage_config_sha256"),
-        selection["stage"]["config_sha256"],
-        "stage config digest",
-    )
-    _assert_equal(marker.get("selection_id"), selection["selection_id"], "selection_id")
-    _assert_equal(
-        marker.get("selection_sha256"),
-        selection["selection_sha256"],
-        "selection_sha256",
+        _payload_sha256(_dataset_request_core(prepared_request)),
+        selection["dataset_request_sha256"],
+        "requested dataset content contract",
     )
     _assert_equal(
         marker.get("dataset_request_sha256"),
         selection["dataset_request_sha256"],
         "dataset_request_sha256",
     )
+    expected_storage = dataset_request_identity_payload(request)[
+        "storage_preparation"
+    ]
+    _assert_equal(
+        marker.get("storage_preparation_spec"),
+        expected_storage,
+        "dataset storage contract",
+    )
+    _assert_equal(
+        marker.get("storage_preparation_spec_sha256"),
+        _payload_sha256(expected_storage),
+        "dataset storage contract digest",
+    )
+    # Selection and stage fields on a dataset marker are provenance only. The
+    # current remote selection is verified separately before Pod creation, so
+    # training-only config changes must not invalidate identical prepared data.
     expected_data_root = f"datasets/{selection['dataset_request_sha256']}"
     _assert_equal(marker.get("data_root_relative"), expected_data_root, "dataset namespace")
     _validate_marker_artifact_paths(marker, selection["dataset_request_sha256"])
@@ -730,17 +751,8 @@ def _bind_marker(
     *,
     volume_root: Path,
 ) -> Dict[str, Any]:
-    if marker.get("schema_version") != 2 or marker.get("kind") != "stage1-dataset":
-        _fail("Readiness marker schema is unsupported")
-    if marker.get("state") != "ready":
-        _fail("Only a ready dataset marker can be bound to a training selection")
+    _verify_marker(marker, selection)
     request = selection["dataset_request"]
-    _assert_equal(marker.get("dataset_profile"), request["profile"], "dataset profile")
-    _assert_equal(
-        marker.get("selected_datasets"), request["selected_datasets"], "dataset providers"
-    )
-    _assert_equal(marker.get("date_range"), request["date_range"], "dataset date range")
-    _validate_marker_artifact_paths(marker, selection["dataset_request_sha256"])
 
     download_artifact = marker.get("download_manifest")
     relative_download_path = _validate_relative_path(
@@ -758,11 +770,9 @@ def _bind_marker(
         download.get("selected_datasets"), request["selected_datasets"], "download providers"
     )
     _assert_equal(download.get("date_range"), request["date_range"], "download date range")
-    _assert_equal(
-        download.get("training_security_scope"),
-        request["preparation"]["training_security_scope"],
-        "download training security scope",
-    )
+    download_security_scope = download.get("training_security_scope")
+    if not isinstance(download_security_scope, str) or not download_security_scope:
+        _fail("Download manifest training security scope is invalid")
     api_policy = download.get("api_policy")
     if not isinstance(api_policy, dict):
         _fail("Download manifest API policy is invalid")

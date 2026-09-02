@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from stock_forecasting.data.content_identity import provider_materialization_digest
 from stock_forecasting.data.ingestion import (
     IngestionOptions,
     _checkpointed_provider_runner,
@@ -179,12 +180,27 @@ def test_provider_checkpoint_identity_ignores_attempt_pacing_but_binds_dataset(
         eodhd_requests_per_second=8.0,
         taiwan_requests_per_second=0.25,
         max_backoff_seconds=300.0,
+        workers=32,
+        acquisition_deadline_epoch_seconds=2_000_000_000.0,
+        preparation_reserve_seconds=7_200,
+        tpex_proxy_url="https://fixture-relay.asia-east1.run.app",
     )
     changed_end = replace(options, end="2026-06-01", dataset_request_sha256="b" * 64)
+    changed_selection_only = replace(options, dataset_request_sha256="b" * 64)
+    changed_us_universe = replace(options, explicit_us_symbols=("MSFT",))
+    changed_cache_revision = replace(options, cache_revision="v2")
 
     original = _provider_checkpoint_identity(options, provider="eodhd")
+    assert original["materialization_digest"] == provider_materialization_digest("eodhd")
     assert _provider_checkpoint_identity(changed_pacing, provider="eodhd") == original
+    assert _provider_checkpoint_identity(changed_selection_only, provider="eodhd") == original
     assert _provider_checkpoint_identity(changed_end, provider="eodhd") != original
+    assert _provider_checkpoint_identity(changed_us_universe, provider="eodhd") != original
+    assert _provider_checkpoint_identity(changed_cache_revision, provider="eodhd") != original
+    assert _provider_checkpoint_identity(
+        changed_us_universe,
+        provider="twse_official",
+    ) == _provider_checkpoint_identity(options, provider="twse_official")
     assert _provider_checkpoint_identity(options, provider="twse_official") != original
 
 

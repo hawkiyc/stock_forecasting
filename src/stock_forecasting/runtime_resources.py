@@ -27,6 +27,38 @@ class AvailableMemoryEstimate:
         }
 
 
+def select_visible_cpu_count(
+    *,
+    reported_cpu_count: int | None,
+    affinity_cpu_count: int | None = None,
+) -> int:
+    """Select the process-visible CPU count from host and affinity limits."""
+
+    reported = 1 if reported_cpu_count is None else reported_cpu_count
+    if isinstance(reported, bool) or reported < 1:
+        raise ValueError("reported_cpu_count must be positive when provided")
+    if affinity_cpu_count is not None and (
+        isinstance(affinity_cpu_count, bool) or affinity_cpu_count < 1
+    ):
+        raise ValueError("affinity_cpu_count must be positive when provided")
+    return max(1, min(reported, affinity_cpu_count or reported))
+
+
+def detect_visible_cpu_count() -> int:
+    """Return the CPU count visible to this process, including affinity limits."""
+
+    affinity_count: int | None = None
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            affinity_count = len(os.sched_getaffinity(0))
+        except OSError:
+            affinity_count = None
+    return select_visible_cpu_count(
+        reported_cpu_count=os.cpu_count(),
+        affinity_cpu_count=affinity_count,
+    )
+
+
 def select_available_memory_estimate(
     *,
     cgroup_headrooms: Sequence[tuple[str, int]] = (),

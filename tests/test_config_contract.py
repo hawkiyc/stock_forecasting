@@ -61,11 +61,13 @@ def test_stage_configs_share_one_model_architecture_and_start_fresh() -> None:
     stage2 = ExperimentConfig.from_yaml(ROOT / "configs/stage2_kronos_base_lora.yaml")
 
     assert stage1.training.stage == "stage1"
-    assert stage1.data.train_fraction == pytest.approx(0.03)
+    assert stage1.data.train_fraction == pytest.approx(0.05)
+    assert stage1.data.max_samples == 500_000
     assert stage1.training.epochs == 2
     assert stage1.training.early_stopping_start_epoch == 2
     assert stage2.training.stage == "stage2"
     assert stage2.data.train_fraction == pytest.approx(1.0)
+    assert stage2.data.max_samples is None
     assert stage2.training.epochs == 5
     assert stage2.training.early_stopping_start_epoch == 1
     assert stage1.training.evaluations_per_epoch == 5
@@ -169,17 +171,30 @@ def test_stage_fraction_contract_fails_closed() -> None:
         ExperimentConfig.model_validate(payload)
 
 
-def test_production_stages_cannot_hide_a_sample_cap(tmp_path: Path) -> None:
-    path = ROOT / "configs/stage1_kronos_base_lora.yaml"
+@pytest.mark.parametrize(
+    ("config_name", "replacement", "message"),
+    [
+        ("stage1_kronos_base_lora.yaml", None, "data.max_samples=500000"),
+        ("stage1_kronos_base_lora.yaml", 499_999, "data.max_samples=500000"),
+        ("stage2_kronos_base_lora.yaml", 500_000, "data.max_samples=None"),
+    ],
+)
+def test_production_stage_sample_caps_fail_closed(
+    tmp_path: Path,
+    config_name: str,
+    replacement: int | None,
+    message: str,
+) -> None:
+    path = ROOT / "configs" / config_name
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    payload["data"]["max_samples"] = 100
-    modified_path = tmp_path / "stage1_with_sample_cap.yaml"
+    payload["data"]["max_samples"] = replacement
+    modified_path = tmp_path / config_name
     modified_path.write_text(
         yaml.safe_dump(payload, sort_keys=False),
         encoding="utf-8",
     )
 
-    with pytest.raises(ValidationError, match="cannot cap max_samples"):
+    with pytest.raises(ValidationError, match=message):
         ExperimentConfig.from_yaml(modified_path)
 
 

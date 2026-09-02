@@ -12,16 +12,29 @@ import pandas as pd
 import pytest
 
 from stock_forecasting.baselines import baseline_arrays
-from stock_forecasting.cli.prepare_data import _validate_dataset_manifest_destination
+from stock_forecasting.cli.prepare_data import (
+    _validate_dataset_manifest_destination,
+)
+from stock_forecasting.cli.prepare_data import (
+    build_parser as build_prepare_parser,
+)
+from stock_forecasting.config import DataConfig
 from stock_forecasting.data.adjustments import asof_adjusted_window
-from stock_forecasting.data.bar_store import bar_store_preparation_spec
+from stock_forecasting.data.bar_store import bar_store_preparation_provenance
 from stock_forecasting.data.benchmarks import resolve_benchmark
+from stock_forecasting.data.content_identity import (
+    CONTENT_IDENTITY_SCHEMA_VERSION,
+    code_content_identity,
+    content_identity_digest,
+    dataset_content_identity,
+)
 from stock_forecasting.data.dataset import FinancialBatchCollator, FinancialWindowDataset
 from stock_forecasting.data.manifest import (
     artifact_metadata,
     atomic_write_json,
     canonical_json_sha256,
-    validate_dataset_preparation_contract,
+    storage_preparation_spec,
+    validate_dataset_storage_contract,
     validate_download_manifest,
     validate_training_dataset_manifest,
 )
@@ -33,6 +46,37 @@ from stock_forecasting.data.schema import (
 )
 from stock_forecasting.data.splits import SPLIT_POLICY, chronological_split
 from stock_forecasting.data.windows import DEFAULT_ALPHA_HORIZONS, build_causal_windows
+from stock_forecasting.dataset_identity import DEFAULT_DATASET_STORAGE_PREPARATION
+
+
+def test_storage_preparation_defaults_are_shared_across_runtime_entrypoints() -> None:
+    arguments = build_prepare_parser().parse_args(
+        ["--input", "raw/market.parquet", "--output", "prepared/bar-store"]
+    )
+
+    assert arguments.window_size == DEFAULT_DATASET_STORAGE_PREPARATION["window_size"]
+    assert arguments.max_abs_log_return == DEFAULT_DATASET_STORAGE_PREPARATION[
+        "max_abs_log_return"
+    ]
+    assert arguments.train_fraction == DEFAULT_DATASET_STORAGE_PREPARATION[
+        "train_fraction"
+    ]
+    assert arguments.validation_fraction == DEFAULT_DATASET_STORAGE_PREPARATION[
+        "validation_fraction"
+    ]
+    assert arguments.purge_bars == DEFAULT_DATASET_STORAGE_PREPARATION["purge_bars"]
+    assert arguments.effective_embargo_bars == DEFAULT_DATASET_STORAGE_PREPARATION[
+        "effective_embargo_bars"
+    ]
+    assert DataConfig.model_fields["input_length"].default == arguments.window_size
+    assert (
+        DataConfig.model_fields["max_abs_log_return"].default
+        == arguments.max_abs_log_return
+    )
+    assert (
+        DataConfig.model_fields["effective_embargo_trading_days"].default
+        == arguments.effective_embargo_bars
+    )
 
 
 def test_dataset_manifest_staging_must_share_the_artifact_root(tmp_path: Path) -> None:
@@ -482,17 +526,24 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
     symbol_index.write_bytes(b"immutable symbol index fixture")
     cutoff_ranges.write_bytes(b"immutable cutoff ranges fixture")
     bar_store_manifest = bar_store / "bar-store.json"
+    selected_datasets = ["tpex_official", "twse_official"]
+    data_content_identity = dataset_content_identity(selected_datasets)
     atomic_write_json(
         bar_store_manifest,
         {
             "schema_version": "1.0",
             "kind": "symbol-oriented-ohlcv-bar-store",
             "state": "ready",
+            "identity": {
+                "materialization_digest": data_content_identity[
+                    "bar_store_materialization_digest"
+                ]
+            },
             "split_counts": {"test": 1, "train": 3, "validation": 1},
         },
     )
     manifest = tmp_path / "dataset-manifest.json"
-    preparation_spec = bar_store_preparation_spec(
+    preparation_provenance = bar_store_preparation_provenance(
         window_size=128,
         max_horizon=14,
         benchmark_mapping_sha256=canonical_json_sha256({}),
@@ -508,6 +559,7 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
         diagnostic_horizons=[1, 20],
         flat_volatility_multiplier=0.25,
     )
+    storage_spec = storage_preparation_spec(preparation_provenance)
     label_statistics = {
         "state": "runtime_calibration_required",
         "source_split": "train",
@@ -553,16 +605,19 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
         },
     }
     payload = {
-        "schema_version": "3.0",
+        "schema_version": "4.0",
         "kind": "ohlcv-bar-store-dataset",
         "state": "ready",
         "training_security_scope": TRAINING_SECURITY_SCOPE,
         "dataset_profile": "tw_only",
-        "selected_datasets": ["tpex_official", "twse_official"],
+        "selected_datasets": selected_datasets,
+        "data_content_identity": data_content_identity,
+        "data_pipeline_digest": content_identity_digest(data_content_identity),
         "split_counts": {"test": 1, "train": 3, "validation": 1},
         "split_audit": split_audit,
-        "preparation_spec": preparation_spec,
-        "preparation_spec_sha256": canonical_json_sha256(preparation_spec),
+        "preparation_provenance": preparation_provenance,
+        "storage_preparation_spec": storage_spec,
+        "storage_preparation_spec_sha256": canonical_json_sha256(storage_spec),
         "label_statistics": label_statistics,
         "artifacts": {
             "raw": artifact_metadata(raw, root=tmp_path, row_count=10),
@@ -582,23 +637,37 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
         bar_store_path=bar_store,
     )
     assert (
-        validate_dataset_preparation_contract(
+        validate_dataset_storage_contract(
             validated,
             input_length=128,
-            h_start=3,
             max_horizon=14,
-            alpha_horizons=list(DEFAULT_ALPHA_HORIZONS),
             benchmark_mapping_path=None,
-            sample_stride=1,
             effective_embargo_trading_days=14,
-            forecast_horizon=5,
-            diagnostic_horizons=[1, 20],
-            stride=5,
-            flat_volatility_multiplier=0.25,
             max_abs_log_return=0.5,
-            embargo_trading_days=5,
         )
-        == preparation_spec
+        == storage_spec
+    )
+
+    provenance_changed = copy.deepcopy(validated)
+    provenance_changed["preparation_provenance"].update(
+        {
+            "diagnostic_horizons": [2, 7],
+            "flat_volatility_multiplier": 9.0,
+            "split_policy": "renamed-audit-policy",
+            "target_horizon": 13,
+            "training_security_scope": "renamed-audit-scope",
+        }
+    )
+    assert (
+        validate_dataset_storage_contract(
+            provenance_changed,
+            input_length=128,
+            max_horizon=14,
+            benchmark_mapping_path=None,
+            effective_embargo_trading_days=14,
+            max_abs_log_return=0.5,
+        )
+        == storage_spec
     )
 
     invalid_boundary = copy.deepcopy(validated)
@@ -606,39 +675,23 @@ def test_ready_manifest_binds_conditional_alpha_contract_and_artifacts(tmp_path:
     invalid_boundary["split_audit"]["splits"]["train"]["label_end_max_at"] = crossing_at
     invalid_boundary["split_audit"]["maximum_label_end"]["train"] = crossing_at
     with pytest.raises(ValueError, match="train labels cross"):
-        validate_dataset_preparation_contract(
+        validate_dataset_storage_contract(
             invalid_boundary,
             input_length=128,
-            h_start=3,
             max_horizon=14,
-            alpha_horizons=list(DEFAULT_ALPHA_HORIZONS),
             benchmark_mapping_path=None,
-            sample_stride=1,
             effective_embargo_trading_days=14,
-            forecast_horizon=5,
-            diagnostic_horizons=[1, 20],
-            stride=5,
-            flat_volatility_multiplier=0.25,
             max_abs_log_return=0.5,
-            embargo_trading_days=5,
         )
 
     with pytest.raises(ValueError, match="window_size"):
-        validate_dataset_preparation_contract(
+        validate_dataset_storage_contract(
             validated,
             input_length=64,
-            h_start=3,
             max_horizon=14,
-            alpha_horizons=list(DEFAULT_ALPHA_HORIZONS),
             benchmark_mapping_path=None,
-            sample_stride=1,
             effective_embargo_trading_days=14,
-            forecast_horizon=5,
-            diagnostic_horizons=[1, 20],
-            stride=5,
-            flat_volatility_multiplier=0.25,
             max_abs_log_return=0.5,
-            embargo_trading_days=5,
         )
 
     raw.write_bytes(b"tampered")
@@ -659,6 +712,8 @@ def test_downloaded_checkpoint_binds_raw_and_request_log_integrity(tmp_path: Pat
     raw.write_bytes(b"immutable raw parquet fixture")
     request_log.write_text('{"provider":"fixture"}\n', encoding="utf-8")
     manifest = tmp_path / "download-manifest.json"
+    selected_datasets = ["tpex_official", "twse_official"]
+    provider_digests = code_content_identity()["provider_materialization_digests"]
     atomic_write_json(
         manifest,
         {
@@ -667,6 +722,25 @@ def test_downloaded_checkpoint_binds_raw_and_request_log_integrity(tmp_path: Pat
             "state": "downloaded",
             "training_security_scope": TRAINING_SECURITY_SCOPE,
             "dataset_profile": "tw_only",
+            "selected_datasets": selected_datasets,
+            "providers": ["tpex_official", "twse_official"],
+            "data_content_identity": {
+                "schema_version": CONTENT_IDENTITY_SCHEMA_VERSION,
+                "selected_datasets": selected_datasets,
+                "provider_materialization_digests": {
+                    provider: provider_digests[provider]
+                    for provider in selected_datasets
+                },
+                "raw_materialization_digest": code_content_identity()[
+                    "raw_materialization_digest"
+                ],
+            },
+            "api_policy": {
+                "provider_materialization_checkpoints": {
+                    "tpex_official": {},
+                    "twse_official": {},
+                }
+            },
             "artifacts": {
                 "raw": artifact_metadata(raw, root=tmp_path, row_count=10),
                 "request_log": artifact_metadata(request_log, root=tmp_path, row_count=1),
@@ -677,13 +751,34 @@ def test_downloaded_checkpoint_binds_raw_and_request_log_integrity(tmp_path: Pat
     validated = validate_download_manifest(manifest, input_path=raw)
     assert validated["state"] == "downloaded"
 
-    obsolete = json.loads(manifest.read_text(encoding="utf-8"))
-    obsolete["training_security_scope"] = "obsolete"
-    atomic_write_json(manifest, obsolete)
+    incompatible_raw = json.loads(manifest.read_text(encoding="utf-8"))
+    incompatible_raw["data_content_identity"]["raw_materialization_digest"] = "0" * 64
+    atomic_write_json(manifest, incompatible_raw)
+    with pytest.raises(ValueError, match="raw data semantics"):
+        validate_download_manifest(manifest, input_path=raw)
+    incompatible_raw["data_content_identity"]["raw_materialization_digest"] = (
+        code_content_identity()["raw_materialization_digest"]
+    )
+    atomic_write_json(manifest, incompatible_raw)
+
+    incomplete = json.loads(manifest.read_text(encoding="utf-8"))
+    incomplete["providers"] = ["twse_official"]
+    atomic_write_json(manifest, incomplete)
+    with pytest.raises(ValueError, match="content identity"):
+        validate_download_manifest(manifest, input_path=raw)
+    incomplete["providers"] = ["tpex_official", "twse_official"]
+    atomic_write_json(manifest, incomplete)
+
+    historical = json.loads(manifest.read_text(encoding="utf-8"))
+    historical["training_security_scope"] = "historical_scope_label"
+    atomic_write_json(manifest, historical)
+    validate_download_manifest(manifest, input_path=raw)
+    historical["training_security_scope"] = ""
+    atomic_write_json(manifest, historical)
     with pytest.raises(ValueError, match="security scope"):
         validate_download_manifest(manifest, input_path=raw)
-    obsolete["training_security_scope"] = TRAINING_SECURITY_SCOPE
-    atomic_write_json(manifest, obsolete)
+    historical["training_security_scope"] = TRAINING_SECURITY_SCOPE
+    atomic_write_json(manifest, historical)
 
     request_log.write_text('{"provider":"tampered"}\n', encoding="utf-8")
     with pytest.raises(ValueError, match="integrity mismatch"):

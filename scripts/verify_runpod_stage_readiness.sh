@@ -67,7 +67,9 @@ if [[ "${MODE}" == "code-only" ]]; then
 fi
 
 CODE_NUMERICAL_PIPELINE_DIGEST="$(printf '%s\n' "${CODE_JSON}" \
-    | python3 "${READINESS_HELPER}" code-numerical-pipeline-digest --marker -)"
+    | python3 "${READINESS_HELPER}" code-numerical-pipeline-digest \
+        --marker - \
+        --dataset-profile "${FIN_TS_DATASET_PROFILE}")"
 DATASET_JSON="$(bash "${S3_WRAPPER}" s3 cp \
     "s3://${RUNPOD_NETWORK_VOLUME_ID}/${DATASET_MARKER_KEY}" - \
     --only-show-errors)"

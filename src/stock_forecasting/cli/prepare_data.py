@@ -14,8 +14,13 @@ from stock_forecasting.data.bar_store import (
     DEFAULT_BUCKET_COUNT,
     DEFAULT_MAX_HORIZON,
     PreparationPaused,
-    bar_store_preparation_spec,
+    bar_store_preparation_provenance,
     build_symbol_bar_store,
+)
+from stock_forecasting.data.content_identity import (
+    bar_store_materialization_digest,
+    content_identity_digest,
+    dataset_content_identity,
 )
 from stock_forecasting.data.horizons import DEFAULT_H_START
 from stock_forecasting.data.manifest import (
@@ -25,9 +30,11 @@ from stock_forecasting.data.manifest import (
     atomic_write_json,
     canonical_json_sha256,
     sha256_file,
+    storage_preparation_spec,
     validate_download_manifest,
 )
 from stock_forecasting.data.schema import TRAINING_SECURITY_SCOPE
+from stock_forecasting.dataset_identity import DEFAULT_DATASET_STORAGE_PREPARATION
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,7 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--download-manifest", type=Path)
     parser.add_argument("--dataset-manifest", type=Path)
     parser.add_argument("--benchmark-mapping", type=Path)
-    parser.add_argument("--window-size", type=int, default=128)
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=DEFAULT_DATASET_STORAGE_PREPARATION["window_size"],
+    )
     parser.add_argument("--stride", type=int, default=5, help="RunPod compatibility sentinel.")
     parser.add_argument("--sample-stride", type=int, default=1)
     parser.add_argument(
@@ -55,17 +66,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-horizon", type=int, default=5)
     parser.add_argument("--diagnostic-horizons", type=int, nargs="+", default=[1, 20])
     parser.add_argument("--flat-volatility-multiplier", type=float, default=0.25)
-    parser.add_argument("--max-abs-log-return", type=float, default=0.5)
-    parser.add_argument("--train-fraction", type=float, default=0.70)
-    parser.add_argument("--validation-fraction", type=float, default=0.15)
-    parser.add_argument("--purge-bars", type=int, default=20)
+    parser.add_argument(
+        "--max-abs-log-return",
+        type=float,
+        default=DEFAULT_DATASET_STORAGE_PREPARATION["max_abs_log_return"],
+    )
+    parser.add_argument(
+        "--train-fraction",
+        type=float,
+        default=DEFAULT_DATASET_STORAGE_PREPARATION["train_fraction"],
+    )
+    parser.add_argument(
+        "--validation-fraction",
+        type=float,
+        default=DEFAULT_DATASET_STORAGE_PREPARATION["validation_fraction"],
+    )
+    parser.add_argument(
+        "--purge-bars",
+        type=int,
+        default=DEFAULT_DATASET_STORAGE_PREPARATION["purge_bars"],
+    )
     parser.add_argument(
         "--embargo-bars",
         type=int,
         default=5,
         help="RunPod compatibility sentinel.",
     )
-    parser.add_argument("--effective-embargo-bars", type=int, default=14)
+    parser.add_argument(
+        "--effective-embargo-bars",
+        type=int,
+        default=DEFAULT_DATASET_STORAGE_PREPARATION["effective_embargo_bars"],
+    )
     parser.add_argument("--bucket-count", type=int, default=DEFAULT_BUCKET_COUNT)
     parser.add_argument("--batch-rows", type=int, default=DEFAULT_BATCH_ROWS)
     parser.add_argument(
@@ -98,20 +129,12 @@ def _validate_dataset_manifest_destination(path: Path, manifest_root: Path) -> N
         raise ValueError("--dataset-manifest must be written directly under the dataset root")
 
 
-def _pipeline_digest() -> str:
-    package_root = Path(__file__).resolve().parents[1]
-    files = [
-        package_root / "cli" / "prepare_data.py",
-        package_root / "data" / "bar_store.py",
-        package_root / "data" / "schema.py",
-        package_root / "data" / "adjustments.py",
-        package_root / "data" / "benchmarks.py",
-        package_root / "data" / "horizons.py",
-        package_root / "data" / "splits.py",
-        package_root / "data" / "manifest.py",
-    ]
-    return canonical_json_sha256(
-        {path.relative_to(package_root).as_posix(): sha256_file(path) for path in files}
+def _pipeline_identity(download: dict[str, Any]) -> dict[str, Any]:
+    acquisition_identity = download["data_content_identity"]
+    return dataset_content_identity(
+        download["selected_datasets"],
+        provider_digests=acquisition_identity["provider_materialization_digests"],
+        raw_digest=acquisition_identity["raw_materialization_digest"],
     )
 
 
@@ -149,7 +172,7 @@ def _ready_manifest(
     result: Any,
     benchmark_mapping_sha256: str,
 ) -> dict[str, Any]:
-    preparation_spec = bar_store_preparation_spec(
+    preparation_provenance = bar_store_preparation_provenance(
         window_size=arguments.window_size,
         max_horizon=DEFAULT_MAX_HORIZON,
         benchmark_mapping_sha256=benchmark_mapping_sha256,
@@ -165,7 +188,9 @@ def _ready_manifest(
         diagnostic_horizons=list(arguments.diagnostic_horizons),
         flat_volatility_multiplier=arguments.flat_volatility_multiplier,
     )
+    storage_spec = storage_preparation_spec(preparation_provenance)
     bar_store_payload = json.loads(result.bar_store_manifest_path.read_text(encoding="utf-8"))
+    pipeline_identity = _pipeline_identity(download)
     return {
         "schema_version": DATASET_MANIFEST_SCHEMA_VERSION,
         "kind": DATASET_MANIFEST_KIND,
@@ -194,9 +219,11 @@ def _ready_manifest(
             "cutoff_range_rows": int(bar_store_payload["cutoff_ranges"]["row_count"]),
         },
         "split_audit": result.split_audit,
-        "preparation_spec": preparation_spec,
-        "preparation_spec_sha256": canonical_json_sha256(preparation_spec),
-        "data_pipeline_digest": _pipeline_digest(),
+        "preparation_provenance": preparation_provenance,
+        "storage_preparation_spec": storage_spec,
+        "storage_preparation_spec_sha256": canonical_json_sha256(storage_spec),
+        "data_content_identity": pipeline_identity,
+        "data_pipeline_digest": content_identity_digest(pipeline_identity),
         "universe_sha256": canonical_json_sha256(download["symbols"]),
         "download_manifest": _relative_download_manifest(
             download_manifest_path,
@@ -244,7 +271,11 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("Stable RunPod target and diagnostic sentinels must remain 5 and [1,20]")
     if arguments.sample_stride != 1 or arguments.stride != 5:
         raise ValueError("Stable lazy sampling requires sample_stride=1 and stride sentinel=5")
-    if arguments.embargo_bars != 5 or arguments.effective_embargo_bars != 14:
+    if (
+        arguments.embargo_bars != 5
+        or arguments.effective_embargo_bars
+        != DEFAULT_DATASET_STORAGE_PREPARATION["effective_embargo_bars"]
+    ):
         raise ValueError("Stable embargo sentinels must remain 5 and effective 14")
     if arguments.workers < 1:
         raise ValueError("workers must be positive")
@@ -281,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
             batch_rows=arguments.batch_rows,
             deadline_epoch_seconds=arguments.deadline_epoch_seconds,
             workers=arguments.workers,
+            materialization_digest=bar_store_materialization_digest(),
         )
     except PreparationPaused as error:
         print(

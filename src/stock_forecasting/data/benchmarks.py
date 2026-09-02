@@ -62,17 +62,34 @@ _TWSE_COMMON_OR_TDR_SYMBOL = re.compile(r"^(?:[1-9][0-9]{3}|91[0-9]{4})[.]TW$")
 _TPEX_COMMON_STOCK_SYMBOL = re.compile(r"^[1-9][0-9]{3}[.]TWO$")
 
 
+def is_allowlisted_us_equity_etf(*, symbol: str) -> bool:
+    """Return whether a US symbol belongs to the audited equity ETF set."""
+
+    return symbol.strip().upper() in US_DOMESTIC_EQUITY_ETFS
+
+
+def is_allowlisted_taiwan_equity_etf(*, symbol: str, market: str) -> bool:
+    """Return whether a Taiwan symbol belongs to the market's audited ETF set."""
+
+    canonical_symbol = symbol.strip().upper()
+    canonical_market = str(market or "").strip().upper()
+    if canonical_market == "TWSE":
+        return canonical_symbol in (TWSE_DOMESTIC_EQUITY_ETFS | TPEX_EXPOSURE_ETFS)
+    # The current single-benchmark policy has no audited TPEx-listed ETF target.
+    return False
+
+
 def is_allowlisted_unleveraged_equity_etf(*, symbol: str, market: str) -> bool:
     """Return whether an ETF belongs to the audited model-target allowlist."""
 
     canonical_symbol = symbol.strip().upper()
     canonical_market = _market(market)
     if canonical_market == "US":
-        return canonical_symbol in US_DOMESTIC_EQUITY_ETFS
-    if canonical_market == "TWSE":
-        return canonical_symbol in (TWSE_DOMESTIC_EQUITY_ETFS | TPEX_EXPOSURE_ETFS)
-    # The current single-benchmark policy has no audited TPEx-listed ETF target.
-    return False
+        return is_allowlisted_us_equity_etf(symbol=canonical_symbol)
+    return is_allowlisted_taiwan_equity_etf(
+        symbol=canonical_symbol,
+        market=canonical_market,
+    )
 
 
 def is_training_target_security(*, symbol: str, asset_type: str, market: str) -> bool:

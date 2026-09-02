@@ -15,50 +15,36 @@ READINESS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(READINESS)
 
 
-def test_guard_accepts_matching_ready_dataset_schema_v2(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_guard_accepts_matching_cpu_preparation_schema_v1() -> None:
     marker = {
-        "schema_version": 2,
-        "kind": "stage1-dataset",
+        "schema_version": 1,
+        "kind": "stage1-cpu-preparation",
         "state": "ready",
         "pod_id": "test-pod",
     }
-    validated: list[object] = []
-
-    def validate_ready_dataset(payload: object) -> object:
-        validated.append(payload)
-        return payload
-
-    monkeypatch.setattr(
-        READINESS,
-        "_validate_quant_dataset_payload",
-        validate_ready_dataset,
-    )
 
     assert (
         READINESS._guard_lifecycle_state(
             marker,
-            expected_kind="stage1-dataset",
+            expected_kind="stage1-cpu-preparation",
             expected_pod_id="test-pod",
         )
         == "ready"
     )
-    assert validated == [marker]
 
 
 @pytest.mark.parametrize(
     "marker",
     (
         {
-            "schema_version": 1,
-            "kind": "stage1-dataset",
+            "schema_version": 2,
+            "kind": "stage1-cpu-preparation",
             "state": "ready",
             "pod_id": "test-pod",
         },
         {
             "schema_version": 2,
-            "kind": "stage1-dataset",
+            "kind": "stage1-cpu-preparation",
             "state": "failed",
             "pod_id": "test-pod",
         },
@@ -70,30 +56,23 @@ def test_guard_rejects_schema_versions_outside_the_state_contract(
     with pytest.raises(ValueError, match="schema"):
         READINESS._guard_lifecycle_state(
             marker,
-            expected_kind="stage1-dataset",
+            expected_kind="stage1-cpu-preparation",
             expected_pod_id="test-pod",
         )
 
 
-def test_guard_rejects_ready_dataset_from_another_pod(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_guard_rejects_cpu_preparation_from_another_pod() -> None:
     marker = {
-        "schema_version": 2,
-        "kind": "stage1-dataset",
+        "schema_version": 1,
+        "kind": "stage1-cpu-preparation",
         "state": "ready",
         "pod_id": "stale-pod",
     }
-    monkeypatch.setattr(
-        READINESS,
-        "_validate_quant_dataset_payload",
-        lambda payload: payload,
-    )
 
     with pytest.raises(ValueError, match="monitored Pod"):
         READINESS._guard_lifecycle_state(
             marker,
-            expected_kind="stage1-dataset",
+            expected_kind="stage1-cpu-preparation",
             expected_pod_id="current-pod",
         )
 
@@ -101,13 +80,13 @@ def test_guard_rejects_ready_dataset_from_another_pod(
 def test_guard_preserves_schema_v1_failure_and_resumable_semantics() -> None:
     failed = {
         "schema_version": 1,
-        "kind": "stage1-dataset",
+        "kind": "stage1-cpu-preparation",
         "state": "failed",
         "pod_id": "test-pod",
     }
     downloaded_active = {
         "schema_version": 1,
-        "kind": "stage1-dataset",
+        "kind": "stage1-cpu-preparation",
         "state": "downloaded",
         "pod_id": "test-pod",
     }
@@ -116,7 +95,7 @@ def test_guard_preserves_schema_v1_failure_and_resumable_semantics() -> None:
     assert (
         READINESS._guard_lifecycle_state(
             failed,
-            expected_kind="stage1-dataset",
+            expected_kind="stage1-cpu-preparation",
             expected_pod_id="test-pod",
         )
         == "failed"
@@ -124,7 +103,7 @@ def test_guard_preserves_schema_v1_failure_and_resumable_semantics() -> None:
     assert (
         READINESS._guard_lifecycle_state(
             downloaded_active,
-            expected_kind="stage1-dataset",
+            expected_kind="stage1-cpu-preparation",
             expected_pod_id="test-pod",
         )
         == "downloaded_active"
@@ -132,7 +111,7 @@ def test_guard_preserves_schema_v1_failure_and_resumable_semantics() -> None:
     assert (
         READINESS._guard_lifecycle_state(
             downloaded_terminal,
-            expected_kind="stage1-dataset",
+            expected_kind="stage1-cpu-preparation",
             expected_pod_id="test-pod",
         )
         == "downloaded"

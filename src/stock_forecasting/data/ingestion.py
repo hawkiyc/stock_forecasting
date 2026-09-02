@@ -18,11 +18,14 @@ from typing import Any
 
 import pandas as pd
 
-from stock_forecasting.config import DatasetProfile
-from stock_forecasting.data.adjustments import apply_cumulative_adjustments
 from stock_forecasting.data.benchmarks import (
     US_BENCHMARK,
-    is_allowlisted_unleveraged_equity_etf,
+    is_allowlisted_us_equity_etf,
+)
+from stock_forecasting.data.content_identity import (
+    CONTENT_IDENTITY_SCHEMA_VERSION,
+    provider_materialization_digest,
+    raw_dataset_materialization_digest,
 )
 from stock_forecasting.data.download_progress import DownloadProgress
 from stock_forecasting.data.manifest import (
@@ -60,8 +63,19 @@ from stock_forecasting.data.schema import (
     TRAINING_TARGET_ASSET_TYPES,
     normalize_ohlcv_frame,
 )
+from stock_forecasting.dataset_profiles import (
+    DatasetProfile,
+    runtime_providers,
+    selected_datasets,
+)
 
-PROVIDER_MATERIALIZATION_REVISION = "provider-materialization-v1"
+RAW_DATASET_ASSEMBLY_POLICY = "complete_provider_checkpoint_concat_v1"
+
+
+def _canonical_raw_batch(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return the logical rows written by the infrastructure-only Parquet sink."""
+
+    return normalize_ohlcv_frame(frame)
 
 
 def _ordered_thread_map[InputT, ResultT](
@@ -157,7 +171,7 @@ class _ParquetSink:
             import pyarrow.parquet as pq
         except ImportError as error:
             raise RuntimeError("Writing Parquet requires pyarrow") from error
-        normalized = normalize_ohlcv_frame(frame)
+        normalized = _canonical_raw_batch(frame)
         table = pa.Table.from_pandas(normalized, preserve_index=False)
         if self.writer is None:
             self.schema = table.schema
@@ -300,6 +314,22 @@ class _ProviderLoopOutcome:
     provider: str
     result: Any | None = None
     error: Exception | None = None
+
+
+def _ordered_completed_provider_artifacts(
+    outcomes: Mapping[str, _ProviderLoopOutcome],
+) -> list[_ProviderArtifacts]:
+    """Return complete provider parts in the canonical raw concatenation order."""
+
+    artifacts: list[_ProviderArtifacts] = []
+    for provider_name in sorted(outcomes):
+        provider_artifacts = outcomes[provider_name].result
+        if not isinstance(provider_artifacts, _ProviderArtifacts):
+            raise TypeError(
+                f"Provider loop returned invalid artifacts: {provider_name}"
+            )
+        artifacts.append(provider_artifacts)
+    return artifacts
 
 
 def _nonnegative_stat(payload: Mapping[str, Any], key: str) -> int:
@@ -765,14 +795,109 @@ def _benchmark_trading_dates(
     }
 
 
-def _selected_datasets(profile: DatasetProfile) -> list[str]:
-    values = {
-        "tw_only": ["tpex_official", "twse_official"],
-        "us_only_eodhd": ["eodhd_us"],
-        "us_tw_eodhd": ["eodhd_us", "tpex_official", "twse_official"],
-        "us_tw_massive": ["massive_us", "tpex_official", "twse_official"],
-    }
-    return sorted(values[profile])
+def _discover_eodhd_materialization_universe(
+    provider: EODHDProvider,
+    *,
+    include_delisted: bool,
+    explicit_us_symbols: tuple[str, ...],
+    explicit_us_etfs: tuple[str, ...],
+    symbol_limit: int | None,
+) -> tuple[list[Instrument], tuple[RequestRecord, ...]]:
+    """Resolve exactly which EODHD instruments enter durable materialization."""
+
+    discovered, requests = provider.discover(include_delisted=include_delisted)
+    return (
+        _select_eodhd_materialization_universe(
+            discovered,
+            explicit_us_symbols=explicit_us_symbols,
+            explicit_us_etfs=explicit_us_etfs,
+            symbol_limit=symbol_limit,
+        ),
+        requests,
+    )
+
+
+def _fetch_eodhd_materialized_instrument(
+    provider: EODHDProvider,
+    instrument: Instrument,
+    *,
+    start: str,
+    exclusive_end: str,
+    dataset_profile: str,
+) -> tuple[Any, Any]:
+    """Apply the exclusive dataset boundary to one EODHD materialization."""
+
+    return provider.fetch_materialized_instrument(
+        instrument,
+        start=start,
+        end=_inclusive_end(exclusive_end),
+        dataset_profile=dataset_profile,
+    )
+
+
+def _taiwan_materialization_months(start: str, exclusive_end: str) -> list[str]:
+    """Return every benchmark month needed by a Taiwan provider."""
+
+    return _months(start, exclusive_end)
+
+
+def _fetch_taiwan_actions(
+    provider: TWSEProvider | TPExProvider,
+    *,
+    start: str,
+    exclusive_end: str,
+) -> Any:
+    """Fetch Taiwan actions using the dataset's exclusive upper boundary."""
+
+    return provider.fetch_actions(
+        start=start,
+        end=_inclusive_end(exclusive_end),
+    )
+
+
+def _fetch_taiwan_benchmark_month(
+    provider: TWSEProvider | TPExProvider,
+    *,
+    month: str,
+    dataset_profile: str,
+) -> Any:
+    """Fetch the benchmark history that defines official trading sessions."""
+
+    return provider.fetch_benchmark_month(
+        month=month,
+        dataset_profile=dataset_profile,
+    )
+
+
+def _taiwan_materialization_dates(
+    benchmark_frame: pd.DataFrame,
+    *,
+    start: str,
+    exclusive_end: str,
+) -> set[str]:
+    """Keep only official benchmark sessions inside the dataset interval."""
+
+    return _benchmark_trading_dates(
+        benchmark_frame,
+        start=start,
+        exclusive_end=exclusive_end,
+    )
+
+
+def _fetch_taiwan_adjusted_date(
+    provider: TWSEProvider | TPExProvider,
+    *,
+    trading_date: str,
+    dataset_profile: str,
+    action_frame: pd.DataFrame,
+) -> tuple[Any, pd.DataFrame]:
+    """Fetch and adjust one official Taiwan market session."""
+
+    return provider.fetch_adjusted_date(
+        date=trading_date,
+        dataset_profile=dataset_profile,
+        action_frame=action_frame,
+    )
 
 
 def _dataset_cache_fallback_roots(
@@ -830,10 +955,7 @@ def _explicit_instruments(
     unsupported_etfs = sorted(
         code
         for code in etfs
-        if not is_allowlisted_unleveraged_equity_etf(
-            symbol=f"{code}.US",
-            market="US",
-        )
+        if not is_allowlisted_us_equity_etf(symbol=f"{code}.US")
     )
     if unsupported_etfs:
         raise ValueError(
@@ -899,10 +1021,7 @@ def _limit_instruments(
         item
         for item in instruments
         if item.asset_type == "stock"
-        or is_allowlisted_unleveraged_equity_etf(
-            symbol=item.canonical_symbol,
-            market=item.market,
-        )
+        or is_allowlisted_us_equity_etf(symbol=item.canonical_symbol)
     ]
     selected: list[Instrument] = []
     for asset_type in ("etf", "stock"):
@@ -935,11 +1054,30 @@ def _ensure_us_benchmark(instruments: list[Instrument]) -> list[Instrument]:
     ]
 
 
+def _select_eodhd_materialization_universe(
+    discovered: list[Instrument],
+    *,
+    explicit_us_symbols: tuple[str, ...],
+    explicit_us_etfs: tuple[str, ...],
+    symbol_limit: int | None,
+) -> list[Instrument]:
+    """Resolve the complete EODHD universe that will be persisted."""
+
+    if explicit_us_symbols or explicit_us_etfs:
+        instruments = _validate_explicit_instruments(
+            _explicit_instruments(explicit_us_symbols, explicit_us_etfs),
+            discovered,
+        )
+    else:
+        instruments = discovered
+    return _ensure_us_benchmark(_limit_instruments(instruments, symbol_limit))
+
+
 def _progress_identity(options: IngestionOptions) -> dict[str, Any]:
     identity: dict[str, Any] = {
         "cache_revision": options.cache_revision,
         "dataset_profile": options.profile,
-        "selected_datasets": _selected_datasets(options.profile),
+        "selected_datasets": selected_datasets(options.profile),
         "date_range": {
             "start_inclusive": options.start,
             "end_exclusive": options.end,
@@ -955,15 +1093,9 @@ def _progress_identity(options: IngestionOptions) -> dict[str, Any]:
                 {f"{value.upper().removesuffix('.US')}.US" for value in options.explicit_us_etfs}
             ),
             "symbol_limit": options.symbol_limit,
-            "symbol_limit_policy": (
-                "up_to_n_allowlisted_unleveraged_equity_etfs_and_n_stocks_"
-                "active_then_delisted_ticker_plus_vti"
-            ),
             "include_delisted_us": options.include_delisted,
         },
     }
-    if options.dataset_request_sha256 is not None:
-        identity["dataset_request_sha256"] = options.dataset_request_sha256
     return identity
 
 
@@ -974,11 +1106,40 @@ def _provider_checkpoint_identity(
 ) -> dict[str, Any]:
     """Bind reusable provider materialization to content-affecting inputs only."""
 
+    materialization_request: dict[str, Any] = {
+        "cache_revision": options.cache_revision,
+        "dataset_profile": options.profile,
+        "date_range": {
+            "start_inclusive": options.start,
+            "end_exclusive": options.end,
+        },
+    }
+    if provider == "eodhd":
+        materialization_request["universe"] = {
+            "mode": (
+                "explicit"
+                if options.explicit_us_symbols or options.explicit_us_etfs
+                else "all"
+            ),
+            "us_stocks": sorted(
+                {
+                    f"{value.upper().removesuffix('.US')}.US"
+                    for value in options.explicit_us_symbols
+                }
+            ),
+            "us_etfs": sorted(
+                {
+                    f"{value.upper().removesuffix('.US')}.US"
+                    for value in options.explicit_us_etfs
+                }
+            ),
+            "symbol_limit": options.symbol_limit,
+            "include_delisted_us": options.include_delisted,
+        }
     return {
-        "materialization_revision": PROVIDER_MATERIALIZATION_REVISION,
+        "materialization_digest": provider_materialization_digest(provider),
         "provider": provider,
-        "training_security_scope": TRAINING_SECURITY_SCOPE,
-        "dataset_request": _progress_identity(options),
+        "materialization_request": materialization_request,
     }
 
 
@@ -1016,8 +1177,17 @@ def ingest_daily_ohlcv(
 ) -> dict[str, Any]:
     """Fetch providers only here; training and evaluation never call this function."""
 
-    if options.profile == "us_tw_massive":
+    try:
+        active_providers = runtime_providers(options.profile)
+    except KeyError as error:
+        raise ValueError(f"Unsupported dataset profile: {options.profile}") from error
+    if "massive" in active_providers:
         MassiveProvider().discover(include_delisted=options.include_delisted)
+    taiwan_provider_classes = tuple(
+        provider_class
+        for provider_class in (TWSEProvider, TPExProvider)
+        if provider_class.name in active_providers
+    )
     if options.max_api_calls < 1:
         raise ValueError("max_api_calls must be positive")
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", options.cache_revision) is None:
@@ -1075,11 +1245,6 @@ def ingest_daily_ohlcv(
         context=_progress_context(options),
     )
     progress.start(request_budget)
-    active_providers: list[str] = []
-    if options.profile in {"us_only_eodhd", "us_tw_eodhd"}:
-        active_providers.append("eodhd")
-    if options.profile in {"tw_only", "us_tw_eodhd", "us_tw_massive"}:
-        active_providers.extend(("twse_official", "tpex_official"))
     provider_workers = max(1, options.workers // len(active_providers))
     stats = {provider: _ProviderStats() for provider in active_providers}
     parts_root = options.manifest_root / f".provider-parts-{uuid.uuid4().hex}"
@@ -1091,14 +1256,24 @@ def ingest_daily_ohlcv(
     sink: _ParquetSink | None = None
     request_log: _RequestLog | None = None
     try:
-        if options.profile in {"tw_only", "us_tw_eodhd", "us_tw_massive"}:
+        if taiwan_provider_classes:
             taiwan_weekdays = _weekdays(options.start, options.end)
-            taiwan_months = _months(options.start, options.end)
-            taiwan_fixed_calls = len(taiwan_months) * 4 + 2
-            taiwan_pre_calendar_upper_bound_calls = len(taiwan_weekdays) * 2 + taiwan_fixed_calls
-            for provider_name in ("twse_official", "tpex_official"):
+            taiwan_months = _taiwan_materialization_months(
+                options.start,
+                options.end,
+            )
+            taiwan_provider_count = len(taiwan_provider_classes)
+            taiwan_fixed_calls = (
+                len(taiwan_months) * 2 + 1
+            ) * taiwan_provider_count
+            taiwan_pre_calendar_upper_bound_calls = (
+                len(taiwan_weekdays) * taiwan_provider_count
+                + taiwan_fixed_calls
+            )
+            for provider_class in taiwan_provider_classes:
+                provider_name = provider_class.name
                 stats[provider_name].estimated_calls = len(taiwan_months) * 2 + 1
-        if options.profile in {"us_only_eodhd", "us_tw_eodhd"}:
+        if "eodhd" in active_providers:
             if not eodhd_api_token:
                 raise ValueError("EODHD_API_TOKEN is required for the selected dataset profile")
 
@@ -1114,55 +1289,34 @@ def ingest_daily_ohlcv(
                     request_budget=request_budget,
                 )
                 provider = EODHDProvider(eod_client, api_token=eodhd_api_token)
-                discovered, discovery_requests = _provider_data_call(
+                instruments, discovery_requests = _provider_data_call(
                     provider="eodhd",
                     operation="discover",
                     item="US",
-                    function=lambda: provider.discover(
-                        include_delisted=options.include_delisted
+                    function=lambda: _discover_eodhd_materialization_universe(
+                        provider,
+                        include_delisted=options.include_delisted,
+                        explicit_us_symbols=options.explicit_us_symbols,
+                        explicit_us_etfs=options.explicit_us_etfs,
+                        symbol_limit=options.symbol_limit,
                     ),
                 )
                 log_part.append(discovery_requests)
-                if options.explicit_us_symbols or options.explicit_us_etfs:
-                    instruments = _validate_explicit_instruments(
-                        _explicit_instruments(
-                            options.explicit_us_symbols,
-                            options.explicit_us_etfs,
-                        ),
-                        discovered,
-                    )
-                else:
-                    instruments = discovered
-                instruments = _ensure_us_benchmark(
-                    _limit_instruments(instruments, options.symbol_limit)
-                )
-                provider_end = _inclusive_end(options.end)
                 provider_stats.estimated_calls += len(discovery_requests) + len(instruments) * 2
 
                 def fetch_eodhd_instrument(
                     instrument: Instrument,
                 ) -> tuple[Any, Any, Instrument]:
-                    instrument_split_fetch = _provider_data_call(
+                    instrument_split_fetch, fetched = _provider_data_call(
                         provider="eodhd",
-                        operation="historical_splits",
+                        operation="materialize_instrument",
                         item=instrument.canonical_symbol,
-                        function=lambda: provider.fetch_historical_split_events(
+                        function=lambda: _fetch_eodhd_materialized_instrument(
+                            provider,
                             instrument,
                             start=options.start,
-                            end=provider_end,
-                        ),
-                    )
-                    fetched = _provider_data_call(
-                        provider="eodhd",
-                        operation="daily_eod",
-                        item=instrument.canonical_symbol,
-                        function=lambda: provider.fetch_instrument(
-                            instrument,
-                            start=options.start,
-                            end=provider_end,
+                            exclusive_end=options.end,
                             dataset_profile=options.profile,
-                            split_events=instrument_split_fetch.frame,
-                            split_adjustment_source="historical_splits",
                         ),
                     )
                     return instrument_split_fetch, fetched, instrument
@@ -1203,7 +1357,7 @@ def ingest_daily_ohlcv(
                 operation=run_eodhd,
             )
 
-        if options.profile in {"tw_only", "us_tw_eodhd", "us_tw_massive"}:
+        if taiwan_provider_classes:
 
             def make_taiwan_runner(
                 provider_class: type[TWSEProvider] | type[TPExProvider],
@@ -1252,9 +1406,10 @@ def ingest_daily_ohlcv(
                         provider=provider_name,
                         operation="corporate_actions",
                         item=f"{options.start}:{_inclusive_end(options.end)}",
-                        function=lambda: provider.fetch_actions(
+                        function=lambda: _fetch_taiwan_actions(
+                            provider,
                             start=options.start,
-                            end=_inclusive_end(options.end),
+                            exclusive_end=options.end,
                         ),
                     )
                     log_part.append(action_fetch.requests)
@@ -1279,30 +1434,16 @@ def ingest_daily_ohlcv(
                     def fetch_taiwan_date(
                         trading_date: str,
                     ) -> tuple[Any, pd.DataFrame]:
-                        def fetch_and_adjust() -> tuple[Any, pd.DataFrame]:
-                            fetched = provider.fetch_date(
-                                date=trading_date,
-                                dataset_profile=options.profile,
-                            )
-                            if not fetched.frame.empty:
-                                adjusted = apply_cumulative_adjustments(
-                                    fetched.frame,
-                                    action_fetch.frame,
-                                )
-                                adjusted["adjustment_source"] = (
-                                    "twse_twt49u"
-                                    if provider_name == "twse_official"
-                                    else "tpex_exdailyq"
-                                )
-                            else:
-                                adjusted = fetched.frame
-                            return fetched, adjusted
-
                         return _provider_data_call(
                             provider=provider_name,
                             operation="daily_quotes",
                             item=trading_date,
-                            function=fetch_and_adjust,
+                            function=lambda: _fetch_taiwan_adjusted_date(
+                                provider,
+                                trading_date=trading_date,
+                                dataset_profile=options.profile,
+                                action_frame=action_fetch.frame,
+                            ),
                         )
 
                     def fetch_taiwan_month(month: str) -> Any:
@@ -1310,7 +1451,8 @@ def ingest_daily_ohlcv(
                             provider=provider_name,
                             operation="benchmark_month",
                             item=month,
-                            function=lambda: provider.fetch_benchmark_month(
+                            function=lambda: _fetch_taiwan_benchmark_month(
+                                provider,
                                 month=month,
                                 dataset_profile=options.profile,
                             ),
@@ -1334,7 +1476,7 @@ def ingest_daily_ohlcv(
                             provider_stats.benchmark_rows += len(benchmark_fetch.frame)
                             sink_part.write(benchmark_fetch.frame)
                             provider_trading_dates.update(
-                                _benchmark_trading_dates(
+                                _taiwan_materialization_dates(
                                     benchmark_fetch.frame,
                                     start=options.start,
                                     exclusive_end=options.end,
@@ -1370,7 +1512,7 @@ def ingest_daily_ohlcv(
                     operation=run_taiwan,
                 )
 
-            for provider_class in (TWSEProvider, TPExProvider):
+            for provider_class in taiwan_provider_classes:
                 runners[provider_class.name] = make_taiwan_runner(provider_class)
 
         runners = {
@@ -1391,12 +1533,10 @@ def ingest_daily_ohlcv(
         if aggregate_error is not None:
             raise aggregate_error
 
+        completed_artifacts = _ordered_completed_provider_artifacts(outcomes)
         sink = _ParquetSink(options.output)
         request_log = _RequestLog(request_log_path)
-        for provider_name, outcome in sorted(outcomes.items()):
-            artifacts = outcome.result
-            if not isinstance(artifacts, _ProviderArtifacts):
-                raise TypeError(f"Provider loop returned invalid artifacts: {provider_name}")
+        for artifacts in completed_artifacts:
             sink.append_parquet(
                 artifacts.parquet_path,
                 check_time=request_budget.check_time,
@@ -1453,12 +1593,9 @@ def ingest_daily_ohlcv(
         if provider_stats.taiwan_trading_dates is not None
     }
     provider_materialization_checkpoints: dict[str, dict[str, Any]] = {}
-    for provider, outcome in sorted(outcomes.items()):
-        artifacts = outcome.result
-        if (
-            not isinstance(artifacts, _ProviderArtifacts)
-            or artifacts.checkpoint_identity_sha256 is None
-        ):
+    for artifacts in _ordered_completed_provider_artifacts(outcomes):
+        provider = artifacts.provider
+        if artifacts.checkpoint_identity_sha256 is None:
             raise RuntimeError(
                 f"Provider completed without a durable materialization checkpoint: {provider}"
             )
@@ -1466,6 +1603,12 @@ def ingest_daily_ohlcv(
             "identity_sha256": artifacts.checkpoint_identity_sha256,
             "reused": artifacts.checkpoint_reused,
         }
+
+    selected_dataset_ids = selected_datasets(options.profile)
+    provider_materialization_digests = {
+        selected: provider_materialization_digest(selected)
+        for selected in selected_dataset_ids
+    }
 
     raw_artifact = artifact_metadata(
         options.output,
@@ -1484,7 +1627,13 @@ def ingest_daily_ohlcv(
         "created_at": datetime.now(UTC).isoformat(),
         "training_security_scope": TRAINING_SECURITY_SCOPE,
         "dataset_profile": options.profile,
-        "selected_datasets": _selected_datasets(options.profile),
+        "selected_datasets": selected_dataset_ids,
+        "data_content_identity": {
+            "schema_version": CONTENT_IDENTITY_SCHEMA_VERSION,
+            "selected_datasets": selected_dataset_ids,
+            "provider_materialization_digests": provider_materialization_digests,
+            "raw_materialization_digest": raw_dataset_materialization_digest(),
+        },
         "providers": sorted(sink.providers),
         "markets": sorted(sink.markets),
         "date_range": {
@@ -1537,7 +1686,8 @@ def ingest_daily_ohlcv(
                 "durable_provider_checkpoints_and_deterministic_merge"
             ),
             "provider_execution_workers_each": provider_workers,
-            "provider_materialization_revision": PROVIDER_MATERIALIZATION_REVISION,
+            "provider_materialization_identity": "content_only_semantic_ast_v1",
+            "raw_dataset_assembly_policy": RAW_DATASET_ASSEMBLY_POLICY,
             "provider_materialization_checkpoint_scope": (
                 "per_dataset_request_and_provider_fail_closed_integrity_checked"
             ),
@@ -1555,7 +1705,7 @@ def ingest_daily_ohlcv(
             ),
             "eodhd_split_strategy": (
                 "per_symbol_historical_splits_reconstruct_unadjusted_volume"
-                if options.profile in {"us_only_eodhd", "us_tw_eodhd"}
+                if "eodhd" in active_providers
                 else None
             ),
             "preparation_reserve_seconds": options.preparation_reserve_seconds,

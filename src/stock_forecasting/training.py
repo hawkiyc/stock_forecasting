@@ -49,6 +49,7 @@ from stock_forecasting.preflight import run_preflight
 from stock_forecasting.runtime_resources import (
     AvailableMemoryEstimate,
     detect_available_memory,
+    detect_visible_cpu_count,
 )
 from stock_forecasting.tracking import (
     TrackingRun,
@@ -144,17 +145,6 @@ class _RuntimeLabelDataset(Dataset[Tensor]):
         return self.source.target_at(index)
 
 
-def _visible_cpu_count() -> int:
-    affinity_count: int | None = None
-    if hasattr(os, "sched_getaffinity"):
-        try:
-            affinity_count = len(os.sched_getaffinity(0))
-        except OSError:
-            affinity_count = None
-    reported = os.cpu_count() or 1
-    return max(1, min(reported, affinity_count or reported))
-
-
 def _available_memory_bytes() -> int:
     """Return scope-compatible available memory for compatibility callers."""
 
@@ -183,7 +173,11 @@ def plan_dataloader_workers(
 
     if isinstance(requested_workers, bool) or requested_workers < 0 or requested_workers > 32:
         raise ValueError("requested_workers must be between 0 and 32")
-    cpu_count = _visible_cpu_count() if visible_cpu_count is None else visible_cpu_count
+    cpu_count = (
+        detect_visible_cpu_count()
+        if visible_cpu_count is None
+        else visible_cpu_count
+    )
     memory_estimate = (
         detect_available_memory()
         if available_memory_bytes is None
@@ -1364,6 +1358,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
             {
                 "training_stage": config.training.stage,
                 "training_fraction": config.data.train_fraction,
+                "training_max_samples": config.data.max_samples,
                 "dataset_profile": config.data.dataset_profile,
                 "selected_datasets": config.data.selected_datasets,
                 "selected_train_samples_per_epoch": selected_train_samples,

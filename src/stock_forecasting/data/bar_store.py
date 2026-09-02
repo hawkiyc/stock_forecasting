@@ -9,7 +9,7 @@ import shutil
 import time
 import uuid
 from collections import Counter, defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
@@ -23,11 +23,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from stock_forecasting.bar_store_integrity import validate_bar_store_artifacts
 from stock_forecasting.data.adjustments import ensure_adjustment_columns
 from stock_forecasting.data.benchmarks import resolve_benchmark
+from stock_forecasting.data.content_identity import (
+    bar_store_materialization_digest,
+)
 from stock_forecasting.data.manifest import (
-    BAR_STORE_KIND,
-    BAR_STORE_SCHEMA_VERSION,
     SUPPORTED_H_START,
     artifact_metadata,
     atomic_write_json,
@@ -39,10 +41,34 @@ from stock_forecasting.data.schema import (
     normalize_ohlcv_frame,
 )
 from stock_forecasting.data.splits import SPLIT_POLICY
+from stock_forecasting.dataset_identity import (
+    BAR_STORE_BUILD_CHECKPOINT_SCHEMA_VERSION,
+    BAR_STORE_KIND,
+    BAR_STORE_SCHEMA_VERSION,
+    DEFAULT_DATASET_STORAGE_PREPARATION,
+    PREPARATION_PROVENANCE_SCHEMA_VERSION,
+)
+from stock_forecasting.runtime_resources import (
+    detect_available_memory,
+    detect_visible_cpu_count,
+)
 
 DEFAULT_BUCKET_COUNT = 128
 DEFAULT_BATCH_ROWS = 1_000_000
-DEFAULT_MAX_HORIZON = 14
+DEFAULT_WINDOW_SIZE = int(DEFAULT_DATASET_STORAGE_PREPARATION["window_size"])
+DEFAULT_MAX_HORIZON = int(DEFAULT_DATASET_STORAGE_PREPARATION["max_horizon"])
+DEFAULT_MAX_ABS_LOG_RETURN = float(
+    DEFAULT_DATASET_STORAGE_PREPARATION["max_abs_log_return"]
+)
+DEFAULT_TRAIN_FRACTION = float(DEFAULT_DATASET_STORAGE_PREPARATION["train_fraction"])
+DEFAULT_VALIDATION_FRACTION = float(
+    DEFAULT_DATASET_STORAGE_PREPARATION["validation_fraction"]
+)
+DEFAULT_PURGE_BARS = int(DEFAULT_DATASET_STORAGE_PREPARATION["purge_bars"])
+DEFAULT_EFFECTIVE_EMBARGO_BARS = int(
+    DEFAULT_DATASET_STORAGE_PREPARATION["effective_embargo_bars"]
+)
+SYMBOL_BUCKET_ALGORITHM = "blake2b-64-modulo-v1"
 RAW_SCAN_ALGORITHM = "partitioned-bucket-row-groups-v3"
 SPLIT_ASSIGNMENT_ALGORITHM = "vectorized-bucket-checkpoints-v1"
 MULTIPROCESS_BACKEND = "process_pool_spawn"
@@ -183,79 +209,6 @@ class _Deadline:
             raise PreparationPaused(
                 f"Bar-store preparation paused before {operation}; durable checkpoints remain"
             )
-
-
-def _visible_cpu_count() -> int:
-    """Return the CPU count visible to this process, including affinity limits."""
-
-    affinity_count: int | None = None
-    if hasattr(os, "sched_getaffinity"):
-        try:
-            affinity_count = len(os.sched_getaffinity(0))
-        except OSError:
-            affinity_count = None
-    reported = os.cpu_count() or 1
-    return max(1, min(reported, affinity_count or reported))
-
-
-def _read_positive_integer(path: Path) -> int | None:
-    try:
-        value = path.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return None
-    if not value or value == "max":
-        return None
-    try:
-        parsed = int(value)
-    except ValueError:
-        return None
-    return parsed if parsed > 0 else None
-
-
-def _detect_available_memory_bytes() -> int:
-    """Return the strictest host/cgroup memory estimate available at runtime."""
-
-    candidates: list[int] = []
-    cgroup_pairs = (
-        (
-            Path("/sys/fs/cgroup/memory.max"),
-            Path("/sys/fs/cgroup/memory.current"),
-        ),
-        (
-            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
-            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
-        ),
-    )
-    for limit_path, usage_path in cgroup_pairs:
-        limit = _read_positive_integer(limit_path)
-        usage = _read_positive_integer(usage_path) or 0
-        if limit is not None and limit > usage:
-            candidates.append(limit - usage)
-
-    try:
-        meminfo = Path("/proc/meminfo").read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        meminfo = ""
-    for line in meminfo.splitlines():
-        fields = line.split()
-        if line.startswith("MemAvailable:") and len(fields) >= 2 and fields[1].isdigit():
-            candidates.append(int(fields[1]) * 1024)
-            break
-
-    try:
-        page_size = int(os.sysconf("SC_PAGE_SIZE"))
-        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
-    except (OSError, ValueError, TypeError, AttributeError):
-        pass
-    else:
-        if page_size > 0 and available_pages > 0:
-            candidates.append(page_size * available_pages)
-
-    if not candidates:
-        raise RuntimeError(
-            "Unable to determine available memory for safe bar-store multiprocessing"
-        )
-    return min(candidates)
 
 
 def _safe_worker_memory_budget(
@@ -610,38 +563,104 @@ def _cleanup_completed_work(work_root: Path) -> None:
     (work_root / "scan-index.json").unlink(missing_ok=True)
 
 
-def _is_scan_execution_upgrade(
-    previous_identity: Mapping[str, Any],
-    current_identity: Mapping[str, Any],
-) -> bool:
-    """Allow checkpoint-layout upgrades only when the data contract is unchanged."""
-
-    ignored = {"raw_scan_algorithm", "raw_scan_target_partition_rows"}
-    previous = {key: value for key, value in previous_identity.items() if key not in ignored}
-    current = {key: value for key, value in current_identity.items() if key not in ignored}
-    return previous == current and previous_identity.get("raw_scan_algorithm") != RAW_SCAN_ALGORITHM
-
-
-def _quarantine_obsolete_scan_work(
+def _quarantine_obsolete_bar_store(
     *,
     root: Path,
-    work_root: Path,
     previous_state: Mapping[str, Any],
 ) -> Path:
-    """Move obsolete derived checkpoints aside without traversing the Network Volume."""
+    """Move an incompatible generated store aside without deleting raw data."""
 
-    shards_root = root / "shards"
-    if work_root.is_symlink() or shards_root.is_symlink():
-        raise ValueError("Bar-store checkpoint roots must not be symbolic links")
-    previous_sha256 = str(previous_state.get("identity_sha256", "unknown"))[:12]
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("Bar-store checkpoint root must be a regular directory")
+    previous_sha256 = str(
+        previous_state.get(
+            "checkpoint_identity_sha256",
+            previous_state.get("identity_sha256", "unknown"),
+        )
+    )[:12]
     quarantine = root.parent / (
-        f".{root.name}-obsolete-scan-{previous_sha256}-{uuid.uuid4().hex[:8]}"
+        f".{root.name}-obsolete-{previous_sha256}-{uuid.uuid4().hex[:8]}"
     )
-    quarantine.mkdir(parents=False, exist_ok=False)
-    work_root.replace(quarantine / "work")
-    if shards_root.exists():
-        shards_root.replace(quarantine / "shards")
+    root.replace(quarantine)
     return quarantine
+
+
+def _reset_generated_bar_store(
+    *,
+    root: Path,
+    previous_state: Mapping[str, Any],
+) -> tuple[Path, Path]:
+    """Quarantine only derived outputs and recreate an empty build workspace."""
+
+    quarantine = _quarantine_obsolete_bar_store(
+        root=root,
+        previous_state=previous_state,
+    )
+    root.mkdir(parents=False, exist_ok=False)
+    work_root = root / ".work"
+    work_root.mkdir(parents=False, exist_ok=False)
+    return work_root, quarantine
+
+
+def _completed_bar_store_result(
+    *,
+    work_root: Path,
+    success_path: Path,
+    manifest_path: Path,
+    index_path: Path,
+    ranges_path: Path,
+    identity_sha256: str,
+) -> BarStoreBuildResult:
+    """Validate finalized metadata before ignoring execution-only checkpoints."""
+
+    integrity = validate_bar_store_artifacts(
+        manifest_path.parent,
+        expected_identity_sha256=identity_sha256,
+    )
+    manifest = integrity.manifest
+    _cleanup_completed_work(work_root)
+    return BarStoreBuildResult(
+        bar_store_manifest_path=manifest_path,
+        symbol_index_path=index_path,
+        cutoff_ranges_path=ranges_path,
+        success_path=success_path,
+        split_counts={str(k): int(v) for k, v in manifest["split_counts"].items()},
+        split_audit=dict(manifest["split_audit"]),
+        quality=dict(manifest["quality"]),
+        execution=dict(manifest["execution"]),
+    )
+
+
+def _recover_bar_store_success_marker(
+    *,
+    success_path: Path,
+    manifest_path: Path,
+    index_path: Path,
+    ranges_path: Path,
+    identity_sha256: str,
+) -> None:
+    """Publish only the final sentinel after validating interrupted outputs."""
+
+    integrity = validate_bar_store_artifacts(
+        manifest_path.parent,
+        expected_identity_sha256=identity_sha256,
+        require_success=False,
+    )
+    manifest = integrity.manifest
+    atomic_write_json(
+        success_path,
+        {
+            "schema_version": BAR_STORE_SCHEMA_VERSION,
+            "kind": "bar-store-success",
+            "state": "ready",
+            "identity_sha256": identity_sha256,
+            "bar_store_manifest_sha256": integrity.manifest_sha256,
+            "symbol_index_sha256": integrity.symbol_index_sha256,
+            "cutoff_ranges_sha256": integrity.cutoff_ranges_sha256,
+            "split_counts": manifest["split_counts"],
+            "recovered_after_interrupted_publication": True,
+        },
+    )
 
 
 def _metadata_value(frame: pd.DataFrame, column: str) -> Any:
@@ -659,8 +678,24 @@ def _read_symbol(index_row: Mapping[str, Any], root: Path) -> pd.DataFrame:
     shard = root / str(index_row["shard_relative_path"])
     row_group = int(index_row["row_group"])
     frame = pq.ParquetFile(shard).read_row_group(row_group).to_pandas()
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
-    return frame.sort_values("timestamp", kind="stable").reset_index(drop=True)
+    return _ordered_symbol_rows(frame)
+
+
+def _ordered_symbol_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize the row order used by every lazy window and label lookup."""
+
+    ordered = frame.copy()
+    ordered["timestamp"] = pd.to_datetime(ordered["timestamp"], utc=True)
+    return ordered.sort_values("timestamp", kind="stable").reset_index(drop=True)
+
+
+def _compacted_symbol_rows(
+    frame: pd.DataFrame,
+) -> Iterable[tuple[str, pd.DataFrame]]:
+    """Yield the logical per-symbol row groups written to the immutable store."""
+
+    for symbol, rows in frame.groupby("symbol", sort=True):
+        yield str(symbol), _ordered_symbol_rows(rows)
 
 
 def _true_ranges(mask: np.ndarray, *, offset: int = 0) -> list[tuple[int, int]]:
@@ -1197,6 +1232,88 @@ def _validated_compacted_bucket(
     return True
 
 
+def _enrich_compacted_frame(
+    frame: pd.DataFrame,
+    *,
+    max_abs_log_return: float,
+) -> pd.DataFrame:
+    """Apply content-affecting cleaning fields independently of checkpoint I/O."""
+
+    enriched = ensure_adjustment_columns(normalize_ohlcv_frame(frame))
+    adjusted_close = enriched["adjusted_close"].to_numpy(dtype=np.float64)
+    symbols = enriched["symbol"].astype(str).to_numpy()
+    timestamps = pd.DatetimeIndex(enriched["timestamp"])
+    transitions = np.zeros(len(enriched), dtype=bool)
+    calendar_gap_days = np.zeros(len(enriched), dtype=np.int32)
+    same_symbol = symbols[1:] == symbols[:-1]
+    log_returns = np.zeros(max(len(enriched) - 1, 0), dtype=np.float64)
+    if len(enriched) > 1:
+        log_returns[same_symbol] = np.diff(
+            np.log(np.maximum(adjusted_close, 1e-12))
+        )[same_symbol]
+        transitions[1:] = same_symbol & (np.abs(log_returns) > max_abs_log_return)
+        timestamp_days = timestamps.asi8 // (24 * 60 * 60 * 1_000_000_000)
+        calendar_gap_days[1:] = np.where(
+            same_symbol,
+            np.maximum(np.diff(timestamp_days), 0),
+            0,
+        ).astype(np.int32)
+    enriched["adjusted_transition_extreme"] = transitions
+    enriched["calendar_gap_days"] = calendar_gap_days
+    return enriched
+
+
+def _symbol_index_metadata(
+    ordered: pd.DataFrame,
+    *,
+    symbol: str,
+    benchmark_mapping: Mapping[str, str],
+) -> dict[str, Any]:
+    """Return content-facing eligibility and audit metadata for one symbol."""
+
+    asset_type = _metadata_value(ordered, "asset_type")
+    market = _metadata_value(ordered, "market")
+    metadata_consistent = asset_type is not None and market is not None
+    decision = resolve_benchmark(
+        symbol=symbol,
+        asset_type=str(asset_type or ""),
+        market=str(market or ""),
+        explicit_mapping=dict(benchmark_mapping),
+    )
+    return {
+        "start_at": pd.Timestamp(ordered["timestamp"].iloc[0]).isoformat(),
+        "end_at": pd.Timestamp(ordered["timestamp"].iloc[-1]).isoformat(),
+        "asset_type": str(asset_type or "unknown"),
+        "market": str(market or "unknown"),
+        "provider": str(_metadata_value(ordered, "provider") or "unknown"),
+        "currency": str(_metadata_value(ordered, "currency") or "unknown"),
+        "source_symbol": str(_metadata_value(ordered, "source_symbol") or symbol),
+        "is_active": _metadata_value(ordered, "is_active"),
+        "dataset_profile": str(_metadata_value(ordered, "dataset_profile") or "unknown"),
+        "eligible": bool(metadata_consistent and decision.eligible),
+        "eligibility_reason": (
+            decision.reason if metadata_consistent else "inconsistent_symbol_metadata"
+        ),
+        "benchmark_symbol": decision.benchmark_symbol or "",
+        "benchmark_policy": decision.policy,
+        "extreme_transition_count": int(ordered["adjusted_transition_extreme"].sum()),
+        "long_calendar_gap_count": int((ordered["calendar_gap_days"] > 10).sum()),
+    }
+
+
+def _exclude_symbols_with_missing_benchmarks(index: pd.DataFrame) -> pd.DataFrame:
+    """Disable targets whose benchmark series is absent from the same bar store."""
+
+    resolved = index.copy()
+    available_symbols = set(resolved["symbol"].astype(str))
+    missing = resolved["eligible"].astype(bool) & ~resolved["benchmark_symbol"].isin(
+        available_symbols
+    )
+    resolved.loc[missing, "eligible"] = False
+    resolved.loc[missing, "eligibility_reason"] = "missing_benchmark"
+    return resolved
+
+
 def _compact_bucket(
     *,
     output_root: Path,
@@ -1233,25 +1350,10 @@ def _compact_bucket(
             )
         tables.append(table)
     table = pa.concat_tables(tables, promote_options="default")
-    frame = ensure_adjustment_columns(normalize_ohlcv_frame(table.to_pandas()))
-    adjusted_close = frame["adjusted_close"].to_numpy(dtype=np.float64)
-    symbols = frame["symbol"].astype(str).to_numpy()
-    timestamps = pd.DatetimeIndex(frame["timestamp"])
-    transitions = np.zeros(len(frame), dtype=bool)
-    calendar_gap_days = np.zeros(len(frame), dtype=np.int32)
-    same_symbol = symbols[1:] == symbols[:-1]
-    log_returns = np.zeros(max(len(frame) - 1, 0), dtype=np.float64)
-    if len(frame) > 1:
-        log_returns[same_symbol] = np.diff(np.log(np.maximum(adjusted_close, 1e-12)))[same_symbol]
-        transitions[1:] = same_symbol & (np.abs(log_returns) > max_abs_log_return)
-        timestamp_days = timestamps.asi8 // (24 * 60 * 60 * 1_000_000_000)
-        calendar_gap_days[1:] = np.where(
-            same_symbol,
-            np.maximum(np.diff(timestamp_days), 0),
-            0,
-        ).astype(np.int32)
-    frame["adjusted_transition_extreme"] = transitions
-    frame["calendar_gap_days"] = calendar_gap_days
+    frame = _enrich_compacted_frame(
+        table.to_pandas(),
+        max_abs_log_return=max_abs_log_return,
+    )
 
     work_root = output_root / ".work"
     staging_parent = work_root / "compaction-staging"
@@ -1264,19 +1366,8 @@ def _compact_bucket(
     observed_dates: set[pd.Timestamp] = set()
     row_group = 0
     try:
-        for symbol, rows in frame.groupby("symbol", sort=True):
-            deadline.check(f"bucket {bucket} symbol {symbol} compaction")
-            ordered = rows.sort_values("timestamp", kind="stable").reset_index(drop=True)
-            symbol_text = str(symbol)
-            asset_type = _metadata_value(ordered, "asset_type")
-            market = _metadata_value(ordered, "market")
-            metadata_consistent = asset_type is not None and market is not None
-            decision = resolve_benchmark(
-                symbol=symbol_text,
-                asset_type=str(asset_type or ""),
-                market=str(market or ""),
-                explicit_mapping=dict(benchmark_mapping),
-            )
+        for symbol_text, ordered in _compacted_symbol_rows(frame):
+            deadline.check(f"bucket {bucket} symbol {symbol_text} compaction")
             symbol_table = pa.Table.from_pandas(ordered, preserve_index=False)
             if writer is None:
                 writer = pq.ParquetWriter(
@@ -1299,25 +1390,11 @@ def _compact_bucket(
                     ).as_posix(),
                     "row_group": row_group,
                     "row_count": len(ordered),
-                    "start_at": pd.Timestamp(ordered["timestamp"].iloc[0]).isoformat(),
-                    "end_at": pd.Timestamp(ordered["timestamp"].iloc[-1]).isoformat(),
-                    "asset_type": str(asset_type or "unknown"),
-                    "market": str(market or "unknown"),
-                    "provider": str(_metadata_value(ordered, "provider") or "unknown"),
-                    "currency": str(_metadata_value(ordered, "currency") or "unknown"),
-                    "source_symbol": str(_metadata_value(ordered, "source_symbol") or symbol_text),
-                    "is_active": _metadata_value(ordered, "is_active"),
-                    "dataset_profile": str(
-                        _metadata_value(ordered, "dataset_profile") or "unknown"
+                    **_symbol_index_metadata(
+                        ordered,
+                        symbol=symbol_text,
+                        benchmark_mapping=benchmark_mapping,
                     ),
-                    "eligible": bool(metadata_consistent and decision.eligible),
-                    "eligibility_reason": (
-                        decision.reason if metadata_consistent else "inconsistent_symbol_metadata"
-                    ),
-                    "benchmark_symbol": decision.benchmark_symbol or "",
-                    "benchmark_policy": decision.policy,
-                    "extreme_transition_count": int(ordered["adjusted_transition_extreme"].sum()),
-                    "long_calendar_gap_count": int((ordered["calendar_gap_days"] > 10).sum()),
                 }
             )
             row_group += 1
@@ -1463,11 +1540,15 @@ def _load_symbol_index(output_root: Path) -> pd.DataFrame:
     parts = sorted((output_root / "shards").glob("bucket-*/symbol-index.parquet"))
     if not parts:
         raise RuntimeError("Bar-store compaction produced no symbol index parts")
-    return (
+    return _ordered_symbol_index(
         pd.concat([pd.read_parquet(path) for path in parts], ignore_index=True)
-        .sort_values("symbol", kind="stable")
-        .reset_index(drop=True)
     )
+
+
+def _ordered_symbol_index(index: pd.DataFrame) -> pd.DataFrame:
+    """Return the canonical symbol-index order independent of bucket layout."""
+
+    return index.sort_values("symbol", kind="stable").reset_index(drop=True)
 
 
 @lru_cache(maxsize=4)
@@ -1509,6 +1590,88 @@ def _candidate_mask(
     return result
 
 
+def _candidate_range_records(
+    *,
+    symbol: str,
+    bucket: int,
+    mask: np.ndarray,
+    timestamps: pd.DatetimeIndex,
+) -> tuple[list[dict[str, Any]], set[pd.Timestamp]]:
+    """Compress one symbol's valid cutoff mask and collect its cutoff dates."""
+
+    ranges: list[dict[str, Any]] = []
+    candidate_dates: set[pd.Timestamp] = set()
+    for start_index, stop_index in _true_ranges(mask):
+        ranges.append(
+            {
+                "symbol": symbol,
+                "bucket": bucket,
+                "start_index": start_index,
+                "stop_index": stop_index,
+                "count": stop_index - start_index,
+            }
+        )
+        candidate_dates.update(timestamps[start_index:stop_index])
+    return ranges, candidate_dates
+
+
+def _eligible_bucket_rows(index: pd.DataFrame, *, bucket: int) -> pd.DataFrame:
+    """Select target symbols for one physical bucket without changing semantics."""
+
+    return index[(index["bucket"] == bucket) & index["eligible"].astype(bool)]
+
+
+def _candidate_bucket_records(
+    *,
+    index: pd.DataFrame,
+    bucket: int,
+    index_by_symbol: Mapping[str, Mapping[str, Any]],
+    read_symbol: Callable[[Mapping[str, Any]], pd.DataFrame],
+    window_size: int,
+    max_horizon: int,
+    check_symbol: Callable[[str], None] | None = None,
+) -> tuple[list[dict[str, Any]], set[pd.Timestamp], Counter[str]]:
+    """Compute one bucket's logical lazy-cutoff candidates without storage I/O."""
+
+    ranges: list[dict[str, Any]] = []
+    candidate_dates: set[pd.Timestamp] = set()
+    exclusions: Counter[str] = Counter()
+    selected = _eligible_bucket_rows(index, bucket=bucket)
+    benchmark_cache: dict[str, pd.DataFrame] = {}
+    for row in selected.to_dict(orient="records"):
+        symbol = str(row["symbol"])
+        if check_symbol is not None:
+            check_symbol(symbol)
+        benchmark_symbol = str(row["benchmark_symbol"])
+        benchmark_row = index_by_symbol.get(benchmark_symbol)
+        if benchmark_row is None:
+            exclusions["missing_benchmark"] += 1
+            continue
+        frame = read_symbol(row)
+        benchmark = benchmark_cache.get(benchmark_symbol)
+        if benchmark is None:
+            benchmark = read_symbol(benchmark_row)
+            benchmark_cache[benchmark_symbol] = benchmark
+        mask = _candidate_mask(
+            frame,
+            benchmark,
+            window_size=window_size,
+            max_horizon=max_horizon,
+        )
+        symbol_ranges, symbol_dates = _candidate_range_records(
+            symbol=symbol,
+            bucket=bucket,
+            mask=mask,
+            timestamps=pd.DatetimeIndex(frame["timestamp"]),
+        )
+        if not symbol_ranges:
+            exclusions["no_valid_cutoffs"] += 1
+            continue
+        ranges.extend(symbol_ranges)
+        candidate_dates.update(symbol_dates)
+    return ranges, candidate_dates, exclusions
+
+
 def _build_candidate_bucket(
     *,
     output_root: Path,
@@ -1529,46 +1692,15 @@ def _build_candidate_bucket(
     staging_parent.mkdir(parents=True, exist_ok=True)
     _discard_stale_staging(staging_parent, bucket_name)
     staging = _staging_directory(staging_parent, bucket_name)
-    ranges: list[dict[str, Any]] = []
-    candidate_dates: set[pd.Timestamp] = set()
-    exclusions: Counter[str] = Counter()
-    selected = index[(index["bucket"] == bucket) & index["eligible"].astype(bool)]
-    benchmark_cache: dict[str, pd.DataFrame] = {}
-    for row in selected.to_dict(orient="records"):
-        deadline.check(f"candidate symbol {row['symbol']}")
-        symbol = str(row["symbol"])
-        benchmark_symbol = str(row["benchmark_symbol"])
-        benchmark_row = index_by_symbol.get(benchmark_symbol)
-        if benchmark_row is None:
-            exclusions["missing_benchmark"] += 1
-            continue
-        frame = _read_symbol(row, output_root)
-        benchmark = benchmark_cache.get(benchmark_symbol)
-        if benchmark is None:
-            benchmark = _read_symbol(benchmark_row, output_root)
-            benchmark_cache[benchmark_symbol] = benchmark
-        mask = _candidate_mask(
-            frame,
-            benchmark,
-            window_size=window_size,
-            max_horizon=max_horizon,
-        )
-        symbol_ranges = _true_ranges(mask)
-        if not symbol_ranges:
-            exclusions["no_valid_cutoffs"] += 1
-            continue
-        timestamps = pd.DatetimeIndex(frame["timestamp"])
-        for start_index, stop_index in symbol_ranges:
-            ranges.append(
-                {
-                    "symbol": symbol,
-                    "bucket": bucket,
-                    "start_index": start_index,
-                    "stop_index": stop_index,
-                    "count": stop_index - start_index,
-                }
-            )
-            candidate_dates.update(timestamps[start_index:stop_index])
+    ranges, candidate_dates, exclusions = _candidate_bucket_records(
+        index=index,
+        bucket=bucket,
+        index_by_symbol=index_by_symbol,
+        read_symbol=lambda row: _read_symbol(row, output_root),
+        window_size=window_size,
+        max_horizon=max_horizon,
+        check_symbol=lambda symbol: deadline.check(f"candidate symbol {symbol}"),
+    )
     if ranges:
         _atomic_parquet(pd.DataFrame(ranges), staging / "candidate-ranges.parquet")
     if candidate_dates:
@@ -1672,23 +1804,38 @@ def _global_dates(
 ) -> tuple[list[pd.Timestamp], list[pd.Timestamp]]:
     observed_parts = sorted((output_root / "shards").glob("bucket-*/observed-dates.parquet"))
     candidate_parts = sorted((work_root / "candidates").glob("bucket-*/candidate-dates.parquet"))
-    observed = sorted(
-        {
-            pd.Timestamp(value)
+    return _global_calendars(
+        observed_values=(
+            value
             for path in observed_parts
             for value in pd.read_parquet(path, columns=["timestamp"])["timestamp"]
-        }
-    )
-    candidates = sorted(
-        {
-            pd.Timestamp(value)
+        ),
+        candidate_values=(
+            value
             for path in candidate_parts
             for value in pd.read_parquet(path, columns=["timestamp"])["timestamp"]
-        }
+        ),
     )
+
+
+def _global_calendars(
+    *,
+    observed_values: Iterable[Any],
+    candidate_values: Iterable[Any],
+) -> tuple[list[pd.Timestamp], list[pd.Timestamp]]:
+    """Build the logical observed and candidate calendars from persisted values."""
+
+    observed = _ordered_unique_timestamps(observed_values)
+    candidates = _ordered_unique_timestamps(candidate_values)
     if not observed or not candidates:
         raise ValueError("No quality-approved cutoff dates were produced")
     return observed, candidates
+
+
+def _ordered_unique_timestamps(values: Iterable[Any]) -> list[pd.Timestamp]:
+    """Return the canonical global calendar used by chronological splitting."""
+
+    return sorted({pd.Timestamp(value) for value in values})
 
 
 def _split_boundaries(
@@ -1745,6 +1892,139 @@ def _observed_timestamp_array(observed_index: Mapping[int, int]) -> np.ndarray:
     return observed
 
 
+def _split_codes(
+    *,
+    timestamp_ns: np.ndarray,
+    indices: np.ndarray,
+    observed_ns: np.ndarray,
+    boundaries: Mapping[str, Any],
+    max_horizon: int,
+) -> tuple[np.ndarray, Counter[str]]:
+    """Assign numerical split codes without filesystem or process concerns."""
+
+    cutoff_ns = timestamp_ns[indices]
+    observed_positions = np.searchsorted(observed_ns, cutoff_ns)
+    if np.any(observed_positions >= len(observed_ns)) or np.any(
+        observed_ns[observed_positions] != cutoff_ns
+    ):
+        raise RuntimeError("Candidate cutoff timestamps are absent from the trading calendar")
+    label_end_ns = timestamp_ns[indices + max_horizon]
+    codes = np.zeros(len(indices), dtype=np.int8)
+    dropped: Counter[str] = Counter()
+
+    train_region = observed_positions < int(boundaries["train_stop"])
+    train_ok = train_region & (label_end_ns < pd.Timestamp(boundaries["train_boundary"]).value)
+    train_crossed = train_region & ~train_ok
+    codes[train_ok] = 1
+    dropped["label_crosses_train_boundary"] += int(train_crossed.sum())
+
+    validation_region = (observed_positions >= int(boundaries["validation_start"])) & (
+        observed_positions < int(boundaries["validation_stop"])
+    )
+    validation_ok = validation_region & (
+        label_end_ns < pd.Timestamp(boundaries["validation_boundary"]).value
+    )
+    validation_crossed = validation_region & ~validation_ok
+    codes[validation_ok] = 2
+    dropped["label_crosses_validation_boundary"] += int(validation_crossed.sum())
+
+    test_region = observed_positions >= int(boundaries["test_start"])
+    codes[test_region] = 3
+    unassigned = codes == 0
+    dropped["purge_or_embargo"] += int(
+        unassigned.sum() - train_crossed.sum() - validation_crossed.sum()
+    )
+    return codes, dropped
+
+
+def _split_range_records(
+    *,
+    symbol: str,
+    indices: np.ndarray,
+    codes: np.ndarray,
+    timestamps: pd.DatetimeIndex,
+    max_horizon: int,
+) -> list[dict[str, Any]]:
+    """Compress per-cutoff split codes into lazy contiguous range records."""
+
+    records: list[dict[str, Any]] = []
+    for code, split in ((1, "train"), (2, "validation"), (3, "test")):
+        for local_start, local_stop in _true_ranges(codes == code):
+            start_index = int(indices[local_start])
+            stop_index = int(indices[local_stop - 1]) + 1
+            records.append(
+                {
+                    "symbol": symbol,
+                    "split": split,
+                    "start_index": start_index,
+                    "stop_index": stop_index,
+                    "count": stop_index - start_index,
+                    "cutoff_start_at": timestamps[start_index].isoformat(),
+                    "cutoff_end_at": timestamps[stop_index - 1].isoformat(),
+                    "label_end_max_at": timestamps[
+                        stop_index - 1 + max_horizon
+                    ].isoformat(),
+                }
+            )
+    return records
+
+
+def _ordered_split_ranges(ranges: pd.DataFrame) -> pd.DataFrame:
+    """Return the canonical lazy-range order used by training datasets."""
+
+    return ranges.sort_values(
+        ["split", "symbol", "start_index"],
+        kind="stable",
+    ).reset_index(drop=True)
+
+
+def _split_bucket_records(
+    *,
+    candidates: pd.DataFrame,
+    index_by_symbol: Mapping[str, Mapping[str, Any]],
+    read_symbol: Callable[[Mapping[str, Any]], pd.DataFrame],
+    boundaries: Mapping[str, Any],
+    max_horizon: int,
+    check_symbol: Callable[[str], None] | None = None,
+) -> tuple[list[dict[str, Any]], Counter[str]]:
+    """Assign and compress one bucket's logical chronological split records."""
+
+    output: list[dict[str, Any]] = []
+    dropped: Counter[str] = Counter()
+    observed_ns = _observed_timestamp_array(boundaries["observed_index"])
+    for symbol, rows in candidates.groupby("symbol", sort=True):
+        symbol_text = str(symbol)
+        if check_symbol is not None:
+            check_symbol(symbol_text)
+        frame = read_symbol(index_by_symbol[symbol_text])
+        timestamps = pd.DatetimeIndex(frame["timestamp"])
+        timestamp_ns = timestamps.asi8
+        for candidate in rows.itertuples(index=False):
+            indices = np.arange(
+                int(candidate.start_index),
+                int(candidate.stop_index),
+                dtype=np.int64,
+            )
+            codes, candidate_dropped = _split_codes(
+                timestamp_ns=timestamp_ns,
+                indices=indices,
+                observed_ns=observed_ns,
+                boundaries=boundaries,
+                max_horizon=max_horizon,
+            )
+            dropped.update(candidate_dropped)
+            output.extend(
+                _split_range_records(
+                    symbol=symbol_text,
+                    indices=indices,
+                    codes=codes,
+                    timestamps=timestamps,
+                    max_horizon=max_horizon,
+                )
+            )
+    return output, dropped
+
+
 def _build_split_bucket(
     *,
     output_root: Path,
@@ -1765,83 +2045,21 @@ def _build_split_bucket(
     staging_parent.mkdir(parents=True, exist_ok=True)
     _discard_stale_staging(staging_parent, bucket_name)
     staging = _staging_directory(staging_parent, bucket_name)
-    output: list[dict[str, Any]] = []
-    dropped: Counter[str] = Counter()
-    train_boundary = pd.Timestamp(boundaries["train_boundary"])
-    validation_boundary = pd.Timestamp(boundaries["validation_boundary"])
-    observed_ns = _observed_timestamp_array(boundaries["observed_index"])
-    train_boundary_ns = train_boundary.value
-    validation_boundary_ns = validation_boundary.value
     candidates = pd.read_parquet(candidate_part)
 
     try:
-        for symbol, rows in candidates.groupby("symbol", sort=True):
-            deadline.check(f"split assignment for {symbol}")
-            symbol_text = str(symbol)
-            frame = _read_symbol(index_by_symbol[symbol_text], output_root)
-            timestamps = pd.DatetimeIndex(frame["timestamp"])
-            timestamp_ns = timestamps.asi8
-            for candidate in rows.itertuples(index=False):
-                indices = np.arange(
-                    int(candidate.start_index),
-                    int(candidate.stop_index),
-                    dtype=np.int64,
-                )
-                cutoff_ns = timestamp_ns[indices]
-                observed_positions = np.searchsorted(observed_ns, cutoff_ns)
-                if np.any(observed_positions >= len(observed_ns)) or np.any(
-                    observed_ns[observed_positions] != cutoff_ns
-                ):
-                    raise RuntimeError(
-                        f"Candidate cutoff timestamps for {symbol_text} are absent from "
-                        "the global trading calendar"
-                    )
-                label_end_ns = timestamp_ns[indices + max_horizon]
-                codes = np.zeros(len(indices), dtype=np.int8)
-
-                train_region = observed_positions < int(boundaries["train_stop"])
-                train_ok = train_region & (label_end_ns < train_boundary_ns)
-                train_crossed = train_region & ~train_ok
-                codes[train_ok] = 1
-                dropped["label_crosses_train_boundary"] += int(train_crossed.sum())
-
-                validation_region = (observed_positions >= int(boundaries["validation_start"])) & (
-                    observed_positions < int(boundaries["validation_stop"])
-                )
-                validation_ok = validation_region & (label_end_ns < validation_boundary_ns)
-                validation_crossed = validation_region & ~validation_ok
-                codes[validation_ok] = 2
-                dropped["label_crosses_validation_boundary"] += int(validation_crossed.sum())
-
-                test_region = observed_positions >= int(boundaries["test_start"])
-                codes[test_region] = 3
-                unassigned = codes == 0
-                dropped["purge_or_embargo"] += int(
-                    unassigned.sum() - train_crossed.sum() - validation_crossed.sum()
-                )
-
-                for code, split in ((1, "train"), (2, "validation"), (3, "test")):
-                    for local_start, local_stop in _true_ranges(codes == code):
-                        start_index = int(indices[local_start])
-                        stop_index = int(indices[local_stop - 1]) + 1
-                        output.append(
-                            {
-                                "symbol": symbol_text,
-                                "split": split,
-                                "start_index": start_index,
-                                "stop_index": stop_index,
-                                "count": stop_index - start_index,
-                                "cutoff_start_at": timestamps[start_index].isoformat(),
-                                "cutoff_end_at": timestamps[stop_index - 1].isoformat(),
-                                "label_end_max_at": timestamps[
-                                    stop_index - 1 + max_horizon
-                                ].isoformat(),
-                            }
-                        )
+        output, dropped = _split_bucket_records(
+            candidates=candidates,
+            index_by_symbol=index_by_symbol,
+            read_symbol=lambda row: _read_symbol(row, output_root),
+            boundaries=boundaries,
+            max_horizon=max_horizon,
+            check_symbol=lambda symbol: deadline.check(
+                f"split assignment for {symbol}"
+            ),
+        )
         if output:
-            ranges = pd.DataFrame(output).sort_values(
-                ["split", "symbol", "start_index"], kind="stable"
-            )
+            ranges = _ordered_split_ranges(pd.DataFrame(output))
             _atomic_parquet(ranges, staging / "cutoff-ranges.parquet")
         atomic_write_json(
             staging / "checkpoint.json",
@@ -1937,9 +2155,12 @@ def _assign_split_ranges(
     split_parts = sorted((work_root / "split-ranges").glob("bucket-*/cutoff-ranges.parquet"))
     if not split_parts:
         raise ValueError("Chronological split produced no lazy cutoff ranges")
-    ranges = pd.concat(
-        [pd.read_parquet(path) for path in split_parts], ignore_index=True
-    ).sort_values(["split", "symbol", "start_index"], kind="stable")
+    ranges = _ordered_split_ranges(
+        pd.concat(
+            [pd.read_parquet(path) for path in split_parts],
+            ignore_index=True,
+        )
+    )
     dropped: Counter[str] = Counter()
     for checkpoint_path in sorted((work_root / "split-ranges").glob("bucket-*/checkpoint.json")):
         checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
@@ -1991,7 +2212,7 @@ def _assign_split_ranges(
         "dropped_counts_by_reason": dict(sorted(dropped.items())),
         "splits": summaries,
     }
-    return ranges.reset_index(drop=True), split_audit, plan
+    return ranges, split_audit, plan
 
 
 def _combine_quality(
@@ -2037,18 +2258,19 @@ def build_symbol_bar_store(
     output_root: str | Path,
     download_manifest: Mapping[str, Any],
     benchmark_mapping: Mapping[str, str] | None = None,
-    window_size: int = 128,
+    window_size: int = DEFAULT_WINDOW_SIZE,
     max_horizon: int = DEFAULT_MAX_HORIZON,
-    max_abs_log_return: float = 0.5,
-    train_fraction: float = 0.70,
-    validation_fraction: float = 0.15,
-    purge_bars: int = 20,
-    embargo_bars: int = 14,
+    max_abs_log_return: float = DEFAULT_MAX_ABS_LOG_RETURN,
+    train_fraction: float = DEFAULT_TRAIN_FRACTION,
+    validation_fraction: float = DEFAULT_VALIDATION_FRACTION,
+    purge_bars: int = DEFAULT_PURGE_BARS,
+    embargo_bars: int = DEFAULT_EFFECTIVE_EMBARGO_BARS,
     bucket_count: int = DEFAULT_BUCKET_COUNT,
     batch_rows: int = DEFAULT_BATCH_ROWS,
     deadline_epoch_seconds: float | None = None,
     workers: int = 1,
     memory_budget_bytes: int | None = None,
+    materialization_digest: str | None = None,
 ) -> BarStoreBuildResult:
     """Build or resume an immutable compressed bar store without materializing windows."""
 
@@ -2062,6 +2284,12 @@ def build_symbol_bar_store(
         raise ValueError("workers must be positive")
     if memory_budget_bytes is not None and memory_budget_bytes < 1:
         raise ValueError("memory_budget_bytes must be positive")
+    content_digest = materialization_digest or bar_store_materialization_digest()
+    if (
+        len(content_digest) != 64
+        or any(character not in "0123456789abcdef" for character in content_digest)
+    ):
+        raise ValueError("materialization_digest must be a lowercase SHA-256 digest")
     if window_size < 2 or max_horizon != DEFAULT_MAX_HORIZON:
         raise ValueError("The approved bar store requires window_size>=2 and max_horizon=14")
     if max_abs_log_return <= 0.0:
@@ -2098,6 +2326,7 @@ def build_symbol_bar_store(
     identity = {
         "schema_version": BAR_STORE_SCHEMA_VERSION,
         "kind": BAR_STORE_KIND,
+        "materialization_digest": content_digest,
         "raw_sha256": raw_sha256,
         "raw_rows": raw_rows,
         "window_size": window_size,
@@ -2106,116 +2335,184 @@ def build_symbol_bar_store(
         "train_fraction": train_fraction,
         "validation_fraction": validation_fraction,
         "purge_bars": purge_bars,
-        "embargo_bars": embargo_bars,
-        "bucket_count": bucket_count,
-        "batch_rows": batch_rows,
-        "raw_scan_algorithm": RAW_SCAN_ALGORITHM,
-        "raw_scan_target_partition_rows": (batch_rows * SOURCE_PARTITION_BATCH_MULTIPLIER),
-        "split_assignment_algorithm": SPLIT_ASSIGNMENT_ALGORITHM,
+        "effective_embargo_bars": embargo_bars,
         "benchmark_mapping_sha256": canonical_json_sha256(mapping),
-        "training_security_scope": TRAINING_SECURITY_SCOPE,
-        "split_policy": SPLIT_POLICY,
     }
     identity_sha256 = canonical_json_sha256(identity)
+    checkpoint_identity = {
+        "schema_version": BAR_STORE_BUILD_CHECKPOINT_SCHEMA_VERSION,
+        "kind": "bar-store-build-checkpoint",
+        "content_identity_sha256": identity_sha256,
+        "bucket_count": bucket_count,
+        "batch_rows": batch_rows,
+        "symbol_bucket_algorithm": SYMBOL_BUCKET_ALGORITHM,
+        "raw_scan_algorithm": RAW_SCAN_ALGORITHM,
+        "raw_scan_target_partition_rows": (
+            batch_rows * SOURCE_PARTITION_BATCH_MULTIPLIER
+        ),
+        "split_assignment_algorithm": SPLIT_ASSIGNMENT_ALGORITHM,
+    }
+    checkpoint_identity_sha256 = canonical_json_sha256(checkpoint_identity)
+
+    final_data_paths = (manifest_path, index_path, ranges_path)
+    final_paths = (success_path, *final_data_paths)
+    final_path_has_symlink = any(path.is_symlink() for path in final_paths)
+    success_present = success_path.exists() or success_path.is_symlink()
+    all_final_files = all(path.is_file() and not path.is_symlink() for path in final_paths)
+    any_final_data_file = any(
+        path.exists() or path.is_symlink() for path in final_data_paths
+    )
+    all_final_data_files = all(
+        path.is_file() and not path.is_symlink() for path in final_data_paths
+    )
+
+    if (
+        final_path_has_symlink
+        or (success_present and not all_final_files)
+        or (
+            not success_present
+            and any_final_data_file
+            and not all_final_data_files
+        )
+    ):
+        work_root, quarantine = _reset_generated_bar_store(
+            root=root,
+            previous_state={"identity_sha256": "incomplete-finalized-store"},
+        )
+        atomic_write_json(
+            work_root / "build-state.json",
+            {
+                "identity": identity,
+                "identity_sha256": identity_sha256,
+                "checkpoint_identity": checkpoint_identity,
+                "checkpoint_identity_sha256": checkpoint_identity_sha256,
+                "incomplete_finalized_store_quarantine": str(quarantine),
+            },
+        )
+    elif all_final_files:
+        try:
+            return _completed_bar_store_result(
+                work_root=work_root,
+                success_path=success_path,
+                manifest_path=manifest_path,
+                index_path=index_path,
+                ranges_path=ranges_path,
+                identity_sha256=identity_sha256,
+            )
+        except (KeyError, OSError, TypeError, ValueError):
+            work_root, quarantine = _reset_generated_bar_store(
+                root=root,
+                previous_state={"identity_sha256": "invalid-finalized-store"},
+            )
+            atomic_write_json(
+                work_root / "build-state.json",
+                {
+                    "identity": identity,
+                    "identity_sha256": identity_sha256,
+                    "checkpoint_identity": checkpoint_identity,
+                    "checkpoint_identity_sha256": checkpoint_identity_sha256,
+                    "invalid_finalized_store_quarantine": str(quarantine),
+                },
+            )
+    elif not success_present and all_final_data_files:
+        try:
+            _recover_bar_store_success_marker(
+                success_path=success_path,
+                manifest_path=manifest_path,
+                index_path=index_path,
+                ranges_path=ranges_path,
+                identity_sha256=identity_sha256,
+            )
+            return _completed_bar_store_result(
+                work_root=work_root,
+                success_path=success_path,
+                manifest_path=manifest_path,
+                index_path=index_path,
+                ranges_path=ranges_path,
+                identity_sha256=identity_sha256,
+            )
+        except (KeyError, OSError, TypeError, ValueError):
+            work_root, quarantine = _reset_generated_bar_store(
+                root=root,
+                previous_state={"identity_sha256": "invalid-recoverable-store"},
+            )
+            atomic_write_json(
+                work_root / "build-state.json",
+                {
+                    "identity": identity,
+                    "identity_sha256": identity_sha256,
+                    "checkpoint_identity": checkpoint_identity,
+                    "checkpoint_identity_sha256": checkpoint_identity_sha256,
+                    "invalid_recoverable_store_quarantine": str(quarantine),
+                },
+            )
+
+    if manifest_path.exists() or manifest_path.is_symlink():
+        try:
+            existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            existing_manifest = {}
+        if (
+            not isinstance(existing_manifest, Mapping)
+            or existing_manifest.get("identity_sha256") != identity_sha256
+        ):
+            work_root, quarantine = _reset_generated_bar_store(
+                root=root,
+                previous_state=(
+                    existing_manifest if isinstance(existing_manifest, Mapping) else {}
+                ),
+            )
+            atomic_write_json(
+                work_root / "build-state.json",
+                {
+                    "identity": identity,
+                    "identity_sha256": identity_sha256,
+                    "checkpoint_identity": checkpoint_identity,
+                    "checkpoint_identity_sha256": checkpoint_identity_sha256,
+                    "incompatible_completed_store_quarantine": str(quarantine),
+                },
+            )
     state_path = work_root / "build-state.json"
     if state_path.is_file():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        if state.get("identity_sha256") != identity_sha256:
-            previous_identity = state.get("identity")
-            finalized_paths = (success_path, manifest_path, index_path, ranges_path)
-            if (
-                isinstance(previous_identity, Mapping)
-                and not any(path.exists() or path.is_symlink() for path in finalized_paths)
-                and _is_scan_execution_upgrade(previous_identity, identity)
-            ):
-                quarantine = _quarantine_obsolete_scan_work(
-                    root=root,
-                    work_root=work_root,
-                    previous_state=state,
-                )
-                work_root.mkdir(parents=False, exist_ok=False)
-                state_path = work_root / "build-state.json"
-                atomic_write_json(
-                    state_path,
-                    {
-                        "identity": identity,
-                        "identity_sha256": identity_sha256,
-                        "checkpoint_upgrade": {
-                            "previous_raw_scan_algorithm": previous_identity.get(
-                                "raw_scan_algorithm"
-                            ),
-                            "quarantined_path": str(quarantine),
-                        },
-                    },
-                )
-            else:
-                raise ValueError(
-                    "Existing bar-store checkpoints belong to a different raw or "
-                    "preparation contract"
-                )
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            state = {}
+        if (
+            not isinstance(state, Mapping)
+            or state.get("identity_sha256") != identity_sha256
+            or state.get("checkpoint_identity_sha256")
+            != checkpoint_identity_sha256
+        ):
+            work_root, quarantine = _reset_generated_bar_store(
+                root=root,
+                previous_state=state if isinstance(state, Mapping) else {},
+            )
+            state_path = work_root / "build-state.json"
+            atomic_write_json(
+                state_path,
+                {
+                    "identity": identity,
+                    "identity_sha256": identity_sha256,
+                    "checkpoint_identity": checkpoint_identity,
+                    "checkpoint_identity_sha256": checkpoint_identity_sha256,
+                    "incompatible_checkpoint_quarantine": str(quarantine),
+                },
+            )
     else:
         atomic_write_json(
             state_path,
-            {"identity": identity, "identity_sha256": identity_sha256},
-        )
-
-    if not success_path.exists() and all(
-        path.is_file() for path in (manifest_path, index_path, ranges_path)
-    ):
-        recovered_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if (
-            recovered_manifest.get("schema_version") != BAR_STORE_SCHEMA_VERSION
-            or recovered_manifest.get("kind") != BAR_STORE_KIND
-            or recovered_manifest.get("state") != "ready"
-            or recovered_manifest.get("identity_sha256") != identity_sha256
-        ):
-            raise ValueError("Recoverable bar-store outputs have an invalid contract")
-        atomic_write_json(
-            success_path,
             {
-                "schema_version": BAR_STORE_SCHEMA_VERSION,
-                "kind": "bar-store-success",
-                "state": "ready",
+                "identity": identity,
                 "identity_sha256": identity_sha256,
-                "bar_store_manifest_sha256": sha256_file(manifest_path),
-                "symbol_index_sha256": sha256_file(index_path),
-                "cutoff_ranges_sha256": sha256_file(ranges_path),
-                "split_counts": recovered_manifest["split_counts"],
-                "recovered_after_interrupted_publication": True,
+                "checkpoint_identity": checkpoint_identity,
+                "checkpoint_identity_sha256": checkpoint_identity_sha256,
             },
         )
-    if all(path.is_file() for path in (success_path, manifest_path, index_path, ranges_path)):
-        success = json.loads(success_path.read_text(encoding="utf-8"))
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if (
-            success.get("schema_version") != BAR_STORE_SCHEMA_VERSION
-            or success.get("kind") != "bar-store-success"
-            or success.get("state") != "ready"
-            or success.get("identity_sha256") != identity_sha256
-            or manifest.get("schema_version") != BAR_STORE_SCHEMA_VERSION
-            or manifest.get("kind") != BAR_STORE_KIND
-            or manifest.get("state") != "ready"
-            or manifest.get("identity_sha256") != identity_sha256
-            or success.get("bar_store_manifest_sha256") != sha256_file(manifest_path)
-            or success.get("symbol_index_sha256") != sha256_file(index_path)
-            or success.get("cutoff_ranges_sha256") != sha256_file(ranges_path)
-            or success.get("split_counts") != manifest.get("split_counts")
-        ):
-            raise ValueError("Completed bar store has an invalid immutable contract")
-        _cleanup_completed_work(work_root)
-        return BarStoreBuildResult(
-            bar_store_manifest_path=manifest_path,
-            symbol_index_path=index_path,
-            cutoff_ranges_path=ranges_path,
-            success_path=success_path,
-            split_counts={str(k): int(v) for k, v in manifest["split_counts"].items()},
-            split_audit=dict(manifest["split_audit"]),
-            quality=dict(manifest["quality"]),
-            execution=dict(manifest["execution"]),
-        )
 
-    detected_cpu_count = _visible_cpu_count()
-    available_memory_bytes = _detect_available_memory_bytes()
+    detected_cpu_count = detect_visible_cpu_count()
+    memory_estimate = detect_available_memory()
+    available_memory_bytes = memory_estimate.available_bytes
     worker_memory_budget_bytes = _safe_worker_memory_budget(
         available_memory_bytes,
         memory_budget_bytes,
@@ -2259,13 +2556,7 @@ def build_symbol_bar_store(
         raise ValueError("Bar-store symbol index contains duplicate symbols")
     if int(index["row_count"].sum()) != raw_rows:
         raise ValueError("Bar-store symbol rows differ from the immutable raw artifact")
-    index_by_symbol = {str(row["symbol"]): row for row in index.to_dict(orient="records")}
-    missing_benchmarks = index["eligible"].astype(bool) & ~index["benchmark_symbol"].isin(
-        index_by_symbol
-    )
-    if missing_benchmarks.any():
-        index.loc[missing_benchmarks, "eligible"] = False
-        index.loc[missing_benchmarks, "eligibility_reason"] = "missing_benchmark"
+    index = _exclude_symbols_with_missing_benchmarks(index)
     planning_root = work_root / "planning"
     planning_root.mkdir(parents=True, exist_ok=True)
     planning_index_path = planning_root / "symbol-index.parquet"
@@ -2343,6 +2634,7 @@ def build_symbol_bar_store(
         "layout": "hash_bucketed_symbol_row_groups",
         "compression": "zstd",
         "bucket_count": bucket_count,
+        "symbol_bucket_algorithm": SYMBOL_BUCKET_ALGORITHM,
         "raw_scan_algorithm": RAW_SCAN_ALGORITHM,
         "raw_scan_batch_rows": batch_rows,
         "raw_scan_source_row_groups": scan["source_row_groups"],
@@ -2353,6 +2645,10 @@ def build_symbol_bar_store(
             "requested_workers": workers,
             "detected_cpu_count": detected_cpu_count,
             "available_memory_bytes_at_planning": available_memory_bytes,
+            "available_memory_source": memory_estimate.source,
+            "available_memory_observations_bytes": dict(
+                memory_estimate.observations
+            ),
             "worker_memory_budget_bytes": worker_memory_budget_bytes,
             "memory_budget_override_bytes": memory_budget_bytes,
             "safe_memory_fraction": SAFE_MEMORY_FRACTION,
@@ -2400,6 +2696,11 @@ def build_symbol_bar_store(
     }
     deadline.check("bar-store manifest publication")
     atomic_write_json(manifest_path, manifest)
+    integrity = validate_bar_store_artifacts(
+        root,
+        expected_identity_sha256=identity_sha256,
+        require_success=False,
+    )
     atomic_write_json(
         success_path,
         {
@@ -2407,9 +2708,9 @@ def build_symbol_bar_store(
             "kind": "bar-store-success",
             "state": "ready",
             "identity_sha256": identity_sha256,
-            "bar_store_manifest_sha256": sha256_file(manifest_path),
-            "symbol_index_sha256": sha256_file(index_path),
-            "cutoff_ranges_sha256": sha256_file(ranges_path),
+            "bar_store_manifest_sha256": integrity.manifest_sha256,
+            "symbol_index_sha256": integrity.symbol_index_sha256,
+            "cutoff_ranges_sha256": integrity.cutoff_ranges_sha256,
             "split_counts": split_counts,
         },
     )
@@ -2426,7 +2727,7 @@ def build_symbol_bar_store(
     )
 
 
-def bar_store_preparation_spec(
+def bar_store_preparation_provenance(
     *,
     window_size: int,
     max_horizon: int,
@@ -2443,10 +2744,10 @@ def bar_store_preparation_spec(
     diagnostic_horizons: list[int],
     flat_volatility_multiplier: float,
 ) -> dict[str, Any]:
-    """Return the immutable, h_start-independent lazy dataset contract."""
+    """Describe preparation for audit without defining dataset identity."""
 
     return {
-        "schema_version": 5,
+        "schema_version": PREPARATION_PROVENANCE_SCHEMA_VERSION,
         "processed_schema_version": "4.0",
         "bar_store_schema_version": BAR_STORE_SCHEMA_VERSION,
         "storage_kind": BAR_STORE_KIND,
