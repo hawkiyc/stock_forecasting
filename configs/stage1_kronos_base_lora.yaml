@@ -1,5 +1,5 @@
 experiment_name: kronos-base-lora-stage1
-description: Quant-only script validation on an exact deterministic 15% training subset.
+description: Quant-only Stage 1 training on an exact deterministic 3% training subset for two epochs.
 
 data:
   raw_path: ${DATA_ROOT:-/runpod-volume/data}/raw/market.parquet
@@ -13,7 +13,7 @@ data:
   diagnostic_horizons: [1, 20]
   stride: 5
   sample_stride: 1
-  train_fraction: 0.15
+  train_fraction: 0.03
   flat_volatility_multiplier: 0.25
   max_abs_log_return: 0.5
   embargo_trading_days: 5
@@ -55,8 +55,7 @@ model:
 training:
   stage: stage1
   seed: 42
-  epochs: 1
-  max_steps: 200
+  epochs: 2
   batch_size: 8
   evaluation_batch_size: 16
   gradient_accumulation_steps: 2
@@ -66,11 +65,14 @@ training:
   warmup_ratio: 0.03
   max_grad_norm: 1.0
   log_every_steps: 1
-  evaluate_every_steps: 50
-  checkpoint_every_steps: 50
-  checkpoint_save_top_k: 3
+  evaluations_per_epoch: 5
+  checkpoint_save_top_k: 5
   checkpoint_monitor: primary_5d/selection_score
   checkpoint_mode: min
+  early_stopping_enabled: true
+  early_stopping_patience_evaluations: 5
+  early_stopping_min_delta: 0.0
+  early_stopping_start_epoch: 2
   output_root: ${SAVED_MODEL_ROOT:-/runpod-volume/savedModel}
   resume_checkpoint: null
   mixed_precision: bf16
@@ -82,7 +84,7 @@ wandb:
   project: ${WANDB_PROJECT:-fin-ts-quant}
   entity: ${WANDB_ENTITY:-}
   group: kronos-base-lora
-  name: stage1-15pct
+  name: stage1-3pct-2epoch
   tags: [quant-only, kronos-base, lora, stage1]
   directory: ${WANDB_DIR:-/runpod-volume}
   mode: online

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,9 +12,11 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from stock_forecasting.checkpointing import (
+    CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
     _load_trainable_model_state,
     _restore_runtime_robust_scales,
     _validate_loaded_model_contract,
+    save_training_completion_result,
     trainable_state_dict,
 )
 from stock_forecasting.cli.prefetch_models import prefetch_repositories
@@ -27,9 +30,149 @@ from stock_forecasting.models.backbones import (
 from stock_forecasting.models.lora import LoRALinear, inject_lora, lora_parameter_names
 from stock_forecasting.models.outputs import MODEL_OUTPUT_SCHEMA_VERSION
 from stock_forecasting.run_contract import training_resume_contract_digest
-from stock_forecasting.training import evaluate_loader
+from stock_forecasting.training import (
+    EarlyStoppingState,
+    epoch_evaluation_steps,
+    evaluate_loader,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_epoch_relative_validation_schedule_has_exactly_five_even_checkpoints() -> None:
+    assert epoch_evaluation_steps(0, 13, 5) == (3, 6, 8, 11, 13)
+    assert epoch_evaluation_steps(1, 13, 5) == (16, 19, 21, 24, 26)
+
+    with pytest.raises(ValueError, match="at least one optimizer step"):
+        epoch_evaluation_steps(0, 4, 5)
+
+
+def test_stage1_early_stopping_cannot_trigger_before_second_epoch() -> None:
+    state = EarlyStoppingState()
+    values = [1.0, 1.1, 1.2, 1.3, 1.4]
+
+    for value in values:
+        assert (
+            state.observe(
+                value,
+                mode="min",
+                min_delta=0.0,
+                patience=5,
+                epoch_number=1,
+                start_epoch=2,
+                enabled=True,
+            )
+            is False
+        )
+
+    assert state.stale_evaluations == 4
+    assert state.observe(
+        1.5,
+        mode="min",
+        min_delta=0.0,
+        patience=5,
+        epoch_number=2,
+        start_epoch=2,
+        enabled=True,
+    )
+    assert state.triggered is True
+    assert EarlyStoppingState.from_dict(state.as_dict()) == state
+
+
+def test_validation_loss_improvement_resets_early_stopping_patience() -> None:
+    state = EarlyStoppingState()
+    for value in (1.0, 1.1, 1.2):
+        state.observe(
+            value,
+            mode="min",
+            min_delta=0.0,
+            patience=2,
+            epoch_number=1,
+            start_epoch=1,
+            enabled=False,
+        )
+
+    assert state.stale_evaluations == 2
+    assert not state.observe(
+        0.9,
+        mode="min",
+        min_delta=0.0,
+        patience=2,
+        epoch_number=2,
+        start_epoch=1,
+        enabled=True,
+    )
+    assert state.stale_evaluations == 0
+    assert state.best_value == pytest.approx(0.9)
+
+
+def test_training_completion_result_is_compact_atomic_and_immutable(
+    tmp_path: Path,
+) -> None:
+    config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    run_directory = tmp_path / "completion-contract-run"
+    run_directory.mkdir()
+    contract_digest = training_resume_contract_digest(config)
+    (run_directory / "run-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
+                "run_id": run_directory.name,
+                "run_key": run_directory.name,
+                "training_resume_contract_sha256": contract_digest,
+            }
+        ),
+        encoding="utf-8",
+    )
+    model = nn.Module()
+    model.register_parameter("weight", nn.Parameter(torch.ones(1)))
+    alpha_head = nn.Module()
+    alpha_head.register_buffer(
+        "robust_scales",
+        torch.ones(len(config.data.alpha_horizons)),
+    )
+    model.add_module("alpha_head", alpha_head)
+
+    result_directory = save_training_completion_result(
+        model=model,
+        config=config,
+        run_directory=run_directory,
+        global_step=10,
+        completed_epochs=1,
+        processed_train_samples=40,
+        planned_train_samples=40,
+        validation_evaluations=1,
+        stop_reason="epochs_completed",
+        early_stopping_state=EarlyStoppingState().as_dict(),
+        metrics={"primary_5d/selection_score": 0.5},
+    )
+
+    assert {path.name for path in result_directory.iterdir()} == {
+        "adapter.safetensors",
+        "resolved-config.yaml",
+        "training-result.json",
+    }
+    assert not (result_directory / "optimizer.pt").exists()
+    assert not (result_directory / "scheduler.pt").exists()
+    payload = json.loads((result_directory / "training-result.json").read_text())
+    assert payload["kind"] == "training-completion-result"
+    assert payload["stop_reason"] == "epochs_completed"
+    assert payload["training_resume_contract_sha256"] == contract_digest
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        save_training_completion_result(
+            model=model,
+            config=config,
+            run_directory=run_directory,
+            global_step=10,
+            completed_epochs=1,
+            processed_train_samples=40,
+            planned_train_samples=40,
+            validation_evaluations=1,
+            stop_reason="epochs_completed",
+            early_stopping_state=EarlyStoppingState().as_dict(),
+            metrics={"primary_5d/selection_score": 0.5},
+        )
 
 
 def test_prefetch_binds_every_repository_to_its_exact_revision(tmp_path: Path) -> None:

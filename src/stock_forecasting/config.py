@@ -242,7 +242,6 @@ class TrainingConfig(StrictModel):
     stage: TrainingStage
     seed: int = 42
     epochs: int = Field(default=1, ge=1)
-    max_steps: int | None = Field(default=None, ge=1)
     batch_size: int = Field(default=8, ge=1)
     evaluation_batch_size: int = Field(default=16, ge=1)
     gradient_accumulation_steps: int = Field(default=1, ge=1)
@@ -252,11 +251,14 @@ class TrainingConfig(StrictModel):
     warmup_ratio: float = Field(default=0.03, ge=0.0, lt=1.0)
     max_grad_norm: float = Field(default=1.0, gt=0.0)
     log_every_steps: Literal[1] = 1
-    evaluate_every_steps: int = Field(default=100, ge=1)
-    checkpoint_every_steps: int = Field(default=100, ge=1)
-    checkpoint_save_top_k: int = Field(default=3, ge=1, le=10)
+    evaluations_per_epoch: int = Field(default=5, ge=1, le=100)
+    checkpoint_save_top_k: int = Field(default=5, ge=1, le=10)
     checkpoint_monitor: str = "primary_5d/selection_score"
     checkpoint_mode: Literal["min", "max"] = "min"
+    early_stopping_enabled: bool = True
+    early_stopping_patience_evaluations: int = Field(default=5, ge=1)
+    early_stopping_min_delta: float = Field(default=0.0, ge=0.0)
+    early_stopping_start_epoch: int = Field(default=1, ge=1)
     output_root: Path = Path("/runpod-volume/savedModel")
     resume_checkpoint: Path | None = None
     mixed_precision: Literal["no", "bf16"] = "bf16"
@@ -269,6 +271,8 @@ class TrainingConfig(StrictModel):
             raise ValueError("checkpoint_monitor must reference a validation primary_5d metric")
         if self.lora_learning_rate > self.learning_rate:
             raise ValueError("lora_learning_rate cannot exceed learning_rate")
+        if self.early_stopping_enabled and self.early_stopping_start_epoch > self.epochs:
+            raise ValueError("early_stopping_start_epoch cannot exceed configured epochs")
         return self
 
 
@@ -367,15 +371,49 @@ class ExperimentConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_stage_contract(self) -> ExperimentConfig:
-        expected_fraction = 0.15 if self.training.stage == "stage1" else 1.0
+        expected_fraction = 0.03 if self.training.stage == "stage1" else 1.0
         if abs(self.data.train_fraction - expected_fraction) > 1e-12:
             raise ValueError(
                 f"{self.training.stage} requires data.train_fraction={expected_fraction}"
             )
         if self.model.time_series_backend == "kronos" and self.data.max_samples is not None:
             raise ValueError(
-                "Production Stage 1/2 cannot cap max_samples; use the exact 15% or full train split"
+                "Production Stage 1/2 cannot cap max_samples; use the exact 3% or full train split"
             )
+        if self.model.time_series_backend == "kronos":
+            expected_epochs = 2 if self.training.stage == "stage1" else 5
+            expected_early_stopping_epoch = 2 if self.training.stage == "stage1" else 1
+            if self.training.epochs != expected_epochs:
+                raise ValueError(
+                    f"{self.training.stage} requires training.epochs={expected_epochs}"
+                )
+            if self.training.evaluations_per_epoch != 5:
+                raise ValueError("Production Stage 1/2 requires five validations per epoch")
+            if self.training.checkpoint_save_top_k != 5:
+                raise ValueError("Production Stage 1/2 must retain the best five checkpoints")
+            if (
+                self.training.checkpoint_monitor != "primary_5d/selection_score"
+                or self.training.checkpoint_mode != "min"
+            ):
+                raise ValueError(
+                    "Production Stage 1/2 early stopping must minimize validation "
+                    "normalized pinball loss"
+                )
+            if not self.training.early_stopping_enabled:
+                raise ValueError("Production Stage 1/2 requires validation-loss early stopping")
+            if (
+                self.training.early_stopping_patience_evaluations != 5
+                or self.training.early_stopping_min_delta != 0.0
+            ):
+                raise ValueError(
+                    "Production Stage 1/2 requires five consecutive non-improving "
+                    "validations for early stopping"
+                )
+            if self.training.early_stopping_start_epoch != expected_early_stopping_epoch:
+                raise ValueError(
+                    f"{self.training.stage} requires early_stopping_start_epoch="
+                    f"{expected_early_stopping_epoch}"
+                )
         return self
 
     @classmethod

@@ -159,7 +159,7 @@ def _load_stage_contract(config_path):
     training_stage = training_values.get("stage")
     if training_stage not in {"stage1", "stage2"}:
         raise ValueError("Training config training.stage must be stage1 or stage2")
-    expected_fraction = 0.15 if training_stage == "stage1" else 1.0
+    expected_fraction = 0.03 if training_stage == "stage1" else 1.0
     if abs(train_fraction - expected_fraction) > 1e-12:
         raise ValueError("Training config stage and train_fraction disagree")
     return StageContract(

@@ -32,6 +32,8 @@ from stock_forecasting.run_paths import (
 CHECKPOINT_MANIFEST = "checkpoint-leaderboard.json"
 BEST_CHECKPOINT_POINTER = "best-checkpoint.json"
 CHECKPOINT_TRANSACTION = ".checkpoint-transaction.json"
+COMPLETION_RESULT_DIRECTORY = "completion-result"
+COMPLETION_RESULT_FILE = "training-result.json"
 REQUIRED_CHECKPOINT_FILES = (
     "adapter.safetensors",
     "optimizer.pt",
@@ -502,6 +504,7 @@ def _stage_checkpoint(
     selection_metric_value: float,
     selection_metric_mode: str,
     metrics: dict[str, float] | None = None,
+    training_progress: dict[str, Any] | None = None,
 ) -> tuple[Path, Path, dict[str, Any]]:
     """Write and validate a checkpoint without publishing its canonical directory."""
 
@@ -549,6 +552,7 @@ def _stage_checkpoint(
         "training_stage": config.training.stage,
         "model_architecture_sha256": config.model_architecture_digest(),
         "metrics": metrics or {},
+        "training_progress": training_progress or {},
         "created_at": datetime.now(UTC).isoformat(),
         "time_series_model_id": config.model.time_series_model_id,
         "time_series_tokenizer_id": config.model.time_series_tokenizer_id,
@@ -600,6 +604,7 @@ def save_checkpoint(
     selection_metric_value: float,
     selection_metric_mode: str,
     metrics: dict[str, float] | None = None,
+    training_progress: dict[str, Any] | None = None,
 ) -> Path:
     """Stage a self-describing checkpoint and atomically publish it."""
 
@@ -616,6 +621,7 @@ def save_checkpoint(
         selection_metric_value=selection_metric_value,
         selection_metric_mode=selection_metric_mode,
         metrics=metrics,
+        training_progress=training_progress,
     )
     try:
         staging_dir.replace(checkpoint_dir)
@@ -624,6 +630,105 @@ def save_checkpoint(
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise
     return checkpoint_dir
+
+
+def save_training_completion_result(
+    *,
+    model: torch.nn.Module,
+    config: ExperimentConfig,
+    run_directory: Path,
+    global_step: int,
+    completed_epochs: int,
+    processed_train_samples: int,
+    planned_train_samples: int,
+    validation_evaluations: int,
+    stop_reason: str,
+    early_stopping_state: dict[str, Any],
+    metrics: dict[str, float],
+) -> Path:
+    """Atomically store final trainable weights without another optimizer copy."""
+
+    integer_values = (
+        global_step,
+        completed_epochs,
+        processed_train_samples,
+        planned_train_samples,
+        validation_evaluations,
+    )
+    if not all(_is_non_negative_int(value) for value in integer_values):
+        raise ValueError("Training completion counters must be non-negative integers")
+    if stop_reason not in {"epochs_completed", "early_stopping"}:
+        raise ValueError("Training completion stop_reason is invalid")
+    if not isinstance(early_stopping_state, dict):
+        raise ValueError("Training completion early-stopping state must be a mapping")
+    if not isinstance(metrics, dict) or any(
+        not isinstance(value, int | float)
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        for value in metrics.values()
+    ):
+        raise ValueError("Training completion metrics must be finite numerical values")
+
+    run_id = validate_run_id(run_directory.name)
+    contract_digest = training_resume_contract_digest(config)
+    run_manifest = _read_json_object(run_directory / "run-manifest.json", "Run manifest")
+    if run_manifest.get("run_id") != run_id or run_manifest.get("run_key") != run_id:
+        raise ValueError("Run manifest identity does not match its canonical run directory")
+    if _artifact_contract_digest(run_manifest, "Run manifest") != contract_digest:
+        raise ValueError("Run manifest does not match the current training resume contract")
+
+    result_directory = run_directory / COMPLETION_RESULT_DIRECTORY
+    if result_directory.exists():
+        raise FileExistsError(f"Training completion result already exists: {result_directory}")
+    staging_directory = run_directory / (
+        f".{COMPLETION_RESULT_DIRECTORY}.staging-{uuid.uuid4().hex}"
+    )
+    staging_directory.mkdir(parents=True, exist_ok=False)
+    try:
+        adapter_path = staging_directory / "adapter.safetensors"
+        config_path = staging_directory / "resolved-config.yaml"
+        save_file(trainable_state_dict(model), adapter_path)
+        config.save_resolved(config_path)
+        payload = {
+            "schema_version": CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
+            "kind": "training-completion-result",
+            "run_id": run_id,
+            "run_key": run_id,
+            "training_resume_contract_sha256": contract_digest,
+            "model_output_schema_version": MODEL_OUTPUT_SCHEMA_VERSION,
+            "training_stage": config.training.stage,
+            "model_architecture_sha256": config.model_architecture_digest(),
+            "global_step": global_step,
+            "completed_epochs": completed_epochs,
+            "processed_train_samples": processed_train_samples,
+            "planned_train_samples": planned_train_samples,
+            "validation_evaluations": validation_evaluations,
+            "stop_reason": stop_reason,
+            "early_stopped": stop_reason == "early_stopping",
+            "early_stopping": early_stopping_state,
+            "metrics": metrics,
+            "runtime_robust_scales": _model_runtime_robust_scales(model),
+            "created_at": datetime.now(UTC).isoformat(),
+            "artifact_files": {
+                "adapter.safetensors": _file_integrity(adapter_path),
+                "resolved-config.yaml": _file_integrity(config_path),
+            },
+        }
+        result_path = staging_directory / COMPLETION_RESULT_FILE
+        result_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        for path in (adapter_path, config_path, result_path):
+            with path.open("rb") as stream:
+                _fsync_descriptor(stream.fileno())
+        _fsync_directory(staging_directory)
+        staging_directory.replace(result_directory)
+        _fsync_directory(run_directory)
+    except BaseException:
+        shutil.rmtree(staging_directory, ignore_errors=True)
+        raise
+    return result_directory
 
 
 def _fsync_descriptor(descriptor: int) -> None:
@@ -1173,6 +1278,7 @@ def save_ranked_checkpoint(
     selection_metric_mode: str,
     save_top_k: int,
     metrics: dict[str, float] | None = None,
+    training_progress: dict[str, Any] | None = None,
 ) -> tuple[Path | None, dict[str, Any]]:
     """Commit a fully staged checkpoint and its validation ranking as one transaction."""
 
@@ -1216,6 +1322,7 @@ def save_ranked_checkpoint(
         selection_metric_value=selection_metric_value,
         selection_metric_mode=selection_metric_mode,
         metrics=metrics,
+        training_progress=training_progress,
     )
     transaction_path = run_directory / CHECKPOINT_TRANSACTION
     transaction_published = False

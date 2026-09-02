@@ -22,6 +22,7 @@ from stock_forecasting.checkpointing import (
     load_checkpoint,
     reconcile_checkpoint_storage,
     save_ranked_checkpoint,
+    save_training_completion_result,
     validate_checkpoint_selection,
 )
 from stock_forecasting.config import ExperimentConfig
@@ -352,6 +353,20 @@ def _flatten_metrics(payload: dict[str, Any], prefix: str = "") -> dict[str, flo
     return flattened
 
 
+def _unflatten_metrics(payload: dict[str, float]) -> dict[str, Any]:
+    nested: dict[str, Any] = {}
+    for path, value in payload.items():
+        keys = path.split("/")
+        cursor = nested
+        for key in keys[:-1]:
+            child = cursor.setdefault(key, {})
+            if not isinstance(child, dict):
+                raise ValueError("Flattened validation metrics contain a path collision")
+            cursor = child
+        cursor[keys[-1]] = value
+    return nested
+
+
 def _validation_monitor_value(metrics: dict[str, Any], monitor: str) -> float:
     value: Any = metrics
     for key in monitor.split("/"):
@@ -439,6 +454,172 @@ def _gradient_divisor(batch_index: int, batch_count: int, accumulation_steps: in
     return min(accumulation_steps, batch_count - group_start)
 
 
+def epoch_evaluation_steps(
+    epoch_index: int,
+    optimizer_steps_per_epoch: int,
+    evaluations_per_epoch: int,
+) -> tuple[int, ...]:
+    """Return exact, evenly spaced global steps for one epoch's validations."""
+
+    if epoch_index < 0:
+        raise ValueError("epoch_index must be non-negative")
+    if optimizer_steps_per_epoch < 1 or evaluations_per_epoch < 1:
+        raise ValueError("Evaluation scheduling requires positive step and evaluation counts")
+    if optimizer_steps_per_epoch < evaluations_per_epoch:
+        raise ValueError(
+            "An epoch must contain at least one optimizer step per requested validation"
+        )
+    epoch_start = epoch_index * optimizer_steps_per_epoch
+    return tuple(
+        epoch_start + math.ceil(index * optimizer_steps_per_epoch / evaluations_per_epoch)
+        for index in range(1, evaluations_per_epoch + 1)
+    )
+
+
+@dataclass
+class EarlyStoppingState:
+    """Track consecutive validation-loss regressions across resumable checkpoints."""
+
+    best_value: float | None = None
+    last_value: float | None = None
+    stale_evaluations: int = 0
+    evaluation_count: int = 0
+    triggered: bool = False
+
+    def observe(
+        self,
+        value: float,
+        *,
+        mode: str,
+        min_delta: float,
+        patience: int,
+        epoch_number: int,
+        start_epoch: int,
+        enabled: bool,
+    ) -> bool:
+        if not math.isfinite(value):
+            raise ValueError("Early-stopping monitor must be finite")
+        if mode not in {"min", "max"}:
+            raise ValueError("Early-stopping mode must be min or max")
+        if min_delta < 0.0 or patience < 1 or min(epoch_number, start_epoch) < 1:
+            raise ValueError("Early-stopping policy is invalid")
+        improved = self.best_value is None or (
+            value < self.best_value - min_delta
+            if mode == "min"
+            else value > self.best_value + min_delta
+        )
+        self.last_value = value
+        self.evaluation_count += 1
+        if improved:
+            self.best_value = value
+            self.stale_evaluations = 0
+        else:
+            self.stale_evaluations += 1
+        self.triggered = bool(
+            enabled and epoch_number >= start_epoch and self.stale_evaluations >= patience
+        )
+        return self.triggered
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "best_value": self.best_value,
+            "last_value": self.last_value,
+            "stale_evaluations": self.stale_evaluations,
+            "evaluation_count": self.evaluation_count,
+            "triggered": self.triggered,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> EarlyStoppingState:
+        if not isinstance(payload, dict):
+            raise ValueError("Checkpoint early-stopping state must be a mapping")
+        expected = {
+            "best_value",
+            "last_value",
+            "stale_evaluations",
+            "evaluation_count",
+            "triggered",
+        }
+        if set(payload) != expected:
+            raise ValueError("Checkpoint early-stopping state is incomplete")
+        best_value = payload["best_value"]
+        last_value = payload["last_value"]
+        if any(
+            value is not None
+            and (
+                not isinstance(value, int | float)
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+            )
+            for value in (best_value, last_value)
+        ):
+            raise ValueError("Checkpoint early-stopping values are invalid")
+        stale_evaluations = payload["stale_evaluations"]
+        evaluation_count = payload["evaluation_count"]
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (stale_evaluations, evaluation_count)
+        ) or not isinstance(payload["triggered"], bool):
+            raise ValueError("Checkpoint early-stopping counters are invalid")
+        if stale_evaluations > evaluation_count:
+            raise ValueError("Checkpoint early-stopping stale count exceeds evaluations")
+        return cls(
+            best_value=float(best_value) if best_value is not None else None,
+            last_value=float(last_value) if last_value is not None else None,
+            stale_evaluations=stale_evaluations,
+            evaluation_count=evaluation_count,
+            triggered=payload["triggered"],
+        )
+
+
+def _training_progress(
+    *,
+    processed_train_samples: int,
+    completed_epochs: int,
+    configured_optimizer_steps: int,
+    early_stopping: EarlyStoppingState,
+) -> dict[str, Any]:
+    return {
+        "processed_train_samples": processed_train_samples,
+        "completed_epochs": completed_epochs,
+        "configured_optimizer_steps": configured_optimizer_steps,
+        "early_stopping": early_stopping.as_dict(),
+    }
+
+
+def _restore_training_progress(
+    payload: Any,
+    *,
+    configured_optimizer_steps: int,
+) -> tuple[int, int, EarlyStoppingState]:
+    if not isinstance(payload, dict) or set(payload) != {
+        "processed_train_samples",
+        "completed_epochs",
+        "configured_optimizer_steps",
+        "early_stopping",
+    }:
+        raise ValueError("Checkpoint training progress is incomplete")
+    processed_train_samples = payload["processed_train_samples"]
+    completed_epochs = payload["completed_epochs"]
+    stored_optimizer_steps = payload["configured_optimizer_steps"]
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in (
+            processed_train_samples,
+            completed_epochs,
+            stored_optimizer_steps,
+        )
+    ):
+        raise ValueError("Checkpoint training progress counters are invalid")
+    if stored_optimizer_steps != configured_optimizer_steps:
+        raise ValueError("Checkpoint optimizer-step budget differs from the selected config")
+    return (
+        processed_train_samples,
+        completed_epochs,
+        EarlyStoppingState.from_dict(payload["early_stopping"]),
+    )
+
+
 @dataclass(frozen=True)
 class TrainingResult:
     run_directory: Path
@@ -448,7 +629,13 @@ class TrainingResult:
     model_architecture_sha256: str
     dataset_profile: str
     selected_datasets: tuple[str, ...]
-    train_samples: int
+    selected_train_samples_per_epoch: int
+    processed_train_samples: int
+    configured_optimizer_steps: int
+    completed_epochs: int
+    validation_evaluations: int
+    stop_reason: str
+    completion_result: Path
     robust_scales: tuple[float, ...]
     validation_metrics: dict[str, Any]
 
@@ -480,28 +667,42 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
-    batches_per_epoch = math.ceil(len(train_loader) / config.training.gradient_accumulation_steps)
-    configured_steps = batches_per_epoch * config.training.epochs
-    total_steps = min(config.training.max_steps or configured_steps, configured_steps)
-    if total_steps < 1:
+    optimizer_steps_per_epoch = math.ceil(
+        len(train_loader) / config.training.gradient_accumulation_steps
+    )
+    configured_steps = optimizer_steps_per_epoch * config.training.epochs
+    if configured_steps < 1:
         raise ValueError("Training budget must contain at least one optimizer step")
+    evaluation_steps = {
+        step
+        for epoch_index in range(config.training.epochs)
+        for step in epoch_evaluation_steps(
+            epoch_index,
+            optimizer_steps_per_epoch,
+            config.training.evaluations_per_epoch,
+        )
+    }
     scheduler = _scheduler(
         optimizer,
-        int(total_steps * config.training.warmup_ratio),
-        total_steps,
+        int(configured_steps * config.training.warmup_ratio),
+        configured_steps,
     )
     tracking: TrackingRun = start_tracking(config)
     global_step = 0
     starting_epoch = 0
     resume_batch_index = 0
-    last_epoch = 0
-    last_batch_index = -1
     last_evaluation_step = -1
     last_checkpoint_step = -1
     validation_metrics: dict[str, Any] = {}
+    last_validation_flat_metrics: dict[str, float] = {}
     best_checkpoint: Path | None = None
     last_ranking: dict[str, Any] = {}
     accumulated_microbatch_losses: list[float] = []
+    accumulated_microbatch_samples = 0
+    processed_train_samples = 0
+    completed_epochs = 0
+    early_stopping = EarlyStoppingState()
+    stop_reason = "epochs_completed"
 
     try:
         reconciliation = reconcile_checkpoint_storage(
@@ -534,16 +735,39 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 raise ValueError("Resume checkpoint model architecture digest differs")
             global_step = int(state["global_step"])
             last_checkpoint_step = global_step
+            last_evaluation_step = global_step
             starting_epoch, resume_batch_index = _resume_coordinates(
                 state,
                 len(train_loader),
             )
-        if global_step > total_steps:
+            (
+                processed_train_samples,
+                completed_epochs,
+                early_stopping,
+            ) = _restore_training_progress(
+                state.get("training_progress"),
+                configured_optimizer_steps=configured_steps,
+            )
+            stored_metrics = state.get("metrics")
+            if not isinstance(stored_metrics, dict) or any(
+                not isinstance(value, int | float)
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                for value in stored_metrics.values()
+            ):
+                raise ValueError("Resume checkpoint validation metrics are invalid")
+            last_validation_flat_metrics = {
+                str(key): float(value) for key, value in stored_metrics.items()
+            }
+            validation_metrics = _unflatten_metrics(last_validation_flat_metrics)
+        if global_step > configured_steps:
             raise ValueError("Resume checkpoint exceeds the configured training budget")
 
         optimizer.zero_grad(set_to_none=True)
         bundle.model.train()
-        stop_training = global_step >= total_steps
+        stop_training = global_step >= configured_steps or early_stopping.triggered
+        if early_stopping.triggered:
+            stop_reason = "early_stopping"
         for epoch in range(starting_epoch, config.training.epochs):
             if stop_training:
                 break
@@ -551,8 +775,6 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
             for batch_index, batch in enumerate(train_loader):
                 if epoch == starting_epoch and batch_index < resume_batch_index:
                     continue
-                last_epoch = epoch
-                last_batch_index = batch_index
                 with _autocast_context(config, device):
                     output = forward_batch(bundle, batch, config, device)
                     if output.loss is None:
@@ -564,6 +786,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                     )
                     loss = output.loss / divisor
                     accumulated_microbatch_losses.append(float(output.loss.detach().cpu()))
+                    accumulated_microbatch_samples += int(batch["target_alpha"].shape[0])
                 loss.backward()
                 should_step = (
                     batch_index + 1
@@ -577,6 +800,8 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                processed_train_samples += accumulated_microbatch_samples
+                accumulated_microbatch_samples = 0
                 optimizer_step_loss = float(np.mean(accumulated_microbatch_losses))
                 accumulated_microbatch_losses.clear()
                 tracking.log(
@@ -594,10 +819,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                     },
                     step=global_step,
                 )
-                if (
-                    global_step % config.training.evaluate_every_steps == 0
-                    or global_step >= total_steps
-                ):
+                if global_step in evaluation_steps:
                     validation_metrics = evaluate_loader(
                         bundle,
                         validation_loader,
@@ -605,95 +827,125 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                         device,
                     )
                     last_evaluation_step = global_step
+                    selection = _validation_monitor_value(
+                        validation_metrics,
+                        config.training.checkpoint_monitor,
+                    )
+                    early_stopping.observe(
+                        selection,
+                        mode=config.training.checkpoint_mode,
+                        min_delta=config.training.early_stopping_min_delta,
+                        patience=config.training.early_stopping_patience_evaluations,
+                        epoch_number=epoch + 1,
+                        start_epoch=config.training.early_stopping_start_epoch,
+                        enabled=config.training.early_stopping_enabled,
+                    )
+                    last_validation_flat_metrics = _flatten_metrics(validation_metrics)
                     tracking.log(
-                        _flatten_metrics(validation_metrics, "validation"),
+                        {
+                            **{
+                                f"validation/{key}": value
+                                for key, value in last_validation_flat_metrics.items()
+                            },
+                            "validation/early_stopping/best_value": (early_stopping.best_value),
+                            "validation/early_stopping/stale_evaluations": (
+                                early_stopping.stale_evaluations
+                            ),
+                            "validation/early_stopping/triggered": int(early_stopping.triggered),
+                            "validation/evaluation_index": early_stopping.evaluation_count,
+                            "validation/epoch_number": epoch + 1,
+                        },
                         step=global_step,
                     )
-                    if (
-                        global_step % config.training.checkpoint_every_steps == 0
-                        or global_step >= total_steps
-                    ):
-                        selection = _validation_monitor_value(
-                            validation_metrics,
-                            config.training.checkpoint_monitor,
-                        )
-                        checkpoint, last_ranking = save_ranked_checkpoint(
-                            model=bundle.model,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            config=config,
-                            run_directory=tracking.directory,
-                            global_step=global_step,
-                            epoch=epoch,
-                            batch_index=batch_index,
-                            selection_metric_name=config.training.checkpoint_monitor,
-                            selection_metric_value=selection,
-                            selection_metric_mode=config.training.checkpoint_mode,
-                            save_top_k=config.training.checkpoint_save_top_k,
-                            metrics=_flatten_metrics(validation_metrics),
-                        )
-                        best_path = last_ranking.get("best_checkpoint")
-                        if isinstance(best_path, str):
-                            best_checkpoint = Path(best_path)
-                        elif checkpoint is not None:
-                            best_checkpoint = checkpoint
-                        last_checkpoint_step = global_step
-                if global_step >= total_steps:
+                    completed_epochs_at_step = (
+                        epoch + 1 if batch_index + 1 == len(train_loader) else epoch
+                    )
+                    checkpoint, last_ranking = save_ranked_checkpoint(
+                        model=bundle.model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        config=config,
+                        run_directory=tracking.directory,
+                        global_step=global_step,
+                        epoch=epoch,
+                        batch_index=batch_index,
+                        selection_metric_name=config.training.checkpoint_monitor,
+                        selection_metric_value=selection,
+                        selection_metric_mode=config.training.checkpoint_mode,
+                        save_top_k=config.training.checkpoint_save_top_k,
+                        metrics=last_validation_flat_metrics,
+                        training_progress=_training_progress(
+                            processed_train_samples=processed_train_samples,
+                            completed_epochs=completed_epochs_at_step,
+                            configured_optimizer_steps=configured_steps,
+                            early_stopping=early_stopping,
+                        ),
+                    )
+                    best_path = last_ranking.get("best_checkpoint")
+                    if isinstance(best_path, str):
+                        best_checkpoint = Path(best_path)
+                    elif checkpoint is not None:
+                        best_checkpoint = checkpoint
+                    last_checkpoint_step = global_step
+                    completed_epochs = completed_epochs_at_step
+                    if early_stopping.triggered:
+                        stop_reason = "early_stopping"
+                        stop_training = True
+                if global_step >= configured_steps:
                     stop_training = True
+                    break
+                if early_stopping.triggered:
                     break
             if stop_training:
                 break
 
-        if last_evaluation_step != global_step:
-            validation_metrics = evaluate_loader(
-                bundle,
-                validation_loader,
-                config,
-                device,
+        if last_evaluation_step != global_step or last_checkpoint_step != global_step:
+            raise RuntimeError(
+                "Training stopped outside the configured epoch-relative validation schedule"
             )
-            tracking.log(
-                _flatten_metrics(validation_metrics, "validation"),
-                step=global_step,
-            )
-        if last_checkpoint_step != global_step:
-            selection = _validation_monitor_value(
-                validation_metrics,
-                config.training.checkpoint_monitor,
-            )
-            checkpoint, last_ranking = save_ranked_checkpoint(
-                model=bundle.model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                config=config,
-                run_directory=tracking.directory,
-                global_step=global_step,
-                epoch=last_epoch,
-                batch_index=last_batch_index,
-                selection_metric_name=config.training.checkpoint_monitor,
-                selection_metric_value=selection,
-                selection_metric_mode=config.training.checkpoint_mode,
-                save_top_k=config.training.checkpoint_save_top_k,
-                metrics=_flatten_metrics(validation_metrics),
-            )
-            best_path = last_ranking.get("best_checkpoint")
-            if isinstance(best_path, str):
-                best_checkpoint = Path(best_path)
-            elif checkpoint is not None:
-                best_checkpoint = checkpoint
         if best_checkpoint is None:
             raise RuntimeError("Training completed without a validation-ranked checkpoint")
+        if not last_validation_flat_metrics:
+            raise RuntimeError("Training completed without finite validation metrics")
+        if stop_reason == "epochs_completed":
+            if global_step != configured_steps or completed_epochs != config.training.epochs:
+                raise RuntimeError("Training ended before every configured epoch completed")
+        elif not early_stopping.triggered:
+            raise RuntimeError("Early-stopping completion has no triggered stopping state")
 
         architecture_digest = config.model_architecture_digest()
+        planned_train_samples = selected_train_samples * config.training.epochs
+        completion_result = save_training_completion_result(
+            model=bundle.model,
+            config=config,
+            run_directory=tracking.directory,
+            global_step=global_step,
+            completed_epochs=completed_epochs,
+            processed_train_samples=processed_train_samples,
+            planned_train_samples=planned_train_samples,
+            validation_evaluations=early_stopping.evaluation_count,
+            stop_reason=stop_reason,
+            early_stopping_state=early_stopping.as_dict(),
+            metrics=last_validation_flat_metrics,
+        )
         tracking.update_summary(
             {
                 "training_stage": config.training.stage,
                 "training_fraction": config.data.train_fraction,
                 "dataset_profile": config.data.dataset_profile,
                 "selected_datasets": config.data.selected_datasets,
-                "train_samples": selected_train_samples,
-                "training_batch_padding_per_epoch": (
-                    train_batch_sampler.padded_sample_count
-                ),
+                "selected_train_samples_per_epoch": selected_train_samples,
+                "planned_train_samples": planned_train_samples,
+                "processed_train_samples": processed_train_samples,
+                "configured_optimizer_steps": configured_steps,
+                "completed_optimizer_steps": global_step,
+                "optimizer_step_coverage_ratio": global_step / configured_steps,
+                "completed_epochs": completed_epochs,
+                "validation_evaluations": early_stopping.evaluation_count,
+                "stop_reason": stop_reason,
+                "early_stopped": stop_reason == "early_stopping",
+                "early_stopping": early_stopping.as_dict(),
+                "training_batch_padding_per_epoch": (train_batch_sampler.padded_sample_count),
                 "runtime_label_calibration": {
                     "source_split": "train",
                     "sample_count": min(
@@ -713,10 +965,15 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                     "monitor": config.training.checkpoint_monitor,
                     "mode": config.training.checkpoint_mode,
                     "save_top_k": config.training.checkpoint_save_top_k,
+                    "evaluations_per_epoch": config.training.evaluations_per_epoch,
                 },
                 "best_checkpoint": str(best_checkpoint),
+                "completion_result": str(completion_result),
                 "global_step": global_step,
-                **_flatten_metrics(validation_metrics, "validation"),
+                **{
+                    f"validation/{key}": value
+                    for key, value in last_validation_flat_metrics.items()
+                },
             }
         )
         if config.wandb.log_model_artifact:
@@ -733,7 +990,13 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
             model_architecture_sha256=architecture_digest,
             dataset_profile=config.data.dataset_profile,
             selected_datasets=tuple(config.data.selected_datasets),
-            train_samples=selected_train_samples,
+            selected_train_samples_per_epoch=selected_train_samples,
+            processed_train_samples=processed_train_samples,
+            configured_optimizer_steps=configured_steps,
+            completed_epochs=completed_epochs,
+            validation_evaluations=early_stopping.evaluation_count,
+            stop_reason=stop_reason,
+            completion_result=completion_result,
             robust_scales=robust_scales,
             validation_metrics=validation_metrics,
         )
@@ -757,12 +1020,19 @@ def write_training_result(result: TrainingResult) -> None:
             {
                 "run_directory": str(result.run_directory),
                 "final_checkpoint": str(result.final_checkpoint),
+                "completion_result": str(result.completion_result),
                 "global_step": result.global_step,
                 "training_stage": result.stage,
                 "model_architecture_sha256": result.model_architecture_sha256,
                 "dataset_profile": result.dataset_profile,
                 "selected_datasets": list(result.selected_datasets),
-                "train_samples": result.train_samples,
+                "selected_train_samples_per_epoch": (result.selected_train_samples_per_epoch),
+                "processed_train_samples": result.processed_train_samples,
+                "configured_optimizer_steps": result.configured_optimizer_steps,
+                "completed_epochs": result.completed_epochs,
+                "validation_evaluations": result.validation_evaluations,
+                "stop_reason": result.stop_reason,
+                "early_stopped": result.stop_reason == "early_stopping",
                 "robust_scales": list(result.robust_scales),
                 "validation_metrics": result.validation_metrics,
             },

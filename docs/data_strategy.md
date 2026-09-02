@@ -264,8 +264,12 @@ max(IQR, 1.4826 * MAD, 1e-4)
 validation/test 不參與 scaling。test 保持 sealed，直到研究流程明確 unlock。
 
 訓練 sampler 以 O(1) 狀態對 valid cutoffs 作 deterministic blockwise permutation。
-Stage 1 的 target set 精確為 15%，Stage 2 為 100%；最後不足一個 batch 時只從同一
-target set 開頭補齊，補齊數量寫入 training summary，不配置全量 window index。
+Stage 1 使用固定且可重現的精確 3% target set，每個 epoch 只改變遍歷順序；Stage 2 為
+100%。最後不足一個 batch 時只從同一 target set 開頭補齊，補齊數量寫入 training
+summary，不配置全量 window index。
+Stage 1 最多 2 epochs，Stage 2 最多 5 epochs；兩者都在每個完整 epoch 做 5 次
+validation，並可依 validation normalized pinball loss early stop。Stage 1 必須先進入
+第 2 epoch，early stopping 才能生效。
 
 ### 11. 資料 QA 與已知限制
 
@@ -578,10 +582,14 @@ Validation/test never influence scaling. Test remains sealed until explicitly
 unlocked by the research protocol.
 
 The training sampler applies a deterministic blockwise permutation with O(1)
-state. Stage 1 targets exactly 15% of valid cutoffs and Stage 2 targets 100%; a
-short final batch is filled only from the beginning of the same target set. The
+state. Stage 1 uses one fixed, reproducible target set containing exactly 3% of
+valid cutoffs and changes only its traversal order between epochs. Stage 2
+targets 100%; a short final batch is filled only from the beginning of the same target set. The
 padding count is recorded in the training summary without allocating a full
 window-index array.
+Stage 1 runs for at most two epochs and Stage 2 for at most five. Both schedule
+five validations per complete epoch and may stop early on validation normalized
+pinball loss; Stage 1 cannot activate early stopping before epoch 2 begins.
 
 ### 11. QA and known limitations
 

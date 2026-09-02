@@ -608,20 +608,62 @@ class BlockwisePermutationSampler(Sampler[int]):
 
     def __iter__(self) -> Iterator[int]:
         block_count = math.ceil(self.sample_count / self.block_size)
+        # Keep membership independent of epoch so multiple epochs revisit one exact subset.
+        selection_multiplier, selection_offset = self._affine_parameters(
+            block_count,
+            self.seed,
+        )
+        last_block_size = self.sample_count - (block_count - 1) * self.block_size
+        last_block_deficit = self.block_size - last_block_size
+        if block_count == 1:
+            last_block_rank = 0
+        else:
+            inverse = pow(selection_multiplier, -1, block_count)
+            last_block_rank = (
+                inverse * ((block_count - 1) - selection_offset)
+            ) % block_count
+
+        selected_block_count = math.ceil(self.target_count / self.block_size)
+        selected_capacity = selected_block_count * self.block_size
+        if last_block_rank < selected_block_count:
+            selected_capacity -= last_block_deficit
+        if selected_capacity < self.target_count:
+            selected_block_count += 1
+
+        # Permute only the selected block ranks to vary traversal without storing indices.
         epoch_seed = self.seed + self.epoch * 1_000_003
-        multiplier, offset = self._affine_parameters(block_count, epoch_seed)
+        order_multiplier, order_offset = self._affine_parameters(
+            selected_block_count,
+            epoch_seed,
+        )
         emitted = 0
         reverse = bool(epoch_seed & 1)
-        for position in range(block_count):
-            block = (multiplier * position + offset) % block_count
+        for position in range(selected_block_count):
+            selection_rank = (
+                order_multiplier * position + order_offset
+            ) % selected_block_count
+            block = (
+                selection_multiplier * selection_rank + selection_offset
+            ) % block_count
             start = block * self.block_size
             stop = min(start + self.block_size, self.sample_count)
-            values = range(stop - 1, start - 1, -1) if reverse else range(start, stop)
+            preceding_capacity = selection_rank * self.block_size
+            if last_block_rank < selection_rank:
+                preceding_capacity -= last_block_deficit
+            take = min(stop - start, self.target_count - preceding_capacity)
+            if take < 1:
+                raise RuntimeError("Sampler selected an empty deterministic block")
+            selected_stop = start + take
+            values = (
+                range(selected_stop - 1, start - 1, -1)
+                if reverse
+                else range(start, selected_stop)
+            )
             for index in values:
-                if emitted >= self.target_count:
-                    return
                 yield index
                 emitted += 1
+        if emitted != self.target_count:
+            raise RuntimeError("Sampler did not emit its exact deterministic target")
 
 
 class FixedSizeBatchSampler(Sampler[list[int]]):

@@ -13,7 +13,7 @@ data:
   diagnostic_horizons: [1, 20]
   stride: 5
   sample_stride: 1
-  train_fraction: 0.15
+  train_fraction: 0.03
   flat_volatility_multiplier: 0.25
   max_abs_log_return: 0.5
   embargo_trading_days: 5
@@ -53,7 +53,6 @@ training:
   stage: stage1
   seed: 42
   epochs: 1
-  max_steps: 2
   batch_size: 4
   evaluation_batch_size: 8
   gradient_accumulation_steps: 1
@@ -63,11 +62,14 @@ training:
   warmup_ratio: 0.0
   max_grad_norm: 1.0
   log_every_steps: 1
-  evaluate_every_steps: 1
-  checkpoint_every_steps: 1
+  evaluations_per_epoch: 1
   checkpoint_save_top_k: 1
   checkpoint_monitor: primary_5d/selection_score
   checkpoint_mode: min
+  early_stopping_enabled: false
+  early_stopping_patience_evaluations: 1
+  early_stopping_min_delta: 0.0
+  early_stopping_start_epoch: 1
   output_root: outputs/checkpoints
   resume_checkpoint: null
   mixed_precision: "no"

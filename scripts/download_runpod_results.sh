@@ -162,6 +162,35 @@ if [[ "${CHECKPOINT_COUNT}" -lt 1 ]]; then
     exit 1
 fi
 
+COMPLETION_RESULT_ROOT="${RUN_DOWNLOAD_ROOT}/completion-result"
+mkdir -p "${COMPLETION_RESULT_ROOT}"
+completion_copy_status=0
+bash "${S3_WRAPPER}" s3 cp \
+    "s3://${RUNPOD_NETWORK_VOLUME_ID}/savedModel/${RUN_ID}/completion-result/" \
+    "${COMPLETION_RESULT_ROOT}/" \
+    --recursive --only-show-errors || completion_copy_status=$?
+REQUIRES_COMPLETION_RESULT="$(python3 -c '
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+print("1" if "evaluations_per_epoch:" in text else "0")
+' "${RUN_DOWNLOAD_ROOT}/resolved-config.yaml")"
+completion_missing=0
+for completion_name in adapter.safetensors resolved-config.yaml training-result.json; do
+    if [[ ! -s "${COMPLETION_RESULT_ROOT}/${completion_name}" ]]; then
+        completion_missing=1
+    fi
+done
+if [[ "${REQUIRES_COMPLETION_RESULT}" == "1" \
+    && ( "${completion_copy_status}" -ne 0 || "${completion_missing}" -ne 0 ) ]]; then
+    echo "Current training contract requires a complete completion-result artifact" >&2
+    exit 1
+fi
+if [[ "${REQUIRES_COMPLETION_RESULT}" != "1" && "${completion_missing}" -ne 0 ]]; then
+    printf 'Legacy run has no completion-result artifact; retained checkpoints remain available.\n'
+fi
+
 download_file "evaluations/${RUN_ID}/validation-benchmark.json" validation-benchmark.json
 download_file \
     "lifecycle/runs/${RUN_ID}/training-completed.json" \

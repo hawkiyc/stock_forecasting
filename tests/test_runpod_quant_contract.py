@@ -735,6 +735,8 @@ def test_download_defaults_to_all_retained_checkpoints_and_can_select_best() -> 
     assert "--checkpointScope|--checkpoint-scope" in download
     assert "checkpoint-download-names" in download
     assert "BEST_CHECKPOINT=\"${CHECKPOINT_NAMES%%$'\\n'*}\"" in download
+    assert "savedModel/${RUN_ID}/completion-result/" in download
+    assert "training-result.json" in download
     assert "checkpoint_scope=%s checkpoint_count=%s" in download
     assert "list-objects-v2" not in download
 

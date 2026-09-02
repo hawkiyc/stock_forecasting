@@ -428,6 +428,23 @@ def test_blockwise_sampler_is_exact_deterministic_and_does_not_store_window_indi
     assert second_epoch != first_epoch
     assert set(second_epoch) == set(first_epoch)
 
+    fractional = BlockwisePermutationSampler(
+        10_003,
+        fraction=0.03,
+        seed=29,
+        block_size=64,
+    )
+    fractional_first_epoch = list(fractional)
+    fractional.set_epoch(1)
+    fractional_second_epoch = list(fractional)
+    assert (
+        len(fractional_first_epoch)
+        == len(set(fractional_first_epoch))
+        == int(10_003 * 0.03)
+    )
+    assert fractional_second_epoch != fractional_first_epoch
+    assert set(fractional_second_epoch) == set(fractional_first_epoch)
+
     fixed_batches = list(FixedSizeBatchSampler(complete, batch_size=128))
     assert all(len(batch) == 128 for batch in fixed_batches)
     assert len(fixed_batches) == 8

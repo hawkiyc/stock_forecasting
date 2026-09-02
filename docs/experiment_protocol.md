@@ -84,13 +84,17 @@ interval 跨越 split 邊界。
 | 項目 | Stage 1 | Stage 2 |
 |---|---|---|
 | 目的 | 驗證完整腳本、資料、GPU、loss、checkpoint 與 validation | 完整 train split 的 PoC 結果 |
-| train 樣本 | O(1) blockwise permutation 的精確 15% target set | 100% train split |
+| train 樣本 | O(1) blockwise permutation 固定選取精確 3%，每個 epoch 只改變順序 | 100% train split |
+| epoch 上限 | 2；第 2 epoch 開始前不得 early stop | 5 |
+| validation cadence | 每個 epoch 的 20%／40%／60%／80%／100% | 同左 |
+| early stopping | normalized pinball validation loss 連續 5 次未改善，第 2 epoch 起生效 | 同一 loss 與 patience，第 1 epoch 起生效 |
+| retention | validation 最佳 5 個完整 checkpoints，加上 completion result | 同左 |
 | validation/test | 完整 ranges 保留；例行評估依 config 確定性限量 | 同左 |
 | 模型架構 | Kronos-base + LoRA + shared resampler + conditioner + alpha head | 完全相同 |
 | 初始化 | 原始 pretrained base | 原始 pretrained base |
 | 接續 Stage 1 checkpoint | 否 | 否 |
 
-Stage 1 不是「最早 15% 時間」，也不是縮短 validation/test。兩個 config 的
+Stage 1 不是「最早 3% 時間」，也不是縮短 validation/test。兩個 config 的
 `config.model_architecture_digest()` 必須相同；此 digest 包含 `h_start`／輸出維度，
 最後不足一個 training batch 的 target set 會從同一集合開頭確定性補齊，且將補齊數量
 寫入 training summary。Stage 2 重新從相同 pretrained revision 開始，以免把 Stage 1
@@ -157,7 +161,9 @@ transaction-cost 假設必須明列；單一 Sharpe 不可解讀為已證明可�
 
 ### 11. Checkpoint 與重現性
 
-每個可接受 checkpoint 必須：
+Production Stage 1/2 不允許 `max_steps` 或固定 step cadence。optimizer budget 由
+target set、batch size、gradient accumulation 與 epoch 數推導，每個 epoch 固定做
+5 次 validation。每個可接受 checkpoint 必須：
 
 1. 由 validation `primary_5d/selection_score` 選出。
 2. 保存 trainable parameter union、optimizer、scheduler、RNG state 與 resolved config。
@@ -166,6 +172,11 @@ transaction-cost 假設必須明列；單一 Sharpe 不可解讀為已證明可�
 4. 通過 artifact SHA-256/size 與 strict trainable-key restore。
 5. 使用 `model_output_schema_version=5.0`；舊 checkpoint fail closed。
 
+Leaderboard 最多保留 validation 最佳 5 個完整可續傳 checkpoints。正常完成或
+early stopping 都另外保存唯一的 `completion-result/`；它包含最後可訓練權重、
+resolved config、停止原因、實際步數／樣本數及 validation metrics，但不重複 optimizer
+與 scheduler state。
+
 報告成功狀態必須以 terminal lifecycle、run manifest、best-checkpoint pointer、trainer
 state 與 raw validation JSON 交叉確認，不能只看 W&B chart 或 README。
 
@@ -173,7 +184,8 @@ state 與 raw validation JSON 交叉確認，不能只看 W&B chart 或 README�
 
 Stage 1：
 
-- train subset 精確為完整 train split 的 15%。
+- train subset 固定且可重現，精確為完整 train split 的 3%；每個 epoch 只改變遍歷
+  順序，最多 2 epochs，且 early stopping 不得在進入第 2 epoch 前生效。
 - 完成 remote ruff/pytest、forward/backward、validation-ranked checkpoint save/reload、
   inference schema smoke 與自動 lifecycle termination。
 - 輸出 `[B,15-h_start,3]` ordered alpha quantiles，`h_start ∈ {1,2,3}`；
@@ -291,13 +303,17 @@ is stored, and no future label interval may cross a split boundary.
 | Item | Stage 1 | Stage 2 |
 |---|---|---|
 | Purpose | Validate the complete script/data/GPU/loss/checkpoint/validation path | Full-train PoC result |
-| Train samples | Exact 15% target set from an O(1)-state blockwise permutation | 100% of train |
+| Train samples | One fixed exact 3% set; only traversal order changes between epochs | 100% of train |
+| Epoch limit | 2; early stopping cannot activate before epoch 2 | 5 |
+| Validation cadence | 20%/40%/60%/80%/100% of every epoch | Same |
+| Early stopping | Five consecutive non-improving normalized-pinball validations, active from epoch 2 | Same loss and patience, active from epoch 1 |
+| Retention | Best five full validation-ranked checkpoints plus completion result | Same |
 | Validation/test | Full ranges retained; routine evaluation deterministically capped by config | Same |
 | Architecture | Kronos-base + LoRA + shared resampler + conditioner + alpha head | Identical |
 | Initialization | Original pretrained base | Original pretrained base |
 | Continue Stage 1 checkpoint | No | No |
 
-Stage 1 is not the earliest 15% of time and does not shrink validation/test.
+Stage 1 is not the earliest 3% of time and does not shrink validation/test.
 Both configs require the same architecture digest. A short final training batch
 is deterministically filled from the beginning of the same target set, and the
 padding count is written to the training summary. Stage 2 restarts from the same
@@ -355,6 +371,10 @@ dataset version.
 
 ### 11. Checkpoint and reproducibility
 
+Production Stage 1/2 permits neither `max_steps` nor fixed-step cadence. The
+target set, batch size, gradient accumulation, and epoch count determine the
+optimizer budget, with exactly five validations scheduled per complete epoch.
+
 An acceptable checkpoint is validation-selected, stores the trainable union,
 optimizer/scheduler/RNG/resolved config, binds run/data/model/source revisions,
 passes artifact and strict-key verification, and declares
@@ -362,11 +382,18 @@ passes artifact and strict-key verification, and declares
 using terminal lifecycle, run manifest, best pointer, trainer state, and raw
 validation JSON—not a W&B chart or README alone.
 
+The leaderboard retains at most the best five full resumable checkpoints.
+Normal completion and early stopping also save one `completion-result/` with
+the final trainable weights, resolved config, stop reason, actual step/sample
+counts, and validation metrics, without duplicating optimizer/scheduler state.
+
 ### 12. Minimum acceptance
 
-Stage 1 uses exactly 15% of train, passes remote ruff/pytest, forward/backward,
-validation-ranked save/reload, inference-schema smoke, and lifecycle
-termination. It outputs ordered `[B,15-h_start,3]` alpha quantiles for
+Stage 1 uses one fixed, reproducible set containing exactly 3% of train for up
+to two epochs and changes only its traversal order. Early stopping cannot
+activate before epoch 2 begins. Stage 1 passes remote ruff/pytest,
+forward/backward, validation-ranked save/reload, inference-schema smoke, and
+lifecycle termination. It outputs ordered `[B,15-h_start,3]` alpha quantiles for
 `h_start in {1,2,3}`, with no LLM, facts, or classifier.
 
 Stage 2 uses the same architecture and pretrained revisions with 100% train,

@@ -165,8 +165,8 @@ def run_preflight(
     elif config.model.time_series_backend == "kronos":
         report.warnings.append("Kronos will run on CPU outside RunPod and may be slow")
 
-    if config.training.stage == "stage1" and config.data.train_fraction != 0.15:
-        report.errors.append("Stage 1 must use exactly 15% of the training split")
+    if config.training.stage == "stage1" and config.data.train_fraction != 0.03:
+        report.errors.append("Stage 1 must use exactly 3% of the training split")
     if config.training.stage == "stage2" and config.data.train_fraction != 1.0:
         report.errors.append("Stage 2 must use the complete training split")
     return report

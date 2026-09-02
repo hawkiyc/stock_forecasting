@@ -163,8 +163,9 @@ raw row group、segment 或 bucket 接續，已完成項目直接跳過。只有
 訓練 DataLoader 以 O(1) sampler 狀態從有效 cutoff ranges 取樣，按需讀取一個 symbol
 row group、建立 128-bar asset/benchmark context，並在記憶體中計算從 `h_start` 到第
 14 個持有交易日的 alpha label。磁碟上不會出現逐-window 或逐-label 資料集；Stage 1
-使用精確 15% 的 valid train cutoffs，Stage 2 使用全部 valid train cutoffs，兩者都
-用固定大小 batch。最後不足一個 batch 時，只從同一個 target set 開頭確定性補齊，補齊
+使用固定且可重現的精確 3% valid train cutoffs，每個 epoch 僅改變遍歷順序；Stage 2
+使用全部 valid train cutoffs，兩者都用固定大小 batch。最後不足一個 batch 時，只從同一個
+target set 開頭確定性補齊，補齊
 數量會寫入 training summary；不會因此配置全量 index。這個 out-of-core 設計可直接處理
 完整長歷史資料，不需要把全部 bars 或所有可能 window 載入 RAM。
 
@@ -303,7 +304,11 @@ symbol limit 或處理契約變動時會使用新的根目錄，不需要手動�
 | 項目                        | Stage 1                                                          | Stage 2                |
 | --------------------------- | ---------------------------------------------------------------- | ---------------------- |
 | 目的                        | 驗證資料、模型、loss、checkpoint、評估與 RunPod 腳本             | 完整資料微調與正式評估 |
-| train 樣本                  | O(1) blockwise sampler 精確取 15% valid train cutoffs             | 100% valid train cutoffs |
+| train 樣本                  | O(1) blockwise sampler 固定取精確 3%，每個 epoch 僅改變順序       | 100% valid train cutoffs |
+| epoch 上限                  | 2；至少進入第 2 個 epoch 才允許 early stop                        | 5                        |
+| validation cadence         | 每個 epoch 的 20%／40%／60%／80%／100%，共 5 次                  | 同左                     |
+| early stopping             | validation normalized pinball loss 連續 5 次未改善；第 2 epoch 起生效 | 同一 loss 與 patience；第 1 epoch 起生效 |
+| 保存結果                    | validation 最佳 5 個完整 checkpoints，加上訓練完成時的精簡權重結果 | 同左                     |
 | validation / test           | 完整 split 保留於 cutoff ranges；例行評估依 config 確定性限量     | 同左                   |
 | 架構                        | Kronos-base + 同一組 LoRA + resampler + conditioner + alpha head | 完全相同               |
 | 初始化                      | 原始 pretrained base                                             | 原始 pretrained base   |
@@ -315,9 +320,16 @@ symbol limit 或處理契約變動時會使用新的根目錄，不需要手動�
 - `configs/stage2_kronos_base_lora.yaml`
 
 兩份設定的 `config.model_architecture_digest()` 必須一致；此 digest 同時綁定模型參數與
-`h_start`／輸出 horizon 契約。Stage 1 的 15% 是 O(1) blockwise permutation 所選出的
-確定性且精確 target set；它不是最早 15%，不會縮小 validation/test，也不會配置全部
+`h_start`／輸出 horizon 契約。Stage 1 的 3% 是 O(1) blockwise permutation 所選出的
+確定性且精確 target set；它不是最早 3%，不會縮小 validation/test，也不會配置全部
 window indices。
+
+Production Stage 1/2 不接受 `max_steps`、固定 step validation cadence 或獨立的固定
+step checkpoint cadence。optimizer budget 完全由 target set、batch size、gradient
+accumulation 與 epoch 數推導；每次 epoch-relative validation 都參與最佳 5 個 checkpoint
+排名。正常跑完或 early stopping 都會另外原子發布唯一的 `completion-result/`，其中保存
+當下的可訓練權重、resolved config、停止原因、實際步數／樣本數與最後 validation metrics，
+但不重複保存已無續傳需求的 optimizer/scheduler state。
 
 ### RunPod 完整操作手冊
 
@@ -1076,7 +1088,8 @@ dataset provenance 與 immutable selection identity。`train/loss` 與
 axis 記錄；使用 gradient accumulation 時記錄該 optimizer step 所含 microbatch
 loss 的平均值。loss 與 validation 即使位於相同 optimizer step，也會各自保留
 history row，不會因重複使用 W&B internal step 而遺失。訓練期間的 validation
-會在每次 evaluation step 上傳所有有限數值指標；訓練後
+固定在每個 epoch 的 20%／40%／60%／80%／100% 上傳所有有限數值指標與
+early-stopping 狀態；訓練後
 benchmark validation 會以 `benchmark_validation/global_step` custom axis 對齊
 被評估 checkpoint，而不回寫已完成 run 的舊 W&B internal step，並上傳模型與
 baseline 的完整數值結果，包括 cross-sectional Sharpe、RankIC、turnover、
@@ -1195,7 +1208,8 @@ bash scripts/runpod_workflow.sh download --checkpointScope all <run-id>
 bash scripts/runpod_workflow.sh download --checkpointScope best <run-id>
 ```
 
-`all` 的意義是 leaderboard 中仍由 top-k retention policy 保留的完整集合，不包含
+`all` 的意義是 leaderboard 中仍由 best-5 retention policy 保留的完整 checkpoint
+集合，不包含
 訓練期間已被該政策刪除的歷史 checkpoints。下載流程直接使用 immutable leaderboard，
 不會以目錄列舉猜測 checkpoint。若本機目錄已存在，必須顯式使用 `--resume` 才會
 填補或重新取得所選範圍的已知檔案：
@@ -1208,7 +1222,7 @@ bash scripts/runpod_workflow.sh download --resume --checkpointScope best <run-id
 
 成果固定下載到被 `.gitignore` 排除的
 `artifacts/runpod/<run-id>/`，包含 run manifest、resolved config、leaderboard、
-best-checkpoint pointer、所選範圍的 checkpoint 目錄、validation benchmark、
+best-checkpoint pointer、所選範圍的 checkpoint 目錄、`completion-result/`、validation benchmark、
 training/validation lifecycle 與 immutable training completion record。`--resume` 不會
 刪除本機既有的其他 checkpoint 目錄；例如從 `all` 切換成 `best` 時不會進行 prune。
 
@@ -1230,6 +1244,7 @@ state。`validation-benchmark.json` 是完整數值 validation 與 baseline 比�
 - `trainer-state.json`
 - optimizer / scheduler state
 - run manifest、checkpoint leaderboard 與 best-checkpoint pointer
+- `completion-result/`：正常跑完或 early stop 當下的最終可訓練權重、停止原因與稽核計數
 - selection ID/SHA、dataset request SHA、stage config SHA 與 requested dataset contract
 - dataset manifest 摘要、architecture digest、Kronos source/model/tokenizer
   revisions 與 bounded training implementation digest
@@ -1256,7 +1271,7 @@ poetry run fin-ts-infer \
 
 PoC 最低驗收條件：
 
-1. Stage 1 精確使用 15% train samples，完整 validation/test，能完成 forward/backward、checkpoint reload 與 inference smoke test。
+1. Stage 1 固定選取精確 3% train samples，規劃 2 epochs，每個 epoch 僅改變順序，且至少進入第 2 epoch 才能 early stop；完整 validation/test 保留不變，並能完成 forward/backward、checkpoint reload 與 inference smoke test。
 2. Stage 2 與 Stage 1 architecture digest 相同，且由相同 pretrained base 重新開始。
 3. 所有 run 都可追溯到 immutable Parquet、dataset profile、provider、symbols、日期範圍與 split counts。
 4. CPU marker 與 active training selection 必須在 stage、config SHA、profile、日期、requested universe 與 dataset request SHA 完全一致；例如 CPU `tw_only` 對 GPU `us_tw_eodhd` 必須在 Pod 建立前 fail closed。
@@ -1500,9 +1515,10 @@ after `_SUCCESS.json` is published.
 The training DataLoader uses an O(1)-state sampler over valid cutoff ranges. It
 loads one symbol row group on demand, constructs aligned 128-bar asset and
 benchmark contexts, and computes alpha labels from `h_start` through holding
-day 14 in memory. No per-window or per-label dataset is written. Stage 1 uses
-exactly 15% of valid train cutoffs, Stage 2 uses all valid train cutoffs, and
-both use fixed-size batches. If the final batch is short, it is deterministically
+day 14 in memory. No per-window or per-label dataset is written. Stage 1 uses one
+fixed, reproducible set containing exactly 3% of valid train cutoffs and changes
+only its traversal order between epochs. Stage 2 uses all valid train cutoffs,
+and both use fixed-size batches. If the final batch is short, it is deterministically
 filled from the beginning of the same target set and the padding count is written
 to the training summary; no full index array is allocated. This out-of-core design
 handles long full-market history without loading all bars or all potential windows
@@ -1660,7 +1676,11 @@ for the same dataset.
 | Item                  | Stage 1                                                                 | Stage 2                                     |
 | --------------------- | ----------------------------------------------------------------------- | ------------------------------------------- |
 | Purpose               | Validate data, model, loss, checkpoints, evaluation, and RunPod scripts | Full-data fine-tuning and formal evaluation |
-| Train samples         | Exact 15% of valid train cutoffs through the O(1) blockwise sampler      | 100% of valid train cutoffs                  |
+| Train samples         | One fixed exact 3% set; only traversal order changes between epochs | 100% of valid train cutoffs                  |
+| Epoch limit           | 2; early stopping is disabled until epoch 2 begins                       | 5                                            |
+| Validation cadence    | Five times per epoch at 20%/40%/60%/80%/100%                             | Same                                         |
+| Early stopping        | Five consecutive non-improving normalized-pinball validations; active from epoch 2 | Same loss and patience; active from epoch 1 |
+| Stored results        | Best five full validation-ranked checkpoints plus compact completion weights | Same                                      |
 | Validation / test     | Full splits remain in cutoff ranges; routine evaluation is deterministically capped by config | Same                                         |
 | Architecture          | Kronos-base + the same LoRA + resampler + conditioner + alpha head      | Identical                                   |
 | Initialization        | Original pretrained base                                                | Original pretrained base                    |
@@ -1674,8 +1694,17 @@ Configs:
 The two configs must have identical `config.model_architecture_digest()` values;
 this digest binds model parameters and the `h_start`/output-horizon contract. Stage
 1 uses an exact deterministic target set selected by an O(1)-state blockwise
-permutation. It is not the earliest 15%, does not shrink validation/test, and does
+permutation. It is not the earliest 3%, does not shrink validation/test, and does
 not allocate all possible window indices.
+
+Production Stage 1/2 rejects `max_steps`, fixed-step validation cadence, and a
+separate fixed-step checkpoint cadence. The optimizer budget is derived only
+from the target set, batch size, gradient accumulation, and epoch count. Every
+epoch-relative validation participates in the best-five checkpoint ranking.
+Normal completion and early stopping both atomically publish one
+`completion-result/` containing the current trainable weights, resolved config,
+stop reason, actual step/sample counts, and final validation metrics, without
+duplicating optimizer/scheduler state that is no longer needed for resume.
 
 ### Complete RunPod operations guide
 
@@ -2532,7 +2561,8 @@ against the `trainer/global_step` custom axis. With gradient accumulation, the
 value is the mean of the microbatch losses contributing to that optimizer step.
 Loss and validation retain separate history rows even when they share an
 optimizer step instead of colliding on W&B's internal step. In-training
-validation sends every finite numeric metric at each evaluation step. The
+validation runs at 20%/40%/60%/80%/100% of every epoch and sends every finite
+numeric metric plus early-stopping state. The
 post-training benchmark uses `benchmark_validation/global_step` as a custom
 axis for the evaluated checkpoint instead of writing to an already committed
 internal W&B step. It logs the complete model-and-baseline results, including
@@ -2663,7 +2693,7 @@ bash scripts/runpod_workflow.sh download --checkpointScope all <run-id>
 bash scripts/runpod_workflow.sh download --checkpointScope best <run-id>
 ```
 
-Here, `all` means the complete set still retained by the leaderboard's top-k
+Here, `all` means the complete checkpoint set still retained by the leaderboard's best-five
 retention policy; it does not include historical checkpoints already deleted
 during training. The download uses the immutable leaderboard directly rather
 than guessing checkpoints from a directory listing. If the local target already
@@ -2679,8 +2709,8 @@ bash scripts/runpod_workflow.sh download --resume --checkpointScope best <run-id
 Results are written under the ignored
 `artifacts/runpod/<run-id>/` directory. They include the run manifest, resolved
 config, leaderboard, best-checkpoint pointer, checkpoint directories selected
-by the scope, validation benchmark, training/validation lifecycle files, and
-immutable training completion record. `--resume` does not delete other local
+by the scope, `completion-result/`, validation benchmark, training/validation
+lifecycle files, and immutable training completion record. `--resume` does not delete other local
 checkpoint directories; for example, switching from `all` to `best` does not
 prune local files.
 
@@ -2704,6 +2734,7 @@ Each run stores at least:
 - `trainer-state.json`
 - Optimizer and scheduler state
 - Run manifest, checkpoint leaderboard, and best-checkpoint pointer
+- `completion-result/`: final trainable weights, stop reason, and audit counters at normal or early-stopped completion
 - Selection ID/SHA, dataset request SHA, stage-config SHA, and requested dataset contract
 - Dataset-manifest summary, architecture digest, Kronos source/model/tokenizer
   revisions, and bounded training-implementation digest
@@ -2732,8 +2763,10 @@ checkpoint metadata. It produces no natural-language explanation.
 
 Minimum PoC acceptance:
 
-1. Stage 1 uses exactly 15% of train samples, retains full validation/test, and
-   completes forward/backward, checkpoint reload, and inference smoke tests.
+1. Stage 1 selects one fixed exact 3% train set for up to two epochs and changes
+   only its traversal order between epochs. Early stopping cannot activate before
+   epoch 2 begins. Full validation/test remain intact, and forward/backward,
+   checkpoint reload, and inference smoke tests complete.
 2. Stage 2 has the same architecture digest and starts again from the same
    pretrained base.
 3. Every run is traceable to immutable Parquet, dataset profile, providers,

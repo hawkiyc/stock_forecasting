@@ -61,9 +61,19 @@ def test_stage_configs_share_one_model_architecture_and_start_fresh() -> None:
     stage2 = ExperimentConfig.from_yaml(ROOT / "configs/stage2_kronos_base_lora.yaml")
 
     assert stage1.training.stage == "stage1"
-    assert stage1.data.train_fraction == pytest.approx(0.15)
+    assert stage1.data.train_fraction == pytest.approx(0.03)
+    assert stage1.training.epochs == 2
+    assert stage1.training.early_stopping_start_epoch == 2
     assert stage2.training.stage == "stage2"
     assert stage2.data.train_fraction == pytest.approx(1.0)
+    assert stage2.training.epochs == 5
+    assert stage2.training.early_stopping_start_epoch == 1
+    assert stage1.training.evaluations_per_epoch == 5
+    assert stage2.training.evaluations_per_epoch == 5
+    assert stage1.training.checkpoint_save_top_k == 5
+    assert stage2.training.checkpoint_save_top_k == 5
+    assert stage1.training.early_stopping_enabled is True
+    assert stage2.training.early_stopping_enabled is True
     assert stage1.model == stage2.model
     assert stage1.model_architecture_digest() == stage2.model_architecture_digest()
     assert stage1.training.resume_checkpoint is None
@@ -171,6 +181,62 @@ def test_production_stages_cannot_hide_a_sample_cap(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError, match="cannot cap max_samples"):
         ExperimentConfig.from_yaml(modified_path)
+
+
+@pytest.mark.parametrize(
+    "obsolete_field",
+    ["max_steps", "evaluate_every_steps", "checkpoint_every_steps"],
+)
+def test_training_config_rejects_obsolete_step_caps_and_cadence(
+    obsolete_field: str,
+) -> None:
+    path = ROOT / "configs/stage1_kronos_base_lora.yaml"
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload["training"][obsolete_field] = 200
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExperimentConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("epochs", 1, "training.epochs=2"),
+        ("evaluations_per_epoch", 4, "five validations per epoch"),
+        ("checkpoint_save_top_k", 4, "best five checkpoints"),
+        (
+            "checkpoint_monitor",
+            "primary_5d/median_correlation",
+            "normalized pinball loss",
+        ),
+        ("checkpoint_mode", "max", "normalized pinball loss"),
+        ("early_stopping_enabled", False, "requires validation-loss early stopping"),
+        (
+            "early_stopping_patience_evaluations",
+            4,
+            "five consecutive non-improving validations",
+        ),
+        (
+            "early_stopping_min_delta",
+            0.001,
+            "five consecutive non-improving validations",
+        ),
+        ("early_stopping_start_epoch", 1, "early_stopping_start_epoch=2"),
+    ],
+)
+def test_stage1_training_control_contract_fails_closed(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    path = ROOT / "configs/stage1_kronos_base_lora.yaml"
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload["training"][field] = value
+    if field == "epochs":
+        payload["training"]["early_stopping_start_epoch"] = 1
+
+    with pytest.raises(ValidationError, match=message):
+        ExperimentConfig.model_validate(payload)
 
 
 def test_model_config_has_no_language_or_fact_branch() -> None:
