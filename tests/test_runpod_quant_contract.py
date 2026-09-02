@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,16 @@ import pytest
 from stock_forecasting.config import ExperimentConfig
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_ruff_preserves_default_virtualenv_exclusions() -> None:
+    with (ROOT / "pyproject.toml").open("rb") as stream:
+        ruff_config = tomllib.load(stream)["tool"]["ruff"]
+
+    assert "exclude" not in ruff_config
+    assert ruff_config["extend-exclude"] == [
+        "src/stock_forecasting/_vendor/kronos"
+    ]
 
 
 def test_runpod_stage_contract_reports_stage1_five_percent_cap() -> None:
