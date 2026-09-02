@@ -66,8 +66,8 @@ if [[ "${MODE}" == "code-only" ]]; then
     exit 0
 fi
 
-CODE_RELEASE_DIGEST="$(printf '%s\n' "${CODE_JSON}" | python3 -c \
-    'import json, sys; print(json.load(sys.stdin)["release_digest"])')"
+CODE_NUMERICAL_PIPELINE_DIGEST="$(printf '%s\n' "${CODE_JSON}" \
+    | python3 "${READINESS_HELPER}" code-numerical-pipeline-digest --marker -)"
 DATASET_JSON="$(bash "${S3_WRAPPER}" s3 cp \
     "s3://${RUNPOD_NETWORK_VOLUME_ID}/${DATASET_MARKER_KEY}" - \
     --only-show-errors)"
@@ -87,7 +87,7 @@ printf '%s\n' "${REMOTE_SELECTION_JSON}" \
 printf '%s\n' "${DATASET_JSON}" \
     | python3 "${READINESS_HELPER}" check-dataset \
         --marker - \
-        --expected-code-release-digest "${CODE_RELEASE_DIGEST}" \
+        --expected-numerical-pipeline-digest "${CODE_NUMERICAL_PIPELINE_DIGEST}" \
         --stage-config "${LOCAL_PROJECT_ROOT}/${RUNPOD_CONFIG}"
 
 verify_remote_size() {
@@ -122,4 +122,5 @@ verify_remote_size download_manifest "Download manifest"
 verify_remote_size request_log "API request log"
 verify_remote_size model_manifest "Hugging Face model manifest"
 
-printf 'GPU creation gate passed: code, dataset, and offline model cache are ready.\n'
+printf '%s\n' \
+    'GPU artifact gate passed: code, dataset, and offline model cache are ready; checking GPU workflow availability next.'

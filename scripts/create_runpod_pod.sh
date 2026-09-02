@@ -9,6 +9,7 @@ LOCAL_PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 S3_WRAPPER="${SCRIPT_DIR}/runpod_s3_project.sh"
 READINESS_HELPER="${SCRIPT_DIR}/runpod_readiness.py"
 REMOTE_CHECKPOINT_PREFLIGHT="${SCRIPT_DIR}/runpod_remote_checkpoint_preflight.py"
+GPU_WORKFLOW_AVAILABILITY_HELPER="${SCRIPT_DIR}/ensure_runpod_gpu_workflow_available.sh"
 # shellcheck source=lib/runpod_paths.sh
 source "${SCRIPT_DIR}/lib/runpod_paths.sh"
 # shellcheck source=lib/runpod_project_env.sh
@@ -314,7 +315,7 @@ verify_remote_checkpoint_run() {
 }
 
 verify_no_active_gpu_workflow() {
-    local lifecycle_keys listed_key lifecycle_key lifecycle_kind lifecycle_json
+    local lifecycle_keys listed_key lifecycle_key lifecycle_kind
     lifecycle_keys="$(bash "${S3_WRAPPER}" s3api list-objects-v2 \
         --bucket "${RUNPOD_NETWORK_VOLUME_ID}" \
         --prefix lifecycle/stage1/ \
@@ -331,14 +332,9 @@ verify_no_active_gpu_workflow() {
             if [[ "${listed_key}" != "${lifecycle_key}" ]]; then
                 continue
             fi
-            lifecycle_json="$(bash "${S3_WRAPPER}" s3 cp \
-                "s3://${RUNPOD_NETWORK_VOLUME_ID}/${lifecycle_key}" - \
-                --only-show-errors)"
-            printf '%s\n' "${lifecycle_json}" \
-                | python3 "${READINESS_HELPER}" gpu-workflow-available \
-                    --marker - \
-                    --network-volume-root "${RUNPOD_VOLUME_MOUNT_PATH}" \
-                    --kind "${lifecycle_kind}" >/dev/null
+            RUNPOD_VOLUME_MOUNT_PATH="${RUNPOD_VOLUME_MOUNT_PATH}" \
+                bash "${GPU_WORKFLOW_AVAILABILITY_HELPER}" \
+                    "${lifecycle_key}" "${lifecycle_kind}"
             break
         done
     done
@@ -364,7 +360,8 @@ verify_completed_training_run() {
 
 if [[ "${RUNPOD_TEST_MODE:-0}" != "1" ]]; then
     if [[ ! -r "${S3_WRAPPER}" || ! -r "${READINESS_HELPER}" \
-        || ! -r "${REMOTE_CHECKPOINT_PREFLIGHT}" ]]; then
+        || ! -r "${REMOTE_CHECKPOINT_PREFLIGHT}" \
+        || ! -r "${GPU_WORKFLOW_AVAILABILITY_HELPER}" ]]; then
         echo "RunPod checkpoint preflight helpers are unavailable" >&2
         exit 127
     fi

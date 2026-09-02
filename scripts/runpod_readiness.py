@@ -26,6 +26,7 @@ ISO_TIMESTAMP_PATTERN = re.compile(
     r"(?P<fraction>\.\d{1,6})?(?P<zone>Z|[+-]\d{2}:\d{2})$"
 )
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
+POD_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 CHECKPOINT_NAME_PATTERN = re.compile(r"^checkpoint-[0-9]{6,}$")
 DATASET_RESUMABLE_STATES = frozenset(
     {
@@ -53,6 +54,19 @@ GUARD_LIFECYCLE_STATES = frozenset(
         "timed_out",
         *DATASET_RESUMABLE_STATES,
     }
+)
+GPU_WORKFLOW_ACTIVE_STATES = frozenset({"preparing", "finalizing"})
+GPU_WORKFLOW_TERMINAL_STATES = frozenset({"ready", "failed", "timed_out"})
+ORPHANED_GPU_WORKFLOW_REASON = "runpod_pod_not_found"
+NUMERICAL_PIPELINE_PATHS = (
+    "src/stock_forecasting/cli/prepare_data.py",
+    "src/stock_forecasting/data/adjustments.py",
+    "src/stock_forecasting/data/bar_store.py",
+    "src/stock_forecasting/data/benchmarks.py",
+    "src/stock_forecasting/data/horizons.py",
+    "src/stock_forecasting/data/manifest.py",
+    "src/stock_forecasting/data/schema.py",
+    "src/stock_forecasting/data/splits.py",
 )
 
 
@@ -659,9 +673,77 @@ def _validate_causal_split_audit(audit, split_counts, label):
             raise ValueError(f"{label} {split} label crosses the next split boundary")
 
 
+def _numerical_pipeline_digest_from_code_payload(code_payload):
+    records = code_payload.get("files")
+    if not isinstance(records, list):
+        raise ValueError("Code manifest has no files")
+    by_path = {
+        record.get("path"): record
+        for record in records
+        if isinstance(record, dict) and isinstance(record.get("path"), str)
+    }
+    missing = sorted(set(NUMERICAL_PIPELINE_PATHS).difference(by_path))
+    if missing:
+        raise ValueError("Code manifest omits numerical pipeline files: " + ", ".join(missing))
+    pipeline_payload = {
+        relative.removeprefix("src/stock_forecasting/"): by_path[relative]["sha256"]
+        for relative in NUMERICAL_PIPELINE_PATHS
+    }
+    return _payload_sha256(pipeline_payload)
+
+
+def command_code_numerical_pipeline_digest(arguments):
+    payload = _validate_code_payload(_load_json(arguments.marker))
+    sys.stdout.write(_numerical_pipeline_digest_from_code_payload(payload) + "\n")
+    return 0
+
+
+def _validate_dataset_code_compatibility(
+    payload,
+    *,
+    code_payload=None,
+    expected_numerical_pipeline_digest=None,
+    expected_code_release_digest=None,
+):
+    """Validate data semantics separately from full source-release provenance."""
+
+    pipeline_digest = payload.get("data_pipeline_digest")
+    if not isinstance(pipeline_digest, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", pipeline_digest
+    ):
+        raise ValueError("Dataset readiness numerical pipeline digest is invalid")
+    if (
+        code_payload is not None
+        and pipeline_digest != _numerical_pipeline_digest_from_code_payload(code_payload)
+    ):
+        raise ValueError("Dataset was prepared with a different numerical pipeline revision")
+    if expected_numerical_pipeline_digest is not None and (
+        not isinstance(expected_numerical_pipeline_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_numerical_pipeline_digest) is None
+    ):
+        raise ValueError("Expected numerical pipeline digest is invalid")
+    if (
+        expected_numerical_pipeline_digest is not None
+        and pipeline_digest != expected_numerical_pipeline_digest
+    ):
+        raise ValueError("Dataset was prepared with a different numerical pipeline revision")
+
+    code_release_digest = payload.get("code_release_digest")
+    if not isinstance(code_release_digest, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", code_release_digest
+    ):
+        raise ValueError("Dataset readiness code release digest is invalid")
+    if (
+        expected_code_release_digest is not None
+        and code_release_digest != expected_code_release_digest
+    ):
+        raise ValueError("Dataset was prepared from a different code release")
+
+
 def _validate_quant_dataset_payload(
     payload,
     code_payload=None,
+    expected_numerical_pipeline_digest=None,
     expected_code_release_digest=None,
     stage_contract=None,
 ):
@@ -831,10 +913,6 @@ def _validate_quant_dataset_payload(
         and preparation_spec.get("embargo_bars") != stage_contract.embargo_trading_days
     ):
         raise ValueError("Dataset embargo differs from the selected training config")
-    pipeline_digest = payload.get("data_pipeline_digest")
-    if not isinstance(pipeline_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", pipeline_digest):
-        raise ValueError("Dataset readiness numerical pipeline digest is invalid")
-
     split_counts = payload.get("split_counts")
     if (
         not isinstance(split_counts, dict)
@@ -869,18 +947,12 @@ def _validate_quant_dataset_payload(
     ):
         raise ValueError("Kronos cache has not passed offline hidden-state verification")
 
-    code_release_digest = payload.get("code_release_digest")
-    if not isinstance(code_release_digest, str) or not re.fullmatch(
-        r"[0-9a-f]{64}", code_release_digest
-    ):
-        raise ValueError("Dataset readiness code release digest is invalid")
-    if code_payload is not None and code_release_digest != code_payload.get("release_digest"):
-        raise ValueError("Dataset was prepared from a different code release")
-    if (
-        expected_code_release_digest is not None
-        and code_release_digest != expected_code_release_digest
-    ):
-        raise ValueError("Dataset was prepared from a different code release")
+    _validate_dataset_code_compatibility(
+        payload,
+        code_payload=code_payload,
+        expected_numerical_pipeline_digest=expected_numerical_pipeline_digest,
+        expected_code_release_digest=expected_code_release_digest,
+    )
     return payload
 
 
@@ -1048,9 +1120,12 @@ def command_check_dataset(arguments):
     )
     payload = _validate_quant_dataset_payload(
         _load_json(arguments.marker),
-        code_payload,
-        arguments.expected_code_release_digest,
-        stage_contract,
+        code_payload=code_payload,
+        expected_numerical_pipeline_digest=(
+            arguments.expected_numerical_pipeline_digest
+        ),
+        expected_code_release_digest=arguments.expected_code_release_digest,
+        stage_contract=stage_contract,
     )
     if arguments.stage_config is not None and payload.get("stage_config_sha256") != _sha256(
         arguments.stage_config
@@ -1325,19 +1400,157 @@ def command_write_training_completion(arguments):
     return 0
 
 
+def _validated_gpu_workflow_status(payload, *, expected_kind, volume_root):
+    if expected_kind not in {"stage1-training", "stage1-validation"}:
+        raise ValueError("GPU workflow lifecycle kind is unsupported")
+    if payload.get("kind") != expected_kind:
+        raise ValueError("GPU workflow lifecycle marker has the wrong kind")
+    _validate_run_lifecycle_paths(payload, volume_root)
+    state = payload.get("state")
+    if state not in GPU_WORKFLOW_ACTIVE_STATES | GPU_WORKFLOW_TERMINAL_STATES:
+        raise ValueError("GPU workflow lifecycle marker has an unsupported state")
+    pod_id = payload.get("pod_id")
+    if state in GPU_WORKFLOW_ACTIVE_STATES and (
+        not isinstance(pod_id, str) or POD_ID_PATTERN.fullmatch(pod_id) is None
+    ):
+        raise ValueError("Active GPU workflow lifecycle marker has an invalid Pod ID")
+    return state, pod_id or ""
+
+
+def command_gpu_workflow_status(arguments):
+    """Print a validated GPU lifecycle state and its owning Pod ID."""
+
+    state, pod_id = _validated_gpu_workflow_status(
+        _load_json(arguments.marker),
+        expected_kind=arguments.kind,
+        volume_root=arguments.network_volume_root.resolve(strict=False),
+    )
+    sys.stdout.write(f"{state}\t{pod_id}\n")
+    return 0
+
+
+def _runpod_pod_probe_state(payload, *, expected_pod_id, command_exit_code):
+    """Classify only an explicit Pod object or an explicit RunPod 404 response."""
+
+    if not isinstance(expected_pod_id, str) or POD_ID_PATTERN.fullmatch(
+        expected_pod_id
+    ) is None:
+        raise ValueError("Expected RunPod Pod ID is invalid")
+    if not isinstance(command_exit_code, int) or isinstance(command_exit_code, bool):
+        raise ValueError("RunPod Pod lookup exit code is invalid")
+    if not isinstance(payload, dict):
+        raise ValueError("RunPod Pod lookup did not return a JSON object")
+    if command_exit_code == 0:
+        if payload.get("id") != expected_pod_id:
+            raise ValueError("RunPod Pod lookup returned a different Pod")
+        return "present"
+    if payload.get("status") == 404 and payload.get("code") == "not_found":
+        return "absent"
+    code = payload.get("code", "unknown_error")
+    status = payload.get("status", "unknown")
+    raise ValueError(
+        "RunPod Pod lookup is indeterminate "
+        f"(exit_code={command_exit_code}, status={status}, code={code})"
+    )
+
+
+def command_runpod_pod_probe_state(arguments):
+    state = _runpod_pod_probe_state(
+        _load_json(arguments.response),
+        expected_pod_id=arguments.expected_pod_id,
+        command_exit_code=arguments.command_exit_code,
+    )
+    sys.stdout.write(state + "\n")
+    return 0
+
+
+def _orphaned_gpu_workflow_payload(
+    payload,
+    *,
+    expected_kind,
+    expected_pod_id,
+    volume_root,
+    minimum_age_seconds,
+    now=None,
+):
+    """Build a terminal audit record after an exact RunPod Pod lookup returned 404."""
+
+    if (
+        not isinstance(minimum_age_seconds, int)
+        or isinstance(minimum_age_seconds, bool)
+        or minimum_age_seconds < 0
+    ):
+        raise ValueError("GPU lifecycle orphan minimum age is invalid")
+    state, pod_id = _validated_gpu_workflow_status(
+        payload,
+        expected_kind=expected_kind,
+        volume_root=volume_root,
+    )
+    if state not in GPU_WORKFLOW_ACTIVE_STATES:
+        raise ValueError("Only an active GPU workflow lifecycle can be reconciled")
+    if pod_id != expected_pod_id:
+        raise ValueError("GPU workflow lifecycle Pod ID changed during reconciliation")
+
+    observed_at = now or datetime.now(timezone.utc)
+    generated_at = _parse_utc_timestamp(
+        payload.get("generated_at"), "GPU workflow lifecycle generated_at"
+    )
+    age_seconds = (observed_at - generated_at).total_seconds()
+    if age_seconds < minimum_age_seconds:
+        raise ValueError(
+            "GPU workflow lifecycle is too recent to reconcile as orphaned "
+            f"(age_seconds={max(0, int(age_seconds))}, "
+            f"minimum_seconds={minimum_age_seconds})"
+        )
+
+    reconciled_at = observed_at.astimezone(timezone.utc).isoformat()
+    reconciled = {
+        **payload,
+        "state": "failed",
+        "generated_at": reconciled_at,
+        "exit_code": 1,
+        "reason": ORPHANED_GPU_WORKFLOW_REASON,
+        "timed_out": False,
+        "reconciliation": {
+            "previous_state": state,
+            "pod_lookup": "not_found",
+            "reconciled_at": reconciled_at,
+        },
+    }
+    if expected_kind == "stage1-training":
+        training_completed = payload.get("training_completed") is True
+        reconciled["training_completed"] = training_completed
+        reconciled["resume_discovery_required"] = not training_completed
+    else:
+        reconciled["validation_completed"] = False
+        reconciled["resume_validation_required"] = True
+    _validate_run_lifecycle_paths(reconciled, volume_root)
+    return reconciled
+
+
+def command_reconcile_orphaned_gpu_workflow(arguments):
+    payload = _orphaned_gpu_workflow_payload(
+        _load_json(arguments.marker),
+        expected_kind=arguments.kind,
+        expected_pod_id=arguments.expected_pod_id,
+        volume_root=arguments.network_volume_root.resolve(strict=False),
+        minimum_age_seconds=arguments.minimum_age_seconds,
+    )
+    json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
 def command_gpu_workflow_available(arguments):
     """Fail closed when a canonical singleton GPU lifecycle is still active."""
 
-    payload = _load_json(arguments.marker)
-    if payload.get("kind") != arguments.kind:
-        raise ValueError("GPU workflow lifecycle marker has the wrong kind")
-    volume_root = arguments.network_volume_root.resolve(strict=False)
-    _validate_run_lifecycle_paths(payload, volume_root)
-    state = payload.get("state")
-    if state in {"preparing", "finalizing"}:
+    state, _ = _validated_gpu_workflow_status(
+        _load_json(arguments.marker),
+        expected_kind=arguments.kind,
+        volume_root=arguments.network_volume_root.resolve(strict=False),
+    )
+    if state in GPU_WORKFLOW_ACTIVE_STATES:
         raise ValueError("Another GPU workflow is active; refusing to create a competing paid Pod")
-    if state not in {"ready", "failed", "timed_out"}:
-        raise ValueError("GPU workflow lifecycle marker has an unsupported state")
     sys.stdout.write(str(state) + "\n")
     return 0
 
@@ -1903,6 +2116,10 @@ def build_parser():
     check_code.add_argument("--project-root", type=Path)
     check_code.set_defaults(handler=command_check_code)
 
+    numerical_pipeline = subparsers.add_parser("code-numerical-pipeline-digest")
+    numerical_pipeline.add_argument("--marker", required=True)
+    numerical_pipeline.set_defaults(handler=command_code_numerical_pipeline_digest)
+
     quarantine = subparsers.add_parser("quarantine-stale-code")
     quarantine.add_argument("--marker", required=True)
     quarantine.add_argument("--project-root", type=Path, required=True)
@@ -1913,6 +2130,7 @@ def build_parser():
     check_dataset = subparsers.add_parser("check-dataset")
     check_dataset.add_argument("--marker", required=True)
     check_dataset.add_argument("--code-marker")
+    check_dataset.add_argument("--expected-numerical-pipeline-digest")
     check_dataset.add_argument("--expected-code-release-digest")
     check_dataset.add_argument("--network-volume-root", type=Path)
     check_dataset.add_argument("--stage-config", type=Path)
@@ -1956,6 +2174,42 @@ def build_parser():
         required=True,
     )
     gpu_workflow.set_defaults(handler=command_gpu_workflow_available)
+
+    gpu_workflow_status = subparsers.add_parser("gpu-workflow-status")
+    gpu_workflow_status.add_argument("--marker", required=True)
+    gpu_workflow_status.add_argument("--network-volume-root", type=Path, required=True)
+    gpu_workflow_status.add_argument(
+        "--kind",
+        choices=("stage1-training", "stage1-validation"),
+        required=True,
+    )
+    gpu_workflow_status.set_defaults(handler=command_gpu_workflow_status)
+
+    pod_probe = subparsers.add_parser("runpod-pod-probe-state")
+    pod_probe.add_argument("--response", required=True)
+    pod_probe.add_argument("--expected-pod-id", required=True)
+    pod_probe.add_argument("--command-exit-code", type=int, required=True)
+    pod_probe.set_defaults(handler=command_runpod_pod_probe_state)
+
+    orphaned_gpu_workflow = subparsers.add_parser(
+        "reconcile-orphaned-gpu-workflow"
+    )
+    orphaned_gpu_workflow.add_argument("--marker", required=True)
+    orphaned_gpu_workflow.add_argument(
+        "--network-volume-root", type=Path, required=True
+    )
+    orphaned_gpu_workflow.add_argument(
+        "--kind",
+        choices=("stage1-training", "stage1-validation"),
+        required=True,
+    )
+    orphaned_gpu_workflow.add_argument("--expected-pod-id", required=True)
+    orphaned_gpu_workflow.add_argument(
+        "--minimum-age-seconds", type=int, default=60
+    )
+    orphaned_gpu_workflow.set_defaults(
+        handler=command_reconcile_orphaned_gpu_workflow
+    )
 
     completed_training_phase = subparsers.add_parser("training-phase-completed")
     completed_training_phase.add_argument("--marker", required=True)
