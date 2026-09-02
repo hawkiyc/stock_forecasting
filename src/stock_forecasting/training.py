@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from numpy.typing import NDArray
 from torch import Tensor
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from stock_forecasting.checkpointing import (
     load_checkpoint,
@@ -31,6 +32,11 @@ from stock_forecasting.data import (
     FinancialBatchCollator,
     FixedSizeBatchSampler,
     LazyFinancialWindowDataset,
+)
+from stock_forecasting.data.manifest import (
+    atomic_write_json,
+    canonical_json_sha256,
+    sha256_file,
 )
 from stock_forecasting.factory import ModelBundle, build_model_bundle
 from stock_forecasting.metrics import (
@@ -48,6 +54,255 @@ from stock_forecasting.tracking import (
 )
 from stock_forecasting.training_paths import resolve_bar_store_path
 
+DATALOADER_AUTO_MAX_WORKERS = 8
+DATALOADER_CPU_RESERVE = 2
+DATALOADER_ACTIVE_PERSISTENT_POOLS = 2
+DATALOADER_MEMORY_FRACTION = 0.25
+DATALOADER_MEMORY_BYTES_PER_WORKER = 512 * 1024**2
+DATALOADER_PARENT_MEMORY_RESERVE_BYTES = 4 * 1024**3
+DATALOADER_TOTAL_SYMBOL_CACHE_ENTRIES = 128
+DATALOADER_PREFETCH_FACTOR = 2
+ROBUST_SCALE_BATCH_SIZE = 256
+ROBUST_SCALE_SELECTION_BLOCK_SIZE = 16
+ROBUST_SCALE_CACHE_SCHEMA_VERSION = "1.0"
+ROBUST_SCALE_ALGORITHM = "parallel-blockwise-runtime-labels-v1"
+_DATALOADER_THREAD_ENVIRONMENT = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "PYARROW_NUM_THREADS",
+)
+
+
+@dataclass(frozen=True)
+class DataLoaderWorkerPlan:
+    """Bound data-loading parallelism by visible CPU and available host memory."""
+
+    source: str
+    requested_workers: int
+    visible_cpu_count: int
+    available_memory_bytes: int
+    worker_memory_budget_bytes: int
+    effective_workers: int
+    active_persistent_pools: int
+    symbol_cache_size_per_worker: int
+    prefetch_factor: int | None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "requested_workers": self.requested_workers,
+            "visible_cpu_count": self.visible_cpu_count,
+            "available_memory_bytes": self.available_memory_bytes,
+            "worker_memory_budget_bytes": self.worker_memory_budget_bytes,
+            "effective_workers": self.effective_workers,
+            "active_persistent_pools": self.active_persistent_pools,
+            "estimated_peak_worker_memory_bytes": (
+                self.effective_workers
+                * self.active_persistent_pools
+                * DATALOADER_MEMORY_BYTES_PER_WORKER
+            ),
+            "memory_bytes_per_worker": DATALOADER_MEMORY_BYTES_PER_WORKER,
+            "symbol_cache_size_per_worker": self.symbol_cache_size_per_worker,
+            "prefetch_factor": self.prefetch_factor,
+            "native_threads_per_worker": 1,
+        }
+
+
+@dataclass(frozen=True)
+class RuntimeRobustScaleResult:
+    """Resolved robust scales plus their persistent cache provenance."""
+
+    scales: tuple[float, ...]
+    cache_path: Path
+    cache_hit: bool
+    identity_sha256: str
+    sample_count: int
+
+
+class _RuntimeLabelDataset(Dataset[Tensor]):
+    """Expose only on-demand labels to the calibration DataLoader."""
+
+    def __init__(self, source: LazyFinancialWindowDataset) -> None:
+        self.source = source
+
+    def __len__(self) -> int:
+        return len(self.source)
+
+    def __getitem__(self, index: int) -> Tensor:
+        return self.source.target_at(index)
+
+
+def _visible_cpu_count() -> int:
+    affinity_count: int | None = None
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            affinity_count = len(os.sched_getaffinity(0))
+        except OSError:
+            affinity_count = None
+    reported = os.cpu_count() or 1
+    return max(1, min(reported, affinity_count or reported))
+
+
+def _read_positive_integer(path: Path) -> int | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    if not value or value == "max":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _available_memory_bytes() -> int:
+    """Return the strictest available-memory estimate exposed by Linux or POSIX."""
+
+    candidates: list[int] = []
+    for limit_path, usage_path in (
+        (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")),
+        (
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+        ),
+    ):
+        limit = _read_positive_integer(limit_path)
+        usage = _read_positive_integer(usage_path) or 0
+        if limit is not None and limit > usage:
+            candidates.append(limit - usage)
+
+    try:
+        meminfo = Path("/proc/meminfo").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        meminfo = ""
+    for line in meminfo.splitlines():
+        fields = line.split()
+        if line.startswith("MemAvailable:") and len(fields) >= 2 and fields[1].isdigit():
+            candidates.append(int(fields[1]) * 1024)
+            break
+
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    else:
+        if page_size > 0 and available_pages > 0:
+            candidates.append(page_size * available_pages)
+    if not candidates:
+        raise RuntimeError("Unable to determine memory available for DataLoader workers")
+    return min(candidates)
+
+
+def _requested_dataloader_workers(config: ExperimentConfig) -> tuple[int, str]:
+    value = os.environ.get("FIN_TS_DATALOADER_WORKERS", "").strip().lower()
+    if not value:
+        return config.training.num_workers, "training_config"
+    if value == "auto":
+        return DATALOADER_AUTO_MAX_WORKERS, "runpod_auto"
+    if not value.isascii() or not value.isdigit() or int(value) > 32:
+        raise ValueError("FIN_TS_DATALOADER_WORKERS must be auto or an integer from 0 to 32")
+    return int(value), "environment"
+
+
+def plan_dataloader_workers(
+    requested_workers: int,
+    *,
+    source: str = "explicit",
+    visible_cpu_count: int | None = None,
+    available_memory_bytes: int | None = None,
+) -> DataLoaderWorkerPlan:
+    """Choose a conservative process count shared by loading and calibration."""
+
+    if isinstance(requested_workers, bool) or requested_workers < 0 or requested_workers > 32:
+        raise ValueError("requested_workers must be between 0 and 32")
+    cpu_count = _visible_cpu_count() if visible_cpu_count is None else visible_cpu_count
+    memory_bytes = (
+        _available_memory_bytes() if available_memory_bytes is None else available_memory_bytes
+    )
+    if (
+        isinstance(cpu_count, bool)
+        or isinstance(memory_bytes, bool)
+        or cpu_count < 1
+        or memory_bytes < 1
+    ):
+        raise ValueError("Visible CPU count and available memory must be positive")
+
+    cpu_reserve = DATALOADER_CPU_RESERVE if cpu_count >= 4 else 1
+    cpu_worker_limit = max(cpu_count - cpu_reserve, 0)
+    memory_budget = max(
+        0,
+        min(
+            int(memory_bytes * DATALOADER_MEMORY_FRACTION),
+            memory_bytes - DATALOADER_PARENT_MEMORY_RESERVE_BYTES,
+        ),
+    )
+    memory_worker_limit = memory_budget // (
+        DATALOADER_MEMORY_BYTES_PER_WORKER * DATALOADER_ACTIVE_PERSISTENT_POOLS
+    )
+    effective_workers = min(
+        requested_workers,
+        cpu_worker_limit,
+        int(memory_worker_limit),
+    )
+    cache_divisor = max(
+        effective_workers * DATALOADER_ACTIVE_PERSISTENT_POOLS,
+        1,
+    )
+    symbol_cache_size = max(
+        4,
+        min(32, DATALOADER_TOTAL_SYMBOL_CACHE_ENTRIES // cache_divisor),
+    )
+    return DataLoaderWorkerPlan(
+        source=source,
+        requested_workers=requested_workers,
+        visible_cpu_count=cpu_count,
+        available_memory_bytes=memory_bytes,
+        worker_memory_budget_bytes=memory_budget,
+        effective_workers=effective_workers,
+        active_persistent_pools=DATALOADER_ACTIVE_PERSISTENT_POOLS,
+        symbol_cache_size_per_worker=symbol_cache_size,
+        prefetch_factor=DATALOADER_PREFETCH_FACTOR if effective_workers else None,
+    )
+
+
+def _initialize_dataloader_worker(_worker_id: int) -> None:
+    """Prevent every loader process from creating its own native thread pools."""
+
+    for name in _DATALOADER_THREAD_ENVIRONMENT:
+        os.environ[name] = "1"
+    torch.set_num_threads(1)
+    try:
+        import pyarrow as pa
+    except ImportError:
+        return
+    pa.set_cpu_count(1)
+    if hasattr(pa, "set_io_thread_count"):
+        pa.set_io_thread_count(1)
+
+
+def _loader_process_options(
+    plan: DataLoaderWorkerPlan,
+    *,
+    persistent: bool,
+) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "num_workers": plan.effective_workers,
+        "persistent_workers": persistent and plan.effective_workers > 0,
+    }
+    if plan.effective_workers > 0:
+        options.update(
+            {
+                "prefetch_factor": plan.prefetch_factor,
+                "worker_init_fn": _initialize_dataloader_worker,
+            }
+        )
+    return options
+
 
 def set_global_seed(seed: int) -> None:
     random.seed(seed)
@@ -59,25 +314,33 @@ def set_global_seed(seed: int) -> None:
 
 def build_dataloaders(
     config: ExperimentConfig,
+    *,
+    worker_plan: DataLoaderWorkerPlan | None = None,
 ) -> tuple[DataLoader[Any], DataLoader[Any], DataLoader[Any]]:
+    if worker_plan is None:
+        requested_workers, source = _requested_dataloader_workers(config)
+        worker_plan = plan_dataloader_workers(requested_workers, source=source)
     bar_store = resolve_bar_store_path(config.data.bar_store_path)
     train_source = LazyFinancialWindowDataset(
         bar_store,
         split="train",
         window_size=config.data.input_length,
         h_start=config.data.h_start,
+        symbol_cache_size=worker_plan.symbol_cache_size_per_worker,
     )
     validation_dataset = LazyFinancialWindowDataset(
         bar_store,
         split="validation",
         window_size=config.data.input_length,
         h_start=config.data.h_start,
+        symbol_cache_size=worker_plan.symbol_cache_size_per_worker,
     )
     test_dataset = LazyFinancialWindowDataset(
         bar_store,
         split="test",
         window_size=config.data.input_length,
         h_start=config.data.h_start,
+        symbol_cache_size=worker_plan.symbol_cache_size_per_worker,
     )
     train_sampler = BlockwisePermutationSampler(
         len(train_source),
@@ -110,9 +373,8 @@ def build_dataloaders(
         train_source,
         batch_sampler=train_batch_sampler,
         collate_fn=collator,
-        num_workers=config.training.num_workers,
         pin_memory=pin_memory,
-        persistent_workers=config.training.num_workers > 0,
+        **_loader_process_options(worker_plan, persistent=True),
     )
     validation_loader = DataLoader(
         validation_dataset,
@@ -120,9 +382,8 @@ def build_dataloaders(
         sampler=validation_sampler,
         shuffle=False,
         collate_fn=collator,
-        num_workers=config.training.num_workers,
         pin_memory=pin_memory,
-        persistent_workers=config.training.num_workers > 0,
+        **_loader_process_options(worker_plan, persistent=True),
     )
     test_loader = DataLoader(
         test_dataset,
@@ -130,9 +391,8 @@ def build_dataloaders(
         sampler=test_sampler,
         shuffle=False,
         collate_fn=collator,
-        num_workers=config.training.num_workers,
         pin_memory=pin_memory,
-        persistent_workers=config.training.num_workers > 0,
+        **_loader_process_options(worker_plan, persistent=True),
     )
     return train_loader, validation_loader, test_loader
 
@@ -142,33 +402,213 @@ def estimate_runtime_robust_scales(
     *,
     sample_count: int,
     seed: int,
+    worker_plan: DataLoaderWorkerPlan | None = None,
 ) -> tuple[float, ...]:
     """Estimate train-only label scales without persisting any label rows."""
 
+    if sample_count < 4:
+        raise ValueError("At least four runtime calibration labels are required")
+    if worker_plan is None:
+        worker_plan = plan_dataloader_workers(0, source="serial_default")
+    selected_sample_count = min(sample_count, len(dataset))
+    if selected_sample_count < 4:
+        raise ValueError("At least four runtime calibration labels are required")
     sampler = BlockwisePermutationSampler(
         len(dataset),
         fraction=1.0,
-        max_samples=min(sample_count, len(dataset)),
+        max_samples=selected_sample_count,
+        seed=seed,
+        block_size=ROBUST_SCALE_SELECTION_BLOCK_SIZE,
+    )
+    # Sorting only this bounded calibration subset preserves its deterministic
+    # membership while grouping nearby row groups for efficient network-volume reads.
+    selected_indices = sorted(sampler)
+    loader = DataLoader(
+        _RuntimeLabelDataset(dataset),
+        batch_size=min(ROBUST_SCALE_BATCH_SIZE, selected_sample_count),
+        sampler=selected_indices,
+        shuffle=False,
+        pin_memory=False,
+        **_loader_process_options(worker_plan, persistent=False),
+    )
+    batches = [batch.numpy().astype(np.float64, copy=False) for batch in loader]
+    values = np.concatenate(batches, axis=0)
+    if values.shape != (selected_sample_count, len(dataset.horizons)):
+        raise RuntimeError("Runtime calibration DataLoader emitted an invalid label matrix")
+    q25, q75 = np.quantile(values, [0.25, 0.75], axis=0)
+    median = np.median(values, axis=0)
+    interquartile_range = q75 - q25
+    median_absolute_deviation = np.median(np.abs(values - median), axis=0) * 1.4826
+    scales = np.maximum.reduce(
+        (
+            interquartile_range,
+            median_absolute_deviation,
+            np.full(len(dataset.horizons), 1e-4, dtype=np.float64),
+        )
+    )
+    if not np.isfinite(scales).all() or (scales <= 0.0).any():
+        raise ValueError("Runtime calibration produced invalid robust scales")
+    return tuple(float(value) for value in scales)
+
+
+def _robust_scale_identity(
+    dataset: LazyFinancialWindowDataset,
+    *,
+    sample_count: int,
+    seed: int,
+) -> dict[str, Any]:
+    manifest_path = dataset.root / "bar-store.json"
+    return {
+        "schema_version": ROBUST_SCALE_CACHE_SCHEMA_VERSION,
+        "algorithm": ROBUST_SCALE_ALGORITHM,
+        "bar_store_manifest_sha256": sha256_file(manifest_path),
+        "split": dataset.split,
+        "horizons": list(dataset.horizons),
+        "sample_count": min(sample_count, len(dataset)),
+        "seed": seed,
+    }
+
+
+def _default_robust_scale_cache_root(dataset: LazyFinancialWindowDataset) -> Path:
+    if dataset.root.parent.name == "prepared":
+        dataset_namespace = dataset.root.parent.parent
+    else:
+        dataset_namespace = dataset.root.parent
+    return dataset_namespace / "training-cache" / "robust-scales"
+
+
+def _load_cached_robust_scales(
+    path: Path,
+    *,
+    identity: dict[str, Any],
+    identity_sha256: str,
+) -> tuple[float, ...]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise ValueError(f"Runtime robust-scale cache is unreadable: {path}") from error
+    scales = payload.get("scales") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {
+            "identity",
+            "identity_sha256",
+            "kind",
+            "scales",
+            "schema_version",
+        }
+        or payload.get("schema_version") != ROBUST_SCALE_CACHE_SCHEMA_VERSION
+        or payload.get("kind") != "runtime-robust-scales"
+        or payload.get("identity") != identity
+        or payload.get("identity_sha256") != identity_sha256
+        or not isinstance(scales, list)
+        or len(scales) != len(identity["horizons"])
+        or any(
+            not isinstance(value, int | float)
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+            for value in scales
+        )
+    ):
+        raise ValueError(f"Runtime robust-scale cache contract is invalid: {path}")
+    return tuple(float(value) for value in scales)
+
+
+def resolve_runtime_robust_scales(
+    dataset: LazyFinancialWindowDataset,
+    *,
+    sample_count: int,
+    seed: int,
+    worker_plan: DataLoaderWorkerPlan,
+    cache_root: str | Path | None = None,
+) -> RuntimeRobustScaleResult:
+    """Reuse or calculate a tiny aggregate cache without materializing labels."""
+
+    identity = _robust_scale_identity(
+        dataset,
+        sample_count=sample_count,
         seed=seed,
     )
-    columns: list[list[float]] = [[] for _ in dataset.horizons]
-    for index in sampler:
-        values = dataset.target_at(index).numpy()
-        for position, value in enumerate(values):
-            columns[position].append(float(value))
-    scales: list[float] = []
-    for horizon, values in zip(dataset.horizons, columns, strict=True):
-        array = np.asarray(values, dtype=np.float64)
-        if array.size < 4:
-            raise ValueError(
-                f"At least four runtime calibration labels are required for horizon {horizon}"
-            )
-        q25, q75 = np.quantile(array, [0.25, 0.75])
-        median = float(np.median(array))
-        iqr = float(q75 - q25)
-        mad_scale = float(np.median(np.abs(array - median)) * 1.4826)
-        scales.append(max(iqr, mad_scale, 1e-4))
-    return tuple(scales)
+    identity_sha256 = canonical_json_sha256(identity)
+    root = (
+        Path(cache_root).resolve(strict=False)
+        if cache_root is not None
+        else _default_robust_scale_cache_root(dataset)
+    )
+    cache_path = root / f"{identity_sha256}.json"
+    if cache_path.is_file():
+        scales = _load_cached_robust_scales(
+            cache_path,
+            identity=identity,
+            identity_sha256=identity_sha256,
+        )
+        print(
+            json.dumps(
+                {
+                    "runtime_robust_scale_calibration": "cache_hit",
+                    "cache_path": str(cache_path),
+                    "sample_count": identity["sample_count"],
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return RuntimeRobustScaleResult(
+            scales=scales,
+            cache_path=cache_path,
+            cache_hit=True,
+            identity_sha256=identity_sha256,
+            sample_count=int(identity["sample_count"]),
+        )
+
+    print(
+        json.dumps(
+            {
+                "runtime_robust_scale_calibration": "running",
+                "effective_workers": worker_plan.effective_workers,
+                "sample_count": identity["sample_count"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    scales = estimate_runtime_robust_scales(
+        dataset,
+        sample_count=sample_count,
+        seed=seed,
+        worker_plan=worker_plan,
+    )
+    atomic_write_json(
+        cache_path,
+        {
+            "schema_version": ROBUST_SCALE_CACHE_SCHEMA_VERSION,
+            "kind": "runtime-robust-scales",
+            "identity": identity,
+            "identity_sha256": identity_sha256,
+            "scales": list(scales),
+        },
+    )
+    print(
+        json.dumps(
+            {
+                "runtime_robust_scale_calibration": "complete",
+                "cache_path": str(cache_path),
+                "effective_workers": worker_plan.effective_workers,
+                "sample_count": identity["sample_count"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return RuntimeRobustScaleResult(
+        scales=scales,
+        cache_path=cache_path,
+        cache_hit=False,
+        identity_sha256=identity_sha256,
+        sample_count=int(identity["sample_count"]),
+    )
 
 
 def _autocast_context(config: ExperimentConfig, device: torch.device) -> Any:
@@ -184,14 +624,17 @@ def forward_batch(
     device: torch.device,
 ) -> Any:
     del config
+    non_blocking = device.type == "cuda"
     return bundle.model(
-        batch["asset_series"].to(device),
-        batch["benchmark_series"].to(device),
-        asset_attention_mask=batch["asset_attention_mask"].to(device),
-        benchmark_attention_mask=batch["benchmark_attention_mask"].to(device),
-        asset_timestamps=batch["asset_timestamps"].to(device),
-        benchmark_timestamps=batch["benchmark_timestamps"].to(device),
-        target_alpha=batch["target_alpha"].to(device),
+        batch["asset_series"].to(device, non_blocking=non_blocking),
+        batch["benchmark_series"].to(device, non_blocking=non_blocking),
+        asset_attention_mask=batch["asset_attention_mask"].to(device, non_blocking=non_blocking),
+        benchmark_attention_mask=batch["benchmark_attention_mask"].to(
+            device, non_blocking=non_blocking
+        ),
+        asset_timestamps=batch["asset_timestamps"].to(device, non_blocking=non_blocking),
+        benchmark_timestamps=batch["benchmark_timestamps"].to(device, non_blocking=non_blocking),
+        target_alpha=batch["target_alpha"].to(device, non_blocking=non_blocking),
     )
 
 
@@ -651,15 +1094,32 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
     preflight.require_success()
     set_global_seed(config.training.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_loader, validation_loader, _test_loader = build_dataloaders(config)
+    requested_workers, worker_source = _requested_dataloader_workers(config)
+    worker_plan = plan_dataloader_workers(
+        requested_workers,
+        source=worker_source,
+    )
+    print(
+        json.dumps(
+            {"dataloader_worker_plan": worker_plan.as_dict()},
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    train_loader, validation_loader, _test_loader = build_dataloaders(
+        config,
+        worker_plan=worker_plan,
+    )
     train_dataset = cast(LazyFinancialWindowDataset, train_loader.dataset)
     train_batch_sampler = cast(FixedSizeBatchSampler, train_loader.batch_sampler)
     selected_train_samples = len(train_batch_sampler.sampler)
-    robust_scales = estimate_runtime_robust_scales(
+    robust_scale_result = resolve_runtime_robust_scales(
         train_dataset,
         sample_count=config.data.label_scale_calibration_samples,
         seed=config.training.seed + 17,
+        worker_plan=worker_plan,
     )
+    robust_scales = robust_scale_result.scales
     bundle = build_model_bundle(config, device, robust_scales=robust_scales)
     parameter_groups, trainable = _optimizer_parameter_groups(bundle, config)
     optimizer = AdamW(
@@ -948,15 +1408,18 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 "training_batch_padding_per_epoch": (train_batch_sampler.padded_sample_count),
                 "runtime_label_calibration": {
                     "source_split": "train",
-                    "sample_count": min(
-                        config.data.label_scale_calibration_samples,
-                        len(train_dataset),
-                    ),
+                    "sample_count": robust_scale_result.sample_count,
                     "seed": config.training.seed + 17,
                     "horizons": config.data.alpha_horizons,
                     "method": "max(iqr,mad_x_1.4826,1e-4)",
                     "robust_scales": list(robust_scales),
+                    "parallel_backend": "pytorch_dataloader_processes",
+                    "effective_workers": worker_plan.effective_workers,
+                    "cache_hit": robust_scale_result.cache_hit,
+                    "cache_path": str(robust_scale_result.cache_path),
+                    "cache_identity_sha256": robust_scale_result.identity_sha256,
                 },
+                "dataloader_worker_plan": worker_plan.as_dict(),
                 "model_architecture_sha256": architecture_digest,
                 "lora_module_names": list(bundle.lora_module_names),
                 "lora_parameter_names": list(bundle.lora_parameter_names),

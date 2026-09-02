@@ -875,6 +875,20 @@ def test_wandb_contract_logs_every_optimizer_step_and_validation_metrics() -> No
     assert "trap terminate_sync_pod EXIT" in wandb_sync_script
 
 
+def test_runpod_training_auto_tunes_multiprocess_data_loading() -> None:
+    entrypoint = (ROOT / "scripts/runpod_entrypoint.sh").read_text(encoding="utf-8")
+    reexec = (ROOT / "scripts/runpod_reexec_with_pid1_env.py").read_text(encoding="utf-8")
+    training = (ROOT / "src/stock_forecasting/training.py").read_text(encoding="utf-8")
+
+    assert 'FIN_TS_DATALOADER_WORKERS="${FIN_TS_DATALOADER_WORKERS:-auto}"' in entrypoint
+    assert '"FIN_TS_DATALOADER_WORKERS"' in reexec
+    assert "DATALOADER_AUTO_MAX_WORKERS = 8" in training
+    assert '"dataloader_worker_plan": worker_plan.as_dict()' in training
+    assert "resolve_runtime_robust_scales(" in training
+    assert '"parallel_backend": "pytorch_dataloader_processes"' in training
+    assert "window_materialized" not in training
+
+
 def test_eodhd_secret_is_cpu_only() -> None:
     reexec = (ROOT / "scripts/runpod_reexec_with_pid1_env.py").read_text(encoding="utf-8")
     create_cpu = (ROOT / "scripts/create_runpod_cpu_pod.sh").read_text(encoding="utf-8")

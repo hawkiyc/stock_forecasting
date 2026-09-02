@@ -34,9 +34,50 @@ from stock_forecasting.training import (
     EarlyStoppingState,
     epoch_evaluation_steps,
     evaluate_loader,
+    plan_dataloader_workers,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_dataloader_worker_plan_is_cpu_and_memory_bounded() -> None:
+    gib = 1024**3
+    full = plan_dataloader_workers(
+        8,
+        source="test",
+        visible_cpu_count=16,
+        available_memory_bytes=64 * gib,
+    )
+    memory_limited = plan_dataloader_workers(
+        8,
+        source="test",
+        visible_cpu_count=16,
+        available_memory_bytes=8 * gib,
+    )
+    cpu_limited = plan_dataloader_workers(
+        8,
+        source="test",
+        visible_cpu_count=4,
+        available_memory_bytes=64 * gib,
+    )
+    disabled = plan_dataloader_workers(
+        0,
+        source="test",
+        visible_cpu_count=16,
+        available_memory_bytes=64 * gib,
+    )
+
+    assert full.effective_workers == 8
+    assert full.prefetch_factor == 2
+    assert full.symbol_cache_size_per_worker == 8
+    assert memory_limited.effective_workers == 2
+    assert cpu_limited.effective_workers == 2
+    assert disabled.effective_workers == 0
+    assert disabled.prefetch_factor is None
+    assert (
+        full.effective_workers * full.active_persistent_pools * full.symbol_cache_size_per_worker
+        <= 128
+    )
 
 
 def test_epoch_relative_validation_schedule_has_exactly_five_even_checkpoints() -> None:

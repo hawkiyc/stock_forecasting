@@ -19,6 +19,10 @@ from stock_forecasting.data.dataset import (
 )
 from stock_forecasting.data.manifest import artifact_metadata, sha256_file
 from stock_forecasting.data.windows import CONTEXT_FIELDS, build_causal_windows
+from stock_forecasting.training import (
+    plan_dataloader_workers,
+    resolve_runtime_robust_scales,
+)
 from stock_forecasting.training_paths import resolve_bar_store_path
 
 
@@ -130,6 +134,63 @@ def test_bar_store_persists_bars_once_and_builds_labels_lazily(
         stream.write(bytes([original[0] ^ 0x01]))
     with pytest.raises(ValueError, match="shard integrity mismatch"):
         resolve_bar_store_path(store)
+
+
+def test_runtime_robust_scales_are_cached_without_materializing_labels(
+    tmp_path: Path,
+    market_frame: pd.DataFrame,
+) -> None:
+    raw = tmp_path / "raw" / "market.parquet"
+    raw.parent.mkdir()
+    market_frame.to_parquet(raw, compression="zstd", index=False)
+    store = tmp_path / "prepared" / "bar-store"
+    build_symbol_bar_store(
+        raw_path=raw,
+        output_root=store,
+        download_manifest=_download_contract(raw, tmp_path, len(market_frame)),
+        window_size=32,
+        bucket_count=4,
+        batch_rows=200,
+        purge_bars=20,
+        embargo_bars=14,
+    )
+    dataset = LazyFinancialWindowDataset(
+        store,
+        split="train",
+        window_size=32,
+        h_start=3,
+    )
+    worker_plan = plan_dataloader_workers(
+        2,
+        source="test",
+        visible_cpu_count=4,
+        available_memory_bytes=16 * 1024**3,
+    )
+    assert worker_plan.effective_workers == 2
+    cache_root = tmp_path / "training-cache" / "robust-scales"
+
+    first = resolve_runtime_robust_scales(
+        dataset,
+        sample_count=16,
+        seed=59,
+        worker_plan=worker_plan,
+        cache_root=cache_root,
+    )
+    second = resolve_runtime_robust_scales(
+        dataset,
+        sample_count=16,
+        seed=59,
+        worker_plan=worker_plan,
+        cache_root=cache_root,
+    )
+
+    assert first.cache_hit is False
+    assert second.cache_hit is True
+    assert second.scales == pytest.approx(first.scales)
+    assert first.cache_path == second.cache_path
+    assert first.cache_path.parent == cache_root.resolve()
+    assert not list(store.rglob("windows.parquet"))
+    assert not list(store.rglob("*label*.parquet"))
 
 
 def test_bar_store_resume_reuses_completed_outputs(

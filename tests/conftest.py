@@ -29,6 +29,7 @@ _PERSISTENT_ENVIRONMENT_KEYS = frozenset(
         "PIP_CACHE_DIR",
         "KRONOS_ROOT",
         "MODEL_CACHE_MANIFEST",
+        "FIN_TS_DATALOADER_WORKERS",
         "FIN_TS_H_START",
     }
 )

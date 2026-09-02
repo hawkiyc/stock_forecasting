@@ -26,6 +26,7 @@ RUNPOD_EXPECTED_TORCH_VERSION="${RUNPOD_EXPECTED_TORCH_VERSION:-2.9.1+cu128}"
 RUNPOD_EXPECTED_CUDA_PREFIX="${RUNPOD_EXPECTED_CUDA_PREFIX:-12.8}"
 RUNPOD_EXPECTED_UBUNTU_VERSION="${RUNPOD_EXPECTED_UBUNTU_VERSION:-24.04}"
 RUNPOD_ROLE="${RUNPOD_ROLE:-gpu-train}"
+FIN_TS_DATALOADER_WORKERS="${FIN_TS_DATALOADER_WORKERS:-auto}"
 RUNTIME_VERIFIER="${PROJECT_ROOT}/scripts/verify_runpod_runtime.py"
 READINESS_HELPER="${PROJECT_ROOT}/scripts/runpod_readiness.py"
 
@@ -37,6 +38,12 @@ if [[ -z "${RUNPOD_POD_ID:-}" \
 fi
 if [[ "${RUNPOD_ROLE}" != "gpu-train" ]]; then
     echo "Training entrypoint requires RUNPOD_ROLE=gpu-train" >&2
+    exit 2
+fi
+if [[ "${FIN_TS_DATALOADER_WORKERS}" != "auto" \
+    && ( ! "${FIN_TS_DATALOADER_WORKERS}" =~ ^(0|[1-9][0-9]*)$ \
+        || "${FIN_TS_DATALOADER_WORKERS}" -gt 32 ) ]]; then
+    echo "FIN_TS_DATALOADER_WORKERS must be auto or an integer from 0 through 32" >&2
     exit 2
 fi
 
@@ -79,6 +86,7 @@ runpod_acquire_gpu_workflow_lease "${NETWORK_VOLUME_ROOT}"
 export NETWORK_VOLUME_ROOT PROJECT_ROOT DATA_ROOT CACHE_ROOT LOG_ROOT SAVED_MODEL_ROOT WANDB_DIR
 export RUNPOD_VOLUME_ROOT="${NETWORK_VOLUME_ROOT}"
 export RUNPOD_SHUTDOWN_ACTION MAX_RUNTIME_SECONDS
+export FIN_TS_DATALOADER_WORKERS
 # Ignore image and SSH cache overrides; all runtime caches are persistent and derived from the volume.
 export XDG_CACHE_HOME="${CACHE_ROOT}/xdg"
 export HF_HOME="${CACHE_ROOT}/huggingface"
