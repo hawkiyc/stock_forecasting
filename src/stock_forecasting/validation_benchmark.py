@@ -241,17 +241,41 @@ def discover_checkpoint(
 
 
 def _unflatten_validation_metrics(flattened: dict[str, Any]) -> dict[str, Any]:
-    nested: dict[str, Any] = {}
     prefix = "validation/"
+    prefixed: dict[str, Any] = {}
+    unprefixed: dict[str, Any] = {}
     for name, value in flattened.items():
-        if not isinstance(name, str) or not name.startswith(prefix):
-            continue
-        components = name[len(prefix) :].split("/")
+        if not isinstance(name, str) or not name:
+            raise ValueError("Checkpoint validation metric name is invalid")
+        if name.startswith(prefix):
+            relative_name = name[len(prefix) :]
+            if not relative_name:
+                raise ValueError("Checkpoint validation metric name is invalid")
+            prefixed[relative_name] = value
+        else:
+            unprefixed[name] = value
+    if prefixed and unprefixed:
+        raise ValueError("Checkpoint mixes validation metric namespaces")
+
+    metrics = prefixed or unprefixed
+    nested: dict[str, Any] = {}
+    for name, value in sorted(metrics.items()):
+        components = name.split("/")
+        if any(not component for component in components):
+            raise ValueError("Checkpoint validation metric name is invalid")
         cursor = nested
         for component in components[:-1]:
-            cursor = cursor.setdefault(component, {})
-        cursor[components[-1]] = value
-    if "primary_5d" not in nested or "cross_sectional_5d" not in nested:
+            child = cursor.setdefault(component, {})
+            if not isinstance(child, dict):
+                raise ValueError("Checkpoint validation metric paths collide")
+            cursor = child
+        leaf = components[-1]
+        if leaf in cursor:
+            raise ValueError("Checkpoint validation metric paths collide")
+        cursor[leaf] = value
+    if not isinstance(nested.get("primary_5d"), dict) or not isinstance(
+        nested.get("cross_sectional_5d"), dict
+    ):
         raise ValueError("Checkpoint has no complete numerical validation metric snapshot")
     return nested
 
