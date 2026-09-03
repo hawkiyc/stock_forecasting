@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from stock_forecasting.config import ExperimentConfig
 from stock_forecasting.training import _flatten_metrics
 from stock_forecasting.validation_benchmark import (
+    VALIDATION_BENCHMARK_SCHEMA_VERSION,
+    ValidationBenchmark,
     _unflatten_validation_metrics,
+    build_evaluation_contract,
     checkpoint_validation_snapshot,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _validation_metrics() -> dict[str, object]:
@@ -56,9 +63,7 @@ def test_checkpoint_snapshot_round_trips_trainer_metric_namespace(
 def test_checkpoint_snapshot_accepts_legacy_validation_prefix() -> None:
     metrics = _validation_metrics()
 
-    assert _unflatten_validation_metrics(
-        _flatten_metrics(metrics, "validation")
-    ) == metrics
+    assert _unflatten_validation_metrics(_flatten_metrics(metrics, "validation")) == metrics
 
 
 def test_checkpoint_snapshot_rejects_mixed_metric_namespaces() -> None:
@@ -75,3 +80,94 @@ def test_checkpoint_snapshot_rejects_mixed_metric_namespaces() -> None:
 def test_checkpoint_snapshot_requires_primary_and_cross_sectional_metrics() -> None:
     with pytest.raises(ValueError, match="complete numerical validation metric snapshot"):
         _unflatten_validation_metrics({"primary_5d/selection_score": 0.2})
+
+
+def _evaluation_contract(
+    config: ExperimentConfig,
+    checkpoint: Path,
+) -> dict[str, Any]:
+    for name in ("adapter.safetensors", "resolved-config.yaml", "trainer-state.json"):
+        path = checkpoint / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(name, encoding="utf-8")
+    return build_evaluation_contract(
+        config,
+        run_id="run-validation-contract",
+        checkpoint=checkpoint,
+        training_resume_contract_sha256="a" * 64,
+        dataset_artifacts={"sha256": "b" * 64},
+        models=["always_buy", "kronos_full"],
+        seeds=[42],
+    )
+
+
+def test_evaluation_contract_ignores_pod_runtime_and_tracking_settings(
+    tmp_path: Path,
+) -> None:
+    first = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    second = first.model_copy(deep=True)
+    second.runtime.max_runtime_seconds = first.runtime.max_runtime_seconds * 2
+    second.runtime.termination_max_attempts += 1
+    second.wandb.project = "different-tracking-project"
+    second.wandb.mode = "offline"
+
+    first_contract = _evaluation_contract(first, tmp_path / "checkpoint")
+    second_contract = _evaluation_contract(second, tmp_path / "checkpoint")
+
+    assert first_contract == second_contract
+
+
+def test_evaluation_contract_keeps_numerical_validation_settings(
+    tmp_path: Path,
+) -> None:
+    first = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    second = first.model_copy(deep=True)
+    second.validation.neural_epochs += 1
+
+    first_contract = _evaluation_contract(first, tmp_path / "checkpoint")
+    second_contract = _evaluation_contract(second, tmp_path / "checkpoint")
+
+    assert first_contract != second_contract
+
+
+def test_resume_normalizes_legacy_contract_without_rerunning_completed_results(
+    tmp_path: Path,
+) -> None:
+    config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    checkpoint = tmp_path / "checkpoint"
+    current_contract = _evaluation_contract(config, checkpoint)
+    legacy_contract = json.loads(json.dumps(current_contract))
+    legacy_contract["version"] = "5.0"
+    legacy_contract["inputs"]["config"] = config.as_dict()
+    del legacy_contract["inputs"]["validation_numerical_config"]
+    legacy_contract["digest"] = "legacy-full-config-digest"
+    output = tmp_path / "validation-benchmark.json"
+    output.write_text(
+        json.dumps(
+            {
+                "schema_version": VALIDATION_BENCHMARK_SCHEMA_VERSION,
+                "evaluation_contract": legacy_contract,
+                "state": "ready",
+                "run_id": "run-validation-contract",
+                "checkpoint": str(checkpoint),
+                "models": {
+                    "always_buy": {"state": "complete"},
+                    "kronos_full": {"state": "complete"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    benchmark = object.__new__(ValidationBenchmark)
+    benchmark.resume = True
+    benchmark.output = output
+    benchmark.evaluation_contract = current_contract
+    benchmark.run_id = "run-validation-contract"
+    benchmark.checkpoint = checkpoint
+
+    resumed = benchmark._initial_payload()
+
+    assert resumed["state"] == "running"
+    assert resumed["evaluation_contract"] == current_contract
+    assert "resume_contract_normalized_at" in resumed
+    assert resumed["models"]["always_buy"]["state"] == "complete"

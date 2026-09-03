@@ -54,8 +54,18 @@ from stock_forecasting.wandb_status import update_wandb_status
 LEARNED_BASELINES = ("gbdt", "gru", "dlinear", "patchtst")
 FULL_MODEL_NAME = "kronos_full"
 ALL_VALIDATION_MODELS = (*RULE_BASELINE_NAMES, *LEARNED_BASELINES, FULL_MODEL_NAME)
-EVALUATION_CONTRACT_VERSION = "5.0"
+EVALUATION_CONTRACT_VERSION = "5.1"
 VALIDATION_BENCHMARK_SCHEMA_VERSION = "5.0"
+LEGACY_EVALUATION_CONTRACT_VERSIONS = ("5.0",)
+VALIDATION_NON_NUMERICAL_CONFIG_FIELDS = (
+    "enabled",
+    "auto_run_after_training",
+    "output_root",
+    "models",
+    "seeds",
+    "recompute_full_model",
+    "resume_completed_models",
+)
 MODEL_DEFINITIONS = {
     "always_buy": "Constant positive-alpha distribution calibrated only on train labels.",
     "zero_return": "Constant zero-alpha distribution calibrated only on train labels.",
@@ -127,6 +137,85 @@ def _file_fingerprint(path: Path) -> dict[str, Any]:
     return {"sha256": digest.hexdigest(), "size_bytes": size_bytes}
 
 
+def _validation_numerical_config(config: ExperimentConfig) -> dict[str, Any]:
+    """Return only settings that can change numerical benchmark results."""
+
+    payload = config.validation.model_dump(mode="json")
+    return {
+        name: value
+        for name, value in payload.items()
+        if name not in VALIDATION_NON_NUMERICAL_CONFIG_FIELDS
+    }
+
+
+def _stored_validation_numerical_config(
+    inputs: dict[str, Any],
+) -> dict[str, Any] | None:
+    current = inputs.get("validation_numerical_config")
+    if isinstance(current, dict):
+        source = current
+    else:
+        legacy_config = inputs.get("config")
+        if not isinstance(legacy_config, dict):
+            return None
+        legacy_validation = legacy_config.get("validation")
+        if not isinstance(legacy_validation, dict):
+            return None
+        source = legacy_validation
+    return {
+        name: value
+        for name, value in source.items()
+        if name not in VALIDATION_NON_NUMERICAL_CONFIG_FIELDS
+    }
+
+
+def _evaluation_contract_resume_view(
+    contract: Any,
+) -> dict[str, Any] | None:
+    """Normalize current and legacy contracts to reusable numerical inputs."""
+
+    if not isinstance(contract, dict):
+        return None
+    if contract.get("version") not in (
+        *LEGACY_EVALUATION_CONTRACT_VERSIONS,
+        EVALUATION_CONTRACT_VERSION,
+    ):
+        return None
+    inputs = contract.get("inputs")
+    if not isinstance(inputs, dict):
+        return None
+    required_inputs = (
+        "run_id",
+        "training_resume_contract_sha256",
+        "dataset_artifacts",
+        "model_architecture_sha256",
+        "models",
+        "seeds",
+        "checkpoint",
+        "evaluation_schema",
+    )
+    if any(name not in inputs for name in required_inputs):
+        return None
+    numerical_config = _stored_validation_numerical_config(inputs)
+    if numerical_config is None:
+        return None
+    return {
+        **{name: inputs[name] for name in required_inputs},
+        "validation_numerical_config": numerical_config,
+    }
+
+
+def _evaluation_contracts_are_resume_compatible(
+    stored: Any,
+    current: dict[str, Any],
+) -> bool:
+    """Compare only inputs that can change persisted numerical results."""
+
+    stored_view = _evaluation_contract_resume_view(stored)
+    current_view = _evaluation_contract_resume_view(current)
+    return stored_view is not None and stored_view == current_view
+
+
 def build_evaluation_contract(
     config: ExperimentConfig,
     *,
@@ -150,7 +239,7 @@ def build_evaluation_contract(
             "training_resume_contract_sha256": training_resume_contract_sha256,
             "dataset_artifacts": dataset_artifacts,
             "model_architecture_sha256": config.model_architecture_digest(),
-            "config": config.as_dict(),
+            "validation_numerical_config": _validation_numerical_config(config),
             "models": list(models),
             "seeds": list(seeds),
             "checkpoint": {
@@ -364,9 +453,7 @@ def _lazy_baseline_arrays(
         seed=seed,
     )
     arrays = (
-        baseline_arrays(dataset.record_at(index) for index in sampler)
-        if build_arrays
-        else None
+        baseline_arrays(dataset.record_at(index) for index in sampler) if build_arrays else None
     )
     return len(dataset), len(sampler), arrays
 
@@ -482,15 +569,22 @@ class ValidationBenchmark:
     def _initial_payload(self) -> dict[str, Any]:
         if self.resume and self.output.is_file():
             payload = _read_json(self.output)
+            stored_contract = payload.get("evaluation_contract")
             if (
                 payload.get("schema_version") != VALIDATION_BENCHMARK_SCHEMA_VERSION
-                or payload.get("evaluation_contract") != self.evaluation_contract
+                or not _evaluation_contracts_are_resume_compatible(
+                    stored_contract,
+                    self.evaluation_contract,
+                )
                 or payload.get("run_id") != self.run_id
                 or Path(str(payload.get("checkpoint", ""))).resolve() != self.checkpoint.resolve()
             ):
                 raise ValueError(
                     "Existing numerical validation output does not match this run contract"
                 )
+            if stored_contract != self.evaluation_contract:
+                payload["evaluation_contract"] = self.evaluation_contract
+                payload["resume_contract_normalized_at"] = _utc_now()
             payload.pop("error", None)
             payload["state"] = "running"
             payload["resumed_at"] = _utc_now()
