@@ -718,19 +718,68 @@ def test_cpu_execution_lifecycle_cannot_overwrite_immutable_dataset_readiness() 
         assert '--marker "${DATASET_MARKER_STAGING}"' in writer
         assert 'mv "${DATASET_MARKER_STAGING}" "${DATASET_MARKER}"' in writer
         assert '--output "${DATASET_MARKER}"' not in writer
-        readiness_writer = writer.split(
-            "publish_dataset_readiness() {", maxsplit=1
-        )[1].split("\n}", maxsplit=1)[0]
-        verify_index = readiness_writer.index(
-            '--verify-only > "${DATASET_MARKER_STAGING}"'
-        )
-        bind_index = readiness_writer.index(
-            '--marker "${DATASET_MARKER_STAGING}"'
-        )
-        publish_index = readiness_writer.index(
-            'mv "${DATASET_MARKER_STAGING}" "${DATASET_MARKER}"'
-        )
-        assert verify_index < bind_index < publish_index
+
+    prepare_readiness_writer = prepare.split(
+        "publish_dataset_readiness() {", maxsplit=1
+    )[1].split("\n}", maxsplit=1)[0]
+    prepare_verify_index = prepare_readiness_writer.index(
+        '--verify-only > "${DATASET_MARKER_STAGING}"'
+    )
+    prepare_bind_index = prepare_readiness_writer.index(
+        '--marker "${DATASET_MARKER_STAGING}"'
+    )
+    prepare_publish_index = prepare_readiness_writer.index(
+        'mv "${DATASET_MARKER_STAGING}" "${DATASET_MARKER}"'
+    )
+    assert prepare_verify_index < prepare_bind_index < prepare_publish_index
+
+    finalizer_contract_validator = finalize.split(
+        "validate_existing_dataset_contract() {", maxsplit=1
+    )[1].split("\n}", maxsplit=1)[0]
+    assert "check-dataset" in finalizer_contract_validator
+    assert '--marker "${DATASET_MARKER}"' in finalizer_contract_validator
+    assert "--network-volume-root" not in finalizer_contract_validator
+
+    finalizer_stager = finalize.split(
+        "stage_dataset_readiness() {", maxsplit=1
+    )[1].split("\n}", maxsplit=1)[0]
+    assert 'fin-ts-verify-stage1-data' in finalizer_stager
+    assert '--dataset-manifest "${DATASET_MANIFEST}"' in finalizer_stager
+    assert '--model-manifest "${MODEL_MANIFEST}"' in finalizer_stager
+    assert '--verify-only > "${DATASET_MARKER_STAGING}"' in finalizer_stager
+
+    finalizer_publisher = finalize.split(
+        "publish_dataset_readiness() {", maxsplit=1
+    )[1].split("\n}", maxsplit=1)[0]
+    finalizer_bind_index = finalizer_publisher.index(
+        '--marker "${DATASET_MARKER_STAGING}"'
+    )
+    finalizer_strict_check_index = finalizer_publisher.index("check-dataset")
+    finalizer_publish_index = finalizer_publisher.index(
+        'mv "${DATASET_MARKER_STAGING}" "${DATASET_MARKER}"'
+    )
+    assert '--network-volume-root "${NETWORK_VOLUME_ROOT}"' in finalizer_publisher
+    assert (
+        finalizer_bind_index
+        < finalizer_strict_check_index
+        < finalizer_publish_index
+    )
+
+    finalizer_main = finalize.split(
+        "write_finalization_state finalizing", maxsplit=1
+    )[1]
+    assert finalizer_main.index("validate_existing_dataset_contract") < (
+        finalizer_main.index("prefetch_hf_models.sh")
+    )
+    assert finalizer_main.index("prefetch_hf_models.sh") < finalizer_main.index(
+        "stage_dataset_readiness"
+    )
+    assert finalizer_main.index("stage_dataset_readiness") < finalizer_main.index(
+        '"${POETRY_BIN}" run pytest'
+    )
+    assert finalizer_main.index('"${POETRY_BIN}" run pytest') < (
+        finalizer_main.index("publish_dataset_readiness")
+    )
     assert "lifecycle/stage1/cpu-preparation.json" in tmux
     assert "stage1-cpu-preparation" in tmux
     assert (

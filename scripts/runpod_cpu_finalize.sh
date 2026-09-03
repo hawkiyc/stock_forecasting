@@ -114,7 +114,17 @@ write_finalization_state() {
     "${command[@]}"
 }
 
-publish_dataset_readiness() {
+validate_existing_dataset_contract() {
+    "${RUNPOD_PYTHON_BIN}" "${SCRIPT_DIR}/runpod_readiness.py" check-dataset \
+        --marker "${DATASET_MARKER}" \
+        --code-marker "${CODE_MARKER}" \
+        --stage-config "${STAGE2_CONFIG_PATH}" \
+        >/dev/null
+    printf '%s\n' \
+        'Existing dataset contract accepted; current artifacts will be revalidated after model cache refresh.'
+}
+
+stage_dataset_readiness() {
     if [[ -e "${DATASET_MARKER_STAGING}" || -L "${DATASET_MARKER_STAGING}" ]]; then
         echo "Refusing to overwrite a staged dataset readiness marker: ${DATASET_MARKER_STAGING}" >&2
         return 3
@@ -127,11 +137,24 @@ publish_dataset_readiness() {
         --volume-root "${NETWORK_VOLUME_ROOT}" \
         --launch-id "${LAUNCH_ID}" \
         --verify-only > "${DATASET_MARKER_STAGING}"
+}
+
+publish_dataset_readiness() {
+    if [[ ! -f "${DATASET_MARKER_STAGING}" || -L "${DATASET_MARKER_STAGING}" ]]; then
+        echo "A verified staged dataset readiness marker is unavailable: ${DATASET_MARKER_STAGING}" >&2
+        return 3
+    fi
     "${RUNPOD_PYTHON_BIN}" "${RUNPOD_SELECTION_HELPER}" bind-marker \
         --project-root "${PROJECT_ROOT}" \
         --selection "${RUNPOD_REMOTE_SELECTION_PATH}" \
         --marker "${DATASET_MARKER_STAGING}" \
         --volume-root "${NETWORK_VOLUME_ROOT}"
+    "${RUNPOD_PYTHON_BIN}" "${SCRIPT_DIR}/runpod_readiness.py" check-dataset \
+        --marker "${DATASET_MARKER_STAGING}" \
+        --code-marker "${CODE_MARKER}" \
+        --stage-config "${STAGE2_CONFIG_PATH}" \
+        --network-volume-root "${NETWORK_VOLUME_ROOT}" \
+        >/dev/null
     if [[ -L "${DATASET_MARKER}" || -d "${DATASET_MARKER}" ]]; then
         echo "Refusing to publish through an unsafe dataset readiness path: ${DATASET_MARKER}" >&2
         return 3
@@ -174,11 +197,7 @@ fi
 "${RUNPOD_PYTHON_BIN}" "${RUNPOD_SELECTION_HELPER}" verify-environment \
     --project-root "${PROJECT_ROOT}" \
     --selection "${RUNPOD_REMOTE_SELECTION_PATH}"
-"${RUNPOD_PYTHON_BIN}" "${SCRIPT_DIR}/runpod_readiness.py" check-dataset \
-    --marker "${DATASET_MARKER}" \
-    --code-marker "${CODE_MARKER}" \
-    --stage-config "${STAGE2_CONFIG_PATH}" \
-    --network-volume-root "${NETWORK_VOLUME_ROOT}"
+validate_existing_dataset_contract
 
 bash "${SCRIPT_DIR}/bootstrap_network_volume.sh"
 RUNPOD_ROLE=cpu-prep bash "${SCRIPT_DIR}/setup_runpod_environment.sh"
@@ -191,6 +210,7 @@ RUNPOD_ROLE=cpu-prep RUNPOD_CONFIG="${STAGE2_CONFIG}" \
 
 cd "${PROJECT_ROOT}"
 "${POETRY_BIN}" env use "${PROJECT_ROOT}/.venv/bin/python"
+stage_dataset_readiness
 "${POETRY_BIN}" run pytest
 publish_dataset_readiness
 
