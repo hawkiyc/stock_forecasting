@@ -28,6 +28,8 @@ FINALIZE_LOG="${RUNPOD_TMUX_LOG_FILE:-${FINALIZE_DIR}/combined.log}"
 METADATA_PATH="${FINALIZE_DIR}/metadata.json"
 CODE_MARKER="${LIFECYCLE_ROOT}/stage1/code.json"
 DATASET_MARKER="${LIFECYCLE_ROOT}/stage1/dataset.json"
+STAGING_ROOT="${NETWORK_VOLUME_ROOT}/tmp/stage1-finalize/${LAUNCH_ID}"
+DATASET_MARKER_STAGING="${STAGING_ROOT}/dataset-readiness-unbound.json"
 # Preserve the existing lifecycle path and kind for deployed guard compatibility.
 FINALIZATION_MARKER="${LIFECYCLE_ROOT}/stage1/mixed-finalization.json"
 MODEL_MANIFEST="${NETWORK_VOLUME_ROOT}/cache/hf-models.json"
@@ -66,7 +68,8 @@ STAGE2_CONFIG_PATH="${PROJECT_ROOT}/${STAGE2_CONFIG}"
 for path_name in \
     PROJECT_ROOT DATA_ROOT LOG_ROOT LIFECYCLE_ROOT POETRY_BIN FINALIZE_DIR \
     FINALIZE_LOG METADATA_PATH CODE_MARKER DATASET_MARKER FINALIZATION_MARKER \
-    MODEL_MANIFEST DATASET_MANIFEST STAGE2_CONFIG_PATH RUNPOD_SHUTDOWN_DIR \
+    STAGING_ROOT DATASET_MARKER_STAGING MODEL_MANIFEST DATASET_MANIFEST \
+    STAGE2_CONFIG_PATH RUNPOD_SHUTDOWN_DIR \
     RUNPOD_SHUTDOWN_MARKER RUNPOD_SELECTION_HELPER RUNPOD_REMOTE_SELECTION_PATH; do
     path_value="${!path_name}"
     case "${path_value}" in
@@ -88,7 +91,8 @@ if [[ ! -f "${STAGE2_CONFIG_PATH}" || -L "${STAGE2_CONFIG_PATH}" ]]; then
 fi
 bash "${SCRIPT_DIR}/verify_runpod_mounted_readiness.sh" --mount-only
 
-mkdir -p "${FINALIZE_DIR}" "${LIFECYCLE_ROOT}/stage1" "${RUNPOD_SHUTDOWN_DIR}"
+mkdir -p "${FINALIZE_DIR}" "${LIFECYCLE_ROOT}/stage1" "${RUNPOD_SHUTDOWN_DIR}" \
+    "${STAGING_ROOT}"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 FINALIZE_SUCCEEDED=0
 
@@ -108,6 +112,32 @@ write_finalization_state() {
         command+=(--exit-code "${exit_code}")
     fi
     "${command[@]}"
+}
+
+publish_dataset_readiness() {
+    if [[ -e "${DATASET_MARKER_STAGING}" || -L "${DATASET_MARKER_STAGING}" ]]; then
+        echo "Refusing to overwrite a staged dataset readiness marker: ${DATASET_MARKER_STAGING}" >&2
+        return 3
+    fi
+    "${POETRY_BIN}" run fin-ts-verify-stage1-data \
+        --dataset-manifest "${DATASET_MANIFEST}" \
+        --code-manifest "${CODE_MARKER}" \
+        --model-manifest "${MODEL_MANIFEST}" \
+        --config "${STAGE2_CONFIG_PATH}" \
+        --volume-root "${NETWORK_VOLUME_ROOT}" \
+        --launch-id "${LAUNCH_ID}" \
+        --verify-only > "${DATASET_MARKER_STAGING}"
+    "${RUNPOD_PYTHON_BIN}" "${RUNPOD_SELECTION_HELPER}" bind-marker \
+        --project-root "${PROJECT_ROOT}" \
+        --selection "${RUNPOD_REMOTE_SELECTION_PATH}" \
+        --marker "${DATASET_MARKER_STAGING}" \
+        --volume-root "${NETWORK_VOLUME_ROOT}"
+    if [[ -L "${DATASET_MARKER}" || -d "${DATASET_MARKER}" ]]; then
+        echo "Refusing to publish through an unsafe dataset readiness path: ${DATASET_MARKER}" >&2
+        return 3
+    fi
+    # Publish only after selection binding and complete marker validation pass.
+    mv "${DATASET_MARKER_STAGING}" "${DATASET_MARKER}"
 }
 
 finish_cpu_finalize() {
@@ -162,19 +192,7 @@ RUNPOD_ROLE=cpu-prep RUNPOD_CONFIG="${STAGE2_CONFIG}" \
 cd "${PROJECT_ROOT}"
 "${POETRY_BIN}" env use "${PROJECT_ROOT}/.venv/bin/python"
 "${POETRY_BIN}" run pytest
-"${POETRY_BIN}" run fin-ts-verify-stage1-data \
-    --dataset-manifest "${DATASET_MANIFEST}" \
-    --code-manifest "${CODE_MARKER}" \
-    --model-manifest "${MODEL_MANIFEST}" \
-    --config "${STAGE2_CONFIG_PATH}" \
-    --volume-root "${NETWORK_VOLUME_ROOT}" \
-    --launch-id "${LAUNCH_ID}" \
-    --output "${DATASET_MARKER}"
-"${RUNPOD_PYTHON_BIN}" "${RUNPOD_SELECTION_HELPER}" bind-marker \
-    --project-root "${PROJECT_ROOT}" \
-    --selection "${RUNPOD_REMOTE_SELECTION_PATH}" \
-    --marker "${DATASET_MARKER}" \
-    --volume-root "${NETWORK_VOLUME_ROOT}"
+publish_dataset_readiness
 
 write_finalization_state ready
 FINALIZE_SUCCEEDED=1

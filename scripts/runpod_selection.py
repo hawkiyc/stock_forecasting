@@ -700,7 +700,9 @@ def _validate_marker_artifact_paths(marker: Dict[str, Any], dataset_request_sha2
         _fail("Readiness marker model manifest path is not approved")
 
 
-def _verify_marker(marker: Dict[str, Any], selection: Dict[str, Any]) -> None:
+def _verify_unbound_marker(marker: Dict[str, Any], selection: Dict[str, Any]) -> None:
+    """Validate dataset content before selection provenance is attached."""
+
     if marker.get("schema_version") != 2 or marker.get("kind") != "stage1-dataset":
         _fail("Readiness marker schema is unsupported")
     if marker.get("state") != "ready":
@@ -711,19 +713,6 @@ def _verify_marker(marker: Dict[str, Any], selection: Dict[str, Any]) -> None:
         marker.get("selected_datasets"), request["selected_datasets"], "dataset providers"
     )
     _assert_equal(marker.get("date_range"), request["date_range"], "dataset date range")
-    prepared_request = marker.get("requested_dataset")
-    if not isinstance(prepared_request, dict):
-        _fail("Readiness marker requested dataset contract is invalid")
-    _assert_equal(
-        _payload_sha256(_dataset_request_core(prepared_request)),
-        selection["dataset_request_sha256"],
-        "requested dataset content contract",
-    )
-    _assert_equal(
-        marker.get("dataset_request_sha256"),
-        selection["dataset_request_sha256"],
-        "dataset_request_sha256",
-    )
     expected_storage = dataset_request_identity_payload(request)[
         "storage_preparation"
     ]
@@ -737,12 +726,31 @@ def _verify_marker(marker: Dict[str, Any], selection: Dict[str, Any]) -> None:
         _payload_sha256(expected_storage),
         "dataset storage contract digest",
     )
+    _validate_marker_artifact_paths(marker, selection["dataset_request_sha256"])
+
+
+def _verify_marker(marker: Dict[str, Any], selection: Dict[str, Any]) -> None:
+    """Validate a fully bound dataset readiness marker."""
+
+    _verify_unbound_marker(marker, selection)
+    prepared_request = marker.get("requested_dataset")
+    if not isinstance(prepared_request, dict):
+        _fail("Readiness marker requested dataset contract is invalid")
+    _assert_equal(
+        _payload_sha256(_dataset_request_core(prepared_request)),
+        selection["dataset_request_sha256"],
+        "requested dataset content contract",
+    )
+    _assert_equal(
+        marker.get("dataset_request_sha256"),
+        selection["dataset_request_sha256"],
+        "dataset_request_sha256",
+    )
     # Selection and stage fields on a dataset marker are provenance only. The
     # current remote selection is verified separately before Pod creation, so
     # training-only config changes must not invalidate identical prepared data.
     expected_data_root = f"datasets/{selection['dataset_request_sha256']}"
     _assert_equal(marker.get("data_root_relative"), expected_data_root, "dataset namespace")
-    _validate_marker_artifact_paths(marker, selection["dataset_request_sha256"])
 
 
 def _bind_marker(
@@ -751,7 +759,7 @@ def _bind_marker(
     *,
     volume_root: Path,
 ) -> Dict[str, Any]:
-    _verify_marker(marker, selection)
+    _verify_unbound_marker(marker, selection)
     request = selection["dataset_request"]
 
     download_artifact = marker.get("download_manifest")

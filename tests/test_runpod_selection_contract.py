@@ -94,6 +94,53 @@ def _marker(selection: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _unbound_marker(selection: dict[str, object]) -> dict[str, object]:
+    marker = _marker(selection)
+    for field in (
+        "selection_id",
+        "selection_sha256",
+        "dataset_request_sha256",
+        "selected_stage",
+        "stage_config_path",
+        "stage_config_sha256",
+        "requested_dataset",
+        "data_root_relative",
+    ):
+        marker.pop(field)
+    return marker
+
+
+def _write_download_manifest(
+    volume_root: Path,
+    marker: dict[str, object],
+    selection: dict[str, object],
+) -> None:
+    request = selection["dataset_request"]
+    assert isinstance(request, dict)
+    universe = request["universe"]
+    assert isinstance(universe, dict)
+    artifact = marker["download_manifest"]
+    assert isinstance(artifact, dict)
+    path = volume_root / str(artifact["relative_path"])
+    path.parent.mkdir(parents=True)
+    SELECTION._atomic_write_json(
+        path,
+        {
+            "dataset_profile": request["profile"],
+            "selected_datasets": request["selected_datasets"],
+            "date_range": request["date_range"],
+            "training_security_scope": (
+                "common_stock_adr_tdr_and_allowlisted_unleveraged_equity_etf_v1"
+            ),
+            "api_policy": {
+                "symbol_limit": universe["symbol_limit"],
+                "include_delisted": universe["include_delisted_us"],
+                "cache_revision": request["revision"],
+            },
+        },
+    )
+
+
 def _selection_environment(
     selection_path: Path,
     selection: dict[str, object],
@@ -109,6 +156,43 @@ def test_exact_cpu_marker_matches_active_training_selection(tmp_path: Path) -> N
     selection = SELECTION._build_selection(_arguments(), project_root)
 
     SELECTION._verify_marker(_marker(selection), selection)
+
+
+def test_unbound_cpu_marker_is_validated_then_bound_to_the_selection(
+    tmp_path: Path,
+) -> None:
+    project_root = _project_root(tmp_path / "project")
+    selection = SELECTION._build_selection(_arguments(), project_root)
+    marker = _unbound_marker(selection)
+    volume_root = tmp_path / "volume"
+    _write_download_manifest(volume_root, marker, selection)
+
+    with pytest.raises(SELECTION.SelectionError, match="requested dataset contract"):
+        SELECTION._verify_marker(marker, selection)
+
+    bound = SELECTION._bind_marker(marker, selection, volume_root=volume_root)
+
+    assert "requested_dataset" not in marker
+    assert bound["requested_dataset"] == selection["dataset_request"]
+    assert bound["dataset_request_sha256"] == selection["dataset_request_sha256"]
+    assert bound["selection_id"] == selection["selection_id"]
+    assert bound["selection_sha256"] == selection["selection_sha256"]
+    SELECTION._verify_marker(bound, selection)
+
+
+def test_binding_rejects_tampered_unbound_dataset_content(tmp_path: Path) -> None:
+    project_root = _project_root(tmp_path / "project")
+    selection = SELECTION._build_selection(_arguments(), project_root)
+    marker = _unbound_marker(selection)
+    storage = marker["storage_preparation_spec"]
+    assert isinstance(storage, dict)
+    storage["window_size"] = 256
+    marker["storage_preparation_spec_sha256"] = SELECTION._payload_sha256(storage)
+    volume_root = tmp_path / "volume"
+    _write_download_manifest(volume_root, marker, selection)
+
+    with pytest.raises(SELECTION.SelectionError, match="dataset storage contract"):
+        SELECTION._bind_marker(marker, selection, volume_root=volume_root)
 
 
 def test_training_only_selection_revision_reuses_identical_dataset_marker(

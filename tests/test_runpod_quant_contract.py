@@ -691,6 +691,7 @@ def test_cpu_acquisition_budget_is_resumable_and_reserves_preparation_time() -> 
 
 def test_cpu_execution_lifecycle_cannot_overwrite_immutable_dataset_readiness() -> None:
     prepare = (ROOT / "scripts/runpod_cpu_prepare.sh").read_text(encoding="utf-8")
+    finalize = (ROOT / "scripts/runpod_cpu_finalize.sh").read_text(encoding="utf-8")
     tmux = (ROOT / "scripts/runpod_tmux_launch.sh").read_text(encoding="utf-8")
     create_cpu = (ROOT / "scripts/create_runpod_cpu_pod.sh").read_text(
         encoding="utf-8"
@@ -701,17 +702,35 @@ def test_cpu_execution_lifecycle_cannot_overwrite_immutable_dataset_readiness() 
         'CPU_PREPARATION_MARKER="${LIFECYCLE_ROOT}/stage1/cpu-preparation.json"'
         in prepare
     )
-    lifecycle_writer = prepare.split("write_lifecycle_state() {", maxsplit=1)[1].split(
-        "finish_cpu_prep() {", maxsplit=1
-    )[0]
+    lifecycle_writer = prepare.split(
+        "write_lifecycle_state() {", maxsplit=1
+    )[1].split("\n}", maxsplit=1)[0]
     assert '--output "${CPU_PREPARATION_MARKER}"' in lifecycle_writer
     assert "--kind stage1-cpu-preparation" in lifecycle_writer
     assert "DATASET_MARKER" not in lifecycle_writer
     assert 'archive_dataset_readiness "${reason}"' in prepare
     assert "archive_stale_dataset_readiness" in prepare
     assert "archive_dataset_readiness stale-selection" in prepare
-    assert "fin-ts-verify-stage1-data" in prepare
-    assert '--output "${DATASET_MARKER}"' in prepare
+    for writer in (prepare, finalize):
+        assert 'DATASET_MARKER_STAGING=' in writer
+        assert 'fin-ts-verify-stage1-data' in writer
+        assert '--verify-only > "${DATASET_MARKER_STAGING}"' in writer
+        assert '--marker "${DATASET_MARKER_STAGING}"' in writer
+        assert 'mv "${DATASET_MARKER_STAGING}" "${DATASET_MARKER}"' in writer
+        assert '--output "${DATASET_MARKER}"' not in writer
+        readiness_writer = writer.split(
+            "publish_dataset_readiness() {", maxsplit=1
+        )[1].split("\n}", maxsplit=1)[0]
+        verify_index = readiness_writer.index(
+            '--verify-only > "${DATASET_MARKER_STAGING}"'
+        )
+        bind_index = readiness_writer.index(
+            '--marker "${DATASET_MARKER_STAGING}"'
+        )
+        publish_index = readiness_writer.index(
+            'mv "${DATASET_MARKER_STAGING}" "${DATASET_MARKER}"'
+        )
+        assert verify_index < bind_index < publish_index
     assert "lifecycle/stage1/cpu-preparation.json" in tmux
     assert "stage1-cpu-preparation" in tmux
     assert (
@@ -719,6 +738,9 @@ def test_cpu_execution_lifecycle_cannot_overwrite_immutable_dataset_readiness() 
         in create_cpu
     )
     assert "lifecycle/stage1/cpu-preparation.json cpu_prepare" in status
+    assert 'verify-marker' in status
+    assert 'reported_state=ready' in status
+    assert 'reason=selection_contract' in status
 
 
 def test_gpu_gate_verifies_lazy_bar_store_artifacts() -> None:

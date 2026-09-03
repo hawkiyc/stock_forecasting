@@ -7,6 +7,7 @@ umask 077
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 S3_WRAPPER="${SCRIPT_DIR}/runpod_s3_project.sh"
+RUNPOD_SELECTION_HELPER="${SCRIPT_DIR}/runpod_selection.py"
 
 # shellcheck source=lib/runpod_project_env.sh
 source "${SCRIPT_DIR}/lib/runpod_project_env.sh"
@@ -28,6 +29,7 @@ summarize_marker() {
     local found=0
     local listed_key=""
     local payload=""
+    local dataset_contract_valid=1
 
     for listed_key in ${AVAILABLE_KEYS}; do
         if [[ "${listed_key}" == "${key}" ]]; then
@@ -42,15 +44,30 @@ summarize_marker() {
     payload="$(bash "${S3_WRAPPER}" s3 cp \
         "s3://${RUNPOD_NETWORK_VOLUME_ID}/${key}" - \
         --only-show-errors)"
+    if [[ "${label}" == "dataset" ]] \
+        && ! printf '%s' "${payload}" | python3 "${RUNPOD_SELECTION_HELPER}" \
+            verify-marker \
+            --project-root "${PROJECT_ROOT}" \
+            --marker - >/dev/null 2>&1; then
+        dataset_contract_valid=0
+    fi
     printf '%s' "${payload}" | python3 -c '
 import json
 import sys
 
 label = sys.argv[1]
 payload = json.load(sys.stdin)
+reported_state = str(payload.get("state", "unknown"))
+dataset_contract_valid = sys.argv[2] == "1"
 fields = [
-    "state=" + str(payload.get("state", "unknown")),
+    "state=" + (
+        "invalid"
+        if label == "dataset" and reported_state == "ready" and not dataset_contract_valid
+        else reported_state
+    ),
 ]
+if label == "dataset" and reported_state == "ready" and not dataset_contract_valid:
+    fields.extend(("reported_state=ready", "reason=selection_contract"))
 for key in (
     "selection_id",
     "dataset_profile",
@@ -62,7 +79,7 @@ for key in (
     if value:
         fields.append(key + "=" + str(value))
 print("{:<12} {}".format(label, " ".join(fields)))
-' "${label}"
+' "${label}" "${dataset_contract_valid}"
 }
 
 summarize_download_progress() {

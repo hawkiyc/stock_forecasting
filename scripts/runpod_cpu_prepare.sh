@@ -29,6 +29,7 @@ DATASET_MARKER="${LIFECYCLE_ROOT}/stage1/dataset.json"
 CPU_PREPARATION_MARKER="${LIFECYCLE_ROOT}/stage1/cpu-preparation.json"
 MODEL_MANIFEST="${NETWORK_VOLUME_ROOT}/cache/hf-models.json"
 STAGING_ROOT="${NETWORK_VOLUME_ROOT}/tmp/stage1-prep/${LAUNCH_ID}"
+DATASET_MARKER_STAGING="${STAGING_ROOT}/dataset-readiness-unbound.json"
 DATA_STAGING_ROOT="${STAGING_ROOT}/data"
 RAW_STAGING="${DATA_STAGING_ROOT}/raw/market.parquet"
 DOWNLOAD_MANIFEST_STAGING="${DATA_STAGING_ROOT}/download-manifest.json"
@@ -210,7 +211,7 @@ fi
 for path_name in \
     PROJECT_ROOT DATA_ROOT LOG_ROOT LIFECYCLE_ROOT POETRY_BIN CONFIG_PATH \
     PREP_DIR PREP_LOG CODE_MARKER DATASET_MARKER CPU_PREPARATION_MARKER \
-    MODEL_MANIFEST STAGING_ROOT \
+    MODEL_MANIFEST STAGING_ROOT DATASET_MARKER_STAGING \
     DATA_STAGING_ROOT RAW_STAGING DOWNLOAD_MANIFEST_STAGING \
     DATASET_MANIFEST_STAGING REQUEST_LOG_STAGING RAW_FINAL BAR_STORE_FINAL \
     BAR_STORE_SUCCESS \
@@ -401,6 +402,35 @@ write_lifecycle_state() {
     "${command[@]}"
 }
 
+publish_dataset_readiness() {
+    local dataset_manifest="$1"
+
+    if [[ -e "${DATASET_MARKER_STAGING}" || -L "${DATASET_MARKER_STAGING}" ]]; then
+        echo "Refusing to overwrite a staged dataset readiness marker: ${DATASET_MARKER_STAGING}" >&2
+        return 3
+    fi
+    "${POETRY_BIN}" run fin-ts-verify-stage1-data \
+        --dataset-manifest "${dataset_manifest}" \
+        --code-manifest "${CODE_MARKER}" \
+        --model-manifest "${MODEL_MANIFEST}" \
+        --config "${CONFIG_PATH}" \
+        --volume-root "${NETWORK_VOLUME_ROOT}" \
+        --launch-id "${LAUNCH_ID}" \
+        --verify-only > "${DATASET_MARKER_STAGING}"
+    "${RUNPOD_PYTHON_BIN}" "${RUNPOD_SELECTION_HELPER}" bind-marker \
+        --project-root "${PROJECT_ROOT}" \
+        --selection "${RUNPOD_REMOTE_SELECTION_PATH}" \
+        --marker "${DATASET_MARKER_STAGING}" \
+        --volume-root "${NETWORK_VOLUME_ROOT}"
+    if [[ -L "${DATASET_MARKER}" || -d "${DATASET_MARKER}" ]]; then
+        echo "Refusing to publish through an unsafe dataset readiness path: ${DATASET_MARKER}" >&2
+        return 3
+    fi
+    # Both paths reside on the network volume, so rename publishes only the
+    # fully bound marker without exposing an intermediate ready state.
+    mv "${DATASET_MARKER_STAGING}" "${DATASET_MARKER}"
+}
+
 finish_cpu_prep() {
     local prep_exit_code=$?
     local prep_state=failed
@@ -513,19 +543,7 @@ if [[ ${REUSE_READY_DATASET} -eq 1 ]]; then
     fi
 fi
 if [[ ${REUSE_READY_DATASET} -eq 1 ]]; then
-    "${POETRY_BIN}" run fin-ts-verify-stage1-data \
-        --dataset-manifest "${DATASET_MANIFEST_FINAL}" \
-        --code-manifest "${CODE_MARKER}" \
-        --model-manifest "${MODEL_MANIFEST}" \
-        --config "${CONFIG_PATH}" \
-        --volume-root "${NETWORK_VOLUME_ROOT}" \
-        --launch-id "${LAUNCH_ID}" \
-        --output "${DATASET_MARKER}"
-    "${RUNPOD_PYTHON_BIN}" "${RUNPOD_SELECTION_HELPER}" bind-marker \
-        --project-root "${PROJECT_ROOT}" \
-        --selection "${RUNPOD_REMOTE_SELECTION_PATH}" \
-        --marker "${DATASET_MARKER}" \
-        --volume-root "${NETWORK_VOLUME_ROOT}"
+    publish_dataset_readiness "${DATASET_MANIFEST_FINAL}"
     PREP_SUCCEEDED=1
     printf 'CPU preparation reused immutable data; selection=%s; dataset profile=%s; readiness manifest: %s\n' \
         "${RUNPOD_SELECTION_ID}" "${FIN_TS_DATASET_PROFILE}" "${DATASET_MARKER}"
@@ -706,20 +724,7 @@ if [[ -e "${DATASET_MANIFEST_FINAL}" || -L "${DATASET_MANIFEST_FINAL}" ]]; then
 fi
 mv "${DATASET_MANIFEST_STAGING}" "${DATASET_MANIFEST_FINAL}"
 
-"${POETRY_BIN}" run fin-ts-verify-stage1-data \
-    --dataset-manifest "${DATASET_MANIFEST_FINAL}" \
-    --code-manifest "${CODE_MARKER}" \
-    --model-manifest "${MODEL_MANIFEST}" \
-    --config "${CONFIG_PATH}" \
-    --volume-root "${NETWORK_VOLUME_ROOT}" \
-    --launch-id "${LAUNCH_ID}" \
-    --output "${DATASET_MARKER}"
-
-"${RUNPOD_PYTHON_BIN}" "${RUNPOD_SELECTION_HELPER}" bind-marker \
-    --project-root "${PROJECT_ROOT}" \
-    --selection "${RUNPOD_REMOTE_SELECTION_PATH}" \
-    --marker "${DATASET_MARKER}" \
-    --volume-root "${NETWORK_VOLUME_ROOT}"
+publish_dataset_readiness "${DATASET_MANIFEST_FINAL}"
 
 PREP_SUCCEEDED=1
 printf 'CPU preparation completed; selection=%s; dataset profile=%s; readiness manifest: %s\n' \
