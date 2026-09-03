@@ -99,7 +99,10 @@ def test_bar_store_persists_bars_once_and_builds_labels_lazily(
     ]
 
     lazy_record = first_day.record_at(0)
-    legacy_item = FinancialWindowDataset([lazy_record])[0]
+    legacy_item = FinancialWindowDataset(
+        [lazy_record],
+        alpha_horizons=first_day.horizons,
+    )[0]
     assert torch.allclose(first_item["asset_series"], legacy_item["asset_series"])
     assert torch.allclose(
         first_item["benchmark_series"],

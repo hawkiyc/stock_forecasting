@@ -260,6 +260,7 @@ def test_automatic_training_batch_contract_fails_closed(
 def test_automatic_evaluation_batch_can_cover_the_training_search_range() -> None:
     payload = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml").as_dict()
     payload["training"]["batch_size"] = "auto"
+    payload["training"]["evaluation_batch_size"] = "auto"
     payload["training"]["gradient_accumulation_steps"] = "auto"
     payload["training"]["target_effective_batch_size"] = 16
     payload["training"]["auto_batch_max_size"] = 16
