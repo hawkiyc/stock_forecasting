@@ -161,7 +161,7 @@ def test_exact_cpu_marker_matches_active_training_selection(tmp_path: Path) -> N
 def test_unbound_cpu_marker_is_validated_then_bound_to_the_selection(
     tmp_path: Path,
 ) -> None:
-    project_root = _project_root(tmp_path / "project")
+    project_root = _project_root(tmp_path)
     selection = SELECTION._build_selection(_arguments(), project_root)
     marker = _unbound_marker(selection)
     volume_root = tmp_path / "volume"
@@ -181,7 +181,7 @@ def test_unbound_cpu_marker_is_validated_then_bound_to_the_selection(
 
 
 def test_binding_rejects_tampered_unbound_dataset_content(tmp_path: Path) -> None:
-    project_root = _project_root(tmp_path / "project")
+    project_root = _project_root(tmp_path)
     selection = SELECTION._build_selection(_arguments(), project_root)
     marker = _unbound_marker(selection)
     storage = marker["storage_preparation_spec"]
