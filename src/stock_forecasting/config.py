@@ -354,7 +354,7 @@ class TrainingConfig(StrictModel):
 
 class WandbConfig(StrictModel):
     enabled: bool = True
-    project: str = "fin-ts-quant"
+    project: str = "stock_forecasting"
     entity: str | None = None
     group: str | None = None
     name: str | None = None

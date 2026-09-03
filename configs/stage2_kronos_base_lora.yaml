@@ -89,7 +89,7 @@ training:
 
 wandb:
   enabled: true
-  project: ${WANDB_PROJECT:-fin-ts-quant}
+  project: ${WANDB_PROJECT:-stock_forecasting}
   entity: ${WANDB_ENTITY:-}
   group: kronos-base-lora
   name: stage2-full

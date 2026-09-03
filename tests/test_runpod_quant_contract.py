@@ -1096,6 +1096,14 @@ def test_checkpoint_download_names_follow_validated_retention_manifest(
 def test_wandb_contract_logs_dynamic_epoch_points_and_validation_metrics() -> None:
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     config = (ROOT / "src/stock_forecasting/config.py").read_text(encoding="utf-8")
+    local_config = (ROOT / "configs/local_mock.yaml").read_text(encoding="utf-8")
+    stage1_config = (ROOT / "configs/stage1_kronos_base_lora.yaml").read_text(
+        encoding="utf-8"
+    )
+    stage2_config = (ROOT / "configs/stage2_kronos_base_lora.yaml").read_text(
+        encoding="utf-8"
+    )
+    create_pod = (ROOT / "scripts/create_runpod_pod.sh").read_text(encoding="utf-8")
     training = (ROOT / "src/stock_forecasting/training.py").read_text(encoding="utf-8")
     validation = (ROOT / "src/stock_forecasting/validation_benchmark.py").read_text(
         encoding="utf-8"
@@ -1105,6 +1113,11 @@ def test_wandb_contract_logs_dynamic_epoch_points_and_validation_metrics() -> No
     wandb_sync_script = (ROOT / "scripts/runpod_wandb_sync.sh").read_text(encoding="utf-8")
 
     assert '"wandb==0.28.0"' in pyproject
+    assert 'project: str = "stock_forecasting"' in config
+    assert "project: stock_forecasting" in local_config
+    assert "project: ${WANDB_PROJECT:-stock_forecasting}" in stage1_config
+    assert "project: ${WANDB_PROJECT:-stock_forecasting}" in stage2_config
+    assert 'WANDB_PROJECT="${WANDB_PROJECT:-stock_forecasting}"' in create_pod
     assert "loss_log_points_per_epoch" in config
     assert "epoch_loss_logging_steps(" in training
     assert '"train/loss": logged_loss' in training

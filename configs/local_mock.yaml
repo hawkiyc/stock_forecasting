@@ -86,7 +86,7 @@ training:
 
 wandb:
   enabled: false
-  project: fin-ts-quant
+  project: stock_forecasting
   entity: null
   group: local
   name: local-mock
