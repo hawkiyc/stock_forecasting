@@ -72,6 +72,20 @@ def test_stage_configs_share_one_model_architecture_and_start_fresh() -> None:
     assert stage2.training.early_stopping_start_epoch == 1
     assert stage1.training.evaluations_per_epoch == 5
     assert stage2.training.evaluations_per_epoch == 5
+    assert stage1.training.batch_size == "auto"
+    assert stage2.training.batch_size == "auto"
+    assert stage1.training.evaluation_batch_size == "auto"
+    assert stage2.training.evaluation_batch_size == "auto"
+    assert stage1.training.gradient_accumulation_steps == "auto"
+    assert stage2.training.gradient_accumulation_steps == "auto"
+    assert stage1.training.num_workers == "auto"
+    assert stage2.training.num_workers == "auto"
+    assert stage1.training.target_effective_batch_size == 256
+    assert stage2.training.target_effective_batch_size == 256
+    assert stage1.training.dataloader_max_prefetch_factor == 16
+    assert stage2.training.dataloader_max_prefetch_factor == 16
+    assert stage1.training.loss_log_points_per_epoch == 250
+    assert stage2.training.loss_log_points_per_epoch == 250
     assert stage1.training.checkpoint_save_top_k == 5
     assert stage2.training.checkpoint_save_top_k == 5
     assert stage1.training.early_stopping_enabled is True
@@ -200,7 +214,12 @@ def test_production_stage_sample_caps_fail_closed(
 
 @pytest.mark.parametrize(
     "obsolete_field",
-    ["max_steps", "evaluate_every_steps", "checkpoint_every_steps"],
+    [
+        "max_steps",
+        "evaluate_every_steps",
+        "checkpoint_every_steps",
+        "log_every_steps",
+    ],
 )
 def test_training_config_rejects_obsolete_step_caps_and_cadence(
     obsolete_field: str,
@@ -210,6 +229,43 @@ def test_training_config_rejects_obsolete_step_caps_and_cadence(
     payload["training"][obsolete_field] = 200
 
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExperimentConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("batch_size", 0, "positive integers"),
+        ("num_workers", -1, "non-negative integer"),
+        ("auto_evaluation_batch_max_size", 12, "powers of two"),
+        (
+            "auto_batch_max_size",
+            512,
+            "cannot exceed target_effective_batch_size",
+        ),
+    ],
+)
+def test_automatic_training_batch_contract_fails_closed(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    payload = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml").as_dict()
+    payload["training"][field] = value
+
+    with pytest.raises(ValidationError, match=message):
+        ExperimentConfig.model_validate(payload)
+
+
+def test_automatic_evaluation_batch_can_cover_the_training_search_range() -> None:
+    payload = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml").as_dict()
+    payload["training"]["batch_size"] = "auto"
+    payload["training"]["gradient_accumulation_steps"] = "auto"
+    payload["training"]["target_effective_batch_size"] = 16
+    payload["training"]["auto_batch_max_size"] = 16
+    payload["training"]["auto_evaluation_batch_max_size"] = 8
+
+    with pytest.raises(ValidationError, match="maximum training batch size"):
         ExperimentConfig.model_validate(payload)
 
 
@@ -292,7 +348,7 @@ def test_training_resume_contract_binds_bounded_implementation_sources() -> None
     implementation = training_implementation_contract()
     contract = training_resume_contract(config)
 
-    assert contract["schema_version"] == TRAINING_RESUME_CONTRACT_VERSION == "5.0"
+    assert contract["schema_version"] == TRAINING_RESUME_CONTRACT_VERSION == "6.0"
     assert contract["model_output_schema_version"] == MODEL_OUTPUT_SCHEMA_VERSION == "5.0"
     assert contract["training_implementation"] == implementation
     assert set(implementation["files"]) == set(TRAINING_IMPLEMENTATION_PATHS)

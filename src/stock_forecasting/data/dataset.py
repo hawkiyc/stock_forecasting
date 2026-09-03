@@ -16,7 +16,11 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, Sampler
 
-from stock_forecasting.data.adjustments import asof_adjusted_window
+from stock_forecasting.data.adjustments import (
+    ADJUSTED_CLOSE_FIELD,
+    ADJUSTED_VOLUME_FIELD,
+    asof_adjusted_window,
+)
 from stock_forecasting.data.benchmarks import is_training_target_security
 from stock_forecasting.data.horizons import (
     DEFAULT_ALPHA_HORIZONS,
@@ -44,10 +48,12 @@ def _context_payload(window: pd.DataFrame) -> dict[str, list[Any]]:
     }
 
 
-def _series_from_context(context: dict[str, Any], series_mode: str) -> torch.Tensor:
-    values = np.column_stack(
-        [np.asarray(context[field], dtype=np.float32) for field in CONTEXT_FIELDS]
-    )
+def _series_from_values(values: np.ndarray, series_mode: str) -> torch.Tensor:
+    values = np.asarray(values, dtype=np.float32)
+    if values.ndim != 2 or values.shape[1] != len(CONTEXT_FIELDS):
+        raise ValueError("OHLCV context has an invalid shape")
+    if not np.isfinite(values).all():
+        raise ValueError("OHLCV context must contain only finite values")
     if series_mode == "relative":
         reference_price = max(float(values[-1, 3]), 1e-12)
         values[:, :4] = np.log(np.maximum(values[:, :4], 1e-12) / reference_price)
@@ -59,8 +65,57 @@ def _series_from_context(context: dict[str, Any], series_mode: str) -> torch.Ten
     return torch.from_numpy(values)
 
 
-def _timestamp_features_from_context(context: dict[str, Any]) -> torch.Tensor:
-    timestamps = pd.DatetimeIndex(pd.to_datetime(context["timestamp"], utc=True))
+def _series_from_context(context: dict[str, Any], series_mode: str) -> torch.Tensor:
+    values = np.column_stack(
+        [np.asarray(context[field], dtype=np.float32) for field in CONTEXT_FIELDS]
+    )
+    return _series_from_values(values, series_mode)
+
+
+def _series_from_asof_adjusted_frame(
+    frame: pd.DataFrame,
+    series_mode: str,
+) -> torch.Tensor:
+    """Create cutoff-causal OHLCV tensors without temporary DataFrame copies."""
+
+    raw_prices = frame.loc[:, list(CONTEXT_FIELDS[:4])].to_numpy(
+        dtype=np.float64,
+        copy=False,
+    )
+    raw_close = raw_prices[:, 3]
+    adjusted_close = (
+        frame[ADJUSTED_CLOSE_FIELD].to_numpy(dtype=np.float64, copy=False)
+        if ADJUSTED_CLOSE_FIELD in frame
+        else raw_close
+    )
+    price_factor = adjusted_close / np.maximum(raw_close, 1e-12)
+    cutoff_price_factor = float(price_factor[-1])
+    if not np.isfinite(cutoff_price_factor) or cutoff_price_factor <= 0.0:
+        raise ValueError("Cutoff total-return adjustment factor is invalid")
+
+    raw_volume = frame[CONTEXT_FIELDS[4]].to_numpy(dtype=np.float64, copy=False)
+    adjusted_volume = (
+        frame[ADJUSTED_VOLUME_FIELD].to_numpy(dtype=np.float64, copy=False)
+        if ADJUSTED_VOLUME_FIELD in frame
+        else raw_volume
+    )
+    volume_factor = np.divide(
+        adjusted_volume,
+        raw_volume,
+        out=np.ones_like(adjusted_volume),
+        where=raw_volume > 0.0,
+    )
+    cutoff_volume_factor = float(volume_factor[-1])
+    if not np.isfinite(cutoff_volume_factor) or cutoff_volume_factor <= 0.0:
+        raise ValueError("Cutoff share adjustment factor is invalid")
+
+    values = np.empty((len(frame), len(CONTEXT_FIELDS)), dtype=np.float32)
+    values[:, :4] = raw_prices * (price_factor / cutoff_price_factor)[:, None]
+    values[:, 4] = raw_volume * (volume_factor / cutoff_volume_factor)
+    return _series_from_values(values, series_mode)
+
+
+def _timestamp_features(timestamps: pd.DatetimeIndex) -> torch.Tensor:
     values = np.column_stack(
         [
             timestamps.minute,
@@ -71,6 +126,11 @@ def _timestamp_features_from_context(context: dict[str, Any]) -> torch.Tensor:
         ]
     ).astype(np.int64)
     return torch.from_numpy(values)
+
+
+def _timestamp_features_from_context(context: dict[str, Any]) -> torch.Tensor:
+    timestamps = pd.DatetimeIndex(pd.to_datetime(context["timestamp"], utc=True))
+    return _timestamp_features(timestamps)
 
 
 def _item_from_record(
@@ -524,12 +584,85 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
             },
         }
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        return _item_from_record(
-            self._record(index),
-            horizons=self.horizons,
-            series_mode=self.series_mode,
+    def _item(self, ordinal: int) -> dict[str, Any]:
+        """Build tensors directly from cached frames without a Python-list round trip."""
+
+        (
+            symbol,
+            index_row,
+            benchmark_symbol,
+            frame,
+            benchmark,
+            cutoff_index,
+            holding_dates,
+            benchmark_holding,
+        ) = self._sample_frames(ordinal)
+        start_index = cutoff_index - self.window_size + 1
+        observed_raw = frame.iloc[start_index : cutoff_index + 1]
+        observed_timestamps = pd.DatetimeIndex(observed_raw["timestamp"])
+        benchmark_observed_raw = self._aligned_rows(
+            benchmark_symbol,
+            benchmark,
+            observed_timestamps,
         )
+        alpha_values, _asset_returns, _benchmark_returns, _exit_dates = (
+            self._target_components(
+                frame=frame,
+                cutoff_index=cutoff_index,
+                holding_dates=holding_dates,
+                benchmark_holding=benchmark_holding,
+            )
+        )
+        if not np.isfinite(alpha_values).all():
+            raise ValueError("Alpha targets must be finite")
+        cutoff_at = pd.Timestamp(frame.loc[cutoff_index, "timestamp"])
+        metadata = {
+            "market": str(index_row["market"]),
+            "provider": str(index_row["provider"]),
+            "dataset_profile": str(index_row["dataset_profile"]),
+        }
+        return {
+            "asset_series": _series_from_asof_adjusted_frame(
+                observed_raw,
+                self.series_mode,
+            ),
+            "asset_timestamp_features": _timestamp_features(observed_timestamps),
+            "benchmark_series": _series_from_asof_adjusted_frame(
+                benchmark_observed_raw,
+                self.series_mode,
+            ),
+            "benchmark_timestamp_features": _timestamp_features(observed_timestamps),
+            "target_alpha": torch.from_numpy(
+                alpha_values.astype(np.float32, copy=False)
+            ),
+            "sample_id": f"{symbol}-{cutoff_at.strftime('%Y%m%dT%H%M%SZ')}",
+            "symbol": symbol,
+            "benchmark_symbol": benchmark_symbol,
+            "asset_type": str(index_row["asset_type"]),
+            "market": metadata["market"],
+            "provider": metadata["provider"],
+            "dataset_profile": metadata["dataset_profile"],
+            "cutoff_at": cutoff_at.isoformat(),
+            "diagnostics": {
+                "capm_abnormal_return": None,
+                "capm_status": "reserved_for_diagnostic_ablation",
+            },
+        }
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        return self._item(index)
+
+    def __getitems__(self, indices: list[int]) -> list[dict[str, Any]]:
+        """Serve one DataLoader batch in index order that maximizes cache locality."""
+
+        ordered = sorted(enumerate(indices), key=lambda item: item[1])
+        resolved = [(position, self._item(index)) for position, index in ordered]
+        items: list[dict[str, Any] | None] = [None] * len(indices)
+        for position, item in resolved:
+            items[position] = item
+        if any(item is None for item in items):
+            raise RuntimeError("Batched lazy dataset lookup did not resolve every index")
+        return [item for item in items if item is not None]
 
     def record_at(self, index: int) -> dict[str, Any]:
         """Return one ephemeral record for numerical baseline compatibility."""
@@ -718,14 +851,27 @@ def _padded_stream(
     batch_first: bool,
     padding_value: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    lengths = torch.tensor([item[series_key].shape[0] for item in items], dtype=torch.long)
+    series_values = [item[series_key] for item in items]
+    timestamp_values = [item[timestamp_key] for item in items]
+    lengths = torch.tensor([value.shape[0] for value in series_values], dtype=torch.long)
+    if bool(torch.all(lengths == lengths[0])):
+        stack_dimension = 0 if batch_first else 1
+        series = torch.stack(series_values, dim=stack_dimension)
+        timestamps = torch.stack(timestamp_values, dim=stack_dimension)
+        mask_shape = (
+            (len(items), int(lengths[0]))
+            if batch_first
+            else (int(lengths[0]), len(items))
+        )
+        mask = torch.ones(mask_shape, dtype=torch.bool)
+        return series, timestamps, mask, lengths
     series = pad_sequence(
-        [item[series_key] for item in items],
+        series_values,
         batch_first=batch_first,
         padding_value=padding_value,
     )
     timestamps = pad_sequence(
-        [item[timestamp_key] for item in items],
+        timestamp_values,
         batch_first=batch_first,
         padding_value=0.0,
     )

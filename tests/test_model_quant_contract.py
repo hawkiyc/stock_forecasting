@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -38,9 +39,12 @@ from stock_forecasting.models.outputs import MODEL_OUTPUT_SCHEMA_VERSION
 from stock_forecasting.run_contract import training_resume_contract_digest
 from stock_forecasting.training import (
     EarlyStoppingState,
+    RuntimeBatchPlan,
     epoch_evaluation_steps,
+    epoch_loss_logging_steps,
     evaluate_loader,
     plan_dataloader_workers,
+    plan_runtime_prefetch,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -104,6 +108,69 @@ def test_dataloader_worker_plan_is_cpu_and_memory_bounded() -> None:
         <= 128
     )
 
+    runpod_auto = plan_dataloader_workers(
+        32,
+        source="runpod_auto",
+        visible_cpu_count=32,
+        available_memory_bytes=60 * gib,
+    )
+    assert runpod_auto.effective_workers == 15
+
+
+def test_prefetch_factor_tracks_gpu_demand_with_memory_and_config_caps() -> None:
+    config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    workers = plan_dataloader_workers(
+        8,
+        source="test",
+        visible_cpu_count=16,
+        available_memory_bytes=64 * 1024**3,
+    )
+
+    def batch_plan(seconds_per_batch: float) -> RuntimeBatchPlan:
+        return RuntimeBatchPlan(
+            source="test",
+            training_batch_size=4,
+            evaluation_batch_size=8,
+            gradient_accumulation_steps=1,
+            effective_batch_size=4,
+            target_effective_batch_size=4,
+            device_name="test-gpu",
+            device_total_memory_bytes=24 * 1024**3,
+            optimizer_state_reserve_bytes=0,
+            seconds_per_training_batch=seconds_per_batch,
+            training_probe=(),
+            evaluation_probe=(),
+        )
+
+    fast = plan_runtime_prefetch(
+        workers,
+        config=config,
+        batch_plan=batch_plan(0.01),
+        largest_host_batch_bytes=1024**2,
+    )
+    slow = plan_runtime_prefetch(
+        workers,
+        config=config,
+        batch_plan=batch_plan(2.0),
+        largest_host_batch_bytes=1024**2,
+    )
+    memory_limited_workers = plan_dataloader_workers(
+        8,
+        source="test",
+        visible_cpu_count=16,
+        available_memory_bytes=8 * 1024**3,
+    )
+    memory_limited = plan_runtime_prefetch(
+        memory_limited_workers,
+        config=config,
+        batch_plan=batch_plan(0.01),
+        largest_host_batch_bytes=256 * 1024**2,
+    )
+
+    assert fast.prefetch_factor == config.training.dataloader_max_prefetch_factor == 4
+    assert slow.prefetch_factor == 2
+    assert memory_limited.prefetch_factor == 1
+
 
 def test_epoch_relative_validation_schedule_has_exactly_five_even_checkpoints() -> None:
     assert epoch_evaluation_steps(0, 13, 5) == (3, 6, 8, 11, 13)
@@ -111,6 +178,16 @@ def test_epoch_relative_validation_schedule_has_exactly_five_even_checkpoints() 
 
     with pytest.raises(ValueError, match="at least one optimizer step"):
         epoch_evaluation_steps(0, 4, 5)
+
+
+def test_loss_logging_resolves_requested_points_from_epoch_length() -> None:
+    steps = epoch_loss_logging_steps(0, 1_953, 250)
+
+    assert len(steps) == 250
+    assert steps[-1] == 1_953
+    assert steps[0] == 8
+    assert set(np.diff(steps)) <= {7, 8}
+    assert epoch_loss_logging_steps(1, 3, 250) == (4, 5, 6)
 
 
 def test_stage1_early_stopping_cannot_trigger_before_second_epoch() -> None:
@@ -275,17 +352,23 @@ def test_quant_model_preserves_head_and_reusable_encoder_shapes(h_start: int) ->
     benchmark_series = torch.rand(2, config.data.input_length, 5)
     mask = torch.ones(2, config.data.input_length, dtype=torch.bool)
     timestamps = torch.zeros(2, config.data.input_length, 5, dtype=torch.long)
-
-    output = bundle.model(
-        asset_series,
-        benchmark_series,
-        asset_attention_mask=mask,
-        benchmark_attention_mask=mask,
-        asset_timestamps=timestamps,
-        benchmark_timestamps=timestamps,
-        target_alpha=torch.zeros(2, len(config.data.alpha_horizons)),
+    backbone_calls: list[None] = []
+    handle = bundle.model.backbone.register_forward_hook(
+        lambda _module, _inputs, _output: backbone_calls.append(None)
     )
 
+    try:
+        output = bundle.model(
+            asset_series,
+            benchmark_series,
+            asset_timestamps=timestamps,
+            benchmark_timestamps=timestamps,
+            target_alpha=torch.zeros(2, len(config.data.alpha_horizons)),
+        )
+    finally:
+        handle.remove()
+
+    assert len(backbone_calls) == 1
     assert set(output) == {
         "loss",
         "pinball_loss",
@@ -333,6 +416,21 @@ def test_mock_checkpoint_contains_only_reusable_numeric_and_alpha_modules() -> N
         for name in state
     )
     assert not any(name.startswith("backbone.") for name in state)
+
+
+def test_pinball_loss_masks_missing_targets_without_host_synchronization() -> None:
+    config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    head = build_model_bundle(config, torch.device("cpu")).model.alpha_head
+    horizon_count = len(config.data.alpha_horizons)
+    predictions = torch.zeros(2, horizon_count, 3, requires_grad=True)
+    target = torch.full((2, horizon_count), float("nan"))
+    target[0, 0] = 1.0
+
+    loss = head.pinball_loss(predictions, target)
+
+    assert float(loss) == pytest.approx(0.5)
+    loss.backward()
+    assert predictions.grad is not None
 
 
 def test_checkpoint_restore_requires_the_exact_trainable_parameter_union() -> None:
@@ -558,6 +656,23 @@ def test_kronos_backbone_batches_equal_length_samples_together() -> None:
     assert output.last_hidden_state.shape == (3, 4, 3)
     assert torch.count_nonzero(output.last_hidden_state[1, 2:]) == 0
     assert torch.equal(output.attention_mask, mask)
+
+
+def test_kronos_backbone_uses_one_fast_path_for_fixed_length_batches() -> None:
+    tokenizer = _BatchTokenizer()
+    backbone = KronosBackbone(
+        _BatchKronos(),
+        tokenizer,
+        max_context=4,
+    )
+    series = torch.rand(3, 4, 5)
+    timestamps = torch.zeros(3, 4, 5, dtype=torch.long)
+
+    output = backbone(series, timestamps=timestamps)
+
+    assert tokenizer.encoded_shapes == [(3, 4, 6)]
+    assert output.last_hidden_state.shape == (3, 4, 3)
+    assert torch.all(output.attention_mask)
 
 
 def test_evaluation_restores_training_mode(

@@ -41,11 +41,12 @@ def _valid_mask(
             f"({batch_size}, {sequence_length}), got {tuple(attention_mask.shape)}"
         )
     mask = attention_mask.to(device=device, dtype=torch.bool)
-    if not mask.any(dim=1).all():
-        raise ValueError("Every time-series sample must contain at least one valid bar")
-    # Variable-length integrations assume padding is only on the right.
-    if ((~mask[:, :-1]) & mask[:, 1:]).any():
-        raise ValueError("time-series attention_mask must be right padded")
+    if device.type == "cpu":
+        if not mask.any(dim=1).all():
+            raise ValueError("Every time-series sample must contain at least one valid bar")
+        # Variable-length integrations assume padding is only on the right.
+        if ((~mask[:, :-1]) & mask[:, 1:]).any():
+            raise ValueError("time-series attention_mask must be right padded")
     return mask
 
 
@@ -91,7 +92,7 @@ class DeterministicTimeSeriesBackbone(nn.Module):
             raise ValueError(
                 f"Input contains {sequence_length} bars, exceeding max_context={self.max_context}"
             )
-        if not torch.isfinite(ohlcv).all():
+        if ohlcv.device.type == "cpu" and not torch.isfinite(ohlcv).all():
             raise ValueError("ohlcv contains non-finite values")
 
         mask = _valid_mask(
@@ -321,10 +322,23 @@ class KronosBackbone(nn.Module):
             raise ValueError(
                 f"Input contains {sequence_length} bars, exceeding max_context={self.max_context}"
             )
-        if not torch.isfinite(ohlcv).all():
+        if ohlcv.device.type == "cpu" and not torch.isfinite(ohlcv).all():
             raise ValueError("ohlcv contains non-finite values")
         if timestamps is not None and timestamps.shape != (batch_size, sequence_length, 5):
             raise ValueError("timestamps must have shape [batch, bars, 5]")
+        if attention_mask is None:
+            self.tokenizer.eval()
+            context = self._encode_batch(ohlcv, timestamps)
+            mask = torch.ones(
+                batch_size,
+                sequence_length,
+                dtype=torch.bool,
+                device=ohlcv.device,
+            )
+            return TimeSeriesBackboneOutput(
+                last_hidden_state=context,
+                attention_mask=mask,
+            )
         mask = _valid_mask(
             attention_mask,
             batch_size=batch_size,

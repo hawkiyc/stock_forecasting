@@ -14,6 +14,7 @@ import stock_forecasting.data.bar_store as bar_store_module
 from stock_forecasting.data.bar_store import PreparationPaused, build_symbol_bar_store
 from stock_forecasting.data.dataset import (
     BlockwisePermutationSampler,
+    FinancialWindowDataset,
     FixedSizeBatchSampler,
     LazyFinancialWindowDataset,
 )
@@ -91,8 +92,19 @@ def test_bar_store_persists_bars_once_and_builds_labels_lazily(
     assert first_item["asset_series"].shape == (32, 5)
     assert first_item["benchmark_series"].shape == (32, 5)
     assert torch.equal(first_day.target_at(0), first_item["target_alpha"])
+    batched_items = first_day.__getitems__([1, 0])
+    assert [item["sample_id"] for item in batched_items] == [
+        first_day[1]["sample_id"],
+        first_day[0]["sample_id"],
+    ]
 
     lazy_record = first_day.record_at(0)
+    legacy_item = FinancialWindowDataset([lazy_record])[0]
+    assert torch.allclose(first_item["asset_series"], legacy_item["asset_series"])
+    assert torch.allclose(
+        first_item["benchmark_series"],
+        legacy_item["benchmark_series"],
+    )
     legacy_by_id = {
         record["sample_id"]: record
         for record in build_causal_windows(

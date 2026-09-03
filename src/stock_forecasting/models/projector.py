@@ -34,14 +34,19 @@ class _PerceiverLayer(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, latents: Tensor, context: Tensor, context_mask: Tensor) -> Tensor:
+    def forward(
+        self,
+        latents: Tensor,
+        context: Tensor,
+        context_mask: Tensor | None,
+    ) -> Tensor:
         query = self.query_norm(latents)
         key_value = self.context_norm(context)
         attended, _ = self.cross_attention(
             query=query,
             key=key_value,
             value=key_value,
-            key_padding_mask=~context_mask,
+            key_padding_mask=None if context_mask is None else ~context_mask,
             need_weights=False,
         )
         latents = latents + self.dropout(attended)
@@ -128,17 +133,12 @@ class CausalPerceiverResampler(nn.Module):
         if hidden_size != self.input_dim:
             raise ValueError(f"Expected hidden size {self.input_dim}, got {hidden_size}")
         if attention_mask is None:
-            mask = torch.ones(
-                batch_size,
-                sequence_length,
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
+            mask = None
         else:
             if attention_mask.shape != (batch_size, sequence_length):
                 raise ValueError("attention_mask does not match hidden_states")
             mask = attention_mask.to(device=hidden_states.device, dtype=torch.bool)
-        if not mask.any(dim=1).all():
+        if mask is not None and mask.device.type == "cpu" and not mask.any(dim=1).all():
             raise ValueError("Every sample must provide at least one valid backbone token")
 
         context = self.context_projection(hidden_states)

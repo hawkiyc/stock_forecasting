@@ -141,10 +141,10 @@ class MultiHorizonAlphaHead(nn.Module):
         if tuple(target.shape) != (predictions.shape[0], len(self.horizons)):
             raise ValueError("target_alpha must have shape [batch, horizons]")
         valid = torch.isfinite(target)
-        if not valid.any():
-            return predictions.sum() * 0.0
+        safe_target = torch.where(valid, target, torch.zeros_like(target))
         scales = self.robust_scales.to(device=predictions.device, dtype=predictions.dtype)
-        errors = (target[..., None] - predictions) / scales[None, :, None]
+        errors = (safe_target[..., None] - predictions) / scales[None, :, None]
         levels = predictions.new_tensor(self.quantiles)
         losses = torch.maximum(levels * errors, (levels - 1.0) * errors)
-        return losses[valid[..., None].expand_as(losses)].mean()
+        weights = valid[..., None].expand_as(losses).to(dtype=losses.dtype)
+        return (losses * weights).sum() / weights.sum().clamp_min(1.0)

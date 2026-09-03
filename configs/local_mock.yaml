@@ -56,12 +56,20 @@ training:
   batch_size: 4
   evaluation_batch_size: 8
   gradient_accumulation_steps: 1
+  target_effective_batch_size: 4
+  auto_batch_min_size: 1
+  auto_batch_max_size: 4
+  auto_evaluation_batch_max_size: 8
+  auto_batch_memory_fraction: 0.72
+  auto_batch_probe_steps: 1
+  dataloader_prefetch_target_seconds: 2.0
+  dataloader_max_prefetch_factor: 4
   learning_rate: 0.0001
   lora_learning_rate: 0.00001
   weight_decay: 0.01
   warmup_ratio: 0.0
   max_grad_norm: 1.0
-  log_every_steps: 1
+  loss_log_points_per_epoch: 10
   evaluations_per_epoch: 1
   checkpoint_save_top_k: 1
   checkpoint_monitor: primary_5d/selection_score

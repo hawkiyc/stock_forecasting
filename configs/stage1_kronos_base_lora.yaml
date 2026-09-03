@@ -56,15 +56,23 @@ training:
   stage: stage1
   seed: 42
   epochs: 2
-  batch_size: 8
-  evaluation_batch_size: 16
-  gradient_accumulation_steps: 2
+  batch_size: auto
+  evaluation_batch_size: auto
+  gradient_accumulation_steps: auto
+  target_effective_batch_size: 256
+  auto_batch_min_size: 4
+  auto_batch_max_size: 256
+  auto_evaluation_batch_max_size: 512
+  auto_batch_memory_fraction: 0.72
+  auto_batch_probe_steps: 2
+  dataloader_prefetch_target_seconds: 2.0
+  dataloader_max_prefetch_factor: 16
   learning_rate: 0.0001
   lora_learning_rate: 0.00001
   weight_decay: 0.01
   warmup_ratio: 0.03
   max_grad_norm: 1.0
-  log_every_steps: 1
+  loss_log_points_per_epoch: 250
   evaluations_per_epoch: 5
   checkpoint_save_top_k: 5
   checkpoint_monitor: primary_5d/selection_score
@@ -76,7 +84,7 @@ training:
   output_root: ${SAVED_MODEL_ROOT:-/runpod-volume/savedModel}
   resume_checkpoint: null
   mixed_precision: bf16
-  num_workers: 2
+  num_workers: auto
   evaluation_max_samples: 20000
 
 wandb:

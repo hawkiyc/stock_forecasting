@@ -1093,7 +1093,7 @@ def test_checkpoint_download_names_follow_validated_retention_manifest(
     assert "transactions disagree" in mismatch.stderr
 
 
-def test_wandb_contract_logs_every_optimizer_step_and_validation_metrics() -> None:
+def test_wandb_contract_logs_dynamic_epoch_points_and_validation_metrics() -> None:
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     config = (ROOT / "src/stock_forecasting/config.py").read_text(encoding="utf-8")
     training = (ROOT / "src/stock_forecasting/training.py").read_text(encoding="utf-8")
@@ -1105,8 +1105,9 @@ def test_wandb_contract_logs_every_optimizer_step_and_validation_metrics() -> No
     wandb_sync_script = (ROOT / "scripts/runpod_wandb_sync.sh").read_text(encoding="utf-8")
 
     assert '"wandb==0.28.0"' in pyproject
-    assert "log_every_steps: Literal[1] = 1" in config
-    assert '"train/loss": optimizer_step_loss' in training
+    assert "loss_log_points_per_epoch" in config
+    assert "epoch_loss_logging_steps(" in training
+    assert '"train/loss": logged_loss' in training
     assert "step=global_step" in training
     assert "last_validation_flat_metrics = _flatten_metrics(validation_metrics)" in training
     assert 'f"validation/{key}": value' in training
@@ -1135,7 +1136,11 @@ def test_runpod_training_auto_tunes_multiprocess_data_loading() -> None:
 
     assert 'FIN_TS_DATALOADER_WORKERS="${FIN_TS_DATALOADER_WORKERS:-auto}"' in entrypoint
     assert '"FIN_TS_DATALOADER_WORKERS"' in reexec
-    assert "DATALOADER_AUTO_MAX_WORKERS = 8" in training
+    assert "DATALOADER_AUTO_MAX_WORKERS = 32" in training
+    assert "resolve_runtime_batch_plan(" in training
+    assert "plan_runtime_prefetch(" in training
+    assert "iter_device_batches(" in training
+    assert "DATALOADER_SELECTION_BLOCK_SIZE = 128" in training
     assert '"dataloader_worker_plan": worker_plan.as_dict()' in training
     assert "resolve_runtime_robust_scales(" in training
     assert '"parallel_backend": "pytorch_dataloader_processes"' in training

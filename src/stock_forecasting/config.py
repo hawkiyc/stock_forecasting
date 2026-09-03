@@ -243,15 +243,23 @@ class TrainingConfig(StrictModel):
     stage: TrainingStage
     seed: int = 42
     epochs: int = Field(default=1, ge=1)
-    batch_size: int = Field(default=8, ge=1)
-    evaluation_batch_size: int = Field(default=16, ge=1)
-    gradient_accumulation_steps: int = Field(default=1, ge=1)
+    batch_size: int | Literal["auto"] = "auto"
+    evaluation_batch_size: int | Literal["auto"] = "auto"
+    gradient_accumulation_steps: int | Literal["auto"] = "auto"
+    target_effective_batch_size: int = Field(default=256, ge=1)
+    auto_batch_min_size: int = Field(default=4, ge=1)
+    auto_batch_max_size: int = Field(default=256, ge=1)
+    auto_evaluation_batch_max_size: int = Field(default=512, ge=1)
+    auto_batch_memory_fraction: float = Field(default=0.72, gt=0.0, lt=1.0)
+    auto_batch_probe_steps: int = Field(default=2, ge=1, le=10)
+    dataloader_prefetch_target_seconds: float = Field(default=2.0, gt=0.0, le=10.0)
+    dataloader_max_prefetch_factor: int = Field(default=8, ge=2, le=16)
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lora_learning_rate: float = Field(default=1e-5, gt=0.0)
     weight_decay: float = Field(default=0.01, ge=0.0)
     warmup_ratio: float = Field(default=0.03, ge=0.0, lt=1.0)
     max_grad_norm: float = Field(default=1.0, gt=0.0)
-    log_every_steps: Literal[1] = 1
+    loss_log_points_per_epoch: int = Field(default=250, ge=1, le=1_000)
     evaluations_per_epoch: int = Field(default=5, ge=1, le=100)
     checkpoint_save_top_k: int = Field(default=5, ge=1, le=10)
     checkpoint_monitor: str = "primary_5d/selection_score"
@@ -263,8 +271,31 @@ class TrainingConfig(StrictModel):
     output_root: Path = Path("/runpod-volume/savedModel")
     resume_checkpoint: Path | None = None
     mixed_precision: Literal["no", "bf16"] = "bf16"
-    num_workers: int = Field(default=2, ge=0)
+    num_workers: int | Literal["auto"] = "auto"
     evaluation_max_samples: int = Field(default=20_000, ge=32)
+
+    @field_validator(
+        "batch_size",
+        "evaluation_batch_size",
+        "gradient_accumulation_steps",
+        mode="before",
+    )
+    @classmethod
+    def validate_automatic_or_positive_integer(cls, value: Any) -> Any:
+        if value == "auto":
+            return value
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("Training batch controls must be 'auto' or positive integers")
+        return value
+
+    @field_validator("num_workers", mode="before")
+    @classmethod
+    def validate_automatic_or_non_negative_integer(cls, value: Any) -> Any:
+        if value == "auto":
+            return value
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("num_workers must be 'auto' or a non-negative integer")
+        return value
 
     @model_validator(mode="after")
     def validate_training_contract(self) -> TrainingConfig:
@@ -274,6 +305,50 @@ class TrainingConfig(StrictModel):
             raise ValueError("lora_learning_rate cannot exceed learning_rate")
         if self.early_stopping_enabled and self.early_stopping_start_epoch > self.epochs:
             raise ValueError("early_stopping_start_epoch cannot exceed configured epochs")
+        if self.auto_batch_min_size > self.auto_batch_max_size:
+            raise ValueError("auto_batch_min_size cannot exceed auto_batch_max_size")
+        if self.auto_batch_max_size > self.target_effective_batch_size:
+            raise ValueError(
+                "auto_batch_max_size cannot exceed target_effective_batch_size"
+            )
+        automatic_sizes = (
+            self.target_effective_batch_size,
+            self.auto_batch_min_size,
+            self.auto_batch_max_size,
+            self.auto_evaluation_batch_max_size,
+        )
+        if any(value & (value - 1) for value in automatic_sizes):
+            raise ValueError("Automatic batch sizes must be powers of two")
+        if self.auto_evaluation_batch_max_size < self.auto_batch_min_size:
+            raise ValueError(
+                "auto_evaluation_batch_max_size cannot be smaller than auto_batch_min_size"
+            )
+        minimum_evaluation_capacity = (
+            self.auto_batch_max_size
+            if self.batch_size == "auto"
+            else self.batch_size
+        )
+        if (
+            self.evaluation_batch_size == "auto"
+            and self.auto_evaluation_batch_max_size < minimum_evaluation_capacity
+        ):
+            raise ValueError(
+                "auto_evaluation_batch_max_size cannot be smaller than the maximum "
+                "training batch size"
+            )
+        if self.batch_size == "auto" and self.gradient_accumulation_steps != "auto":
+            raise ValueError(
+                "Automatic batch sizing requires automatic gradient accumulation"
+            )
+        if (
+            isinstance(self.batch_size, int)
+            and self.gradient_accumulation_steps == "auto"
+            and self.target_effective_batch_size % self.batch_size != 0
+        ):
+            raise ValueError(
+                "target_effective_batch_size must be divisible by an explicit batch_size "
+                "when gradient accumulation is automatic"
+            )
         return self
 
 
