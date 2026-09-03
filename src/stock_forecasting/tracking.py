@@ -121,11 +121,14 @@ def collect_dataset_provenance(
 
 
 def collect_selection_provenance() -> dict[str, Any]:
-    """Collect the non-secret selection identity already checked by the mounted gate."""
+    """Collect active training and prepared-dataset selection provenance."""
 
     selection_id = os.environ.get("RUNPOD_SELECTION_ID", "")
     selection_sha256 = os.environ.get("RUNPOD_SELECTION_SHA256", "")
     dataset_request_sha256 = os.environ.get("RUNPOD_DATASET_REQUEST_SHA256", "")
+    selected_stage = os.environ.get("RUNPOD_STAGE", "")
+    stage_config_sha256 = os.environ.get("RUNPOD_STAGE_CONFIG_SHA256", "")
+    stage_config_path = os.environ.get("RUNPOD_CONFIG", "")
     if not selection_id and not os.environ.get("RUNPOD_POD_ID"):
         return {"status": "unavailable"}
     if _SELECTION_ID_PATTERN.fullmatch(selection_id) is None:
@@ -134,6 +137,12 @@ def collect_selection_provenance() -> dict[str, Any]:
         raise ValueError("RunPod selection digest is unavailable or invalid")
     if _SHA256_PATTERN.fullmatch(dataset_request_sha256) is None:
         raise ValueError("RunPod dataset request digest is unavailable or invalid")
+    if selected_stage not in {"stage1", "stage2"}:
+        raise ValueError("RunPod training stage is unavailable or invalid")
+    if _SHA256_PATTERN.fullmatch(stage_config_sha256) is None:
+        raise ValueError("RunPod stage config digest is unavailable or invalid")
+    if not stage_config_path:
+        raise ValueError("RunPod stage config path is unavailable")
 
     volume_root = canonical_network_volume_root()
     marker = Path(
@@ -145,21 +154,46 @@ def collect_selection_provenance() -> dict[str, Any]:
     if not marker.is_file():
         raise FileNotFoundError(f"RunPod dataset readiness marker is missing: {marker}")
     payload = json.loads(marker.read_text(encoding="utf-8"))
-    expected = {
+    active_selection = {
         "selection_id": selection_id,
         "selection_sha256": selection_sha256,
         "dataset_request_sha256": dataset_request_sha256,
-        "selected_stage": os.environ.get("RUNPOD_STAGE", ""),
-        "stage_config_sha256": os.environ.get("RUNPOD_STAGE_CONFIG_SHA256", ""),
+        "selected_stage": selected_stage,
+        "stage_config_path": stage_config_path,
+        "stage_config_sha256": stage_config_sha256,
     }
-    for key, value in expected.items():
-        if payload.get(key) != value:
-            raise ValueError(f"RunPod selection provenance disagrees on {key}")
+    if payload.get("dataset_request_sha256") != dataset_request_sha256:
+        raise ValueError(
+            "RunPod selection provenance disagrees on dataset_request_sha256"
+        )
+    dataset_marker_selection = {
+        "selection_id": payload.get("selection_id"),
+        "selection_sha256": payload.get("selection_sha256"),
+        "selected_stage": payload.get("selected_stage"),
+        "stage_config_path": payload.get("stage_config_path"),
+        "stage_config_sha256": payload.get("stage_config_sha256"),
+    }
+    if _SELECTION_ID_PATTERN.fullmatch(
+        str(dataset_marker_selection["selection_id"])
+    ) is None:
+        raise ValueError("RunPod dataset marker selection ID is invalid")
+    for key in ("selection_sha256", "stage_config_sha256"):
+        if _SHA256_PATTERN.fullmatch(str(dataset_marker_selection[key])) is None:
+            raise ValueError(f"RunPod dataset marker {key} is invalid")
+    if dataset_marker_selection["selected_stage"] not in {"stage1", "stage2"}:
+        raise ValueError("RunPod dataset marker training stage is invalid")
+    marker_stage_config_path = dataset_marker_selection["stage_config_path"]
+    if not isinstance(marker_stage_config_path, str) or not marker_stage_config_path:
+        raise ValueError("RunPod dataset marker stage config path is invalid")
     return {
         "status": "ready",
         "path": str(marker),
-        **expected,
-        "stage_config_path": payload.get("stage_config_path"),
+        **active_selection,
+        "dataset_marker_selection": dataset_marker_selection,
+        "dataset_marker_selection_matches_active": (
+            dataset_marker_selection
+            == {key: active_selection[key] for key in dataset_marker_selection}
+        ),
         "requested_dataset": payload.get("requested_dataset"),
     }
 

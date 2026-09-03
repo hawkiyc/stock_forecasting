@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from stock_forecasting.tracking import TrackingRun
+from stock_forecasting.tracking import TrackingRun, collect_selection_provenance
 from stock_forecasting.wandb_status import read_wandb_status, update_wandb_status
 
 
@@ -24,6 +24,79 @@ class _FailingLogBackend:
 
     def finish(self, *, exit_code: int = 0) -> None:
         assert exit_code == 1
+
+
+def _configure_selection_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    dataset_request_sha256: str,
+) -> None:
+    marker = tmp_path / "dataset.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "selection_id": "selection-1111111111111111",
+                "selection_sha256": "1" * 64,
+                "dataset_request_sha256": dataset_request_sha256,
+                "selected_stage": "stage1",
+                "stage_config_path": "configs/stage1_kronos_base_lora.yaml",
+                "stage_config_sha256": "2" * 64,
+                "requested_dataset": {"profile": "us_tw_eodhd"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RUNPOD_POD_ID", "test-pod")
+    monkeypatch.setenv("NETWORK_VOLUME_ROOT", str(tmp_path))
+    monkeypatch.setenv("RUNPOD_VOLUME_ROOT", str(tmp_path))
+    monkeypatch.setenv("DATASET_READINESS_MANIFEST", str(marker))
+    monkeypatch.setenv("RUNPOD_SELECTION_ID", "selection-aaaaaaaaaaaaaaaa")
+    monkeypatch.setenv("RUNPOD_SELECTION_SHA256", "a" * 64)
+    monkeypatch.setenv("RUNPOD_DATASET_REQUEST_SHA256", "d" * 64)
+    monkeypatch.setenv("RUNPOD_STAGE", "stage1")
+    monkeypatch.setenv("RUNPOD_CONFIG", "configs/stage1_kronos_base_lora.yaml")
+    monkeypatch.setenv("RUNPOD_STAGE_CONFIG_SHA256", "b" * 64)
+
+
+def test_tracking_accepts_training_only_selection_revisions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configure_selection_provenance(
+        monkeypatch,
+        tmp_path,
+        dataset_request_sha256="d" * 64,
+    )
+
+    provenance = collect_selection_provenance()
+
+    assert provenance["selection_id"] == "selection-aaaaaaaaaaaaaaaa"
+    assert provenance["selection_sha256"] == "a" * 64
+    assert provenance["stage_config_sha256"] == "b" * 64
+    assert provenance["dataset_request_sha256"] == "d" * 64
+    assert provenance["dataset_marker_selection"] == {
+        "selection_id": "selection-1111111111111111",
+        "selection_sha256": "1" * 64,
+        "selected_stage": "stage1",
+        "stage_config_path": "configs/stage1_kronos_base_lora.yaml",
+        "stage_config_sha256": "2" * 64,
+    }
+    assert provenance["dataset_marker_selection_matches_active"] is False
+
+
+def test_tracking_rejects_a_different_dataset_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configure_selection_provenance(
+        monkeypatch,
+        tmp_path,
+        dataset_request_sha256="e" * 64,
+    )
+
+    with pytest.raises(ValueError, match="dataset_request_sha256"):
+        collect_selection_provenance()
 
 
 def test_component_states_merge_into_one_workflow_status(tmp_path: Path) -> None:
