@@ -1005,34 +1005,133 @@ bash scripts/runpod_workflow.sh cpu-logs
 bash scripts/runpod_workflow.sh readiness --gpu
 ```
 
-Stage 2 使用相同 dataset request 時會得到相同 data namespace，但以 100%
-train split 重新從相同 pretrained base 開始，不接續 Stage 1 checkpoint。
-必須重新執行 `configure --stage stage2` 並明確提供與原 CPU dataset 相同的
-profile/date/universe/dataset revision/`h_start`。stage/config identity 由 active selection
-另行驗證；只要 dataset request 與 storage/content identity 相同，純訓練設定變更不會使
-既有 dataset marker 失效。範例：
+##### 從 Stage 1 完整切換至 Stage 2
 
-```bash
-bash scripts/runpod_workflow.sh configure \
-  --stage stage2 \
-  --data-profile tw_only \
-  --start 2015-01-01 \
-  --end 2026-07-27 \
-  --h-start 3 \
-  --universe all
-bash scripts/runpod_workflow.sh sync --apply
-bash scripts/runpod_workflow.sh cpu prepare
-```
+Stage 2 使用相同 dataset request 時會得到相同 data namespace，但會使用既有
+chronological split 中 100% 的 **train partition**；validation/test partition 仍保持隔離。
+Stage 2 會從相同 pretrained base 開始，不接續 Stage 1 checkpoint。切換 stage 本身不會
+下載 provider 資料或重建 bar store，但 profile、日期、universe、dataset revision 等資料
+身分若改變，就會建立另一個 immutable dataset namespace。
 
-Stage 2 的 CPU Pod 建立完成後，腳本會提示在 SSH 內執行
-`bash scripts/runpod_tmux_launch.sh cpu-finalize`；不要誤用 Stage 1 的
-`cpu-prepare` 名稱重新下載資料。
+請依下列順序操作，不要跳過 dataset request SHA 比對：
 
-CPU workflow 完成後，在本機再次執行
-`bash scripts/runpod_workflow.sh readiness --gpu`。若只把 stage 改成 Stage 2，
-但 profile/date/universe/dataset revision/`h_start` 與先前不同，dataset request SHA
-也會不同，不會錯用舊
-Parquet。
+1. **本機控制端：記錄現有 Stage 1 selection。** `configure` 會改變 active selection，
+   所以必須先保存目前的 `dataset_request_sha256`，並抄下 profile、revision、起訖日期、
+   `h_start`、universe、symbol limit 與 explicit symbol lists：
+
+   ```bash
+   bash scripts/runpod_workflow.sh selection show
+   ```
+
+2. **本機控制端：建立 Stage 2 selection。** 明確提供上一步顯示的相同資料參數；不要直接
+   執行無參數的互動式 `configure` 後接受預設值。下例只有在現有 Stage 1 selection
+   恰好使用相同值時才可原樣執行：
+
+   ```bash
+   bash scripts/runpod_workflow.sh configure \
+     --stage stage2 \
+     --data-profile us_tw_eodhd \
+     --dataset-revision v1 \
+     --start 2021-01-01 \
+     --end 2026-06-01 \
+     --h-start 1 \
+     --universe all
+
+   bash scripts/runpod_workflow.sh selection show
+   ```
+
+   `--end` 是不包含該日的 exclusive boundary。`all` 模式若原本沒有
+   `symbol_limit`，就不要加入 `--symbol-limit`、`--stocks` 或 `--etfs`；`explicit`
+   模式則必須逐字保留原本的 `--stocks` 與 `--etfs`。新的 `selection_id`／
+   `selection_sha256` 應該改變，但新的 `dataset_request_sha256` 必須和步驟 1 完全相同。
+   若不同，立即停止；不要執行 sync，也不要建立 CPU 或 GPU Pod。重新執行正確的
+   `configure` 不會呼叫資料 API。
+
+3. **本機控制端：上傳目前程式碼與 Stage 2 selection。**
+
+   ```bash
+   bash scripts/runpod_workflow.sh sync --apply
+   ```
+
+4. **本機控制端：建立 Stage 2 CPU finalization Pod。** 這個非互動命令會立即建立付費
+   CPU Pod；`--max-api-calls 1` 只滿足共用建立介面的必要參數，`cpu-finalize` 不會使用
+   provider acquisition budget：
+
+   ```bash
+   bash scripts/runpod_workflow.sh cpu prepare \
+     --max-api-calls 1
+   ```
+
+   Active selection 是 `stage2` 時，建立腳本會自動把 workflow 映射為
+   `cpu-finalize`。建立成功後的提示必須是：
+
+   ```text
+   After SSH login, run: bash scripts/runpod_tmux_launch.sh cpu-finalize
+   ```
+
+   若提示仍為 `cpu-prepare`，不要在該 Pod 啟動 workflow；先重新檢查 active selection。
+
+5. **CPU Pod：執行 Stage 2 finalization。** 由 RunPod Console SSH 登入剛建立的 CPU
+   Pod，然後執行：
+
+   ```bash
+   cd /runpod-volume/stock_forecasting
+   bash scripts/runpod_tmux_launch.sh cpu-finalize
+   ```
+
+   即時查看 tmux：
+
+   ```bash
+   tmux -L fin-ts-cpu-finalize attach -t fin-ts-cpu-finalize
+   ```
+
+   Finalizer 只會驗證程式碼、runtime、既有 dataset/bar store、Hugging Face cache 與
+   Stage 2 config，執行完整 pytest，然後把既有 dataset readiness marker 綁到新的
+   Stage 2 selection。它不會執行 `fin-ts-download`、provider API acquisition、
+   `fin-ts-prepare` 或 bar-store materialization。
+
+6. **本機控制端：等待 CPU finalization 完成並通過 GPU gate。** Pod 終止後執行：
+
+   ```bash
+   bash scripts/runpod_workflow.sh status
+   bash scripts/runpod_workflow.sh readiness --gpu
+   ```
+
+   `status` 必須顯示 dataset ready，且 `readiness --gpu` 必須成功。Finalization 完成前，
+   dataset marker 暫時仍顯示舊 Stage 1 selection ID 是正常的；不要以此判定資料需要重建。
+
+7. **本機控制端：列出 GPU 並建立 Stage 2 training Pod。** `gpuId` 必須使用清單中的
+   完整名稱；`--maxRuntime` 同時涵蓋訓練與自動 validation：
+
+   ```bash
+   bash scripts/runpodctl_project.sh gpu list
+
+   bash scripts/runpod_workflow.sh train \
+     --maxRuntime 24h \
+     --gpuId "NVIDIA GeForce RTX 5090"
+   ```
+
+8. **GPU Pod：啟動 Stage 2 訓練。** 由 RunPod Console SSH 登入剛建立的 GPU Pod，
+   然後執行：
+
+   ```bash
+   cd /runpod-volume/stock_forecasting
+   bash scripts/runpod_tmux_launch.sh stage1-train
+   ```
+
+   `stage1-train` 是保留給既有部署的 workflow 名稱，不會把 Stage 2 降回 Stage 1；實際
+   config 由 immutable selection 的 `RUNPOD_CONFIG` 決定。啟動記錄必須顯示 Stage 2
+   config。若要即時查看：
+
+   ```bash
+   tmux -L fin-ts-stage1-train attach -t fin-ts-stage1-train
+   ```
+
+9. **本機控制端：確認 terminal state。** 訓練與自動 validation 完成、Pod 終止後執行：
+
+   ```bash
+   bash scripts/runpod_workflow.sh status
+   ```
 
 #### 4. 建立 GPU Pod 並訓練
 
@@ -2502,35 +2601,146 @@ Do not rent a GPU until this gate passes:
 bash scripts/runpod_workflow.sh readiness --gpu
 ```
 
-Stage 2 uses the same data namespace when its dataset request is identical, but
-trains on 100% of the train split from the same pretrained base. It does not
-continue from a Stage 1 checkpoint. Run `configure --stage stage2` again and
-explicitly supply the same profile/date/universe/dataset revision/`h_start` as
-the intended CPU dataset. The active selection validates stage/config identity
-separately; a training-only configuration change does not invalidate an existing
-dataset marker when dataset request and storage/content identities still match.
-For example:
+##### Complete Stage 1 to Stage 2 transition
 
-```bash
-bash scripts/runpod_workflow.sh configure \
-  --stage stage2 \
-  --data-profile tw_only \
-  --start 2015-01-01 \
-  --end 2026-07-27 \
-  --h-start 3 \
-  --universe all
-bash scripts/runpod_workflow.sh sync --apply
-bash scripts/runpod_workflow.sh cpu prepare
-```
+Stage 2 uses the same data namespace when its dataset request is identical and
+uses 100% of the existing chronological **train partition**; the validation and
+test partitions remain isolated. It starts from the same pretrained base rather
+than continuing from a Stage 1 checkpoint. Changing only the stage does not
+download provider data or rebuild the bar store, but changing the profile,
+dates, universe, or dataset revision creates another immutable dataset namespace.
 
-After creating a Stage 2 CPU Pod, follow its SSH prompt and run
-`bash scripts/runpod_tmux_launch.sh cpu-finalize`; do not use the Stage 1
-`cpu-prepare` name to download the data again.
+Follow this sequence and do not skip the dataset request SHA comparison:
 
-After the CPU workflow completes, rerun
-`bash scripts/runpod_workflow.sh readiness --gpu` locally. If only the stage is
-changed but profile/date/universe differs from the prior CPU deployment, the
-dataset request SHA also differs and the old Parquet cannot be selected.
+1. **Local control machine: record the current Stage 1 selection.** `configure`
+   changes the active selection, so first save its `dataset_request_sha256` and
+   record the profile, revision, start/end dates, `h_start`, universe, symbol
+   limit, and explicit symbol lists:
+
+   ```bash
+   bash scripts/runpod_workflow.sh selection show
+   ```
+
+2. **Local control machine: create the Stage 2 selection.** Explicitly provide
+   the same data values printed in the previous step. Do not run interactive
+   `configure` without arguments and accept its defaults. The following example
+   is directly reusable only when the current Stage 1 selection has these exact
+   values:
+
+   ```bash
+   bash scripts/runpod_workflow.sh configure \
+     --stage stage2 \
+     --data-profile us_tw_eodhd \
+     --dataset-revision v1 \
+     --start 2021-01-01 \
+     --end 2026-06-01 \
+     --h-start 1 \
+     --universe all
+
+   bash scripts/runpod_workflow.sh selection show
+   ```
+
+   `--end` is an exclusive boundary. If the original `all` selection has no
+   symbol limit, do not add `--symbol-limit`, `--stocks`, or `--etfs`; an
+   `explicit` selection must preserve its exact `--stocks` and `--etfs` lists.
+   The new `selection_id` and `selection_sha256` should change, but the new
+   `dataset_request_sha256` must exactly match the value recorded in step 1. If
+   it differs, stop immediately: do not sync or create a CPU/GPU Pod. Rerunning
+   the correct `configure` command does not call a data API.
+
+3. **Local control machine: upload the current code and Stage 2 selection.**
+
+   ```bash
+   bash scripts/runpod_workflow.sh sync --apply
+   ```
+
+4. **Local control machine: create the Stage 2 CPU finalization Pod.** This
+   non-interactive command immediately creates a paid CPU Pod. The
+   `--max-api-calls 1` value only satisfies the shared creator interface;
+   `cpu-finalize` does not use a provider acquisition budget:
+
+   ```bash
+   bash scripts/runpod_workflow.sh cpu prepare \
+     --max-api-calls 1
+   ```
+
+   When the active selection is `stage2`, the creator automatically maps the
+   workflow to `cpu-finalize`. Its success message must say:
+
+   ```text
+   After SSH login, run: bash scripts/runpod_tmux_launch.sh cpu-finalize
+   ```
+
+   If it still says `cpu-prepare`, do not start that Pod workflow; inspect the
+   active selection first.
+
+5. **CPU Pod: run Stage 2 finalization.** Connect to the newly created CPU Pod
+   through the RunPod Console SSH command and run:
+
+   ```bash
+   cd /runpod-volume/stock_forecasting
+   bash scripts/runpod_tmux_launch.sh cpu-finalize
+   ```
+
+   Attach for live observation:
+
+   ```bash
+   tmux -L fin-ts-cpu-finalize attach -t fin-ts-cpu-finalize
+   ```
+
+   The finalizer validates the code, runtime, existing dataset/bar store,
+   Hugging Face cache, and Stage 2 config; runs the complete pytest suite; and
+   binds the existing dataset readiness marker to the new Stage 2 selection. It
+   does not run `fin-ts-download`, provider API acquisition, `fin-ts-prepare`, or
+   bar-store materialization.
+
+6. **Local control machine: wait for finalization and pass the GPU gate.** After
+   the CPU Pod terminates, run:
+
+   ```bash
+   bash scripts/runpod_workflow.sh status
+   bash scripts/runpod_workflow.sh readiness --gpu
+   ```
+
+   `status` must report a ready dataset and `readiness --gpu` must succeed. Until
+   finalization completes, it is normal for the dataset marker to retain the old
+   Stage 1 selection ID; that alone is not a rebuild signal.
+
+7. **Local control machine: list GPUs and create the Stage 2 training Pod.** Use
+   one complete `gpuId` from the current list. `--maxRuntime` covers training and
+   the automatic validation workflow together:
+
+   ```bash
+   bash scripts/runpodctl_project.sh gpu list
+
+   bash scripts/runpod_workflow.sh train \
+     --maxRuntime 24h \
+     --gpuId "NVIDIA GeForce RTX 5090"
+   ```
+
+8. **GPU Pod: start Stage 2 training.** Connect through the RunPod Console SSH
+   command and run:
+
+   ```bash
+   cd /runpod-volume/stock_forecasting
+   bash scripts/runpod_tmux_launch.sh stage1-train
+   ```
+
+   `stage1-train` is the compatibility workflow name retained for existing
+   deployments; it does not downgrade Stage 2 to Stage 1. The immutable
+   selection's `RUNPOD_CONFIG` determines the actual config, and the launch log
+   must identify the Stage 2 config. Attach for live observation with:
+
+   ```bash
+   tmux -L fin-ts-stage1-train attach -t fin-ts-stage1-train
+   ```
+
+9. **Local control machine: verify the terminal state.** After training plus
+   automatic validation finishes and the Pod terminates, run:
+
+   ```bash
+   bash scripts/runpod_workflow.sh status
+   ```
 
 #### 4. Create a GPU Pod and train
 
