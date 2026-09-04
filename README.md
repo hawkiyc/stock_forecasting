@@ -316,6 +316,10 @@ symbol limit 或處理契約變動時會使用新的根目錄，不需要手動�
 | 初始化                      | 原始 pretrained base                                             | 原始 pretrained base   |
 | 是否接續 Stage 1 checkpoint | 否                                                               | 否                     |
 
+表中的「不接續 Stage 1 checkpoint」是指 Stage 2 不以 Stage 1 權重初始化；
+同一個 Stage 的未完成 run 仍可從完整 checkpoint 繼續。實際操作請參閱
+「中斷後接續同一個 Stage 的訓練」。
+
 設定檔：
 
 - `configs/stage1_kronos_base_lora.yaml`
@@ -1260,25 +1264,78 @@ bash scripts/runpod_workflow.sh status
 `<run-id>`。SSH/tmux 只用於仍存活 Pod 的即時除錯，不是 terminal state 的
 權威來源。
 
-若 training loop 在 `--maxRuntime` 前未完成，training lifecycle 會是 `timed_out`
-（或錯誤時為 `failed`）且 `training_completed` 不會為 true。使用下列指令會在
-本機選取該 run 最新、完整且通過 hash／resume contract 的 retained checkpoint，
-沿用同一個 run ID、optimizer 與 scheduler 狀態建立新 Pod：
+##### 中斷後接續同一個 Stage 的訓練
+
+若 training loop 在 `--maxRuntime` 前未完成、Pod 被手動終止，或執行錯誤造成中斷，
+training lifecycle 應為 `timed_out` 或 `failed`，而且 `training_completed` 不得為
+true。接續前先確認原 Pod 已終止，並在本機控制端執行：
+
+```bash
+bash scripts/runpod_workflow.sh status
+bash scripts/runpod_workflow.sh selection show
+```
+
+active selection 必須與該 run 記錄的 stage、config 與 dataset identity 一致。只為了
+接續同一個 run，不需要重新執行 `configure`、`cpu prepare` 或 provider API
+acquisition。如果本機程式碼已改變，必須等原訓練 Pod 終止後才上傳：
+
+```bash
+bash scripts/runpod_workflow.sh sync --dry-run
+bash scripts/runpod_workflow.sh sync --apply
+```
+
+接續訓練不會普遍略過 training resume contract 差異。相同 contract 可直接接續；
+不同 contract 只有在程式碼內明確登錄、舊新檔案雜湊完全相符，且資料、
+模型與訓練語意都沒有改變的單向 migration 才會通過。任何其他 config、dataset、
+model architecture、受監控訓練程式碼或 checkpoint artifact integrity 差異都會
+fail closed。
+
+建議明確指定 `<run-id>`，避免在有多個失敗或超時 run 時選錯：
 
 ```bash
 bash scripts/runpod_workflow.sh resume <run-id>
-# Optional overrides:
+```
+
+如需指定新 Pod 這一段的執行上限與 GPU：
+
+```bash
 bash scripts/runpod_workflow.sh resume \
   --maxRuntime 18h \
   --gpuId "NVIDIA GeForce RTX 5090" \
   <run-id>
 ```
 
-省略 `<run-id>` 時只接受最新 `failed`／`timed_out` 且尚未完成 training phase 的
-training lifecycle。若 immutable `training-completed.json` 已存在，`resume` 會拒絕
-續訓並要求改用獨立 validation。SSH 登入續訓 Pod 後仍執行
-`bash scripts/runpod_tmux_launch.sh stage1-train`；訓練完成後會接著跑 validation，
-發布 terminal 狀態並關閉 Pod。
+未指定 `<run-id>` 時，只會從 canonical training lifecycle 選擇最新的
+`failed`／`timed_out` 且尚未完成 training phase 的 run。`resume` 會在建立付費
+GPU Pod **之前**進行遠端 preflight：完整驗證 run manifest、checkpoint pointer、
+trainer state、resolved config 與每個 artifact hash。若有有效且比最佳五個
+retained checkpoints 都更新的 `temp_checkpoint.json`，會優先接續它；否則從
+最佳五個中選擇 `global_step` 最大的 checkpoint，不是單純選擇 validation
+metric 最佳者。沒有完整可接續 checkpoint 時不會建立 Pod。
+
+新 Pod 會沿用原本的 run ID 與 W&B run ID，並還原模型可訓練權重、optimizer、
+scheduler、RNG、已完成 batch／optimizer step、early-stopping 與 runtime batch plan。
+`--maxRuntime` 是新 Pod 這一段執行的上限，不會把原 run 的計數歸零。
+
+Pod 建立成功後，由 RunPod Console SSH 登入並執行：
+
+```bash
+cd /runpod-volume/stock_forecasting
+bash scripts/runpod_tmux_launch.sh stage1-train
+```
+
+`stage1-train` 是兼容性 workflow 名稱；實際接續 Stage 1 或 Stage 2 由 immutable
+selection 的 config 決定。即時查看：
+
+```bash
+tmux -L fin-ts-stage1-train attach -t fin-ts-stage1-train
+```
+
+訓練正常跑完或 early stopping 觸發後，流程會發布 immutable
+`training-completed.json`、移除不再需要的 temporary checkpoint pointer，接著自動執行
+validation。若 `training-completed.json` 已存在，`resume` 會拒絕續訓並要求改用
+獨立 validation。Pod 終止後再以 `bash scripts/runpod_workflow.sh status` 確認最後的
+terminal state。
 
 若訓練已完成但需要獨立重跑 validation，可在本機建立 validation Pod。active
 selection 必須與該 run 保存的 stage 與 dataset identity 相同：
@@ -1809,6 +1866,10 @@ for the same dataset.
 | Architecture          | Kronos-base + the same LoRA + resampler + conditioner + alpha head      | Identical                                   |
 | Initialization        | Original pretrained base                                                | Original pretrained base                    |
 | Continue from Stage 1 | No                                                                      | No                                          |
+
+"Do not continue from Stage 1" means that Stage 2 does not initialize from
+Stage 1 weights. An incomplete run can still resume from a complete checkpoint
+within the same stage; see "Resume interrupted training in the same stage."
 
 Configs:
 
@@ -2882,27 +2943,87 @@ Only `state=ready` means that lifecycle completed. Treat `failed` and
 checkpoints, evaluations, W&B, and run-scoped logs. SSH/tmux is only for live
 debugging while a Pod still exists; it is not the authority for terminal state.
 
-If the training loop has not completed when `--maxRuntime` expires, the
-training lifecycle is `timed_out` (`failed` for an execution error) and
-`training_completed` is not true. The command below selects the run's latest
-complete retained checkpoint after hash and resume-contract validation, then
-creates a new Pod with the same run ID, optimizer state, and scheduler state:
+##### Resume interrupted training in the same stage
+
+If the training loop does not complete before `--maxRuntime`, the Pod is
+terminated manually, or an execution error interrupts it, the training
+lifecycle must be `timed_out` or `failed`, and `training_completed` must not be
+true. Confirm that the original Pod is terminal, then inspect the authoritative
+state and active selection on the local control machine:
+
+```bash
+bash scripts/runpod_workflow.sh status
+bash scripts/runpod_workflow.sh selection show
+```
+
+The active selection must match the stage, config, and dataset identity stored
+by the run. Resuming the same run alone does not require rerunning `configure`,
+`cpu prepare`, or provider API acquisition. If local source has changed, wait
+until the original training Pod is terminal before uploading it:
+
+```bash
+bash scripts/runpod_workflow.sh sync --dry-run
+bash scripts/runpod_workflow.sh sync --apply
+```
+
+Resume does not generally waive training-resume-contract differences. An
+identical contract resumes normally. A different contract is accepted only by
+an explicitly registered, directional migration whose exact old and new file
+digests match while all data, model, and training semantics remain unchanged.
+Every other config, dataset, model-architecture, monitored training-source, or
+checkpoint-artifact-integrity difference fails closed.
+
+Specify `<run-id>` explicitly to avoid selecting the wrong run when multiple
+failed or timed-out runs exist:
 
 ```bash
 bash scripts/runpod_workflow.sh resume <run-id>
-# Optional overrides:
+```
+
+To select the new Pod segment's runtime limit and GPU explicitly:
+
+```bash
 bash scripts/runpod_workflow.sh resume \
   --maxRuntime 18h \
   --gpuId "NVIDIA GeForce RTX 5090" \
   <run-id>
 ```
 
-Without `<run-id>`, only the latest `failed` or `timed_out` training lifecycle
-whose training phase is incomplete is accepted. If immutable
-`training-completed.json` exists, `resume` rejects further training and directs
-the operator to standalone validation. After SSH login, run
-`bash scripts/runpod_tmux_launch.sh stage1-train` as usual; resumed training is
-followed by validation, terminal-state publication, and Pod termination.
+Without `<run-id>`, the canonical training lifecycle can select only its latest
+`failed` or `timed_out` run whose training phase is incomplete. Before creating
+a paid GPU Pod, `resume` remotely validates the run manifest, checkpoint
+pointer, trainer state, resolved config, and every artifact hash. A valid
+`temp_checkpoint.json` newer than all best-five retained checkpoints is
+preferred; otherwise, resume selects the best-five checkpoint with the greatest
+`global_step`, not merely the checkpoint with the best validation metric. No
+Pod is created when no complete resumable checkpoint exists.
+
+The new Pod preserves the original run ID and W&B run ID and restores trainable
+model weights, optimizer, scheduler, RNG, completed batch/optimizer-step
+progress, early-stopping state, and runtime batch plan. `--maxRuntime` limits
+this new Pod segment; it does not reset the original run's progress.
+
+After the Pod is created, connect through the RunPod Console SSH and run:
+
+```bash
+cd /runpod-volume/stock_forecasting
+bash scripts/runpod_tmux_launch.sh stage1-train
+```
+
+`stage1-train` is the compatibility workflow name. The immutable selection's
+config determines whether Stage 1 or Stage 2 resumes. Attach for live output:
+
+```bash
+tmux -L fin-ts-stage1-train attach -t fin-ts-stage1-train
+```
+
+Normal completion or early stopping publishes immutable
+`training-completed.json`, removes the no-longer-needed temporary checkpoint
+pointer, and then runs validation automatically. If `training-completed.json`
+already exists, `resume` rejects further training and directs the operator to
+standalone validation. After Pod termination, run
+`bash scripts/runpod_workflow.sh status` again to confirm the final terminal
+state.
 
 If training completed but validation must be rerun independently, create a
 validation Pod locally. The active selection must match the stage and dataset
