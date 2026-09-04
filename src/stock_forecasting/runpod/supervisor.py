@@ -23,7 +23,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-from stock_forecasting.checkpointing import validate_checkpoint_selection
+from stock_forecasting.checkpointing import latest_resume_checkpoint
 from stock_forecasting.run_paths import (
     canonical_network_volume_root,
     checkpoint_run_directory,
@@ -237,20 +237,10 @@ def _latest_resume_checkpoint(checkpoint_root: Path, run_key: str) -> Path | Non
     run_directory = checkpoint_run_directory(checkpoint_root, run_key)
     if not run_directory.is_dir():
         return None
-    candidates: list[tuple[int, Path]] = []
-    leaderboard_path = run_directory / "checkpoint-leaderboard.json"
     try:
-        validate_checkpoint_selection(run_directory)
-        leaderboard = json.loads(leaderboard_path.read_text(encoding="utf-8"))
-        rows = leaderboard["checkpoints"]
-        candidates.extend(
-            (int(row["global_step"]), run_directory / str(row["path"])) for row in rows
-        )
+        return latest_resume_checkpoint(run_directory)
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
-        pass
-    if not candidates:
         return None
-    return max(candidates, key=lambda item: (item[0], str(item[1])))[1]
 
 
 def _training_completed_marker(

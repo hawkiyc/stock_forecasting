@@ -22,7 +22,8 @@ from stock_forecasting.config import ExperimentConfig
 from stock_forecasting.models import MODEL_OUTPUT_SCHEMA_VERSION
 from stock_forecasting.run_contract import (
     CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
-    training_resume_contract_digest,
+    compatible_training_resume_contract_digest,
+    training_resume_contract,
 )
 from stock_forecasting.run_paths import (
     CHECKPOINT_NAME_PATTERN,
@@ -31,6 +32,7 @@ from stock_forecasting.run_paths import (
 
 CHECKPOINT_MANIFEST = "checkpoint-leaderboard.json"
 BEST_CHECKPOINT_POINTER = "best-checkpoint.json"
+TEMP_CHECKPOINT_POINTER = "temp_checkpoint.json"
 CHECKPOINT_TRANSACTION = ".checkpoint-transaction.json"
 COMPLETION_RESULT_DIRECTORY = "completion-result"
 COMPLETION_RESULT_FILE = "training-result.json"
@@ -320,6 +322,89 @@ def validate_checkpoint_trainer_state(
     return state
 
 
+def _temporary_checkpoint_row(
+    root: Path,
+    *,
+    monitor: str,
+    mode: str,
+    contract_digest: str,
+) -> dict[str, Any] | None:
+    pointer_path = root / TEMP_CHECKPOINT_POINTER
+    if not pointer_path.exists():
+        return None
+    pointer = _read_json_object(pointer_path, "Temporary-checkpoint pointer")
+    expected_keys = {
+        "schema_version",
+        "kind",
+        "run_id",
+        "run_key",
+        "training_resume_contract_sha256",
+        "selection_source",
+        "monitor",
+        "mode",
+        "path",
+        "global_step",
+        "value",
+        "created_at",
+    }
+    run_id = validate_run_id(root.name)
+    checkpoint_name = pointer.get("path")
+    global_step = pointer.get("global_step")
+    value = pointer.get("value")
+    created_at = pointer.get("created_at")
+    if (
+        set(pointer) != expected_keys
+        or pointer.get("schema_version") != CHECKPOINT_ARTIFACT_SCHEMA_VERSION
+        or pointer.get("kind") != "temporary-resume-checkpoint"
+        or pointer.get("run_id") != run_id
+        or pointer.get("run_key") != run_id
+        or pointer.get("training_resume_contract_sha256") != contract_digest
+        or pointer.get("selection_source") != "validation"
+        or pointer.get("monitor") != monitor
+        or pointer.get("mode") != mode
+        or not isinstance(checkpoint_name, str)
+        or CHECKPOINT_NAME_PATTERN.fullmatch(checkpoint_name) is None
+        or not _is_non_negative_int(global_step)
+        or f"checkpoint-{global_step:06d}" != checkpoint_name
+        or not isinstance(value, int | float)
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or not isinstance(created_at, str)
+        or not created_at
+    ):
+        raise ValueError("Temporary-checkpoint pointer is invalid")
+    checkpoint_directory = root / checkpoint_name
+    state = validate_checkpoint_trainer_state(checkpoint_directory)
+    selection = state["selection"]
+    if (
+        state.get("training_resume_contract_sha256") != contract_digest
+        or state.get("global_step") != global_step
+        or state.get("created_at") != created_at
+        or selection.get("metric") != monitor
+        or selection.get("mode") != mode
+        or float(selection["value"]) != float(value)
+    ):
+        raise ValueError("Temporary checkpoint and its pointer disagree")
+    return {
+        "path": checkpoint_name,
+        "global_step": global_step,
+        "value": float(value),
+        "created_at": created_at,
+    }
+
+
+def _active_temporary_checkpoint(
+    temporary: dict[str, Any] | None,
+    checkpoints: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if temporary is None:
+        return None
+    if not checkpoints:
+        return temporary
+    latest_ranked_step = max(int(row["global_step"]) for row in checkpoints)
+    return temporary if int(temporary["global_step"]) > latest_ranked_step else None
+
+
 def validate_checkpoint_selection(
     run_directory: str | Path,
     *,
@@ -436,15 +521,6 @@ def validate_checkpoint_selection(
         or float(pointer_value) != float(checkpoints[0]["value"])
     ):
         raise ValueError("Best-checkpoint pointer and leaderboard values disagree")
-    if retained_checkpoint is not None and (
-        CHECKPOINT_NAME_PATTERN.fullmatch(retained_checkpoint) is None
-        or retained_checkpoint not in names
-    ):
-        raise ValueError("Requested checkpoint is not retained by the validation leaderboard")
-    if retained_checkpoint is not None and require_latest_step:
-        latest = max(checkpoints, key=lambda row: int(row["global_step"]))
-        if retained_checkpoint != latest["path"]:
-            raise ValueError("Training resume requires the retained checkpoint with maximum step")
     for row in checkpoints:
         checkpoint_name = str(row["path"])
         checkpoint_directory = root / checkpoint_name
@@ -474,7 +550,47 @@ def validate_checkpoint_selection(
             raise ValueError(
                 f"Trainer state and validation leaderboard disagree for {checkpoint_name}"
             )
+    temporary = _temporary_checkpoint_row(
+        root,
+        monitor=str(monitor),
+        mode=str(mode),
+        contract_digest=contract_digest,
+    )
+    active_temporary = _active_temporary_checkpoint(temporary, checkpoints)
+    if retained_checkpoint is not None:
+        if CHECKPOINT_NAME_PATTERN.fullmatch(retained_checkpoint) is None:
+            raise ValueError("Requested checkpoint name is not canonical")
+        if require_latest_step:
+            latest = active_temporary or max(
+                checkpoints,
+                key=lambda row: int(row["global_step"]),
+            )
+            if retained_checkpoint != latest["path"]:
+                raise ValueError("Training resume requires the checkpoint with maximum step")
+        elif retained_checkpoint not in names:
+            raise ValueError("Requested checkpoint is not retained by the validation leaderboard")
     return best
+
+
+def latest_resume_checkpoint(run_directory: str | Path) -> Path:
+    """Return the newest validated temporary checkpoint or retained ranked checkpoint."""
+
+    root = Path(run_directory)
+    validate_checkpoint_selection(root)
+    leaderboard = _read_json_object(root / CHECKPOINT_MANIFEST, "Checkpoint leaderboard")
+    checkpoints = leaderboard["checkpoints"]
+    contract_digest = _artifact_contract_digest(leaderboard, "Checkpoint leaderboard")
+    temporary = _temporary_checkpoint_row(
+        root,
+        monitor=str(leaderboard["monitor"]),
+        mode=str(leaderboard["mode"]),
+        contract_digest=contract_digest,
+    )
+    selected = _active_temporary_checkpoint(temporary, checkpoints) or max(
+        checkpoints,
+        key=lambda row: int(row["global_step"]),
+    )
+    return root / str(selected["path"])
 
 
 def trainable_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -513,12 +629,10 @@ def _stage_checkpoint(
     if scheduler is None:
         raise ValueError("Canonical checkpoints require scheduler state")
     run_id = validate_run_id(run_directory.name)
-    contract_digest = training_resume_contract_digest(config)
     run_manifest = _read_json_object(run_directory / "run-manifest.json", "Run manifest")
     if run_manifest.get("run_id") != run_id or run_manifest.get("run_key") != run_id:
         raise ValueError("Run manifest identity does not match its canonical run directory")
-    if _artifact_contract_digest(run_manifest, "Run manifest") != contract_digest:
-        raise ValueError("Run manifest does not match the current training resume contract")
+    contract_digest = compatible_training_resume_contract_digest(config, run_manifest)
     if not selection_metric_name.startswith("primary_5d/"):
         raise ValueError("Checkpoint selection must use a validation primary_5d metric")
     if (
@@ -670,12 +784,10 @@ def save_training_completion_result(
         raise ValueError("Training completion metrics must be finite numerical values")
 
     run_id = validate_run_id(run_directory.name)
-    contract_digest = training_resume_contract_digest(config)
     run_manifest = _read_json_object(run_directory / "run-manifest.json", "Run manifest")
     if run_manifest.get("run_id") != run_id or run_manifest.get("run_key") != run_id:
         raise ValueError("Run manifest identity does not match its canonical run directory")
-    if _artifact_contract_digest(run_manifest, "Run manifest") != contract_digest:
-        raise ValueError("Run manifest does not match the current training resume contract")
+    contract_digest = compatible_training_resume_contract_digest(config, run_manifest)
 
     result_directory = run_directory / COMPLETION_RESULT_DIRECTORY
     if result_directory.exists():
@@ -725,6 +837,7 @@ def save_training_completion_result(
         _fsync_directory(staging_directory)
         staging_directory.replace(result_directory)
         _fsync_directory(run_directory)
+        _discard_temporary_checkpoint(run_directory)
     except BaseException:
         shutil.rmtree(staging_directory, ignore_errors=True)
         raise
@@ -761,6 +874,101 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
+def _discard_temporary_checkpoint(root: Path) -> None:
+    pointer_path = root / TEMP_CHECKPOINT_POINTER
+    if not pointer_path.exists():
+        return
+    pointer = _read_json_object(pointer_path, "Temporary-checkpoint pointer")
+    run_manifest = _read_json_object(root / "run-manifest.json", "Run manifest")
+    contract_digest = _artifact_contract_digest(run_manifest, "Run manifest")
+    monitor = pointer.get("monitor")
+    mode = pointer.get("mode")
+    if not isinstance(monitor, str) or not isinstance(mode, str):
+        raise ValueError("Temporary-checkpoint pointer has an invalid selection policy")
+    temporary = _temporary_checkpoint_row(
+        root,
+        monitor=monitor,
+        mode=mode,
+        contract_digest=contract_digest,
+    )
+    assert temporary is not None
+    retained_names: set[str] = set()
+    leaderboard_path = root / CHECKPOINT_MANIFEST
+    if leaderboard_path.exists():
+        leaderboard = _read_json_object(leaderboard_path, "Checkpoint leaderboard")
+        checkpoints = leaderboard.get("checkpoints")
+        if not isinstance(checkpoints, list):
+            raise ValueError("Checkpoint leaderboard contains an invalid retained set")
+        retained_names = {str(row.get("path")) for row in checkpoints if isinstance(row, dict)}
+    pointer_path.unlink()
+    _fsync_directory(root)
+    temporary_path = root / str(temporary["path"])
+    if temporary_path.name not in retained_names and temporary_path.exists():
+        shutil.rmtree(temporary_path)
+        _fsync_directory(root)
+
+
+def _publish_temporary_checkpoint(
+    root: Path,
+    *,
+    staging_directory: Path,
+    checkpoint_directory: Path,
+    candidate: dict[str, Any],
+    monitor: str,
+    mode: str,
+    save_top_k: int,
+) -> None:
+    run_id = validate_run_id(root.name)
+    run_manifest = _read_json_object(root / "run-manifest.json", "Run manifest")
+    contract_digest = _artifact_contract_digest(run_manifest, "Run manifest")
+    previous = _temporary_checkpoint_row(
+        root,
+        monitor=monitor,
+        mode=mode,
+        contract_digest=contract_digest,
+    )
+    ranked, _unranked = _ranked_checkpoint_rows(root, monitor=monitor, mode=mode)
+    retained_names = {
+        str(row["path"])
+        for row in sorted(
+            [*ranked, candidate],
+            key=lambda row: _checkpoint_sort_key(row, mode),
+        )[:save_top_k]
+    }
+    if candidate["path"] in retained_names:
+        raise RuntimeError("Temporary checkpoint unexpectedly qualifies for validation top-k")
+    _validate_transaction_checkpoint(
+        staging_directory,
+        canonical_name=checkpoint_directory.name,
+        row=candidate,
+        run_id=run_id,
+        contract_digest=contract_digest,
+        monitor=monitor,
+        mode=mode,
+    )
+    pointer = {
+        "schema_version": CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
+        "kind": "temporary-resume-checkpoint",
+        "run_id": run_id,
+        "run_key": run_id,
+        "training_resume_contract_sha256": contract_digest,
+        "selection_source": "validation",
+        "monitor": monitor,
+        "mode": mode,
+        "path": candidate["path"],
+        "global_step": candidate["global_step"],
+        "value": candidate["value"],
+        "created_at": candidate["created_at"],
+    }
+    _promote_staged_checkpoint(staging_directory, checkpoint_directory, root)
+    _atomic_json(root / TEMP_CHECKPOINT_POINTER, pointer)
+    if previous is not None and previous["path"] != candidate["path"]:
+        previous_path = root / str(previous["path"])
+        if previous_path.name not in retained_names and previous_path.exists():
+            shutil.rmtree(previous_path)
+            _fsync_directory(root)
+
+
 def _ranked_checkpoint_rows(
     run_directory: Path,
     *,
@@ -772,6 +980,13 @@ def _ranked_checkpoint_rows(
     if run_manifest.get("run_id") != run_id or run_manifest.get("run_key") != run_id:
         raise ValueError("Run manifest identity does not match its canonical run directory")
     contract_digest = _artifact_contract_digest(run_manifest, "Run manifest")
+    temporary = _temporary_checkpoint_row(
+        run_directory,
+        monitor=monitor,
+        mode=mode,
+        contract_digest=contract_digest,
+    )
+    temporary_name = str(temporary["path"]) if temporary is not None else None
     ranked: list[dict[str, Any]] = []
     unranked: list[Path] = []
     for checkpoint in sorted(run_directory.glob("checkpoint-*")):
@@ -779,6 +994,8 @@ def _ranked_checkpoint_rows(
             continue
         if CHECKPOINT_NAME_PATTERN.fullmatch(checkpoint.name) is None:
             raise ValueError(f"Checkpoint directory has a non-canonical name: {checkpoint.name}")
+        if checkpoint.name == temporary_name:
+            continue
         state_path = checkpoint / "trainer-state.json"
         required_paths = tuple(checkpoint / name for name in REQUIRED_CHECKPOINT_FILES)
         if any(not path.is_file() or path.stat().st_size <= 0 for path in required_paths):
@@ -1164,6 +1381,7 @@ def reconcile_checkpoint_storage(
     for target_name in (
         CHECKPOINT_MANIFEST,
         BEST_CHECKPOINT_POINTER,
+        TEMP_CHECKPOINT_POINTER,
         CHECKPOINT_TRANSACTION,
     ):
         for temporary in root.glob(f".{target_name}.tmp-*"):
@@ -1171,7 +1389,20 @@ def reconcile_checkpoint_storage(
     ranked, unranked = _ranked_checkpoint_rows(root, monitor=monitor, mode=mode)
     staging = sorted(path for path in root.glob(".checkpoint-*.staging-*") if path.is_dir())
     retained = ranked[:save_top_k]
-    latest_completed = max(ranked, key=lambda row: int(row["global_step"])) if ranked else None
+    run_manifest = _read_json_object(root / "run-manifest.json", "Run manifest")
+    temporary = _temporary_checkpoint_row(
+        root,
+        monitor=monitor,
+        mode=mode,
+        contract_digest=_artifact_contract_digest(run_manifest, "Run manifest"),
+    )
+    active_temporary = _active_temporary_checkpoint(temporary, retained)
+    if temporary is not None and active_temporary is None:
+        _discard_temporary_checkpoint(root)
+        temporary = None
+    latest_completed = active_temporary or (
+        max(retained, key=lambda row: int(row["global_step"])) if retained else None
+    )
     if resume_checkpoint is not None:
         requested = Path(resume_checkpoint)
         if (
@@ -1182,10 +1413,6 @@ def reconcile_checkpoint_storage(
         if latest_completed is None or requested.name != latest_completed["path"]:
             raise ValueError(
                 "Training resume checkpoint must have the maximum completed global_step"
-            )
-        if requested.name not in {row["path"] for row in retained}:
-            raise ValueError(
-                "Latest completed checkpoint is not retained by the validation top-k policy"
             )
     removed_paths = [root / row["path"] for row in ranked[save_top_k:]] + unranked + staging
     transaction = _checkpoint_transaction_payload(
@@ -1287,28 +1514,14 @@ def save_ranked_checkpoint(
         mode=selection_metric_mode,
         save_top_k=save_top_k,
     )
-    if not prepare_checkpoint_save(
+    qualifies_for_ranking = prepare_checkpoint_save(
         run_directory,
         monitor=selection_metric_name,
         mode=selection_metric_mode,
         save_top_k=save_top_k,
         global_step=global_step,
         selection_value=selection_metric_value,
-    ):
-        ranked, _unranked = _ranked_checkpoint_rows(
-            run_directory,
-            monitor=selection_metric_name,
-            mode=selection_metric_mode,
-        )
-        retained = ranked[:save_top_k]
-        return None, {
-            "best_checkpoint": str(run_directory / retained[0]["path"]),
-            "current_retained": False,
-            "current_rank": None,
-            "retained_count": len(retained),
-            "removed": [],
-            "manifest": str(run_directory / CHECKPOINT_MANIFEST),
-        }
+    )
     staging_dir, checkpoint_dir, candidate = _stage_checkpoint(
         model=model,
         optimizer=optimizer,
@@ -1324,6 +1537,36 @@ def save_ranked_checkpoint(
         metrics=metrics,
         training_progress=training_progress,
     )
+    if not qualifies_for_ranking:
+        try:
+            _publish_temporary_checkpoint(
+                run_directory,
+                staging_directory=staging_dir,
+                checkpoint_directory=checkpoint_dir,
+                candidate=candidate,
+                monitor=selection_metric_name,
+                mode=selection_metric_mode,
+                save_top_k=save_top_k,
+            )
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+        ranked, _unranked = _ranked_checkpoint_rows(
+            run_directory,
+            monitor=selection_metric_name,
+            mode=selection_metric_mode,
+        )
+        retained = ranked[:save_top_k]
+        return checkpoint_dir, {
+            "best_checkpoint": str(run_directory / retained[0]["path"]),
+            "current_retained": False,
+            "current_rank": None,
+            "retained_count": len(retained),
+            "removed": [],
+            "manifest": str(run_directory / CHECKPOINT_MANIFEST),
+            "temporary_checkpoint": str(checkpoint_dir),
+            "latest_resume_checkpoint": str(checkpoint_dir),
+        }
     transaction_path = run_directory / CHECKPOINT_TRANSACTION
     transaction_published = False
     try:
@@ -1360,6 +1603,7 @@ def save_ranked_checkpoint(
             mode=selection_metric_mode,
             save_top_k=save_top_k,
         )
+        _discard_temporary_checkpoint(run_directory)
     except BaseException:
         transaction_published = transaction_published or transaction_path.exists()
         if not transaction_published:
@@ -1455,7 +1699,14 @@ def _validate_loaded_model_contract(
     """Reject evaluation or inference under a different model or training stage."""
 
     expected_architecture = config.model_architecture_digest()
-    expected_resume_contract = training_resume_contract_digest(config)
+    run_manifest = _read_json_object(
+        checkpoint_dir.parent / "run-manifest.json",
+        "Run manifest",
+    )
+    expected_resume_contract = compatible_training_resume_contract_digest(
+        config,
+        run_manifest,
+    )
     if trainer_state.get("model_output_schema_version") != MODEL_OUTPUT_SCHEMA_VERSION:
         raise ValueError("Checkpoint predates the conditional alpha output contract")
     if trainer_state.get("training_resume_contract_sha256") != expected_resume_contract:
@@ -1483,6 +1734,7 @@ def _validate_loaded_model_contract(
     if (
         stored_config.model_architecture_digest() != expected_architecture
         or stored_config.training.stage != config.training.stage
+        or training_resume_contract(stored_config) != training_resume_contract(config)
     ):
         raise ValueError("Checkpoint resolved config differs from its selected model contract")
 

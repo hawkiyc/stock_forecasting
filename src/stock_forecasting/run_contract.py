@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from stock_forecasting.checkpoint_resume_migrations import CHECKPOINT_RETENTION_MIGRATIONS
 from stock_forecasting.config import ExperimentConfig
 from stock_forecasting.data.manifest import load_dataset_manifest, sha256_file
 from stock_forecasting.models import MODEL_OUTPUT_SCHEMA_VERSION
@@ -79,9 +80,7 @@ def _dataset_resume_contract(config: ExperimentConfig) -> dict[str, Any]:
         "dataset_profile": payload["dataset_profile"],
         "selected_datasets": payload["selected_datasets"],
         "data_pipeline_digest": payload["data_pipeline_digest"],
-        "storage_preparation_spec_sha256": payload[
-            "storage_preparation_spec_sha256"
-        ],
+        "storage_preparation_spec_sha256": payload["storage_preparation_spec_sha256"],
         "universe_sha256": payload["universe_sha256"],
         "split_counts": payload["split_counts"],
         "artifacts": payload["artifacts"],
@@ -109,6 +108,103 @@ def training_resume_contract(config: ExperimentConfig) -> dict[str, Any]:
 def training_resume_contract_digest(config: ExperimentConfig) -> str:
     _, digest = training_resume_contract_fingerprint(config)
     return digest
+
+
+def _canonical_payload_digest(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validated_implementation_files(
+    implementation: Any,
+    *,
+    label: str,
+) -> dict[str, str]:
+    if not isinstance(implementation, dict) or set(implementation) != {"sha256", "files"}:
+        raise ValueError(f"{label} has an invalid training implementation contract")
+    files = implementation.get("files")
+    if (
+        not isinstance(files, dict)
+        or set(files) != set(TRAINING_IMPLEMENTATION_PATHS)
+        or any(
+            not isinstance(path, str)
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            for path, digest in files.items()
+        )
+    ):
+        raise ValueError(f"{label} has invalid training implementation file digests")
+    expected_digest = _canonical_payload_digest(files)
+    if implementation.get("sha256") != expected_digest:
+        raise ValueError(f"{label} training implementation digest is inconsistent")
+    return dict(files)
+
+
+def _checkpoint_retention_migration_matches(
+    stored_contract: dict[str, Any],
+    current_contract: dict[str, Any],
+) -> bool:
+    stored_semantics = {
+        key: value for key, value in stored_contract.items() if key != "training_implementation"
+    }
+    current_semantics = {
+        key: value for key, value in current_contract.items() if key != "training_implementation"
+    }
+    if stored_semantics != current_semantics:
+        return False
+    stored_files = _validated_implementation_files(
+        stored_contract.get("training_implementation"),
+        label="Stored training resume contract",
+    )
+    current_files = _validated_implementation_files(
+        current_contract.get("training_implementation"),
+        label="Current training resume contract",
+    )
+    changed_files = {path for path in stored_files if stored_files[path] != current_files[path]}
+    for migration in CHECKPOINT_RETENTION_MIGRATIONS:
+        from_files = migration["from_files"]
+        to_files = migration["to_files"]
+        if (
+            changed_files == set(from_files) == set(to_files)
+            and all(stored_files[path] == digest for path, digest in from_files.items())
+            and all(current_files[path] == digest for path, digest in to_files.items())
+        ):
+            return True
+    return False
+
+
+def compatible_training_resume_contract_digest(
+    config: ExperimentConfig,
+    run_manifest: dict[str, Any],
+) -> str:
+    """Return the stored digest after an exact, allowlisted retention-only migration."""
+
+    stored_digest = run_manifest.get("training_resume_contract_sha256")
+    if (
+        not isinstance(stored_digest, str)
+        or len(stored_digest) != 64
+        or any(character not in "0123456789abcdef" for character in stored_digest)
+    ):
+        raise ValueError("Run manifest has an invalid training resume contract digest")
+    current_contract = training_resume_contract(config)
+    current_digest = _canonical_payload_digest(current_contract)
+    if stored_digest == current_digest:
+        return stored_digest
+    stored_contract = run_manifest.get("training_resume_contract")
+    if not isinstance(stored_contract, dict):
+        raise ValueError("Run manifest has no training resume contract snapshot")
+    if _canonical_payload_digest(stored_contract) != stored_digest:
+        raise ValueError("Run manifest training resume contract snapshot is inconsistent")
+    if not _checkpoint_retention_migration_matches(stored_contract, current_contract):
+        raise ValueError("Run manifest does not match the current training resume contract")
+    return stored_digest
 
 
 def training_resume_contract_fingerprint(
@@ -140,12 +236,20 @@ def validate_training_resume_contract(
         saved_model_root=root.parent,
         run_id=run_id,
     )
-    expected_digest = training_resume_contract_digest(config)
-    artifacts = (
-        (root / "run-manifest.json", "Run manifest"),
-        (checkpoint / "trainer-state.json", "Trainer state"),
-    )
-    for path, label in artifacts:
+    run_manifest_path = root / "run-manifest.json"
+    try:
+        run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise FileNotFoundError(f"Run manifest is missing: {run_manifest_path}") from error
+    if not isinstance(run_manifest, dict):
+        raise ValueError("Run manifest must contain a JSON object")
+    if run_manifest.get("run_id") != run_id or run_manifest.get("run_key") != run_id:
+        raise ValueError("Run manifest identity does not match its canonical run directory")
+    if run_manifest.get("schema_version") != CHECKPOINT_ARTIFACT_SCHEMA_VERSION:
+        raise ValueError("Run manifest does not use the current checkpoint artifact schema")
+    expected_digest = compatible_training_resume_contract_digest(config, run_manifest)
+    trainer_state_path = checkpoint / "trainer-state.json"
+    for path, label in ((trainer_state_path, "Trainer state"),):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError as error:
@@ -158,6 +262,7 @@ def validate_training_resume_contract(
             raise ValueError(f"{label} does not use the current checkpoint artifact schema")
         if payload.get("training_resume_contract_sha256") != expected_digest:
             raise ValueError(f"{label} does not match the current training resume contract")
+    current_contract = training_resume_contract(config)
     for path, label in (
         (root / "resolved-config.yaml", "Run resolved config"),
         (checkpoint / "resolved-config.yaml", "Checkpoint resolved config"),
@@ -165,6 +270,6 @@ def validate_training_resume_contract(
         if not path.is_file() or path.stat().st_size <= 0:
             raise FileNotFoundError(f"{label} is missing or empty: {path}")
         stored_config = ExperimentConfig.from_yaml(path)
-        if training_resume_contract_digest(stored_config) != expected_digest:
+        if training_resume_contract(stored_config) != current_contract:
             raise ValueError(f"{label} does not match the current training resume contract")
     return expected_digest

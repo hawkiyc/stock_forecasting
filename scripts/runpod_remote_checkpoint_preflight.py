@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import math
 import re
 import subprocess
 import sys
@@ -69,6 +70,34 @@ class RunPodS3Reader:
         if not isinstance(payload, dict):
             raise RemoteCheckpointPreflightError(f"{label} must contain a JSON object")
         return payload
+
+    def optional_json_object(self, key, label):
+        output = self._run(
+            [
+                "s3api",
+                "list-objects-v2",
+                "--bucket",
+                self.bucket,
+                "--prefix",
+                key,
+                "--max-keys",
+                "1",
+                "--query",
+                "Contents[].Key",
+                "--output",
+                "text",
+            ],
+            label,
+        )
+        try:
+            keys = output.decode("utf-8").split()
+        except UnicodeDecodeError as error:
+            raise RemoteCheckpointPreflightError(
+                f"{label} existence check returned invalid UTF-8"
+            ) from error
+        if key not in keys:
+            return None
+        return self.json_object(key, label)
 
     def bytes_object(self, key, label):
         content = self._run(
@@ -253,8 +282,7 @@ def _dataset_contract(readiness_payload, dataset_payload, dataset_manifest_sha25
         for name in ("bar_store_manifest", "symbol_index", "cutoff_ranges")
     }
     if raw["sha256"] != _dataset_artifact(readiness_payload, "raw")["sha256"] or any(
-        artifact["sha256"]
-        != _dataset_artifact(readiness_payload, name)["sha256"]
+        artifact["sha256"] != _dataset_artifact(readiness_payload, name)["sha256"]
         for name, artifact in lazy_artifacts.items()
     ):
         raise ValueError("Dataset readiness marker and numerical artifacts disagree")
@@ -331,6 +359,75 @@ def _best_checkpoint_from_pointer(
     ):
         raise ValueError("Best-checkpoint pointer and leaderboard values disagree")
     return checkpoint_name
+
+
+def _temporary_checkpoint_from_pointer(
+    pointer,
+    *,
+    run_id,
+    contract_digest,
+    monitor,
+    mode,
+):
+    expected_keys = {
+        "schema_version",
+        "kind",
+        "run_id",
+        "run_key",
+        "training_resume_contract_sha256",
+        "selection_source",
+        "monitor",
+        "mode",
+        "path",
+        "global_step",
+        "value",
+        "created_at",
+    }
+    checkpoint_name = pointer.get("path")
+    global_step = pointer.get("global_step")
+    value = pointer.get("value")
+    created_at = pointer.get("created_at")
+    if (
+        set(pointer) != expected_keys
+        or pointer.get("kind") != "temporary-resume-checkpoint"
+        or pointer.get("run_id") != run_id
+        or pointer.get("run_key") != run_id
+        or readiness._checkpoint_artifact_contract_digest(
+            pointer,
+            "Temporary-checkpoint pointer",
+        )
+        != contract_digest
+        or pointer.get("selection_source") != "validation"
+        or pointer.get("monitor") != monitor
+        or pointer.get("mode") != mode
+        or not isinstance(checkpoint_name, str)
+        or readiness.CHECKPOINT_NAME_PATTERN.fullmatch(checkpoint_name) is None
+        or not isinstance(global_step, int)
+        or isinstance(global_step, bool)
+        or global_step < 0
+        or f"checkpoint-{global_step:06d}" != checkpoint_name
+        or not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or not isinstance(created_at, str)
+        or not created_at
+    ):
+        raise ValueError("Temporary-checkpoint pointer is invalid")
+    return {
+        "path": checkpoint_name,
+        "global_step": global_step,
+        "value": float(value),
+        "created_at": created_at,
+    }
+
+
+def _latest_resume_checkpoint_row(checkpoints, temporary_row):
+    latest_retained = max(checkpoints, key=lambda row: int(row["global_step"]))
+    if temporary_row is not None and int(temporary_row["global_step"]) > int(
+        latest_retained["global_step"]
+    ):
+        return temporary_row
+    return latest_retained
 
 
 def _verify_checkpoint_artifacts(
@@ -429,12 +526,31 @@ def validate_remote_checkpoint_run(
         mode,
     )
     retained_names = [str(row["path"]) for row in checkpoints]
+    temporary_pointer = reader.optional_json_object(
+        f"{run_root}/temp_checkpoint.json",
+        "temporary-checkpoint pointer",
+    )
+    temporary_row = (
+        _temporary_checkpoint_from_pointer(
+            temporary_pointer,
+            run_id=canonical_run_id,
+            contract_digest=contract_digest,
+            monitor=monitor,
+            mode=mode,
+        )
+        if temporary_pointer is not None
+        else None
+    )
+    if temporary_row is not None and temporary_row["path"] in retained_names:
+        raise ValueError("Temporary checkpoint must not also be validation-retained")
+    latest_resume = _latest_resume_checkpoint_row(checkpoints, temporary_row)
+    active_temporary = temporary_row if latest_resume is temporary_row else None
     if selection_policy == "latest":
-        latest_row = max(checkpoints, key=lambda row: int(row["global_step"]))
+        latest_row = latest_resume
         selected_checkpoint = checkpoint_name or str(latest_row["path"])
         if selected_checkpoint != latest_row["path"]:
             raise ValueError(
-                "Training resume checkpoint must be the latest retained global_step: "
+                "Training resume checkpoint must have the latest global_step: "
                 f"requested {selected_checkpoint}, latest {latest_row['path']}"
             )
     elif selection_policy == "best":
@@ -446,11 +562,14 @@ def validate_remote_checkpoint_run(
             raise ValueError("Retained-checkpoint selection requires --checkpoint-name")
         selected_checkpoint = checkpoint_name
 
+    allowed_names = set(retained_names)
+    if selection_policy == "latest" and active_temporary is not None:
+        allowed_names.add(str(active_temporary["path"]))
     if (
         readiness.CHECKPOINT_NAME_PATTERN.fullmatch(selected_checkpoint) is None
-        or selected_checkpoint not in retained_names
+        or selected_checkpoint not in allowed_names
     ):
-        raise ValueError("Selected checkpoint is not retained by the validation leaderboard")
+        raise ValueError("Selected checkpoint is not available under its requested policy")
 
     for row in checkpoints:
         retained_name = str(row["path"])
@@ -471,6 +590,30 @@ def validate_remote_checkpoint_run(
             reader,
             canonical_run_id,
             retained_name,
+            trainer_state,
+        )
+
+    if temporary_row is not None:
+        temporary_name = str(temporary_row["path"])
+        trainer_state = reader.json_object(
+            f"{run_root}/{temporary_name}/trainer-state.json",
+            f"{temporary_name}/trainer-state.json",
+        )
+        readiness._validate_trainer_state_identity(
+            trainer_state,
+            run_id=canonical_run_id,
+            checkpoint_name=temporary_name,
+            row=temporary_row,
+            monitor=monitor,
+            mode=mode,
+            contract_digest=contract_digest,
+        )
+        if trainer_state.get("created_at") != temporary_row["created_at"]:
+            raise ValueError("Temporary checkpoint and its pointer disagree")
+        _verify_checkpoint_artifacts(
+            reader,
+            canonical_run_id,
+            temporary_name,
             trainer_state,
         )
 
