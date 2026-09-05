@@ -14,7 +14,7 @@ CHECKPOINT_RETENTION_MIGRATIONS: Final = (
         },
         "to_files": {
             "training.py": (
-                "a2521d3b5389c345e2e956e441f7806840e5b721c0c73be3ed1550a6bba4c1ff"
+                "75277a0a7271c8557daae4544b55f65d12c5700b84039634fa38b283054318d1"
             ),
         },
     },
@@ -39,7 +39,7 @@ CHECKPOINT_RETENTION_MIGRATIONS: Final = (
                 "2b41ead1d3a74040419d393374755aee137d5fbe68a49da88eb7fbe9a1773044"
             ),
             "training.py": (
-                "a2521d3b5389c345e2e956e441f7806840e5b721c0c73be3ed1550a6bba4c1ff"
+                "75277a0a7271c8557daae4544b55f65d12c5700b84039634fa38b283054318d1"
             ),
         },
     },
@@ -52,7 +52,20 @@ CHECKPOINT_RETENTION_MIGRATIONS: Final = (
         },
         "to_files": {
             "training.py": (
+                "75277a0a7271c8557daae4544b55f65d12c5700b84039634fa38b283054318d1"
+            ),
+        },
+    },
+    {
+        "id": "adaptive-gpu-batch-probe-binding-v1",
+        "from_files": {
+            "training.py": (
                 "a2521d3b5389c345e2e956e441f7806840e5b721c0c73be3ed1550a6bba4c1ff"
+            ),
+        },
+        "to_files": {
+            "training.py": (
+                "75277a0a7271c8557daae4544b55f65d12c5700b84039634fa38b283054318d1"
             ),
         },
     },

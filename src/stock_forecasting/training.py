@@ -7,10 +7,11 @@ import math
 import os
 import random
 import time
+from collections.abc import Iterator
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterator, cast
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -1551,12 +1552,12 @@ def _measure_cuda_batch(
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
 
-        def run_once() -> None:
+        def run_once(batch: dict[str, Any]) -> None:
             nonlocal output
             output = None
             context = nullcontext() if training else torch.inference_mode()
             with context, _autocast_context(config, device):
-                output = forward_batch(bundle, device_batch, config, device)
+                output = forward_batch(bundle, batch, config, device)
                 if training:
                     if output.loss is None:
                         raise RuntimeError("Batch probe did not produce a training loss")
@@ -1564,11 +1565,11 @@ def _measure_cuda_batch(
             if training:
                 bundle.model.zero_grad(set_to_none=True)
 
-        run_once()
+        run_once(device_batch)
         torch.cuda.synchronize(device)
         started = time.perf_counter()
         for _ in range(config.training.auto_batch_probe_steps):
-            run_once()
+            run_once(device_batch)
         torch.cuda.synchronize(device)
         seconds_per_batch = (
             time.perf_counter() - started
