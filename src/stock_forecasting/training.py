@@ -10,7 +10,7 @@ import time
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Iterator, cast
 
 import numpy as np
 import torch
@@ -18,7 +18,7 @@ from numpy.typing import NDArray
 from torch import Tensor
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from stock_forecasting.checkpointing import (
     load_checkpoint,
@@ -50,6 +50,7 @@ from stock_forecasting.metrics import (
 from stock_forecasting.preflight import run_preflight
 from stock_forecasting.runtime_resources import (
     AvailableMemoryEstimate,
+    CGROUP_V1_UNLIMITED_THRESHOLD_BYTES,
     detect_available_memory,
     detect_visible_cpu_count,
 )
@@ -81,6 +82,9 @@ ROBUST_SCALE_BATCH_SIZE = 256
 ROBUST_SCALE_SELECTION_BLOCK_SIZE = 16
 ROBUST_SCALE_CACHE_SCHEMA_VERSION = "1.0"
 ROBUST_SCALE_ALGORITHM = "parallel-blockwise-runtime-labels-v1"
+TRAINING_PROGRESS_SCHEMA_VERSION = "2.0"
+RUNTIME_EXECUTION_PLAN_SCHEMA_VERSION = "1.0"
+CANONICAL_TRAINING_SCHEDULE_SCHEMA_VERSION = "1.0"
 _DATALOADER_THREAD_ENVIRONMENT = (
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -137,6 +141,122 @@ class DataLoaderWorkerPlan:
             ),
             "native_threads_per_worker": 1,
         }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Any,
+        *,
+        source: str | None = None,
+    ) -> DataLoaderWorkerPlan:
+        if not isinstance(payload, dict):
+            raise ValueError("Checkpoint DataLoader worker plan must be a mapping")
+        expected = {
+            "source",
+            "requested_workers",
+            "visible_cpu_count",
+            "available_memory_bytes",
+            "available_memory_source",
+            "available_memory_observations_bytes",
+            "worker_memory_budget_bytes",
+            "effective_workers",
+            "active_persistent_pools",
+            "estimated_peak_worker_memory_bytes",
+            "memory_bytes_per_worker",
+            "symbol_cache_size_per_worker",
+            "prefetch_factor",
+            "prefetched_batches_per_pool",
+            "prefetch_memory_budget_bytes",
+            "estimated_peak_prefetch_memory_bytes",
+            "native_threads_per_worker",
+        }
+        if set(payload) != expected:
+            raise ValueError("Checkpoint DataLoader worker plan is incomplete")
+        if not isinstance(payload["source"], str) or not isinstance(
+            payload["available_memory_source"], str
+        ):
+            raise ValueError("Checkpoint DataLoader worker labels are invalid")
+        observations = payload["available_memory_observations_bytes"]
+        if not isinstance(observations, dict) or not observations or any(
+            not isinstance(key, str)
+            or not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 1
+            for key, value in observations.items()
+        ):
+            raise ValueError("Checkpoint memory observations are invalid")
+        integer_fields = (
+            "requested_workers",
+            "visible_cpu_count",
+            "available_memory_bytes",
+            "worker_memory_budget_bytes",
+            "effective_workers",
+            "active_persistent_pools",
+            "symbol_cache_size_per_worker",
+            "prefetched_batches_per_pool",
+            "prefetch_memory_budget_bytes",
+            "estimated_peak_prefetch_memory_bytes",
+        )
+        if any(
+            not isinstance(payload[name], int)
+            or isinstance(payload[name], bool)
+            or payload[name] < 0
+            for name in integer_fields
+        ):
+            raise ValueError("Checkpoint DataLoader worker counters are invalid")
+        if payload["visible_cpu_count"] < 1 or payload["available_memory_bytes"] < 1:
+            raise ValueError("Checkpoint CPU and memory capacity must be positive")
+        if payload["active_persistent_pools"] != DATALOADER_ACTIVE_PERSISTENT_POOLS:
+            raise ValueError("Checkpoint DataLoader pool count is unsupported")
+        if payload["memory_bytes_per_worker"] != DATALOADER_MEMORY_BYTES_PER_WORKER:
+            raise ValueError("Checkpoint DataLoader worker-memory estimate is unsupported")
+        if payload["native_threads_per_worker"] != 1:
+            raise ValueError("Checkpoint DataLoader native-thread count is unsupported")
+        prefetch_factor = payload["prefetch_factor"]
+        if prefetch_factor is not None and (
+            not isinstance(prefetch_factor, int)
+            or isinstance(prefetch_factor, bool)
+            or prefetch_factor < 1
+        ):
+            raise ValueError("Checkpoint DataLoader prefetch factor is invalid")
+        plan = cls(
+            source=source or str(payload["source"]),
+            requested_workers=int(payload["requested_workers"]),
+            visible_cpu_count=int(payload["visible_cpu_count"]),
+            available_memory_bytes=int(payload["available_memory_bytes"]),
+            available_memory_source=str(payload["available_memory_source"]),
+            available_memory_observations=tuple(
+                sorted((str(key), int(value)) for key, value in observations.items())
+            ),
+            worker_memory_budget_bytes=int(payload["worker_memory_budget_bytes"]),
+            effective_workers=int(payload["effective_workers"]),
+            active_persistent_pools=int(payload["active_persistent_pools"]),
+            symbol_cache_size_per_worker=int(payload["symbol_cache_size_per_worker"]),
+            prefetch_factor=prefetch_factor,
+            prefetched_batches_per_pool=int(payload["prefetched_batches_per_pool"]),
+            prefetch_memory_budget_bytes=int(payload["prefetch_memory_budget_bytes"]),
+            estimated_peak_prefetch_memory_bytes=int(
+                payload["estimated_peak_prefetch_memory_bytes"]
+            ),
+        )
+        if payload["estimated_peak_worker_memory_bytes"] != (
+            plan.effective_workers
+            * plan.active_persistent_pools
+            * DATALOADER_MEMORY_BYTES_PER_WORKER
+        ):
+            raise ValueError("Checkpoint DataLoader worker-memory total is inconsistent")
+        expected_prefetched_batches = (
+            0
+            if plan.prefetch_factor is None
+            else plan.effective_workers * plan.prefetch_factor
+        )
+        if plan.prefetched_batches_per_pool != expected_prefetched_batches:
+            raise ValueError("Checkpoint DataLoader prefetch count is inconsistent")
+        if plan.effective_workers == 0 and plan.prefetch_factor is not None:
+            raise ValueError("Checkpoint serial DataLoader cannot prefetch in workers")
+        if plan.effective_workers > 0 and plan.prefetch_factor is None:
+            raise ValueError("Checkpoint multiprocessing DataLoader requires prefetching")
+        return plan
 
 
 @dataclass(frozen=True)
@@ -271,6 +391,274 @@ class RuntimeBatchPlan:
 
 
 @dataclass(frozen=True)
+class RuntimeHardwareSnapshot:
+    """Stable accelerator and host capacities used to decide plan reuse."""
+
+    requested_gpu_id: str
+    device_type: str
+    device_name: str
+    device_total_memory_bytes: int
+    compute_capability: str
+    host_memory_capacity_bytes: int
+    host_memory_capacity_source: str
+    visible_cpu_count: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "requested_gpu_id": self.requested_gpu_id,
+            "device_type": self.device_type,
+            "device_name": self.device_name,
+            "device_total_memory_bytes": self.device_total_memory_bytes,
+            "compute_capability": self.compute_capability,
+            "host_memory_capacity_bytes": self.host_memory_capacity_bytes,
+            "host_memory_capacity_source": self.host_memory_capacity_source,
+            "visible_cpu_count": self.visible_cpu_count,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> RuntimeHardwareSnapshot:
+        expected = {
+            "requested_gpu_id",
+            "device_type",
+            "device_name",
+            "device_total_memory_bytes",
+            "compute_capability",
+            "host_memory_capacity_bytes",
+            "host_memory_capacity_source",
+            "visible_cpu_count",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected:
+            raise ValueError("Checkpoint runtime hardware snapshot is incomplete")
+        for name in (
+            "requested_gpu_id",
+            "device_type",
+            "device_name",
+            "compute_capability",
+            "host_memory_capacity_source",
+        ):
+            if not isinstance(payload[name], str):
+                raise ValueError("Checkpoint runtime hardware text field is invalid")
+        for name in (
+            "device_total_memory_bytes",
+            "host_memory_capacity_bytes",
+            "visible_cpu_count",
+        ):
+            if (
+                not isinstance(payload[name], int)
+                or isinstance(payload[name], bool)
+                or payload[name] < 0
+            ):
+                raise ValueError("Checkpoint runtime hardware capacity is invalid")
+        if payload["visible_cpu_count"] < 1 or payload["host_memory_capacity_bytes"] < 1:
+            raise ValueError("Checkpoint host capacity must be positive")
+        if payload["device_type"] not in {"cpu", "cuda"}:
+            raise ValueError("Checkpoint runtime device type is unsupported")
+        if payload["device_type"] == "cuda" and payload["device_total_memory_bytes"] < 1:
+            raise ValueError("Checkpoint CUDA memory capacity must be positive")
+        return cls(**payload)
+
+    def capacity_identity(self) -> tuple[Any, ...]:
+        """Exclude transient free-memory observations from hardware identity."""
+
+        return (
+            self.requested_gpu_id,
+            self.device_type,
+            self.device_name,
+            self.device_total_memory_bytes,
+            self.compute_capability,
+            self.host_memory_capacity_bytes,
+            self.visible_cpu_count,
+        )
+
+
+@dataclass(frozen=True)
+class CanonicalTrainingSchedule:
+    """Immutable step coordinates established by the first training Pod."""
+
+    epochs: int
+    evaluations_per_epoch: int
+    optimizer_steps_per_epoch: int
+    configured_optimizer_steps: int
+
+    def __post_init__(self) -> None:
+        values = (
+            self.epochs,
+            self.evaluations_per_epoch,
+            self.optimizer_steps_per_epoch,
+            self.configured_optimizer_steps,
+        )
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+            for value in values
+        ):
+            raise ValueError("Canonical training schedule is invalid")
+        if self.configured_optimizer_steps != self.epochs * self.optimizer_steps_per_epoch:
+            raise ValueError("Canonical optimizer-step budget is inconsistent")
+        if self.optimizer_steps_per_epoch < self.evaluations_per_epoch:
+            raise ValueError("Canonical validation schedule is impossible")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": CANONICAL_TRAINING_SCHEDULE_SCHEMA_VERSION,
+            "epochs": self.epochs,
+            "evaluations_per_epoch": self.evaluations_per_epoch,
+            "optimizer_steps_per_epoch": self.optimizer_steps_per_epoch,
+            "configured_optimizer_steps": self.configured_optimizer_steps,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> CanonicalTrainingSchedule:
+        expected = {
+            "schema_version",
+            "epochs",
+            "evaluations_per_epoch",
+            "optimizer_steps_per_epoch",
+            "configured_optimizer_steps",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected:
+            raise ValueError("Checkpoint canonical training schedule is incomplete")
+        if payload["schema_version"] != CANONICAL_TRAINING_SCHEDULE_SCHEMA_VERSION:
+            raise ValueError("Checkpoint canonical training schedule version is unsupported")
+        schedule = cls(
+            epochs=payload["epochs"],
+            evaluations_per_epoch=payload["evaluations_per_epoch"],
+            optimizer_steps_per_epoch=payload["optimizer_steps_per_epoch"],
+            configured_optimizer_steps=payload["configured_optimizer_steps"],
+        )
+        return schedule
+
+
+@dataclass(frozen=True)
+class RuntimeExecutionPlan:
+    """One Pod's hardware-specific data-loading and optimizer-step plan."""
+
+    source: str
+    replan_reason: str
+    hardware: RuntimeHardwareSnapshot
+    batch_plan: RuntimeBatchPlan
+    worker_plan: DataLoaderWorkerPlan
+    optimizer_steps_per_epoch: int
+    configured_optimizer_steps: int
+    resume_canonical_global_step: int
+    resume_runtime_global_step: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": RUNTIME_EXECUTION_PLAN_SCHEMA_VERSION,
+            "source": self.source,
+            "replan_reason": self.replan_reason,
+            "hardware": self.hardware.as_dict(),
+            "batch_plan": self.batch_plan.as_dict(),
+            "dataloader_worker_plan": self.worker_plan.as_dict(),
+            "optimizer_steps_per_epoch": self.optimizer_steps_per_epoch,
+            "configured_optimizer_steps": self.configured_optimizer_steps,
+            "resume_canonical_global_step": self.resume_canonical_global_step,
+            "resume_runtime_global_step": self.resume_runtime_global_step,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> RuntimeExecutionPlan:
+        expected = {
+            "schema_version",
+            "source",
+            "replan_reason",
+            "hardware",
+            "batch_plan",
+            "dataloader_worker_plan",
+            "optimizer_steps_per_epoch",
+            "configured_optimizer_steps",
+            "resume_canonical_global_step",
+            "resume_runtime_global_step",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected:
+            raise ValueError("Checkpoint runtime execution plan is incomplete")
+        if payload["schema_version"] != RUNTIME_EXECUTION_PLAN_SCHEMA_VERSION:
+            raise ValueError("Checkpoint runtime execution plan version is unsupported")
+        if not isinstance(payload["source"], str) or not isinstance(
+            payload["replan_reason"], str
+        ):
+            raise ValueError("Checkpoint runtime execution plan labels are invalid")
+        counters = tuple(
+            payload[name]
+            for name in (
+                "optimizer_steps_per_epoch",
+                "configured_optimizer_steps",
+                "resume_canonical_global_step",
+                "resume_runtime_global_step",
+            )
+        )
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in counters
+        ):
+            raise ValueError("Checkpoint runtime execution counters are invalid")
+        if payload["optimizer_steps_per_epoch"] < 1:
+            raise ValueError("Checkpoint runtime optimizer-step count must be positive")
+        if (
+            payload["configured_optimizer_steps"] < payload["optimizer_steps_per_epoch"]
+            or payload["configured_optimizer_steps"]
+            % payload["optimizer_steps_per_epoch"]
+            != 0
+            or payload["resume_runtime_global_step"]
+            > payload["configured_optimizer_steps"]
+        ):
+            raise ValueError("Checkpoint runtime optimizer-step budget is inconsistent")
+        return cls(
+            source=payload["source"],
+            replan_reason=payload["replan_reason"],
+            hardware=RuntimeHardwareSnapshot.from_dict(payload["hardware"]),
+            batch_plan=RuntimeBatchPlan.from_dict(payload["batch_plan"]),
+            worker_plan=DataLoaderWorkerPlan.from_dict(
+                payload["dataloader_worker_plan"]
+            ),
+            optimizer_steps_per_epoch=payload["optimizer_steps_per_epoch"],
+            configured_optimizer_steps=payload["configured_optimizer_steps"],
+            resume_canonical_global_step=payload["resume_canonical_global_step"],
+            resume_runtime_global_step=payload["resume_runtime_global_step"],
+        )
+
+
+@dataclass(frozen=True)
+class ResumeCoordinates:
+    """Equivalent canonical and current-runtime positions for one checkpoint."""
+
+    starting_epoch: int
+    resume_batch_index: int
+    canonical_global_step: int
+    runtime_global_step: int
+
+
+class ResumableFixedSizeBatchSampler(Sampler[list[int]]):
+    """Skip completed batch indices before workers read network-volume data."""
+
+    def __init__(self, source: FixedSizeBatchSampler) -> None:
+        self.source = source
+        self.start_batch_index = 0
+
+    def __len__(self) -> int:
+        return len(self.source)
+
+    @property
+    def sampler(self) -> BlockwisePermutationSampler:
+        return self.source.sampler
+
+    @property
+    def padded_sample_count(self) -> int:
+        return self.source.padded_sample_count
+
+    def set_epoch(self, epoch: int, *, start_batch_index: int = 0) -> None:
+        if not 0 <= start_batch_index <= len(self.source):
+            raise ValueError("Resume batch index is outside the training epoch")
+        self.source.set_epoch(epoch)
+        self.start_batch_index = start_batch_index
+
+    def __iter__(self) -> Iterator[list[int]]:
+        for batch_index, batch in enumerate(self.source):
+            if batch_index >= self.start_batch_index:
+                yield batch
+
+
+@dataclass(frozen=True)
 class RuntimeRobustScaleResult:
     """Resolved robust scales plus their persistent cache provenance."""
 
@@ -298,6 +686,84 @@ def _available_memory_bytes() -> int:
     """Return scope-compatible available memory for compatibility callers."""
 
     return detect_available_memory().available_bytes
+
+
+def _read_positive_integer(path: Path) -> int | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not value.isascii() or not value.isdigit():
+        return None
+    parsed = int(value)
+    return parsed if parsed > 0 else None
+
+
+def _linux_total_memory_bytes() -> int | None:
+    try:
+        lines = Path("/proc/meminfo").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if not line.startswith("MemTotal:"):
+            continue
+        fields = line.split()
+        if len(fields) == 3 and fields[1].isdigit() and fields[2] == "kB":
+            return int(fields[1]) * 1024
+    return None
+
+
+def _host_memory_capacity() -> tuple[int, str]:
+    """Return a stable container memory ceiling instead of transient headroom."""
+
+    candidates: list[tuple[str, int]] = []
+    cgroup_v2 = _read_positive_integer(Path("/sys/fs/cgroup/memory.max"))
+    if (
+        cgroup_v2 is not None
+        and cgroup_v2 < CGROUP_V1_UNLIMITED_THRESHOLD_BYTES
+    ):
+        candidates.append(("cgroup_v2_limit", cgroup_v2))
+    cgroup_v1 = _read_positive_integer(
+        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    )
+    if (
+        cgroup_v1 is not None
+        and cgroup_v1 < CGROUP_V1_UNLIMITED_THRESHOLD_BYTES
+    ):
+        candidates.append(("cgroup_v1_limit", cgroup_v1))
+    linux_total = _linux_total_memory_bytes()
+    if linux_total is not None:
+        candidates.append(("linux_mem_total", linux_total))
+    if not candidates:
+        estimate = detect_available_memory()
+        return estimate.available_bytes, f"available_fallback:{estimate.source}"
+    source, capacity = min(candidates, key=lambda row: row[1])
+    return capacity, source
+
+
+def runtime_hardware_snapshot(device: torch.device) -> RuntimeHardwareSnapshot:
+    """Capture stable hardware identity plus the user-requested RunPod GPU ID."""
+
+    device_name = "cpu"
+    total_device_memory = 0
+    compute_capability = ""
+    if device.type == "cuda":
+        properties = torch.cuda.get_device_properties(device)
+        device_name = properties.name
+        total_device_memory = int(properties.total_memory)
+        major, minor = torch.cuda.get_device_capability(device)
+        compute_capability = f"{major}.{minor}"
+    host_memory_capacity, host_memory_source = _host_memory_capacity()
+    return RuntimeHardwareSnapshot(
+        requested_gpu_id=os.environ.get("RUNPOD_REQUESTED_GPU_ID", "").strip(),
+        device_type=device.type,
+        device_name=device_name,
+        device_total_memory_bytes=total_device_memory,
+        compute_capability=compute_capability,
+        host_memory_capacity_bytes=host_memory_capacity,
+        host_memory_capacity_source=host_memory_source,
+        visible_cpu_count=detect_visible_cpu_count(),
+    )
 
 
 def _requested_dataloader_workers(config: ExperimentConfig) -> tuple[int, str]:
@@ -484,6 +950,64 @@ def plan_runtime_prefetch(
     )
 
 
+def runtime_resource_plan_reuse_reason(
+    stored_plan: RuntimeExecutionPlan | None,
+    *,
+    current_hardware: RuntimeHardwareSnapshot,
+    current_worker_plan: DataLoaderWorkerPlan,
+) -> str:
+    """Explain whether a checkpoint's hardware-specific plan remains safe."""
+
+    if stored_plan is None:
+        return "checkpoint_has_no_hardware_plan"
+    if stored_plan.hardware.capacity_identity() != current_hardware.capacity_identity():
+        return "hardware_capacity_changed"
+    if (
+        stored_plan.batch_plan.device_name != current_hardware.device_name
+        or stored_plan.batch_plan.device_total_memory_bytes
+        != current_hardware.device_total_memory_bytes
+    ):
+        return "accelerator_batch_plan_identity_changed"
+    stored_workers = stored_plan.worker_plan
+    if stored_workers.requested_workers != current_worker_plan.requested_workers:
+        return "requested_worker_count_changed"
+    if stored_workers.effective_workers > current_worker_plan.effective_workers:
+        return "current_host_memory_headroom_is_lower"
+    current_prefetch_limit = int(
+        current_worker_plan.available_memory_bytes
+        * DATALOADER_PREFETCH_MEMORY_FRACTION
+    )
+    if stored_workers.estimated_peak_prefetch_memory_bytes > current_prefetch_limit:
+        return "current_prefetch_memory_headroom_is_lower"
+    return "checkpoint_hardware_match"
+
+
+def reuse_dataloader_worker_plan(
+    stored_plan: DataLoaderWorkerPlan,
+    current_plan: DataLoaderWorkerPlan,
+) -> DataLoaderWorkerPlan:
+    """Reuse queue dimensions while retaining current memory observations."""
+
+    return replace(
+        current_plan,
+        source="checkpoint_hardware_match",
+        effective_workers=stored_plan.effective_workers,
+        symbol_cache_size_per_worker=stored_plan.symbol_cache_size_per_worker,
+        prefetch_factor=stored_plan.prefetch_factor,
+        prefetched_batches_per_pool=stored_plan.prefetched_batches_per_pool,
+        prefetch_memory_budget_bytes=max(
+            stored_plan.estimated_peak_prefetch_memory_bytes,
+            int(
+                current_plan.available_memory_bytes
+                * DATALOADER_PREFETCH_MEMORY_FRACTION
+            ),
+        ),
+        estimated_peak_prefetch_memory_bytes=(
+            stored_plan.estimated_peak_prefetch_memory_bytes
+        ),
+    )
+
+
 def _initialize_dataloader_worker(_worker_id: int) -> None:
     """Prevent every loader process from creating its own native thread pools."""
 
@@ -635,9 +1159,11 @@ def build_dataloaders(
     )
     if len(train_sampler) < training_batch_size:
         raise ValueError("Selected training samples do not fill one fixed-size batch")
-    train_batch_sampler = FixedSizeBatchSampler(
-        train_sampler,
-        batch_size=training_batch_size,
+    train_batch_sampler = ResumableFixedSizeBatchSampler(
+        FixedSizeBatchSampler(
+            train_sampler,
+            batch_size=training_batch_size,
+        )
     )
     collator = FinancialBatchCollator()
     pin_memory = torch.cuda.is_available()
@@ -1579,15 +2105,49 @@ def _validation_monitor_value(metrics: dict[str, Any], monitor: str) -> float:
     return float(value)
 
 
-def _scheduler(optimizer: AdamW, warmup_steps: int, total_steps: int) -> LambdaLR:
-    def schedule(step: int) -> float:
-        if warmup_steps and step < warmup_steps:
-            return float(step + 1) / float(warmup_steps)
-        remaining = max(total_steps - warmup_steps, 1)
-        progress = min(max(step - warmup_steps, 0) / remaining, 1.0)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+def _learning_rate_multiplier(step: int, warmup_steps: int, total_steps: int) -> float:
+    if warmup_steps and step < warmup_steps:
+        return float(step + 1) / float(warmup_steps)
+    remaining = max(total_steps - warmup_steps, 1)
+    progress = min(max(step - warmup_steps, 0) / remaining, 1.0)
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    return LambdaLR(optimizer, schedule)
+
+def _scheduler(optimizer: AdamW, warmup_steps: int, total_steps: int) -> LambdaLR:
+    return LambdaLR(
+        optimizer,
+        lambda step: _learning_rate_multiplier(step, warmup_steps, total_steps),
+    )
+
+
+def _realign_scheduler(
+    scheduler: LambdaLR,
+    *,
+    runtime_global_step: int,
+    warmup_steps: int,
+    total_steps: int,
+) -> None:
+    """Move a loaded scheduler into this Pod's runtime step coordinate system."""
+
+    if runtime_global_step < 0 or total_steps < 1:
+        raise ValueError("Scheduler resume coordinates are invalid")
+    multiplier = _learning_rate_multiplier(
+        runtime_global_step,
+        warmup_steps,
+        total_steps,
+    )
+    learning_rates = [base_lr * multiplier for base_lr in scheduler.base_lrs]
+    if len(learning_rates) != len(scheduler.optimizer.param_groups):
+        raise ValueError("Scheduler parameter-group count changed during resume")
+    for parameter_group, learning_rate in zip(
+        scheduler.optimizer.param_groups,
+        learning_rates,
+        strict=True,
+    ):
+        parameter_group["lr"] = learning_rate
+    scheduler.last_epoch = runtime_global_step
+    scheduler._step_count = runtime_global_step + 1
+    scheduler._last_lr = learning_rates
 
 
 def _optimizer_parameter_groups(
@@ -1638,20 +2198,154 @@ def _optimizer_parameter_groups(
     return groups, trainable
 
 
-def _resume_coordinates(state: dict[str, Any], batch_count: int) -> tuple[int, int]:
-    epoch = int(state["epoch"])
-    batch_index = int(state["batch_index"]) + 1
-    if batch_index >= batch_count:
-        return epoch + 1, 0
-    return epoch, batch_index
-
-
-def _checkpoint_runtime_batch_plan(checkpoint: str | Path) -> RuntimeBatchPlan:
-    state = validate_checkpoint_trainer_state(checkpoint)
+def _checkpoint_runtime_execution_plan(
+    state: dict[str, Any],
+) -> RuntimeExecutionPlan | None:
     progress = state.get("training_progress")
     if not isinstance(progress, dict):
         raise ValueError("Resume checkpoint has no runtime training progress")
-    return RuntimeBatchPlan.from_dict(progress.get("runtime_batch_plan"))
+    payload = progress.get("runtime_execution_plan")
+    if payload is None:
+        if progress.get("schema_version") == TRAINING_PROGRESS_SCHEMA_VERSION:
+            raise ValueError("Resume checkpoint has no runtime execution plan")
+        return None
+    return RuntimeExecutionPlan.from_dict(payload)
+
+
+def _canonical_training_schedule(
+    progress: Any,
+    *,
+    epochs: int,
+    evaluations_per_epoch: int,
+    initial_optimizer_steps_per_epoch: int | None = None,
+) -> CanonicalTrainingSchedule:
+    if progress is None:
+        if initial_optimizer_steps_per_epoch is None:
+            raise ValueError("Initial optimizer-step count is required")
+        return CanonicalTrainingSchedule(
+            epochs=epochs,
+            evaluations_per_epoch=evaluations_per_epoch,
+            optimizer_steps_per_epoch=initial_optimizer_steps_per_epoch,
+            configured_optimizer_steps=initial_optimizer_steps_per_epoch * epochs,
+        )
+    if not isinstance(progress, dict):
+        raise ValueError("Checkpoint training progress must be a mapping")
+    if progress.get("schema_version") == TRAINING_PROGRESS_SCHEMA_VERSION:
+        schedule = CanonicalTrainingSchedule.from_dict(
+            progress.get("canonical_schedule")
+        )
+        if schedule.epochs != epochs or schedule.evaluations_per_epoch != (
+            evaluations_per_epoch
+        ):
+            raise ValueError("Checkpoint canonical schedule differs from the selected config")
+        return schedule
+
+    configured_steps = progress.get("configured_optimizer_steps")
+    if (
+        not isinstance(configured_steps, int)
+        or isinstance(configured_steps, bool)
+        or configured_steps < 1
+        or configured_steps % epochs != 0
+    ):
+        raise ValueError("Legacy checkpoint optimizer-step budget is invalid")
+    return CanonicalTrainingSchedule(
+        epochs=epochs,
+        evaluations_per_epoch=evaluations_per_epoch,
+        optimizer_steps_per_epoch=configured_steps // epochs,
+        configured_optimizer_steps=configured_steps,
+    )
+
+
+def aligned_epoch_event_steps(
+    epoch_index: int,
+    *,
+    runtime_optimizer_steps_per_epoch: int,
+    canonical_optimizer_steps_per_epoch: int,
+    points_per_epoch: int,
+) -> tuple[tuple[int, int], ...]:
+    """Pair runtime event steps with immutable canonical checkpoint steps."""
+
+    points = min(
+        points_per_epoch,
+        runtime_optimizer_steps_per_epoch,
+        canonical_optimizer_steps_per_epoch,
+    )
+    runtime_steps = epoch_evaluation_steps(
+        epoch_index,
+        runtime_optimizer_steps_per_epoch,
+        points,
+    )
+    canonical_steps = epoch_evaluation_steps(
+        epoch_index,
+        canonical_optimizer_steps_per_epoch,
+        points,
+    )
+    return tuple(zip(runtime_steps, canonical_steps, strict=True))
+
+
+def resume_coordinates(
+    state: dict[str, Any],
+    *,
+    schedule: CanonicalTrainingSchedule,
+    runtime_optimizer_steps_per_epoch: int,
+    runtime_batch_count: int,
+    gradient_accumulation_steps: int,
+) -> ResumeCoordinates:
+    """Align a canonical validation checkpoint to the current Pod's batch plan."""
+
+    canonical_global_step = state.get("global_step")
+    if (
+        not isinstance(canonical_global_step, int)
+        or isinstance(canonical_global_step, bool)
+        or canonical_global_step < 0
+        or canonical_global_step > schedule.configured_optimizer_steps
+    ):
+        raise ValueError("Resume checkpoint canonical step is invalid")
+    if runtime_optimizer_steps_per_epoch < schedule.evaluations_per_epoch:
+        raise ValueError("Current hardware plan cannot run every required validation")
+    if runtime_batch_count < 1 or gradient_accumulation_steps < 1:
+        raise ValueError("Current runtime DataLoader coordinates are invalid")
+
+    starting_epoch, canonical_step_within_epoch = divmod(
+        canonical_global_step,
+        schedule.optimizer_steps_per_epoch,
+    )
+    if canonical_step_within_epoch == 0:
+        runtime_step_within_epoch = 0
+    else:
+        if starting_epoch >= schedule.epochs:
+            raise ValueError("Resume checkpoint exceeds the canonical epoch budget")
+        canonical_boundaries = epoch_evaluation_steps(
+            0,
+            schedule.optimizer_steps_per_epoch,
+            schedule.evaluations_per_epoch,
+        )
+        try:
+            boundary_index = canonical_boundaries.index(canonical_step_within_epoch)
+        except ValueError as error:
+            raise ValueError(
+                "Resume checkpoint is not on a canonical validation boundary"
+            ) from error
+        runtime_step_within_epoch = epoch_evaluation_steps(
+            0,
+            runtime_optimizer_steps_per_epoch,
+            schedule.evaluations_per_epoch,
+        )[boundary_index]
+
+    runtime_global_step = (
+        starting_epoch * runtime_optimizer_steps_per_epoch
+        + runtime_step_within_epoch
+    )
+    resume_batch_index = min(
+        runtime_batch_count,
+        runtime_step_within_epoch * gradient_accumulation_steps,
+    )
+    return ResumeCoordinates(
+        starting_epoch=starting_epoch,
+        resume_batch_index=resume_batch_index,
+        canonical_global_step=canonical_global_step,
+        runtime_global_step=runtime_global_step,
+    )
 
 
 def _gradient_divisor(batch_index: int, batch_count: int, accumulation_steps: int) -> int:
@@ -1797,50 +2491,74 @@ def _training_progress(
     *,
     processed_train_samples: int,
     completed_epochs: int,
-    configured_optimizer_steps: int,
     early_stopping: EarlyStoppingState,
-    runtime_batch_plan: RuntimeBatchPlan,
+    canonical_schedule: CanonicalTrainingSchedule,
+    runtime_execution_plan: RuntimeExecutionPlan,
 ) -> dict[str, Any]:
     return {
+        "schema_version": TRAINING_PROGRESS_SCHEMA_VERSION,
         "processed_train_samples": processed_train_samples,
         "completed_epochs": completed_epochs,
-        "configured_optimizer_steps": configured_optimizer_steps,
         "early_stopping": early_stopping.as_dict(),
-        "runtime_batch_plan": runtime_batch_plan.as_dict(),
+        "canonical_schedule": canonical_schedule.as_dict(),
+        "runtime_execution_plan": runtime_execution_plan.as_dict(),
     }
 
 
 def _restore_training_progress(
     payload: Any,
     *,
-    configured_optimizer_steps: int,
-    runtime_batch_plan: RuntimeBatchPlan,
+    canonical_schedule: CanonicalTrainingSchedule,
 ) -> tuple[int, int, EarlyStoppingState]:
-    if not isinstance(payload, dict) or set(payload) != {
-        "processed_train_samples",
-        "completed_epochs",
-        "configured_optimizer_steps",
-        "early_stopping",
-        "runtime_batch_plan",
-    }:
+    if not isinstance(payload, dict):
         raise ValueError("Checkpoint training progress is incomplete")
+    if payload.get("schema_version") == TRAINING_PROGRESS_SCHEMA_VERSION:
+        expected = {
+            "schema_version",
+            "processed_train_samples",
+            "completed_epochs",
+            "early_stopping",
+            "canonical_schedule",
+            "runtime_execution_plan",
+        }
+        if set(payload) != expected:
+            raise ValueError("Checkpoint training progress is incomplete")
+        stored_schedule = CanonicalTrainingSchedule.from_dict(
+            payload["canonical_schedule"]
+        )
+        if stored_schedule != canonical_schedule:
+            raise ValueError("Checkpoint canonical schedule changed during resume")
+        RuntimeExecutionPlan.from_dict(payload["runtime_execution_plan"])
+    else:
+        expected = {
+            "processed_train_samples",
+            "completed_epochs",
+            "configured_optimizer_steps",
+            "early_stopping",
+            "runtime_batch_plan",
+        }
+        if set(payload) != expected:
+            raise ValueError("Legacy checkpoint training progress is incomplete")
+        stored_optimizer_steps = payload["configured_optimizer_steps"]
+        if (
+            not isinstance(stored_optimizer_steps, int)
+            or isinstance(stored_optimizer_steps, bool)
+            or stored_optimizer_steps != canonical_schedule.configured_optimizer_steps
+        ):
+            raise ValueError("Checkpoint optimizer-step budget differs from its canonical plan")
+        RuntimeBatchPlan.from_dict(payload["runtime_batch_plan"])
     processed_train_samples = payload["processed_train_samples"]
     completed_epochs = payload["completed_epochs"]
-    stored_optimizer_steps = payload["configured_optimizer_steps"]
     if any(
         not isinstance(value, int) or isinstance(value, bool) or value < 0
         for value in (
             processed_train_samples,
             completed_epochs,
-            stored_optimizer_steps,
         )
     ):
         raise ValueError("Checkpoint training progress counters are invalid")
-    if stored_optimizer_steps != configured_optimizer_steps:
-        raise ValueError("Checkpoint optimizer-step budget differs from the selected config")
-    stored_batch_plan = RuntimeBatchPlan.from_dict(payload["runtime_batch_plan"])
-    if stored_batch_plan.as_dict() != runtime_batch_plan.as_dict():
-        raise ValueError("Checkpoint runtime batch plan differs from the resumed runtime")
+    if completed_epochs > canonical_schedule.epochs:
+        raise ValueError("Checkpoint completed-epoch count exceeds the canonical plan")
     return (
         processed_train_samples,
         completed_epochs,
@@ -1879,10 +2597,37 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
     preflight.require_success()
     set_global_seed(config.training.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    resume_preview: dict[str, Any] | None = None
+    stored_execution_plan: RuntimeExecutionPlan | None = None
+    if config.training.resume_checkpoint is not None:
+        resume_preview = validate_checkpoint_trainer_state(
+            config.training.resume_checkpoint
+        )
+        stored_execution_plan = _checkpoint_runtime_execution_plan(resume_preview)
+
+    hardware = runtime_hardware_snapshot(device)
     requested_workers, worker_source = _requested_dataloader_workers(config)
-    worker_plan = plan_dataloader_workers(
+    current_worker_plan = plan_dataloader_workers(
         requested_workers,
         source=worker_source,
+    )
+    replan_reason = (
+        "fresh_training"
+        if resume_preview is None
+        else runtime_resource_plan_reuse_reason(
+            stored_execution_plan,
+            current_hardware=hardware,
+            current_worker_plan=current_worker_plan,
+        )
+    )
+    reuse_checkpoint_plan = replan_reason == "checkpoint_hardware_match"
+    worker_plan = (
+        reuse_dataloader_worker_plan(
+            cast(RuntimeExecutionPlan, stored_execution_plan).worker_plan,
+            current_worker_plan,
+        )
+        if reuse_checkpoint_plan
+        else current_worker_plan
     )
     datasets = build_lazy_datasets(config, worker_plan=worker_plan)
     train_dataset = datasets[0]
@@ -1896,8 +2641,11 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
     bundle = build_model_bundle(config, device, robust_scales=robust_scales)
     probe_sample = train_dataset[0]
     batch_plan = (
-        _checkpoint_runtime_batch_plan(config.training.resume_checkpoint)
-        if config.training.resume_checkpoint is not None
+        RuntimeBatchPlan.from_dict(
+            cast(RuntimeExecutionPlan, stored_execution_plan).batch_plan.as_dict(),
+            source="checkpoint_hardware_match",
+        )
+        if reuse_checkpoint_plan
         else resolve_runtime_batch_plan(
             config,
             bundle=bundle,
@@ -1914,29 +2662,23 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
             collator([probe_sample] * batch_plan.evaluation_batch_size)
         ),
     )
-    worker_plan = plan_runtime_prefetch(
-        worker_plan,
-        config=config,
-        batch_plan=batch_plan,
-        largest_host_batch_bytes=largest_host_batch_bytes,
-    )
-    print(
-        json.dumps(
-            {
-                "runtime_batch_plan": batch_plan.as_dict(),
-                "dataloader_worker_plan": worker_plan.as_dict(),
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
+    if not reuse_checkpoint_plan:
+        worker_plan = plan_runtime_prefetch(
+            worker_plan,
+            config=config,
+            batch_plan=batch_plan,
+            largest_host_batch_bytes=largest_host_batch_bytes,
+        )
     train_loader, validation_loader, _test_loader = build_dataloaders(
         config,
         worker_plan=worker_plan,
         batch_plan=batch_plan,
         datasets=datasets,
     )
-    train_batch_sampler = cast(FixedSizeBatchSampler, train_loader.batch_sampler)
+    train_batch_sampler = cast(
+        ResumableFixedSizeBatchSampler,
+        train_loader.batch_sampler,
+    )
     selected_train_samples = len(train_batch_sampler.sampler)
     parameter_groups, trainable = _optimizer_parameter_groups(bundle, config)
     optimizer = AdamW(
@@ -1948,54 +2690,118 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
     optimizer_steps_per_epoch = math.ceil(
         len(train_loader) / batch_plan.gradient_accumulation_steps
     )
-    configured_steps = optimizer_steps_per_epoch * config.training.epochs
-    if configured_steps < 1:
+    runtime_configured_steps = optimizer_steps_per_epoch * config.training.epochs
+    if runtime_configured_steps < 1:
         raise ValueError("Training budget must contain at least one optimizer step")
-    evaluation_steps = {
-        step
+    canonical_schedule = _canonical_training_schedule(
+        None if resume_preview is None else resume_preview.get("training_progress"),
+        epochs=config.training.epochs,
+        evaluations_per_epoch=config.training.evaluations_per_epoch,
+        initial_optimizer_steps_per_epoch=(
+            optimizer_steps_per_epoch if resume_preview is None else None
+        ),
+    )
+    coordinate_state = resume_preview or {"global_step": 0}
+    coordinates = resume_coordinates(
+        coordinate_state,
+        schedule=canonical_schedule,
+        runtime_optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+        runtime_batch_count=len(train_loader),
+        gradient_accumulation_steps=batch_plan.gradient_accumulation_steps,
+    )
+    execution_plan = RuntimeExecutionPlan(
+        source=("checkpoint_reuse" if reuse_checkpoint_plan else "runtime_probe"),
+        replan_reason=replan_reason,
+        hardware=hardware,
+        batch_plan=batch_plan,
+        worker_plan=worker_plan,
+        optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+        configured_optimizer_steps=runtime_configured_steps,
+        resume_canonical_global_step=coordinates.canonical_global_step,
+        resume_runtime_global_step=coordinates.runtime_global_step,
+    )
+    evaluation_alignment = {
+        runtime_step: canonical_step
         for epoch_index in range(config.training.epochs)
-        for step in epoch_evaluation_steps(
+        for runtime_step, canonical_step in aligned_epoch_event_steps(
             epoch_index,
-            optimizer_steps_per_epoch,
-            config.training.evaluations_per_epoch,
+            runtime_optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+            canonical_optimizer_steps_per_epoch=(
+                canonical_schedule.optimizer_steps_per_epoch
+            ),
+            points_per_epoch=config.training.evaluations_per_epoch,
         )
     }
-    loss_logging_steps = {
-        step
-        for epoch_index in range(config.training.epochs)
-        for step in epoch_loss_logging_steps(
-            epoch_index,
-            optimizer_steps_per_epoch,
-            config.training.loss_log_points_per_epoch,
-        )
-    }
-    actual_loss_points = min(
+    maximum_loss_points = min(
         config.training.loss_log_points_per_epoch,
         optimizer_steps_per_epoch,
+        canonical_schedule.optimizer_steps_per_epoch,
     )
+    actual_loss_points = (
+        maximum_loss_points // config.training.evaluations_per_epoch
+    ) * config.training.evaluations_per_epoch
+    if actual_loss_points < config.training.evaluations_per_epoch:
+        raise ValueError("Loss logging cannot cover every validation boundary")
+    loss_logging_alignment = {
+        runtime_step: canonical_step
+        for epoch_index in range(config.training.epochs)
+        for runtime_step, canonical_step in aligned_epoch_event_steps(
+            epoch_index,
+            runtime_optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+            canonical_optimizer_steps_per_epoch=(
+                canonical_schedule.optimizer_steps_per_epoch
+            ),
+            points_per_epoch=actual_loss_points,
+        )
+    }
     loss_logging_plan = {
         "requested_points_per_epoch": config.training.loss_log_points_per_epoch,
         "actual_points_per_epoch": actual_loss_points,
-        "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
-        "nominal_interval_steps": math.ceil(
+        "runtime_optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+        "canonical_optimizer_steps_per_epoch": (
+            canonical_schedule.optimizer_steps_per_epoch
+        ),
+        "runtime_nominal_interval_steps": math.ceil(
             optimizer_steps_per_epoch / actual_loss_points
         ),
     }
     print(
-        json.dumps({"loss_logging_plan": loss_logging_plan}, sort_keys=True),
+        json.dumps(
+            {
+                "canonical_training_schedule": canonical_schedule.as_dict(),
+                "runtime_execution_plan": execution_plan.as_dict(),
+                "loss_logging_plan": loss_logging_plan,
+            },
+            sort_keys=True,
+        ),
         flush=True,
+    )
+    runtime_warmup_steps = int(
+        runtime_configured_steps * config.training.warmup_ratio
     )
     scheduler = _scheduler(
         optimizer,
-        int(configured_steps * config.training.warmup_ratio),
-        configured_steps,
+        runtime_warmup_steps,
+        runtime_configured_steps,
     )
     tracking: TrackingRun = start_tracking(config)
-    global_step = 0
-    starting_epoch = 0
-    resume_batch_index = 0
+    runtime_execution_plan_path = atomic_write_json(
+        tracking.directory / "runtime-execution-plan.json",
+        {
+            "schema_version": RUNTIME_EXECUTION_PLAN_SCHEMA_VERSION,
+            "kind": "training-runtime-execution-plan",
+            "canonical_training_schedule": canonical_schedule.as_dict(),
+            "runtime_execution_plan": execution_plan.as_dict(),
+        },
+    )
+    global_step = coordinates.canonical_global_step
+    runtime_global_step = coordinates.runtime_global_step
+    starting_epoch = coordinates.starting_epoch
+    resume_batch_index = coordinates.resume_batch_index
     last_evaluation_step = -1
     last_checkpoint_step = -1
+    last_runtime_evaluation_step = -1
+    last_runtime_checkpoint_step = -1
     validation_metrics: dict[str, Any] = {}
     last_validation_flat_metrics: dict[str, float] = {}
     best_checkpoint: Path | None = None
@@ -2037,21 +2843,42 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 raise ValueError("Resume checkpoint belongs to a different training stage")
             if state.get("model_architecture_sha256") != config.model_architecture_digest():
                 raise ValueError("Resume checkpoint model architecture digest differs")
-            global_step = int(state["global_step"])
+            loaded_coordinates = resume_coordinates(
+                state,
+                schedule=canonical_schedule,
+                runtime_optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+                runtime_batch_count=len(train_loader),
+                gradient_accumulation_steps=(
+                    batch_plan.gradient_accumulation_steps
+                ),
+            )
+            if loaded_coordinates != coordinates:
+                raise RuntimeError("Resume checkpoint changed during training setup")
+            global_step = loaded_coordinates.canonical_global_step
+            runtime_global_step = loaded_coordinates.runtime_global_step
             last_checkpoint_step = global_step
             last_evaluation_step = global_step
-            starting_epoch, resume_batch_index = _resume_coordinates(
-                state,
-                len(train_loader),
-            )
+            last_runtime_checkpoint_step = runtime_global_step
+            last_runtime_evaluation_step = runtime_global_step
+            starting_epoch = loaded_coordinates.starting_epoch
+            resume_batch_index = loaded_coordinates.resume_batch_index
             (
                 processed_train_samples,
                 completed_epochs,
                 early_stopping,
             ) = _restore_training_progress(
                 state.get("training_progress"),
-                configured_optimizer_steps=configured_steps,
-                runtime_batch_plan=batch_plan,
+                canonical_schedule=canonical_schedule,
+            )
+            if completed_epochs != starting_epoch:
+                raise ValueError(
+                    "Checkpoint completed epochs disagree with canonical progress"
+                )
+            _realign_scheduler(
+                scheduler,
+                runtime_global_step=runtime_global_step,
+                warmup_steps=runtime_warmup_steps,
+                total_steps=runtime_configured_steps,
             )
             stored_metrics = state.get("metrics")
             if not isinstance(stored_metrics, dict) or any(
@@ -2065,21 +2892,32 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 str(key): float(value) for key, value in stored_metrics.items()
             }
             validation_metrics = _unflatten_metrics(last_validation_flat_metrics)
-        if global_step > configured_steps:
+        if global_step > canonical_schedule.configured_optimizer_steps:
             raise ValueError("Resume checkpoint exceeds the configured training budget")
+        if runtime_global_step > runtime_configured_steps:
+            raise ValueError("Mapped resume checkpoint exceeds the runtime training budget")
 
         optimizer.zero_grad(set_to_none=True)
         bundle.model.train()
-        stop_training = global_step >= configured_steps or early_stopping.triggered
+        stop_training = (
+            runtime_global_step >= runtime_configured_steps
+            or global_step >= canonical_schedule.configured_optimizer_steps
+            or early_stopping.triggered
+        )
         if early_stopping.triggered:
             stop_reason = "early_stopping"
         for epoch in range(starting_epoch, config.training.epochs):
             if stop_training:
                 break
-            train_batch_sampler.set_epoch(epoch)
-            for batch_index, batch in enumerate(iter_device_batches(train_loader, device)):
-                if epoch == starting_epoch and batch_index < resume_batch_index:
-                    continue
+            epoch_start_batch = resume_batch_index if epoch == starting_epoch else 0
+            train_batch_sampler.set_epoch(
+                epoch,
+                start_batch_index=epoch_start_batch,
+            )
+            for batch_index, batch in enumerate(
+                iter_device_batches(train_loader, device),
+                start=epoch_start_batch,
+            ):
                 with _autocast_context(config, device):
                     output = forward_batch(bundle, batch, config, device)
                     if output.loss is None:
@@ -2110,10 +2948,11 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
+                runtime_global_step += 1
                 processed_train_samples += accumulated_microbatch_samples
                 accumulated_microbatch_samples = 0
-                if global_step in loss_logging_steps:
+                if runtime_global_step in loss_logging_alignment:
+                    global_step = loss_logging_alignment[runtime_global_step]
                     if accumulated_loss_sum is None or accumulated_loss_count < 1:
                         raise RuntimeError("Loss logging cadence has no accumulated loss")
                     logged_loss = float(
@@ -2138,7 +2977,8 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                     )
                     accumulated_loss_sum = None
                     accumulated_loss_count = 0
-                if global_step in evaluation_steps:
+                if runtime_global_step in evaluation_alignment:
+                    global_step = evaluation_alignment[runtime_global_step]
                     validation_metrics = evaluate_loader(
                         bundle,
                         validation_loader,
@@ -2146,6 +2986,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                         device,
                     )
                     last_evaluation_step = global_step
+                    last_runtime_evaluation_step = runtime_global_step
                     selection = _validation_monitor_value(
                         validation_metrics,
                         config.training.checkpoint_monitor,
@@ -2177,7 +3018,10 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                         step=global_step,
                     )
                     completed_epochs_at_step = (
-                        epoch + 1 if batch_index + 1 == len(train_loader) else epoch
+                        epoch + 1
+                        if global_step
+                        == (epoch + 1) * canonical_schedule.optimizer_steps_per_epoch
+                        else epoch
                     )
                     checkpoint, last_ranking = save_ranked_checkpoint(
                         model=bundle.model,
@@ -2196,9 +3040,9 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                         training_progress=_training_progress(
                             processed_train_samples=processed_train_samples,
                             completed_epochs=completed_epochs_at_step,
-                            configured_optimizer_steps=configured_steps,
                             early_stopping=early_stopping,
-                            runtime_batch_plan=batch_plan,
+                            canonical_schedule=canonical_schedule,
+                            runtime_execution_plan=execution_plan,
                         ),
                     )
                     best_path = last_ranking.get("best_checkpoint")
@@ -2207,11 +3051,12 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                     elif checkpoint is not None:
                         best_checkpoint = checkpoint
                     last_checkpoint_step = global_step
+                    last_runtime_checkpoint_step = runtime_global_step
                     completed_epochs = completed_epochs_at_step
                     if early_stopping.triggered:
                         stop_reason = "early_stopping"
                         stop_training = True
-                if global_step >= configured_steps:
+                if runtime_global_step >= runtime_configured_steps:
                     stop_training = True
                     break
                 if early_stopping.triggered:
@@ -2219,7 +3064,12 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
             if stop_training:
                 break
 
-        if last_evaluation_step != global_step or last_checkpoint_step != global_step:
+        if (
+            last_evaluation_step != global_step
+            or last_checkpoint_step != global_step
+            or last_runtime_evaluation_step != runtime_global_step
+            or last_runtime_checkpoint_step != runtime_global_step
+        ):
             raise RuntimeError(
                 "Training stopped outside the configured epoch-relative validation schedule"
             )
@@ -2228,7 +3078,11 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
         if not last_validation_flat_metrics:
             raise RuntimeError("Training completed without finite validation metrics")
         if stop_reason == "epochs_completed":
-            if global_step != configured_steps or completed_epochs != config.training.epochs:
+            if (
+                global_step != canonical_schedule.configured_optimizer_steps
+                or runtime_global_step != runtime_configured_steps
+                or completed_epochs != config.training.epochs
+            ):
                 raise RuntimeError("Training ended before every configured epoch completed")
         elif not early_stopping.triggered:
             raise RuntimeError("Early-stopping completion has no triggered stopping state")
@@ -2258,9 +3112,15 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 "selected_train_samples_per_epoch": selected_train_samples,
                 "planned_train_samples": planned_train_samples,
                 "processed_train_samples": processed_train_samples,
-                "configured_optimizer_steps": configured_steps,
+                "configured_optimizer_steps": (
+                    canonical_schedule.configured_optimizer_steps
+                ),
                 "completed_optimizer_steps": global_step,
-                "optimizer_step_coverage_ratio": global_step / configured_steps,
+                "optimizer_step_coverage_ratio": (
+                    global_step / canonical_schedule.configured_optimizer_steps
+                ),
+                "runtime_configured_optimizer_steps": runtime_configured_steps,
+                "runtime_completed_optimizer_steps": runtime_global_step,
                 "completed_epochs": completed_epochs,
                 "validation_evaluations": early_stopping.evaluation_count,
                 "stop_reason": stop_reason,
@@ -2268,6 +3128,9 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 "early_stopping": early_stopping.as_dict(),
                 "training_batch_padding_per_epoch": (train_batch_sampler.padded_sample_count),
                 "runtime_batch_plan": batch_plan.as_dict(),
+                "runtime_execution_plan": execution_plan.as_dict(),
+                "runtime_execution_plan_path": str(runtime_execution_plan_path),
+                "canonical_training_schedule": canonical_schedule.as_dict(),
                 "loss_logging_plan": loss_logging_plan,
                 "runtime_label_calibration": {
                     "source_split": "train",
@@ -2318,7 +3181,9 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
             selected_datasets=tuple(config.data.selected_datasets),
             selected_train_samples_per_epoch=selected_train_samples,
             processed_train_samples=processed_train_samples,
-            configured_optimizer_steps=configured_steps,
+            configured_optimizer_steps=(
+                canonical_schedule.configured_optimizer_steps
+            ),
             completed_epochs=completed_epochs,
             validation_evaluations=early_stopping.evaluation_count,
             stop_reason=stop_reason,
@@ -2332,6 +3197,9 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 {
                     "failed": True,
                     "global_step": global_step,
+                    "runtime_global_step": runtime_global_step,
+                    "runtime_execution_plan": execution_plan.as_dict(),
+                    "runtime_execution_plan_path": str(runtime_execution_plan_path),
                     "training_stage": config.training.stage,
                 }
             )

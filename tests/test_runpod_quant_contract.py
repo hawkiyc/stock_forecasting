@@ -1193,6 +1193,7 @@ def test_wandb_contract_logs_dynamic_epoch_points_and_validation_metrics() -> No
 
 def test_runpod_training_auto_tunes_multiprocess_data_loading() -> None:
     entrypoint = (ROOT / "scripts/runpod_entrypoint.sh").read_text(encoding="utf-8")
+    create_pod = (ROOT / "scripts/create_runpod_pod.sh").read_text(encoding="utf-8")
     reexec = (ROOT / "scripts/runpod_reexec_with_pid1_env.py").read_text(encoding="utf-8")
     training = (ROOT / "src/stock_forecasting/training.py").read_text(encoding="utf-8")
 
@@ -1205,6 +1206,10 @@ def test_runpod_training_auto_tunes_multiprocess_data_loading() -> None:
     assert "resolve_runtime_batch_plan(" in training
     assert "plan_runtime_prefetch(" in training
     assert "iter_device_batches(" in training
+    assert 'tracking.directory / "runtime-execution-plan.json"' in training
+    assert '"RUNPOD_REQUESTED_GPU_ID":"%s"' in create_pod
+    assert '"${RUNPOD_GPU_ID}" "${MAX_RUNTIME_SECONDS}"' in create_pod
+    assert '"RUNPOD_REQUESTED_GPU_ID"' in reexec
     assert "DATALOADER_SELECTION_BLOCK_SIZE = 128" in training
     assert '"dataloader_worker_plan": worker_plan.as_dict()' in training
     assert "resolve_runtime_robust_scales(" in training

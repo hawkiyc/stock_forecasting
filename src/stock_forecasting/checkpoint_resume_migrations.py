@@ -14,7 +14,7 @@ CHECKPOINT_RETENTION_MIGRATIONS: Final = (
         },
         "to_files": {
             "training.py": (
-                "d54aaa84c5adda60051cb3574baa54e4009211629198f540c99ae11b83173437"
+                "a2521d3b5389c345e2e956e441f7806840e5b721c0c73be3ed1550a6bba4c1ff"
             ),
         },
     },
@@ -39,7 +39,20 @@ CHECKPOINT_RETENTION_MIGRATIONS: Final = (
                 "2b41ead1d3a74040419d393374755aee137d5fbe68a49da88eb7fbe9a1773044"
             ),
             "training.py": (
+                "a2521d3b5389c345e2e956e441f7806840e5b721c0c73be3ed1550a6bba4c1ff"
+            ),
+        },
+    },
+    {
+        "id": "hardware-portable-runtime-plan-v2",
+        "from_files": {
+            "training.py": (
                 "d54aaa84c5adda60051cb3574baa54e4009211629198f540c99ae11b83173437"
+            ),
+        },
+        "to_files": {
+            "training.py": (
+                "a2521d3b5389c345e2e956e441f7806840e5b721c0c73be3ed1550a6bba4c1ff"
             ),
         },
     },
