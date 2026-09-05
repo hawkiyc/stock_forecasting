@@ -23,7 +23,12 @@ from stock_forecasting.checkpointing import (
 )
 from stock_forecasting.cli.prefetch_models import prefetch_repositories
 from stock_forecasting.config import ExperimentConfig
-from stock_forecasting.data import FinancialBatchCollator, FinancialWindowDataset
+from stock_forecasting.data import (
+    BlockwisePermutationSampler,
+    FinancialBatchCollator,
+    FinancialWindowDataset,
+    FixedSizeBatchSampler,
+)
 from stock_forecasting.factory import (
     PINNED_KRONOS_SOURCE_REVISION,
     _promote_trainable_parameters_to_fp32,
@@ -38,13 +43,27 @@ from stock_forecasting.models.lora import LoRALinear, inject_lora, lora_paramete
 from stock_forecasting.models.outputs import MODEL_OUTPUT_SCHEMA_VERSION
 from stock_forecasting.run_contract import training_resume_contract_digest
 from stock_forecasting.training import (
+    BatchProbeMeasurement,
+    CanonicalTrainingSchedule,
     EarlyStoppingState,
+    ResumableFixedSizeBatchSampler,
     RuntimeBatchPlan,
+    RuntimeExecutionPlan,
+    RuntimeHardwareSnapshot,
+    _automatic_gradient_accumulation_steps,
+    _canonical_training_schedule,
+    _hardware_batch_expansion_maximum,
+    _next_adaptive_batch_candidate,
+    _realign_scheduler,
+    _scheduler,
+    aligned_epoch_event_steps,
     epoch_evaluation_steps,
     epoch_loss_logging_steps,
     evaluate_loader,
     plan_dataloader_workers,
     plan_runtime_prefetch,
+    resume_coordinates,
+    runtime_resource_plan_reuse_reason,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -116,6 +135,14 @@ def test_dataloader_worker_plan_is_cpu_and_memory_bounded() -> None:
     )
     assert runpod_auto.effective_workers == 15
 
+    large_host = plan_dataloader_workers(
+        128,
+        source="runpod_auto",
+        visible_cpu_count=64,
+        available_memory_bytes=512 * gib,
+    )
+    assert large_host.effective_workers == 62
+
 
 def test_prefetch_factor_tracks_gpu_demand_with_memory_and_config_caps() -> None:
     config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
@@ -168,8 +195,72 @@ def test_prefetch_factor_tracks_gpu_demand_with_memory_and_config_caps() -> None
     )
 
     assert fast.prefetch_factor == config.training.dataloader_max_prefetch_factor == 4
+    assert fast.prefetched_batches_per_pool == 32
+    assert fast.estimated_peak_prefetch_memory_bytes == 64 * 1024**2
+    assert fast.prefetch_memory_budget_bytes == int(64 * 1024**3 * 0.10)
     assert slow.prefetch_factor == 2
     assert memory_limited.prefetch_factor == 1
+
+
+def test_adaptive_batch_search_expands_only_while_throughput_scales() -> None:
+    def measurement(batch_size: int, samples_per_second: float) -> BatchProbeMeasurement:
+        return BatchProbeMeasurement(
+            batch_size=batch_size,
+            seconds_per_batch=batch_size / samples_per_second,
+            samples_per_second=samples_per_second,
+            peak_allocated_bytes=batch_size * 1024,
+            projected_peak_bytes=batch_size * 1024,
+            accepted=True,
+            outcome="accepted",
+        )
+
+    scaling = [measurement(64, 900.0), measurement(128, 1_000.0)]
+    slight_regression = [measurement(64, 1_000.0), measurement(128, 920.0)]
+    regression = [measurement(64, 1_000.0), measurement(128, 850.0)]
+    assert _next_adaptive_batch_candidate(scaling, expansion_maximum=4_096) == 256
+    assert (
+        _next_adaptive_batch_candidate(
+            slight_regression,
+            expansion_maximum=4_096,
+        )
+        == 256
+    )
+    assert _next_adaptive_batch_candidate(regression, expansion_maximum=4_096) is None
+
+    gib = 1024**3
+    assert (
+        _hardware_batch_expansion_maximum(
+            configured_maximum=256,
+            device_total_memory_bytes=32 * gib,
+            absolute_maximum=4_096,
+        )
+        == 512
+    )
+    assert (
+        _hardware_batch_expansion_maximum(
+            configured_maximum=256,
+            device_total_memory_bytes=192 * gib,
+            absolute_maximum=4_096,
+        )
+        == 2_048
+    )
+
+
+def test_automatic_effective_batch_is_stable_floor_not_hardware_ceiling() -> None:
+    assert (
+        _automatic_gradient_accumulation_steps(
+            target_effective_batch_size=256,
+            training_batch_size=32,
+        )
+        == 8
+    )
+    assert (
+        _automatic_gradient_accumulation_steps(
+            target_effective_batch_size=256,
+            training_batch_size=512,
+        )
+        == 1
+    )
 
 
 def test_epoch_relative_validation_schedule_has_exactly_five_even_checkpoints() -> None:
@@ -180,6 +271,202 @@ def test_epoch_relative_validation_schedule_has_exactly_five_even_checkpoints() 
         epoch_evaluation_steps(0, 4, 5)
 
 
+def test_hardware_change_preserves_canonical_checkpoint_step_coordinates() -> None:
+    schedule = CanonicalTrainingSchedule(
+        epochs=5,
+        evaluations_per_epoch=5,
+        optimizer_steps_per_epoch=300_000,
+        configured_optimizer_steps=1_500_000,
+    )
+
+    epoch_boundary = resume_coordinates(
+        {"global_step": 300_000},
+        schedule=schedule,
+        runtime_optimizer_steps_per_epoch=150_000,
+        runtime_batch_count=150_000,
+        gradient_accumulation_steps=1,
+    )
+    first_second_epoch_event = aligned_epoch_event_steps(
+        1,
+        runtime_optimizer_steps_per_epoch=150_000,
+        canonical_optimizer_steps_per_epoch=300_000,
+        points_per_epoch=5,
+    )[0]
+    mid_epoch = resume_coordinates(
+        {"global_step": 360_000},
+        schedule=schedule,
+        runtime_optimizer_steps_per_epoch=150_000,
+        runtime_batch_count=150_000,
+        gradient_accumulation_steps=1,
+    )
+
+    assert epoch_boundary.starting_epoch == 1
+    assert epoch_boundary.resume_batch_index == 0
+    assert epoch_boundary.runtime_global_step == 150_000
+    assert first_second_epoch_event == (180_000, 360_000)
+    assert mid_epoch.starting_epoch == 1
+    assert mid_epoch.resume_batch_index == 30_000
+    assert mid_epoch.runtime_global_step == 180_000
+    assert mid_epoch.canonical_global_step == 360_000
+
+    downgraded = aligned_epoch_event_steps(
+        1,
+        runtime_optimizer_steps_per_epoch=600_000,
+        canonical_optimizer_steps_per_epoch=300_000,
+        points_per_epoch=5,
+    )[0]
+    assert downgraded == (720_000, 360_000)
+
+
+def test_legacy_checkpoint_budget_becomes_the_canonical_schedule() -> None:
+    schedule = _canonical_training_schedule(
+        {"configured_optimizer_steps": 1_500_000},
+        epochs=5,
+        evaluations_per_epoch=5,
+    )
+
+    assert schedule.optimizer_steps_per_epoch == 300_000
+    assert schedule.configured_optimizer_steps == 1_500_000
+
+
+def test_resume_rejects_non_validation_canonical_checkpoint() -> None:
+    schedule = CanonicalTrainingSchedule(
+        epochs=2,
+        evaluations_per_epoch=5,
+        optimizer_steps_per_epoch=100,
+        configured_optimizer_steps=200,
+    )
+
+    with pytest.raises(ValueError, match="canonical validation boundary"):
+        resume_coordinates(
+            {"global_step": 21},
+            schedule=schedule,
+            runtime_optimizer_steps_per_epoch=50,
+            runtime_batch_count=50,
+            gradient_accumulation_steps=1,
+        )
+
+
+def test_scheduler_is_realigned_to_the_current_runtime_step_budget() -> None:
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0)
+    scheduler = _scheduler(optimizer, warmup_steps=10, total_steps=100)
+
+    _realign_scheduler(
+        scheduler,
+        runtime_global_step=50,
+        warmup_steps=10,
+        total_steps=100,
+    )
+
+    expected = 0.5 * (1.0 + np.cos(np.pi * (40 / 90)))
+    assert scheduler.last_epoch == 50
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(expected)
+
+
+def test_runtime_execution_plan_reuses_only_matching_safe_hardware() -> None:
+    gib = 1024**3
+    hardware = RuntimeHardwareSnapshot(
+        requested_gpu_id="NVIDIA GeForce RTX 5090",
+        device_type="cuda",
+        device_name="NVIDIA GeForce RTX 5090",
+        device_total_memory_bytes=32 * gib,
+        compute_capability="12.0",
+        host_memory_capacity_bytes=64 * gib,
+        host_memory_capacity_source="cgroup_v2_limit",
+        visible_cpu_count=16,
+    )
+    workers = plan_dataloader_workers(
+        8,
+        source="runpod_auto",
+        visible_cpu_count=16,
+        available_memory_bytes=56 * gib,
+    )
+    batch = RuntimeBatchPlan(
+        source="cuda_probe",
+        training_batch_size=256,
+        evaluation_batch_size=512,
+        gradient_accumulation_steps=1,
+        effective_batch_size=256,
+        target_effective_batch_size=256,
+        device_name=hardware.device_name,
+        device_total_memory_bytes=hardware.device_total_memory_bytes,
+        optimizer_state_reserve_bytes=2 * gib,
+        seconds_per_training_batch=0.25,
+        training_probe=(),
+        evaluation_probe=(),
+    )
+    stored = RuntimeExecutionPlan(
+        source="runtime_probe",
+        replan_reason="fresh_training",
+        hardware=hardware,
+        batch_plan=batch,
+        worker_plan=workers,
+        optimizer_steps_per_epoch=300_000,
+        configured_optimizer_steps=1_500_000,
+        resume_canonical_global_step=0,
+        resume_runtime_global_step=0,
+    )
+
+    assert RuntimeExecutionPlan.from_dict(stored.as_dict()) == stored
+    assert (
+        runtime_resource_plan_reuse_reason(
+            stored,
+            current_hardware=hardware,
+            current_worker_plan=workers,
+        )
+        == "checkpoint_hardware_match"
+    )
+
+    upgraded = RuntimeHardwareSnapshot(
+        requested_gpu_id="NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        device_type="cuda",
+        device_name="NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        device_total_memory_bytes=96 * gib,
+        compute_capability="12.0",
+        host_memory_capacity_bytes=128 * gib,
+        host_memory_capacity_source="cgroup_v2_limit",
+        visible_cpu_count=32,
+    )
+    assert (
+        runtime_resource_plan_reuse_reason(
+            stored,
+            current_hardware=upgraded,
+            current_worker_plan=workers,
+        )
+        == "hardware_capacity_changed"
+    )
+
+    reduced_headroom = plan_dataloader_workers(
+        8,
+        source="runpod_auto",
+        visible_cpu_count=16,
+        available_memory_bytes=8 * gib,
+    )
+    assert (
+        runtime_resource_plan_reuse_reason(
+            stored,
+            current_hardware=hardware,
+            current_worker_plan=reduced_headroom,
+        )
+        == "current_host_memory_headroom_is_lower"
+    )
+
+
+def test_resume_batch_sampler_skips_completed_batches_before_dataset_reads() -> None:
+    source = FixedSizeBatchSampler(
+        BlockwisePermutationSampler(16, seed=17, block_size=4),
+        batch_size=4,
+    )
+    expected = list(source)
+    resumable = ResumableFixedSizeBatchSampler(source)
+
+    resumable.set_epoch(0, start_batch_index=2)
+
+    assert len(resumable) == 4
+    assert list(resumable) == expected[2:]
+
+
 def test_loss_logging_resolves_requested_points_from_epoch_length() -> None:
     steps = epoch_loss_logging_steps(0, 1_953, 250)
 
@@ -188,6 +475,27 @@ def test_loss_logging_resolves_requested_points_from_epoch_length() -> None:
     assert steps[0] == 8
     assert set(np.diff(steps)) <= {7, 8}
     assert epoch_loss_logging_steps(1, 3, 250) == (4, 5, 6)
+
+    validation_alignment = dict(
+        aligned_epoch_event_steps(
+            0,
+            runtime_optimizer_steps_per_epoch=13,
+            canonical_optimizer_steps_per_epoch=300,
+            points_per_epoch=5,
+        )
+    )
+    loss_alignment = dict(
+        aligned_epoch_event_steps(
+            0,
+            runtime_optimizer_steps_per_epoch=13,
+            canonical_optimizer_steps_per_epoch=300,
+            points_per_epoch=10,
+        )
+    )
+    assert {
+        runtime_step: loss_alignment[runtime_step]
+        for runtime_step in validation_alignment
+    } == validation_alignment
 
 
 def test_stage1_early_stopping_cannot_trigger_before_second_epoch() -> None:

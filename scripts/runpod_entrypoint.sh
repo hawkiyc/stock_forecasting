@@ -42,8 +42,8 @@ if [[ "${RUNPOD_ROLE}" != "gpu-train" ]]; then
 fi
 if [[ "${FIN_TS_DATALOADER_WORKERS}" != "auto" \
     && ( ! "${FIN_TS_DATALOADER_WORKERS}" =~ ^(0|[1-9][0-9]*)$ \
-        || "${FIN_TS_DATALOADER_WORKERS}" -gt 32 ) ]]; then
-    echo "FIN_TS_DATALOADER_WORKERS must be auto or an integer from 0 through 32" >&2
+        || "${FIN_TS_DATALOADER_WORKERS}" -gt 128 ) ]]; then
+    echo "FIN_TS_DATALOADER_WORKERS must be auto or an integer from 0 through 128" >&2
     exit 2
 fi
 
