@@ -61,7 +61,7 @@ from stock_forecasting.tracking import (
 )
 from stock_forecasting.training_paths import resolve_bar_store_path
 
-DATALOADER_AUTO_MAX_WORKERS = 32
+DATALOADER_AUTO_MAX_WORKERS = 128
 DATALOADER_CPU_RESERVE = 2
 DATALOADER_ACTIVE_PERSISTENT_POOLS = 2
 DATALOADER_MEMORY_FRACTION = 0.25
@@ -70,8 +70,13 @@ DATALOADER_PARENT_MEMORY_RESERVE_BYTES = 4 * 1024**3
 DATALOADER_TOTAL_SYMBOL_CACHE_ENTRIES = 128
 DATALOADER_INITIAL_PREFETCH_FACTOR = 2
 DATALOADER_SELECTION_BLOCK_SIZE = 128
-DATALOADER_PREFETCH_MEMORY_FRACTION = 0.05
+DATALOADER_PREFETCH_MEMORY_FRACTION = 0.10
 AUTO_BATCH_THROUGHPUT_TOLERANCE = 0.03
+AUTO_BATCH_EXPANSION_THROUGHPUT_TOLERANCE = 0.10
+AUTO_BATCH_EXPANSION_MAX_SIZE = 4_096
+AUTO_EVALUATION_BATCH_EXPANSION_MAX_SIZE = 8_192
+AUTO_BATCH_EXPANSION_MEMORY_QUANTUM_BYTES = 24 * 1024**3
+CUDA_FREE_MEMORY_FRACTION = 0.90
 ROBUST_SCALE_BATCH_SIZE = 256
 ROBUST_SCALE_SELECTION_BLOCK_SIZE = 16
 ROBUST_SCALE_CACHE_SCHEMA_VERSION = "1.0"
@@ -100,6 +105,9 @@ class DataLoaderWorkerPlan:
     active_persistent_pools: int
     symbol_cache_size_per_worker: int
     prefetch_factor: int | None
+    prefetched_batches_per_pool: int
+    prefetch_memory_budget_bytes: int
+    estimated_peak_prefetch_memory_bytes: int
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -122,6 +130,11 @@ class DataLoaderWorkerPlan:
             "memory_bytes_per_worker": DATALOADER_MEMORY_BYTES_PER_WORKER,
             "symbol_cache_size_per_worker": self.symbol_cache_size_per_worker,
             "prefetch_factor": self.prefetch_factor,
+            "prefetched_batches_per_pool": self.prefetched_batches_per_pool,
+            "prefetch_memory_budget_bytes": self.prefetch_memory_budget_bytes,
+            "estimated_peak_prefetch_memory_bytes": (
+                self.estimated_peak_prefetch_memory_bytes
+            ),
             "native_threads_per_worker": 1,
         }
 
@@ -152,7 +165,7 @@ class BatchProbeMeasurement:
 
 @dataclass(frozen=True)
 class RuntimeBatchPlan:
-    """Hardware-resolved micro-batches with a stable effective batch contract."""
+    """Hardware-resolved micro-batches with a stable effective-batch floor."""
 
     source: str
     training_batch_size: int
@@ -295,8 +308,15 @@ def _requested_dataloader_workers(config: ExperimentConfig) -> tuple[int, str]:
         return config.training.num_workers, "training_config"
     if value == "auto":
         return DATALOADER_AUTO_MAX_WORKERS, "runpod_auto"
-    if not value.isascii() or not value.isdigit() or int(value) > 32:
-        raise ValueError("FIN_TS_DATALOADER_WORKERS must be auto or an integer from 0 to 32")
+    if (
+        not value.isascii()
+        or not value.isdigit()
+        or int(value) > DATALOADER_AUTO_MAX_WORKERS
+    ):
+        raise ValueError(
+            "FIN_TS_DATALOADER_WORKERS must be auto or an integer from 0 to "
+            f"{DATALOADER_AUTO_MAX_WORKERS}"
+        )
     return int(value), "environment"
 
 
@@ -309,8 +329,15 @@ def plan_dataloader_workers(
 ) -> DataLoaderWorkerPlan:
     """Choose a conservative process count shared by loading and calibration."""
 
-    if isinstance(requested_workers, bool) or requested_workers < 0 or requested_workers > 32:
-        raise ValueError("requested_workers must be between 0 and 32")
+    if (
+        isinstance(requested_workers, bool)
+        or requested_workers < 0
+        or requested_workers > DATALOADER_AUTO_MAX_WORKERS
+    ):
+        raise ValueError(
+            "requested_workers must be between 0 and "
+            f"{DATALOADER_AUTO_MAX_WORKERS}"
+        )
     cpu_count = (
         detect_visible_cpu_count()
         if visible_cpu_count is None
@@ -373,6 +400,11 @@ def plan_dataloader_workers(
         prefetch_factor=(
             DATALOADER_INITIAL_PREFETCH_FACTOR if effective_workers else None
         ),
+        prefetched_batches_per_pool=(
+            effective_workers * DATALOADER_INITIAL_PREFETCH_FACTOR
+        ),
+        prefetch_memory_budget_bytes=0,
+        estimated_peak_prefetch_memory_bytes=0,
     )
 
 
@@ -393,9 +425,27 @@ def plan_runtime_prefetch(
 ) -> DataLoaderWorkerPlan:
     """Size the worker queue from measured GPU demand and host-memory headroom."""
 
+    if (
+        isinstance(largest_host_batch_bytes, bool)
+        or largest_host_batch_bytes < 1
+    ):
+        raise ValueError("largest_host_batch_bytes must be a positive integer")
     workers = worker_plan.effective_workers
     if workers == 0:
         return replace(worker_plan, prefetch_factor=None)
+    queue_budget = max(
+        largest_host_batch_bytes * worker_plan.active_persistent_pools,
+        int(
+            worker_plan.available_memory_bytes
+            * DATALOADER_PREFETCH_MEMORY_FRACTION
+        ),
+    )
+    memory_worker_limit = max(
+        1,
+        queue_budget
+        // (largest_host_batch_bytes * worker_plan.active_persistent_pools),
+    )
+    workers = min(workers, int(memory_worker_limit))
     seconds_per_batch = batch_plan.seconds_per_training_batch
     if seconds_per_batch is None or seconds_per_batch <= 0.0:
         demand_limit = DATALOADER_INITIAL_PREFETCH_FACTOR
@@ -404,13 +454,6 @@ def plan_runtime_prefetch(
             config.training.dataloader_prefetch_target_seconds / seconds_per_batch
         )
         demand_limit = max(2, math.ceil(buffered_batches / workers))
-    queue_budget = max(
-        largest_host_batch_bytes,
-        int(
-            worker_plan.available_memory_bytes
-            * DATALOADER_PREFETCH_MEMORY_FRACTION
-        ),
-    )
     per_factor_bytes = max(
         largest_host_batch_bytes
         * workers
@@ -426,7 +469,19 @@ def plan_runtime_prefetch(
             config.training.dataloader_max_prefetch_factor,
         ),
     )
-    return replace(worker_plan, prefetch_factor=int(factor))
+    return replace(
+        worker_plan,
+        effective_workers=workers,
+        prefetch_factor=int(factor),
+        prefetched_batches_per_pool=workers * int(factor),
+        prefetch_memory_budget_bytes=queue_budget,
+        estimated_peak_prefetch_memory_bytes=(
+            largest_host_batch_bytes
+            * workers
+            * int(factor)
+            * worker_plan.active_persistent_pools
+        ),
+    )
 
 
 def _initialize_dataloader_worker(_worker_id: int) -> None:
@@ -958,7 +1013,7 @@ def _measure_cuda_batch(
     device: torch.device,
     training: bool,
     optimizer_state_reserve_bytes: int,
-    device_total_memory_bytes: int,
+    device_memory_limit_bytes: int,
 ) -> BatchProbeMeasurement:
     collator = FinancialBatchCollator()
     output: Any | None = None
@@ -996,9 +1051,7 @@ def _measure_cuda_batch(
         projected_peak = peak_allocated + (
             optimizer_state_reserve_bytes if training else 0
         )
-        accepted = projected_peak <= int(
-            device_total_memory_bytes * config.training.auto_batch_memory_fraction
-        )
+        accepted = projected_peak <= device_memory_limit_bytes
         return BatchProbeMeasurement(
             batch_size=batch_size,
             seconds_per_batch=seconds_per_batch,
@@ -1047,6 +1100,71 @@ def _select_batch_measurement(
     return min(near_optimal, key=lambda measurement: measurement.batch_size)
 
 
+def _hardware_batch_expansion_maximum(
+    *,
+    configured_maximum: int,
+    device_total_memory_bytes: int,
+    absolute_maximum: int,
+) -> int:
+    """Scale the probe ceiling with VRAM while retaining an absolute safety cap."""
+
+    if min(configured_maximum, device_total_memory_bytes, absolute_maximum) < 1:
+        raise ValueError("Automatic batch expansion inputs must be positive")
+    memory_multiplier = max(
+        1,
+        (
+            device_total_memory_bytes
+            + AUTO_BATCH_EXPANSION_MEMORY_QUANTUM_BYTES
+            - 1
+        )
+        // AUTO_BATCH_EXPANSION_MEMORY_QUANTUM_BYTES,
+    )
+    return min(
+        absolute_maximum,
+        configured_maximum * memory_multiplier,
+    )
+
+
+def _next_adaptive_batch_candidate(
+    measurements: list[BatchProbeMeasurement],
+    *,
+    expansion_maximum: int,
+) -> int | None:
+    """Continue past the configured ceiling only while throughput still scales."""
+
+    if not measurements or expansion_maximum < 1:
+        return None
+    latest = measurements[-1]
+    if not latest.accepted or latest.batch_size >= expansion_maximum:
+        return None
+    accepted = [measurement for measurement in measurements if measurement.accepted]
+    best_throughput = max(
+        cast(float, measurement.samples_per_second) for measurement in accepted
+    )
+    threshold = best_throughput * (
+        1.0 - AUTO_BATCH_EXPANSION_THROUGHPUT_TOLERANCE
+    )
+    if cast(float, latest.samples_per_second) < threshold:
+        return None
+    return min(latest.batch_size * 2, expansion_maximum)
+
+
+def _automatic_gradient_accumulation_steps(
+    *,
+    target_effective_batch_size: int,
+    training_batch_size: int,
+) -> int:
+    """Keep the configured effective batch as a floor on larger accelerators."""
+
+    if training_batch_size < target_effective_batch_size:
+        if target_effective_batch_size % training_batch_size != 0:
+            raise ValueError(
+                "The selected automatic batch must divide target_effective_batch_size"
+            )
+        return target_effective_batch_size // training_batch_size
+    return 1
+
+
 def _probe_cuda_candidates(
     *,
     bundle: ModelBundle,
@@ -1056,15 +1174,19 @@ def _probe_cuda_candidates(
     device: torch.device,
     training: bool,
     optimizer_state_reserve_bytes: int,
-    device_total_memory_bytes: int,
+    device_memory_limit_bytes: int,
+    expansion_maximum: int | None = None,
 ) -> tuple[BatchProbeMeasurement, tuple[BatchProbeMeasurement, ...]]:
     measurements: list[BatchProbeMeasurement] = []
+    pending_candidates = list(candidates)
     previous_mode = bundle.model.training
     cpu_rng_state = torch.get_rng_state()
     cuda_rng_state = torch.cuda.get_rng_state_all()
     bundle.model.train(training)
     try:
-        for batch_size in candidates:
+        candidate_index = 0
+        while candidate_index < len(pending_candidates):
+            batch_size = pending_candidates[candidate_index]
             measurement = _measure_cuda_batch(
                 bundle=bundle,
                 sample=sample,
@@ -1073,11 +1195,22 @@ def _probe_cuda_candidates(
                 device=device,
                 training=training,
                 optimizer_state_reserve_bytes=optimizer_state_reserve_bytes,
-                device_total_memory_bytes=device_total_memory_bytes,
+                device_memory_limit_bytes=device_memory_limit_bytes,
             )
             measurements.append(measurement)
             if measurement.outcome in {"cuda_out_of_memory", "memory_guard"}:
                 break
+            if (
+                expansion_maximum is not None
+                and candidate_index == len(pending_candidates) - 1
+            ):
+                next_candidate = _next_adaptive_batch_candidate(
+                    measurements,
+                    expansion_maximum=expansion_maximum,
+                )
+                if next_candidate is not None:
+                    pending_candidates.append(next_candidate)
+            candidate_index += 1
     finally:
         bundle.model.train(previous_mode)
         torch.set_rng_state(cpu_rng_state)
@@ -1096,6 +1229,11 @@ def resolve_runtime_batch_plan(
 
     device_name = "cpu"
     device_total_memory_bytes = 0
+    device_memory_limit_bytes = 0
+    training_expansion_maximum = config.training.auto_batch_max_size
+    evaluation_expansion_maximum = (
+        config.training.auto_evaluation_batch_max_size
+    )
     optimizer_state_reserve_bytes = sum(
         parameter.numel() * parameter.element_size() * 2
         for parameter in bundle.model.parameters()
@@ -1109,6 +1247,50 @@ def resolve_runtime_batch_plan(
         properties = torch.cuda.get_device_properties(device)
         device_name = properties.name
         device_total_memory_bytes = int(properties.total_memory)
+        free_memory_bytes, _total_memory_bytes = torch.cuda.mem_get_info(device)
+        allocated_memory_bytes = int(torch.cuda.memory_allocated(device))
+        device_memory_limit_bytes = min(
+            int(
+                device_total_memory_bytes
+                * config.training.auto_batch_memory_fraction
+            ),
+            allocated_memory_bytes
+            + int(free_memory_bytes * CUDA_FREE_MEMORY_FRACTION),
+        )
+        training_expansion_maximum = _hardware_batch_expansion_maximum(
+            configured_maximum=config.training.auto_batch_max_size,
+            device_total_memory_bytes=device_total_memory_bytes,
+            absolute_maximum=AUTO_BATCH_EXPANSION_MAX_SIZE,
+        )
+        evaluation_expansion_maximum = _hardware_batch_expansion_maximum(
+            configured_maximum=config.training.auto_evaluation_batch_max_size,
+            device_total_memory_bytes=device_total_memory_bytes,
+            absolute_maximum=AUTO_EVALUATION_BATCH_EXPANSION_MAX_SIZE,
+        )
+        print(
+            json.dumps(
+                {
+                    "cuda_batch_search": {
+                        "adaptive_evaluation_maximum": (
+                            evaluation_expansion_maximum
+                        ),
+                        "adaptive_training_maximum": training_expansion_maximum,
+                        "configured_evaluation_maximum": (
+                            config.training.auto_evaluation_batch_max_size
+                        ),
+                        "configured_training_maximum": (
+                            config.training.auto_batch_max_size
+                        ),
+                        "device_allocated_memory_bytes": allocated_memory_bytes,
+                        "device_free_memory_bytes": int(free_memory_bytes),
+                        "device_memory_limit_bytes": device_memory_limit_bytes,
+                        "device_total_memory_bytes": device_total_memory_bytes,
+                    }
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
     if isinstance(config.training.batch_size, int):
         training_batch_size = config.training.batch_size
@@ -1121,10 +1303,12 @@ def resolve_runtime_batch_plan(
                 device=device,
                 training=True,
                 optimizer_state_reserve_bytes=optimizer_state_reserve_bytes,
-                device_total_memory_bytes=device_total_memory_bytes,
+                device_memory_limit_bytes=device_memory_limit_bytes,
             )
             seconds_per_training_batch = selected.seconds_per_batch
     elif device.type == "cuda":
+        # The configured range remains the mandatory baseline. Larger candidates
+        # are measured only when throughput at its boundary still justifies them.
         selected, training_probe = _probe_cuda_candidates(
             bundle=bundle,
             sample=sample,
@@ -1136,7 +1320,11 @@ def resolve_runtime_batch_plan(
             device=device,
             training=True,
             optimizer_state_reserve_bytes=optimizer_state_reserve_bytes,
-            device_total_memory_bytes=device_total_memory_bytes,
+            device_memory_limit_bytes=device_memory_limit_bytes,
+            expansion_maximum=max(
+                config.training.auto_batch_max_size,
+                training_expansion_maximum,
+            ),
         )
         training_batch_size = selected.batch_size
         seconds_per_training_batch = selected.seconds_per_batch
@@ -1144,12 +1332,11 @@ def resolve_runtime_batch_plan(
         training_batch_size = config.training.auto_batch_min_size
 
     if config.training.gradient_accumulation_steps == "auto":
-        if config.training.target_effective_batch_size % training_batch_size != 0:
-            raise ValueError(
-                "The selected automatic batch must divide target_effective_batch_size"
-            )
-        accumulation_steps = (
-            config.training.target_effective_batch_size // training_batch_size
+        accumulation_steps = _automatic_gradient_accumulation_steps(
+            target_effective_batch_size=(
+                config.training.target_effective_batch_size
+            ),
+            training_batch_size=training_batch_size,
         )
     else:
         accumulation_steps = config.training.gradient_accumulation_steps
@@ -1158,18 +1345,26 @@ def resolve_runtime_batch_plan(
     if isinstance(config.training.evaluation_batch_size, int):
         evaluation_batch_size = config.training.evaluation_batch_size
     elif device.type == "cuda":
+        evaluation_initial_maximum = max(
+            training_batch_size,
+            config.training.auto_evaluation_batch_max_size,
+        )
         selected, evaluation_probe = _probe_cuda_candidates(
             bundle=bundle,
             sample=sample,
             candidates=_batch_candidates(
                 training_batch_size,
-                config.training.auto_evaluation_batch_max_size,
+                evaluation_initial_maximum,
             ),
             config=config,
             device=device,
             training=False,
             optimizer_state_reserve_bytes=0,
-            device_total_memory_bytes=device_total_memory_bytes,
+            device_memory_limit_bytes=device_memory_limit_bytes,
+            expansion_maximum=max(
+                evaluation_initial_maximum,
+                evaluation_expansion_maximum,
+            ),
         )
         evaluation_batch_size = selected.batch_size
     else:

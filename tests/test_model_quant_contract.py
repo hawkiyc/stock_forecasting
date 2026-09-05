@@ -38,8 +38,12 @@ from stock_forecasting.models.lora import LoRALinear, inject_lora, lora_paramete
 from stock_forecasting.models.outputs import MODEL_OUTPUT_SCHEMA_VERSION
 from stock_forecasting.run_contract import training_resume_contract_digest
 from stock_forecasting.training import (
+    BatchProbeMeasurement,
     EarlyStoppingState,
     RuntimeBatchPlan,
+    _automatic_gradient_accumulation_steps,
+    _hardware_batch_expansion_maximum,
+    _next_adaptive_batch_candidate,
     epoch_evaluation_steps,
     epoch_loss_logging_steps,
     evaluate_loader,
@@ -116,6 +120,14 @@ def test_dataloader_worker_plan_is_cpu_and_memory_bounded() -> None:
     )
     assert runpod_auto.effective_workers == 15
 
+    large_host = plan_dataloader_workers(
+        128,
+        source="runpod_auto",
+        visible_cpu_count=64,
+        available_memory_bytes=512 * gib,
+    )
+    assert large_host.effective_workers == 62
+
 
 def test_prefetch_factor_tracks_gpu_demand_with_memory_and_config_caps() -> None:
     config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
@@ -168,8 +180,72 @@ def test_prefetch_factor_tracks_gpu_demand_with_memory_and_config_caps() -> None
     )
 
     assert fast.prefetch_factor == config.training.dataloader_max_prefetch_factor == 4
+    assert fast.prefetched_batches_per_pool == 32
+    assert fast.estimated_peak_prefetch_memory_bytes == 64 * 1024**2
+    assert fast.prefetch_memory_budget_bytes == int(64 * 1024**3 * 0.10)
     assert slow.prefetch_factor == 2
     assert memory_limited.prefetch_factor == 1
+
+
+def test_adaptive_batch_search_expands_only_while_throughput_scales() -> None:
+    def measurement(batch_size: int, samples_per_second: float) -> BatchProbeMeasurement:
+        return BatchProbeMeasurement(
+            batch_size=batch_size,
+            seconds_per_batch=batch_size / samples_per_second,
+            samples_per_second=samples_per_second,
+            peak_allocated_bytes=batch_size * 1024,
+            projected_peak_bytes=batch_size * 1024,
+            accepted=True,
+            outcome="accepted",
+        )
+
+    scaling = [measurement(64, 900.0), measurement(128, 1_000.0)]
+    slight_regression = [measurement(64, 1_000.0), measurement(128, 920.0)]
+    regression = [measurement(64, 1_000.0), measurement(128, 850.0)]
+    assert _next_adaptive_batch_candidate(scaling, expansion_maximum=4_096) == 256
+    assert (
+        _next_adaptive_batch_candidate(
+            slight_regression,
+            expansion_maximum=4_096,
+        )
+        == 256
+    )
+    assert _next_adaptive_batch_candidate(regression, expansion_maximum=4_096) is None
+
+    gib = 1024**3
+    assert (
+        _hardware_batch_expansion_maximum(
+            configured_maximum=256,
+            device_total_memory_bytes=32 * gib,
+            absolute_maximum=4_096,
+        )
+        == 512
+    )
+    assert (
+        _hardware_batch_expansion_maximum(
+            configured_maximum=256,
+            device_total_memory_bytes=192 * gib,
+            absolute_maximum=4_096,
+        )
+        == 2_048
+    )
+
+
+def test_automatic_effective_batch_is_stable_floor_not_hardware_ceiling() -> None:
+    assert (
+        _automatic_gradient_accumulation_steps(
+            target_effective_batch_size=256,
+            training_batch_size=32,
+        )
+        == 8
+    )
+    assert (
+        _automatic_gradient_accumulation_steps(
+            target_effective_batch_size=256,
+            training_batch_size=512,
+        )
+        == 1
+    )
 
 
 def test_epoch_relative_validation_schedule_has_exactly_five_even_checkpoints() -> None:

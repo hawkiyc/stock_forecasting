@@ -274,10 +274,12 @@ def test_remote_resume_prefers_only_a_newer_temporary_checkpoint() -> None:
     assert REMOTE_PREFLIGHT._latest_resume_checkpoint_row(retained, None) is retained[1]
 
 
-def test_current_interrupted_run_contract_allows_only_the_retention_migration() -> None:
+@pytest.mark.parametrize("migration", CHECKPOINT_RETENTION_MIGRATIONS)
+def test_current_interrupted_run_contract_allows_only_exact_migrations(
+    migration: dict[str, Any],
+) -> None:
     config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
     current = training_resume_contract(config)
-    migration = CHECKPOINT_RETENTION_MIGRATIONS[0]
     current_files = current["training_implementation"]["files"]
     assert {path: current_files[path] for path in migration["to_files"]} == migration["to_files"]
 

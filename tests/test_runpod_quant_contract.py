@@ -1197,8 +1197,11 @@ def test_runpod_training_auto_tunes_multiprocess_data_loading() -> None:
     training = (ROOT / "src/stock_forecasting/training.py").read_text(encoding="utf-8")
 
     assert 'FIN_TS_DATALOADER_WORKERS="${FIN_TS_DATALOADER_WORKERS:-auto}"' in entrypoint
+    assert '"${FIN_TS_DATALOADER_WORKERS}" -gt 128' in entrypoint
     assert '"FIN_TS_DATALOADER_WORKERS"' in reexec
-    assert "DATALOADER_AUTO_MAX_WORKERS = 32" in training
+    assert "DATALOADER_AUTO_MAX_WORKERS = 128" in training
+    assert "AUTO_BATCH_EXPANSION_MAX_SIZE = 4_096" in training
+    assert "AUTO_EVALUATION_BATCH_EXPANSION_MAX_SIZE = 8_192" in training
     assert "resolve_runtime_batch_plan(" in training
     assert "plan_runtime_prefetch(" in training
     assert "iter_device_batches(" in training
