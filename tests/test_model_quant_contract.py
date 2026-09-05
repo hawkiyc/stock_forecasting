@@ -41,7 +41,10 @@ from stock_forecasting.models.backbones import (
 )
 from stock_forecasting.models.lora import LoRALinear, inject_lora, lora_parameter_names
 from stock_forecasting.models.outputs import MODEL_OUTPUT_SCHEMA_VERSION
-from stock_forecasting.run_contract import training_resume_contract_digest
+from stock_forecasting.run_contract import (
+    training_resume_contract_digest,
+    training_resume_contract_fingerprint,
+)
 from stock_forecasting.training import (
     BatchProbeMeasurement,
     CanonicalTrainingSchedule,
@@ -798,10 +801,27 @@ def test_loaded_checkpoint_must_match_model_ids_architecture_and_stage(
     tmp_path: Path,
 ) -> None:
     config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
-    config.save_resolved(tmp_path / "resolved-config.yaml")
+    run_directory = tmp_path / "loaded-checkpoint-contract"
+    checkpoint_directory = run_directory / "checkpoint-000001"
+    checkpoint_directory.mkdir(parents=True)
+    config.save_resolved(run_directory / "resolved-config.yaml")
+    config.save_resolved(checkpoint_directory / "resolved-config.yaml")
+    resume_contract, resume_contract_digest = training_resume_contract_fingerprint(config)
+    (run_directory / "run-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
+                "run_id": run_directory.name,
+                "run_key": run_directory.name,
+                "training_resume_contract": resume_contract,
+                "training_resume_contract_sha256": resume_contract_digest,
+            }
+        ),
+        encoding="utf-8",
+    )
     state = {
         "model_output_schema_version": MODEL_OUTPUT_SCHEMA_VERSION,
-        "training_resume_contract_sha256": training_resume_contract_digest(config),
+        "training_resume_contract_sha256": resume_contract_digest,
         "model_architecture_sha256": config.model_architecture_digest(),
         "training_stage": config.training.stage,
         "time_series_model_id": config.model.time_series_model_id,
@@ -811,25 +831,25 @@ def test_loaded_checkpoint_must_match_model_ids_architecture_and_stage(
         "kronos_source_revision": config.model.kronos_source_revision,
     }
 
-    _validate_loaded_model_contract(tmp_path, state, config)
+    _validate_loaded_model_contract(checkpoint_directory, state, config)
 
     with pytest.raises(ValueError, match="implementation or dataset contract"):
         _validate_loaded_model_contract(
-            tmp_path,
+            checkpoint_directory,
             {**state, "training_resume_contract_sha256": "0" * 64},
             config,
         )
 
     with pytest.raises(ValueError, match="training stage"):
         _validate_loaded_model_contract(
-            tmp_path,
+            checkpoint_directory,
             {**state, "training_stage": "stage2"},
             config,
         )
 
     with pytest.raises(ValueError, match="predates the conditional alpha"):
         _validate_loaded_model_contract(
-            tmp_path,
+            checkpoint_directory,
             {**state, "model_output_schema_version": "3.1"},
             config,
         )
