@@ -14,7 +14,7 @@ CHECKPOINT_RETENTION_MIGRATIONS: Final = (
         },
         "to_files": {
             "training.py": (
-                "75277a0a7271c8557daae4544b55f65d12c5700b84039634fa38b283054318d1"
+                "8c733eacca16cef30ada2ee11dfe8a47500a9a67c8075e1844ae0406f9dd3009"
             ),
         },
     },
@@ -39,7 +39,7 @@ CHECKPOINT_RETENTION_MIGRATIONS: Final = (
                 "2b41ead1d3a74040419d393374755aee137d5fbe68a49da88eb7fbe9a1773044"
             ),
             "training.py": (
-                "75277a0a7271c8557daae4544b55f65d12c5700b84039634fa38b283054318d1"
+                "8c733eacca16cef30ada2ee11dfe8a47500a9a67c8075e1844ae0406f9dd3009"
             ),
         },
     },
@@ -52,7 +52,7 @@ CHECKPOINT_RETENTION_MIGRATIONS: Final = (
         },
         "to_files": {
             "training.py": (
-                "75277a0a7271c8557daae4544b55f65d12c5700b84039634fa38b283054318d1"
+                "8c733eacca16cef30ada2ee11dfe8a47500a9a67c8075e1844ae0406f9dd3009"
             ),
         },
     },
@@ -65,7 +65,20 @@ CHECKPOINT_RETENTION_MIGRATIONS: Final = (
         },
         "to_files": {
             "training.py": (
+                "8c733eacca16cef30ada2ee11dfe8a47500a9a67c8075e1844ae0406f9dd3009"
+            ),
+        },
+    },
+    {
+        "id": "adaptive-gpu-import-order-v1",
+        "from_files": {
+            "training.py": (
                 "75277a0a7271c8557daae4544b55f65d12c5700b84039634fa38b283054318d1"
+            ),
+        },
+        "to_files": {
+            "training.py": (
+                "8c733eacca16cef30ada2ee11dfe8a47500a9a67c8075e1844ae0406f9dd3009"
             ),
         },
     },

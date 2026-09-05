@@ -50,8 +50,8 @@ from stock_forecasting.metrics import (
 )
 from stock_forecasting.preflight import run_preflight
 from stock_forecasting.runtime_resources import (
-    AvailableMemoryEstimate,
     CGROUP_V1_UNLIMITED_THRESHOLD_BYTES,
+    AvailableMemoryEstimate,
     detect_available_memory,
     detect_visible_cpu_count,
 )
