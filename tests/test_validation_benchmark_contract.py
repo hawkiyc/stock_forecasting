@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from stock_forecasting.checkpoint_resume_migrations import CHECKPOINT_RETENTION_MIGRATIONS
 from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.run_contract import (
+    CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
+    training_resume_contract,
+)
 from stock_forecasting.training import _flatten_metrics
 from stock_forecasting.validation_benchmark import (
     VALIDATION_BENCHMARK_SCHEMA_VERSION,
@@ -19,6 +26,17 @@ from stock_forecasting.validation_benchmark import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _canonical_digest(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _validation_metrics() -> dict[str, object]:
@@ -128,6 +146,71 @@ def test_evaluation_contract_keeps_numerical_validation_settings(
     second_contract = _evaluation_contract(second, tmp_path / "checkpoint")
 
     assert first_contract != second_contract
+
+
+def test_validation_setup_accepts_an_allowlisted_training_code_migration(
+    tmp_path: Path,
+) -> None:
+    config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    run_id = "run-validation-migrated-code"
+    config.training.output_root = tmp_path / "savedModel"
+    config.validation.output_root = tmp_path / "evaluations"
+    run_directory = config.training.output_root / run_id
+    checkpoint = config.training.output_root / run_id / "checkpoint-000001"
+    checkpoint.mkdir(parents=True)
+    current_contract = training_resume_contract(config)
+    migration = CHECKPOINT_RETENTION_MIGRATIONS[0]
+    assert {
+        path: current_contract["training_implementation"]["files"][path]
+        for path in migration["to_files"]
+    } == migration["to_files"]
+    stored_contract = copy.deepcopy(current_contract)
+    stored_files = stored_contract["training_implementation"]["files"]
+    stored_files.update(migration["from_files"])
+    stored_contract["training_implementation"]["sha256"] = _canonical_digest(stored_files)
+    stored_training_digest = _canonical_digest(stored_contract)
+    (run_directory / "run-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
+                "run_id": run_id,
+                "run_key": run_id,
+                "training_resume_contract": stored_contract,
+                "training_resume_contract_sha256": stored_training_digest,
+            }
+        ),
+        encoding="utf-8",
+    )
+    config.save_resolved(run_directory / "resolved-config.yaml")
+    config.save_resolved(checkpoint / "resolved-config.yaml")
+    (checkpoint / "adapter.safetensors").write_bytes(b"adapter")
+    (checkpoint / "trainer-state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
+                "run_id": run_id,
+                "run_key": run_id,
+                "training_resume_contract_sha256": stored_training_digest,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    benchmark = ValidationBenchmark(
+        config,
+        run_id=run_id,
+        checkpoint=checkpoint,
+        output=config.validation.output_root / run_id / "validation-benchmark.json",
+        lifecycle=tmp_path / "lifecycle" / "stage1" / "validation.json",
+        models=["always_buy"],
+        seeds=[42],
+        resume=True,
+        recompute_full_model=False,
+    )
+
+    inputs = benchmark.evaluation_contract["inputs"]
+    assert inputs["training_resume_contract_sha256"] == stored_training_digest
+    assert inputs["dataset_artifacts"] == current_contract["dataset_artifacts"]
 
 
 def test_resume_normalizes_legacy_contract_without_rerunning_completed_results(

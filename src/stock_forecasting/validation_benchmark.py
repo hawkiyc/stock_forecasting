@@ -33,7 +33,7 @@ from stock_forecasting.data import (
     LazyFinancialWindowDataset,
 )
 from stock_forecasting.run_contract import (
-    training_resume_contract_fingerprint,
+    training_resume_contract,
     validate_training_resume_contract,
 )
 from stock_forecasting.run_paths import (
@@ -542,9 +542,7 @@ class ValidationBenchmark:
             run_directory=checkpoint.parent,
             checkpoint_directory=checkpoint,
         )
-        training_contract, current_digest = training_resume_contract_fingerprint(config)
-        if current_digest != training_digest:
-            raise RuntimeError("Training resume contract changed during validation setup")
+        training_contract = training_resume_contract(config)
         self.config = config
         self.run_id = run_id
         self.checkpoint = checkpoint
