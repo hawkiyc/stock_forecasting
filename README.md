@@ -1479,6 +1479,8 @@ model/tokenizer cache 必須仍存在且契約一致；不能直接改指向另�
 `runpod_tmux_launch.sh` 的訓練 lifecycle，不延長 Pod 原有的 hard deadline；執行期間須維持
 終端連線，完成後自行依既有方式關閉不再使用的 Pod。可用 `probe-scales --help` 查看
 所有參數。GPU 記憶體不足時可降低 `--batch-size`，抽樣列不受 batch size 影響。
+SSH session 缺少 Pod 環境變數時，腳本會使用既有 allowlist PID 1 importer 載入，
+不需要手動重設 Stage、volume 或 credential 變數。
 
 診斷內容：
 
@@ -3271,6 +3273,8 @@ create or terminate Pods, join the training lifecycle in `runpod_tmux_launch.sh`
 the Pod's existing hard deadline. Keep the terminal connected and close unused Pods through
 the existing workflow afterward. Use `probe-scales --help` for all options. Reduce
 `--batch-size` if extraction runs out of GPU memory; sample membership is batch-size invariant.
+For SSH sessions, the script reuses the existing allowlisted PID 1 environment importer;
+no manual stage, volume or credential exports are required.
 
 The diagnostic includes:
 

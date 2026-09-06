@@ -30,6 +30,19 @@ EOF
     exit 0
 fi
 
+# SSH sessions may omit the Pod environment. Reuse the existing allowlisted
+# importer, without executing Python on the local macOS control machine.
+if [[ "${RUNPOD_TEST_MODE:-0}" != "1" \
+    && "${RUNPOD_SSH_ENV_IMPORTED:-0}" != "1" \
+    && -r /proc/1/environ ]]; then
+    if [[ ! -x /usr/local/bin/python ]]; then
+        echo "RunPod PID 1 environment importer is unavailable" >&2
+        exit 127
+    fi
+    exec /usr/local/bin/python "${SCRIPT_DIR}/runpod_reexec_with_pid1_env.py" -- \
+        bash "${BASH_SOURCE[0]}" "$@"
+fi
+
 if [[ -z "${RUNPOD_POD_ID:-}" ]]; then
     echo "Scale probing must run inside an existing CUDA RunPod Pod; no local model execution" >&2
     exit 2

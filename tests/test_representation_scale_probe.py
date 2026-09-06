@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -448,12 +449,17 @@ def test_pending_transaction_is_rejected_without_shared_recovery_or_writes(
 
 def test_workflow_routes_help_and_blocks_local_checkpoint_execution(tmp_path: Path) -> None:
     command = ["bash", str(ROOT / "scripts/runpod_workflow.sh"), "probe-scales"]
-    help_result = subprocess.run([*command, "--help"], capture_output=True, text=True, check=False)
+    # Do not import the real Pod environment when these tests run on cloud hardware.
+    environment = {**os.environ, "RUNPOD_TEST_MODE": "1"}
+    help_result = subprocess.run(
+        [*command, "--help"], env=environment, capture_output=True, text=True, check=False
+    )
     assert help_result.returncode == 0
     assert "existing CUDA RunPod" in help_result.stdout
     assert "does not create/terminate" in help_result.stdout
     result = subprocess.run(
         [*command, "--checkpoint", str(tmp_path)],
+        env=environment,
         capture_output=True,
         text=True,
         check=False,
