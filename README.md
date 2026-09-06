@@ -1446,6 +1446,92 @@ poetry run fin-ts-infer \
 
 推論輸出只包含數值 forecast、資料 provenance、encoder shape 與 checkpoint metadata，不包含自然語言解釋。
 
+### 歷史尺度表徵診斷
+
+`probe-scales` 讀取既有 checkpoint，固定 Kronos / LoRA / resampler / conditioner / head
+權重，使用獨立 ridge 線性探針檢查各層是否仍可讀出歷史尺度。它不是重新訓練 forecast
+模型，也不會新增尺度特徵分支。此功能沿用 checkpoint 原有的 train / validation
+資料切分，不修改日期邊界，不建立 test loader，不計算未來 alpha 標籤。
+
+先透過既有 `sync --apply` / 雲端程式碼部署流程更新程式碼。下列命令**在已掛載原始
+network volume、具備既有專案環境與 CUDA 的 RunPod GPU Pod 內執行**；本機只負責同步
+與下載，不載入 checkpoint。該 Pod 不應同時執行訓練或 validation 工作：
+
+```bash
+cd /runpod-volume/stock_forecasting
+bash scripts/runpod_workflow.sh probe-scales \
+  --checkpoint /runpod-volume/savedModel/<run-id> \
+  --train-samples 16384 \
+  --validation-samples 4096 \
+  --batch-size 16 \
+  --ridge-alpha 10 \
+  --seed 42
+```
+
+Run 目錄會使用經完整性驗證的 validation-selected best checkpoint；也可指定完整的
+`<run-id>/checkpoint-NNNNNN` 路徑。設定一律取自所選 checkpoint 的 `resolved-config.yaml`，
+不採用目前 active Stage 設定。原 checkpoint 綁定的 bar store、dataset manifest 與
+model/tokenizer cache 必須仍存在且契約一致；不能直接改指向另一個資料版本。
+
+命令為前景執行，與訓練 / validation 共用排他 GPU lease。它不建立或終止 Pod，不接入
+`runpod_tmux_launch.sh` 的訓練 lifecycle，不延長 Pod 原有的 hard deadline；執行期間須維持
+終端連線，完成後自行依既有方式關閉不再使用的 Pod。可用 `probe-scales --help` 查看
+所有參數。GPU 記憶體不足時可降低 `--batch-size`，抽樣列不受 batch size 影響。
+
+診斷內容：
+
+- 四種讀取方式：Kronos 的 asset / benchmark masked mean 串接、兩者最後有效 token
+  串接、兩組 resampler latent mean 串接，以及 alpha head 實際使用的 conditioned mean。
+- 八個歷史目標：asset、benchmark、兩者差值的 20 / 60 個交易日對數報酬標準差，以及
+  asset / benchmark 全輸入視窗的收盤價 `std / mean`。採 as-of 調整後的輸入價格、
+  `ddof=0`、不年化；至少需要 61 根有效 K 線。這些尺度不是未來持有期 alpha。
+- Train / validation 各自固定種子、無放回均勻抽樣，所有讀取方式共用同一組樣本。
+  探針 train 候選為原資料版本的**完整 train split**，不保證等於 Stage 1 模型曾見過的
+  5% 子集；不是每檔股票或每個日期等權抽樣。
+- 特徵與目標的平均值、標準差只在 train 擬合；固定 ridge alpha，不用 validation 選參。
+  同時比較 train 平均值基準與固定種子打亂 train 標籤的 ridge 對照。
+- 輸出 train / validation R²、MAE、RMSE、Pearson r、相對 train 平均值的 MSE skill，
+  以及各市場 validation 指標、特徵維度、常數特徵數及每個特徵對應的 train 樣本數。
+
+每次執行建立新的獨立目錄：
+
+```text
+/runpod-volume/diagnostics/representation-scales/<run-id>/<checkpoint>/probe-<UTC>-<id>/
+  status.json                  # Only state=complete establishes a completed diagnostic
+  probe.log
+  report.json                  # Metrics, settings, data/checkpoint/source SHA-256 provenance
+  summary.md                   # Full Traditional Chinese section, then full English section
+  samples.jsonl                # Split-local row order, sample IDs, cutoffs, symbols and markets
+  probes.npz                   # Train-only scalers, ridge coefficients and shuffle permutation
+  validation_predictions.npz   # Historical targets and predictions in validation row order
+```
+
+不覆寫 checkpoint、best pointer、既有 validation 報告或完成標記。失敗留下的 partial
+結果不可當作完成報告；重跑會建立新目錄。現有 `download` 命令仍只處理原本的訓練 / validation
+產物，不會自動下載本診斷目錄；可從 Pod 的 network volume 取回整個診斷目錄。
+
+`probes.npz` 以 `<readout>__feature_mean/feature_scale/coef/intercept` 儲存探針。
+計算順序為 `Xz = (X - feature_mean) / feature_scale`、
+`Yz = Xz @ coef.T + intercept`；前 8 欄為真實標籤探針，後 8 欄為打亂標籤對照，
+兩組分別以 `Y = Yz * target_scale + target_mean` 還原尺度。目標欄位順序見
+`report.json.target_contract.names`。原始高維表徵不落盤。
+
+解讀時先確認 validation 同時優於平均值與打亂標籤對照。MSE skill 定義為
+`1 - MSE_probe / MSE_train_mean_baseline`，正值才代表勝過該基準；R² 的分母則使用
+validation 自身平均值，兩者不能混為一談。常數目標的 R²、常數向量的 Pearson r、
+零分母的 skill 以 JSON `null` / Markdown `N/A` 表示。Train 高但 validation 低，應先檢查
+探針過擬合或分布差異。低分只表示目前 pooling + 線性探針無法讀出，不足以證明資訊消失；
+不同層維度不同，分數差不能直接解讀為資訊損失。重疊視窗與共用 benchmark 並非獨立樣本，
+本功能不提供顯著性或自動架構裁決；可讀出歷史尺度也不等於能預測未來 alpha。
+預設 16,384 / 4,096 筆為可調整的成本上限，不是統計充分性的保證。
+
+已建立專案環境的雲端 Pod 可先執行不下載模型的合成資料／mock checkpoint 契約測試：
+
+```bash
+cd /runpod-volume/stock_forecasting
+.venv/bin/python -m pytest tests/test_representation_scale_probe.py
+```
+
 ### 驗收原則
 
 PoC 最低驗收條件：
@@ -3144,6 +3230,105 @@ poetry run fin-ts-infer \
 
 Inference returns only numerical forecasts, data provenance, encoder shapes, and
 checkpoint metadata. It produces no natural-language explanation.
+
+### Historical scale representation diagnostics
+
+`probe-scales` loads an existing checkpoint, freezes Kronos / LoRA / resampler / conditioner /
+head weights, and fits separate ridge probes to test historical-scale decodability. It does
+not retrain the forecasting model or add a numerical feature branch. It preserves the
+checkpoint's train/validation split membership and date boundaries, creates no test loader,
+and calculates no future alpha labels.
+
+Update source through the existing `sync --apply` / cloud code-deployment workflow first.
+Run the following **inside an existing CUDA RunPod GPU Pod with the original network volume
+and project environment mounted**, not on the local control machine. The Pod should not be
+running training or validation concurrently:
+
+```bash
+cd /runpod-volume/stock_forecasting
+bash scripts/runpod_workflow.sh probe-scales \
+  --checkpoint /runpod-volume/savedModel/<run-id> \
+  --train-samples 16384 \
+  --validation-samples 4096 \
+  --batch-size 16 \
+  --ridge-alpha 10 \
+  --seed 42
+```
+
+A run directory resolves its integrity-validated, validation-selected best checkpoint;
+an exact `<run-id>/checkpoint-NNNNNN` path is also supported. Configuration always comes
+from that checkpoint's `resolved-config.yaml`, never the current active stage selection.
+The original bound bar store, dataset manifest and model/tokenizer cache must still exist
+and pass compatibility checks; do not substitute another dataset version.
+
+This foreground command shares the exclusive training/validation GPU lease. It does not
+create or terminate Pods, join the training lifecycle in `runpod_tmux_launch.sh`, or extend
+the Pod's existing hard deadline. Keep the terminal connected and close unused Pods through
+the existing workflow afterward. Use `probe-scales --help` for all options. Reduce
+`--batch-size` if extraction runs out of GPU memory; sample membership is batch-size invariant.
+
+The diagnostic includes:
+
+- Four readouts: concatenated asset/benchmark Kronos masked means, concatenated last valid
+  Kronos tokens, concatenated resampler latent means, and the exact conditioned-token mean
+  consumed by the alpha head.
+- Eight past-only targets: asset, benchmark and asset-minus-benchmark daily log-return
+  standard deviations over 20/60 trading returns, plus each stream's full-context close-price
+  `std / mean`. Inputs use as-of adjusted prices, `ddof=0`, no annualization and at least 61
+  valid bars. These are not future holding-period alpha targets.
+- Seeded uniform sampling without replacement within each original split, shared by all
+  readouts. Probe train candidates cover the **full train split**, not necessarily the 5%
+  subset seen during Stage 1. Sampling is not equal-weighted by symbol or date.
+- Train-only feature/target scalers and a fixed ridge alpha, without validation tuning.
+  Controls use the train target mean and a ridge probe fitted to shuffled train targets.
+- Train/validation R², MAE, RMSE, Pearson r and MSE skill relative to the train-mean baseline;
+  per-market validation metrics, feature dimensions, constant-feature counts and train
+  samples per feature.
+
+Every execution creates a new independent directory:
+
+```text
+/runpod-volume/diagnostics/representation-scales/<run-id>/<checkpoint>/probe-<UTC>-<id>/
+  status.json                  # Only state=complete establishes a completed diagnostic
+  probe.log
+  report.json                  # Metrics, settings, data/checkpoint/source SHA-256 provenance
+  summary.md                   # Full Traditional Chinese section, then full English section
+  samples.jsonl                # Split-local row order, sample IDs, cutoffs, symbols and markets
+  probes.npz                   # Train-only scalers, ridge coefficients and shuffle permutation
+  validation_predictions.npz   # Historical targets and predictions in validation row order
+```
+
+Checkpoints, best pointers, existing validation reports and completion markers are not
+overwritten. Partial artifacts from a failed attempt are not completed results; retrying
+creates a new directory. The existing `download` command remains scoped to training and
+validation artifacts and does not automatically retrieve this diagnostic directory;
+retrieve the whole directory from the Pod's network volume.
+
+`probes.npz` stores `<readout>__feature_mean/feature_scale/coef/intercept`.
+Reconstruction uses `Xz = (X - feature_mean) / feature_scale` and
+`Yz = Xz @ coef.T + intercept`. The first eight columns predict true targets and the last
+eight form the shuffled-label control. Restore each group with
+`Y = Yz * target_scale + target_mean`; target order is in
+`report.json.target_contract.names`. High-dimensional extracted representations are not saved.
+
+Check whether validation outperforms both controls. MSE skill is
+`1 - MSE_probe / MSE_train_mean_baseline`; positive values beat that baseline. R² instead
+uses the validation mean in its denominator. Constant-target R², constant-vector Pearson r
+and zero-denominator skill are JSON `null` / Markdown `N/A`. High train but low validation
+scores can indicate probe overfitting or distribution shift. A weak pooling + linear probe
+does not establish absence of information. Readout dimensions differ, so score gaps alone
+do not establish information loss. Overlapping windows/shared benchmarks are not independent
+samples; this feature makes no significance claim or automatic architecture decision.
+Scale decodability does not establish future-alpha predictability. The default 16,384 /
+4,096 sample limits bound cost; they do not guarantee statistical sufficiency.
+
+An existing cloud Pod with the project environment can first run the download-free
+synthetic-data/mock-checkpoint contract tests:
+
+```bash
+cd /runpod-volume/stock_forecasting
+.venv/bin/python -m pytest tests/test_representation_scale_probe.py
+```
 
 ### Acceptance principles
 

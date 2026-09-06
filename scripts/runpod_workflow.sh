@@ -25,6 +25,7 @@ Usage:
   bash scripts/runpod_workflow.sh train [--maxRuntime DURATION] [--gpuId GPU_ID]
   bash scripts/runpod_workflow.sh resume [--maxRuntime DURATION] [--gpuId GPU_ID] [RUN_ID]
   bash scripts/runpod_workflow.sh validate [VALIDATION OPTIONS]
+  bash scripts/runpod_workflow.sh probe-scales --checkpoint CHECKPOINT [PROBE OPTIONS]  # existing GPU Pod only
   bash scripts/runpod_workflow.sh status
   bash scripts/runpod_workflow.sh download [--resume] [--checkpointScope all|best] [RUN_ID]
   bash scripts/runpod_workflow.sh cpu-logs
@@ -388,6 +389,9 @@ EOF
         ;;
     validate)
         exec bash "${SCRIPT_DIR}/create_runpod_validation_pod.sh" "$@"
+        ;;
+    probe-scales)
+        exec bash "${SCRIPT_DIR}/runpod_probe_scales.sh" "$@"
         ;;
     status)
         [[ $# -eq 0 ]] || { usage; exit 2; }
