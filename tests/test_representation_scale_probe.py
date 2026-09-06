@@ -15,9 +15,18 @@ import torch
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
-from stock_forecasting.checkpointing import load_checkpoint, save_ranked_checkpoint
-from stock_forecasting.cli.evaluate import resolve_checkpoint
-from stock_forecasting.cli.probe_scales import build_parser, render_summary, run_probe
+import stock_forecasting.cli.probe_scales as probe_cli
+from stock_forecasting.checkpointing import (
+    CHECKPOINT_TRANSACTION,
+    load_checkpoint,
+    save_ranked_checkpoint,
+)
+from stock_forecasting.cli.probe_scales import (
+    build_parser,
+    render_summary,
+    resolve_probe_checkpoint,
+    run_probe,
+)
 from stock_forecasting.config import ExperimentConfig
 from stock_forecasting.data.bar_store import build_symbol_bar_store
 from stock_forecasting.data.dataset import LazyFinancialWindowDataset
@@ -309,6 +318,7 @@ def test_mock_checkpoint_extraction_preserves_weights_and_checkpoint_files(
     config.training.output_root = tmp_path / "savedModel"
     run = config.training.output_root / "run-scale-probe-test"
     run.mkdir(parents=True)
+    config.save_resolved(run / "resolved-config.yaml")
     contract, digest = training_resume_contract_fingerprint(config)
     (run / "run-manifest.json").write_text(
         json.dumps(
@@ -341,7 +351,11 @@ def test_mock_checkpoint_extraction_preserves_weights_and_checkpoint_files(
         metrics={"primary_5d/selection_score": 0.1},
     )
     assert checkpoint is not None
-    assert resolve_checkpoint(run, saved_model_root=config.training.output_root) == checkpoint
+    assert resolve_probe_checkpoint(run, saved_model_root=config.training.output_root) == checkpoint
+    assert (
+        resolve_probe_checkpoint(checkpoint, saved_model_root=config.training.output_root)
+        == checkpoint
+    )
     before_files = {str(path): sha256_file(path) for path in run.rglob("*") if path.is_file()}
     torch.manual_seed(8)
     restored = build_model_bundle(config, torch.device("cpu")).model
@@ -406,6 +420,30 @@ def test_direct_cli_cannot_bypass_the_script_lease(
     with pytest.raises(RuntimeError, match="verify the mount and GPU lease"):
         run_probe(tmp_path, ScaleProbeSettings())
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("exact", [False, True])
+def test_pending_transaction_is_rejected_without_shared_recovery_or_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exact: bool,
+) -> None:
+    root = tmp_path / "savedModel"
+    run = root / "run-pending"
+    checkpoint = run / "checkpoint-000001"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "adapter.safetensors").write_bytes(b"fixture")
+    transaction = run / CHECKPOINT_TRANSACTION
+    transaction.write_text('{"state": "pending"}', encoding="utf-8")
+    before = {str(path): sha256_file(path) for path in run.rglob("*") if path.is_file()}
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("Shared checkpoint recovery must not run")
+
+    monkeypatch.setattr(probe_cli, "resolve_checkpoint", forbidden)
+    with pytest.raises(ValueError, match="pending selection transaction"):
+        resolve_probe_checkpoint(checkpoint if exact else run, saved_model_root=root)
+    assert before == {str(path): sha256_file(path) for path in run.rglob("*") if path.is_file()}
 
 
 def test_workflow_routes_help_and_blocks_local_checkpoint_execution(tmp_path: Path) -> None:

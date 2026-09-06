@@ -1472,6 +1472,8 @@ Run 目錄會使用經完整性驗證的 validation-selected best checkpoint；�
 `<run-id>/checkpoint-NNNNNN` 路徑。設定一律取自所選 checkpoint 的 `resolved-config.yaml`，
 不採用目前 active Stage 設定。原 checkpoint 綁定的 bar store、dataset manifest 與
 model/tokenizer cache 必須仍存在且契約一致；不能直接改指向另一個資料版本。
+若 run 留有未完成的 checkpoint-selection transaction，診斷會先拒絕執行；須由原訓練
+流程完成復原，不會在唯讀診斷中觸發 checkpoint 自動修復或刪除。
 
 命令為前景執行，與訓練 / validation 共用排他 GPU lease。它不建立或終止 Pod，不接入
 `runpod_tmux_launch.sh` 的訓練 lifecycle，不延長 Pod 原有的 hard deadline；執行期間須維持
@@ -3260,6 +3262,9 @@ an exact `<run-id>/checkpoint-NNNNNN` path is also supported. Configuration alwa
 from that checkpoint's `resolved-config.yaml`, never the current active stage selection.
 The original bound bar store, dataset manifest and model/tokenizer cache must still exist
 and pass compatibility checks; do not substitute another dataset version.
+Runs with a pending checkpoint-selection transaction are rejected before shared checkpoint
+validation can repair anything. Recover through the original training workflow first;
+the read-only diagnostic never triggers checkpoint reconciliation or deletion.
 
 This foreground command shares the exclusive training/validation GPU lease. It does not
 create or terminate Pods, join the training lifecycle in `runpod_tmux_launch.sh`, or extend

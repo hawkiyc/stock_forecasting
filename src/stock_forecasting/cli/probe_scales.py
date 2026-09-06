@@ -19,7 +19,7 @@ import numpy as np
 import sklearn
 import torch
 
-from stock_forecasting.checkpointing import load_checkpoint
+from stock_forecasting.checkpointing import CHECKPOINT_TRANSACTION, load_checkpoint
 from stock_forecasting.cli.evaluate import resolve_checkpoint
 from stock_forecasting.config import ExperimentConfig
 from stock_forecasting.data.dataset import LazyFinancialWindowDataset
@@ -63,6 +63,23 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
         json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
+
+
+def resolve_probe_checkpoint(path: Path, *, saved_model_root: Path) -> Path:
+    """Reject pending transactions before shared selection can reconcile them."""
+
+    source = path.expanduser().resolve(strict=False)
+    root = saved_model_root.expanduser().resolve(strict=False)
+    run = source.parent if (source / "adapter.safetensors").is_file() else source
+    if run.parent != root:
+        raise ValueError("Probe checkpoints must belong to a canonical saved-model run")
+    transaction = run / CHECKPOINT_TRANSACTION
+    if transaction.exists() or transaction.is_symlink():
+        raise ValueError(
+            "Checkpoint has a pending selection transaction; recover it through the original "
+            "training workflow before running this read-only diagnostic"
+        )
+    return resolve_checkpoint(source, saved_model_root=root)
 
 
 def render_summary(report: dict[str, Any]) -> str:
@@ -157,7 +174,7 @@ def run_probe(checkpoint_path: Path, settings: ScaleProbeSettings) -> Path:
             "Use bash scripts/runpod_workflow.sh probe-scales to verify the mount and GPU lease"
         )
     volume = canonical_network_volume_root()
-    checkpoint = resolve_checkpoint(checkpoint_path, saved_model_root=volume / "savedModel")
+    checkpoint = resolve_probe_checkpoint(checkpoint_path, saved_model_root=volume / "savedModel")
     config = ExperimentConfig.from_yaml(checkpoint / "resolved-config.yaml")
     validate_training_output_root(config.training.output_root)
     if config.model.time_series_backend != "kronos":
