@@ -27,6 +27,7 @@ Usage:
   bash scripts/runpod_workflow.sh validate [VALIDATION OPTIONS]
   bash scripts/runpod_workflow.sh status
   bash scripts/runpod_workflow.sh download [--resume] [--checkpointScope all|best] [RUN_ID]
+  bash scripts/runpod_workflow.sh download-probes [PROBE_RUN_ID]
   bash scripts/runpod_workflow.sh cpu-logs
 EOF
 }
@@ -398,6 +399,9 @@ EOF
         ;;
     download)
         exec bash "${SCRIPT_DIR}/download_runpod_results.sh" "$@"
+        ;;
+    download-probes)
+        exec bash "${SCRIPT_DIR}/download_runpod_probes.sh" "$@"
         ;;
     cpu-logs)
         [[ $# -eq 0 ]] || { usage; exit 2; }

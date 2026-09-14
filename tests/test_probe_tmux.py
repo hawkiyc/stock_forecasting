@@ -278,11 +278,16 @@ class ProbeTmuxTests(unittest.TestCase):
                 section = readme.split(heading, 1)[1].split("\n#### ", 1)[0]
                 commands = [part.split("```", 1)[0] for part in section.split("```bash\n")[1:]]
                 commands_by_language.append(commands)
-                self.assertEqual(len(commands), 6)
-                self.assertEqual(section.count("bash scripts/runpod_s3_project.sh s3 cp"), 3)
-                self.assertEqual(section.count("bash scripts/runpod_s3_project.sh s3 ls"), 3)
-                self.assertIn("python3 -m json.tool", section)
-                self.assertIn("report.json.artifacts_sha256", section)
+                self.assertEqual(commands, [
+                    "bash scripts/runpod_workflow.sh download-probes\n",
+                    "bash scripts/runpod_workflow.sh download-probes "
+                    "run-20260905T203327Z-270337978\n",
+                ])
+                for forbidden in (
+                    "runpod_s3_project.sh", "PROBE_VOLUME_ID", "PROBE_CHECKPOINT", "PROBE_ID",
+                    "PROBE_LAUNCH_ID", "s3://", "python3 -m json.tool",
+                ):
+                    self.assertNotIn(forbidden, section)
                 self.assertIn("state: complete", section)
                 for command in commands:
                     self.assertNotIn("runpod_tmux_launch.sh", command)
