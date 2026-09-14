@@ -1411,6 +1411,9 @@ state。`validation-benchmark.json` 是完整數值 validation 與 baseline 比�
 不要只根據 W&B 畫面或 README 宣稱 run 成功，應同時檢查 lifecycle 的
 `state`、run ID、result path 與本機下載的原始 JSON。
 
+歷史尺度表徵診斷不包含在此 `download` 範圍內；請使用下方
+[在本機下載診斷結果](#在本機下載診斷結果)的 S3 下載步驟。
+
 實際訓練 stage 由 active immutable selection 與它綁定的 config SHA 決定。
 操作命令、tmux session 或 lifecycle 路徑中的 `stage1-*` 名稱不會覆寫該選擇。
 
@@ -1601,6 +1604,100 @@ SSH session 缺少 Pod 環境變數時，腳本會使用既有 allowlist PID 1 i
 結果不可當作完成報告；重跑會建立新目錄。現有 `download` 命令仍只處理原本的訓練 / validation
 產物，不會自動下載本診斷目錄。診斷目錄與 tmux 日誌都在持久化 network volume，Pod 終止後
 仍保留，可透過該 volume 的 S3 介面取回。
+
+#### 在本機下載診斷結果
+
+以下命令全部在**本機專案根目錄**執行，不是在 Pod 內執行；不需要建立 GPU Pod、
+SSH、tmux 或安裝模型依賴。沿用已完成 credentials / volume 設定的
+`scripts/runpod_s3_project.sh`，由腳本讀取專案的 S3 憑證、region 與 endpoint；
+不需要手動匯出 API key，也不要直接 `source .env`。
+
+1. **指定 volume 與被診斷模型的 run ID，列出已有結果。** 將下列尖括號內容替換為實際值。
+   `<network-volume-id>` 是原本 network volume 的 ID，可從部署輸出或 Pod 啟動時的
+   `Verified RunPod network volume mount: ... volume_id=...` 確認，**不是 Pod ID**。
+   `<run-id>` 則取自 `Independent diagnostic output` / `Scale probe complete` 所印出的
+   `/diagnostics/representation-scales/<run-id>/...`，不是建立診斷 Pod 時配置的新 run ID。
+
+   ```bash
+   PROBE_VOLUME_ID="<network-volume-id>"
+   PROBE_RUN_ID="<run-id>"
+   bash scripts/runpod_s3_project.sh s3 ls \
+     "s3://${PROBE_VOLUME_ID}/diagnostics/representation-scales/${PROBE_RUN_ID}/" \
+     --recursive
+   ```
+
+   若沒有保留 run ID，先列出診斷根目錄，再填入 `PROBE_RUN_ID`：
+
+   ```bash
+   bash scripts/runpod_s3_project.sh s3 ls \
+     "s3://${PROBE_VOLUME_ID}/diagnostics/representation-scales/"
+   ```
+
+   列表中的 `checkpoint-NNNNNN/probe-<UTC>-<id>/` 才是一個獨立診斷目錄；
+   最新目錄不一定執行成功，不能僅依名稱或時間將它當作完整結果。
+
+2. **下載該模型 run 的所有診斷。** 保留 checkpoint 與 probe 子目錄，因此多次執行的
+   報告不會混在一起；只下載診斷產物，不下載模型權重或資料集：
+
+   ```bash
+   bash scripts/runpod_s3_project.sh s3 cp \
+     "s3://${PROBE_VOLUME_ID}/diagnostics/representation-scales/${PROBE_RUN_ID}/" \
+     "artifacts/diagnostics/representation-scales/${PROBE_RUN_ID}/" \
+     --recursive
+   ```
+
+   若只要**其中一次診斷**，改用下列命令；checkpoint 名稱與 probe ID 必須取自前一步
+   的列表或診斷輸出，不要用 tmux 的 `launch-...` ID 代替 `probe-...` ID：
+
+   ```bash
+   PROBE_CHECKPOINT="<checkpoint-name>"
+   PROBE_ID="<probe-id>"
+   bash scripts/runpod_s3_project.sh s3 cp \
+     "s3://${PROBE_VOLUME_ID}/diagnostics/representation-scales/${PROBE_RUN_ID}/${PROBE_CHECKPOINT}/${PROBE_ID}/" \
+     "artifacts/diagnostics/representation-scales/${PROBE_RUN_ID}/${PROBE_CHECKPOINT}/${PROBE_ID}/" \
+     --recursive
+   ```
+
+   下載位置位於 `.gitignore` 已排除的 `artifacts/`。這裡使用 S3 copy，**不接受訓練
+   downloader 的 `--resume`**；中斷後可重跑同一命令，會重新下載並覆寫同名檔案，
+   不會刪除其他本機檔案。不要把手動編輯的報告存入同一下載目錄。
+
+3. **確認下載完整後再閱讀報告。** 確認 copy 命令成功、所選 probe 目錄中有前述七個
+   產物，且該目錄的 `status.json` 為 `state: complete`。若下載了整個 run，先依列表
+   設定前述 `PROBE_CHECKPOINT` 與 `PROBE_ID`，再檢查單次診斷：
+
+   ```bash
+   python3 -m json.tool \
+     "artifacts/diagnostics/representation-scales/${PROBE_RUN_ID}/${PROBE_CHECKPOINT}/${PROBE_ID}/status.json"
+   ```
+
+   `status.json` 的 checkpoint 應與 `report.json.checkpoint.path` 及所選目錄一致。
+   `samples.jsonl`、`probes.npz`、`validation_predictions.npz` 可計算 SHA-256，與
+   `report.json.artifacts_sha256` 對照；僅有 `state: complete` 不能證明本機所有檔案
+   都已下載完整。先閱讀 `summary.md` 的中英摘要，再查看 `report.json` 的完整指標、
+   抽樣設定與 provenance；數值陣列保留在兩個 `.npz`，不需要在本機載入模型。
+   `running` / `failed` 或缺檔的目錄只可作為排錯資料，不能當成完成的診斷。
+
+4. **需要排錯時，另外下載該次 tmux 日誌。** 日誌不包含在診斷結果目錄內。
+   先列出 launch，再使用 launcher 印出的同一次 `launch-...` ID；若未保留對應 ID，
+   可檢查候選 launch 的 `combined.log`，以其 `Independent diagnostic output` 路徑
+   對應 probe，不能假設最新 launch 就是要分析的那次：
+
+   ```bash
+   bash scripts/runpod_s3_project.sh s3 ls \
+     "s3://${PROBE_VOLUME_ID}/logs/tmux/fin-ts-probe-scales/"
+   PROBE_LAUNCH_ID="<launch-id>"
+   bash scripts/runpod_s3_project.sh s3 cp \
+     "s3://${PROBE_VOLUME_ID}/logs/tmux/fin-ts-probe-scales/${PROBE_LAUNCH_ID}/" \
+     "artifacts/diagnostics/tmux/fin-ts-probe-scales/${PROBE_LAUNCH_ID}/" \
+     --recursive
+   ```
+
+   tmux 的 `status.json` 使用 `succeeded` / `failed` / `timed_out`，與數值診斷目錄的
+   `state: complete` 是不同狀態檔，請勿混淆。Pod 終止後仍可下載上述兩類產物；
+   不要求診斷 lifecycle 標記存在，因此也適用於加入本機 guard 診斷整合前的歷史結果。
+
+#### 解讀診斷結果
 
 `probes.npz` 以 `<readout>__feature_mean/feature_scale/coef/intercept` 儲存探針。
 計算順序為 `Xz = (X - feature_mean) / feature_scale`、
@@ -3285,6 +3382,9 @@ numerical validation and baseline comparison. Do not claim run success from a
 W&B chart or README alone; inspect the lifecycle `state`, run ID, result path,
 and downloaded raw JSON together.
 
+Historical scale representation diagnostics are outside this `download` scope. Use the
+S3 instructions under [Download diagnostic results locally](#download-diagnostic-results-locally).
+
 The active immutable selection and its bound config SHA control the selected
 stage. Names containing `stage1-*` in operation commands, tmux sessions, or
 lifecycle paths do not override that selection.
@@ -3503,6 +3603,113 @@ creates a new directory. The existing `download` command remains scoped to train
 validation artifacts and does not automatically retrieve this diagnostic directory.
 Diagnostic outputs and tmux logs survive Pod termination on the persistent network volume
 and can be retrieved through its S3 interface.
+
+#### Download diagnostic results locally
+
+Run every command below from the **local project root**, not inside a Pod. No GPU Pod,
+SSH connection, tmux session or model dependencies are needed. Use the existing
+`scripts/runpod_s3_project.sh` after the project's credentials / volume setup; the wrapper
+loads the project's S3 credentials, region and endpoint. Do not manually export API keys
+or directly `source .env`.
+
+1. **Select the volume and the diagnosed model's run ID, then list available results.**
+   Replace the angle-bracket placeholders with actual values. `<network-volume-id>` is
+   the original network volume ID from deployment output or
+   `Verified RunPod network volume mount: ... volume_id=...`, **not the Pod ID**.
+   Take `<run-id>` from the `/diagnostics/representation-scales/<run-id>/...` path printed
+   by `Independent diagnostic output` / `Scale probe complete`, not the new run ID
+   allocated when creating the diagnostic Pod.
+
+   ```bash
+   PROBE_VOLUME_ID="<network-volume-id>"
+   PROBE_RUN_ID="<run-id>"
+   bash scripts/runpod_s3_project.sh s3 ls \
+     "s3://${PROBE_VOLUME_ID}/diagnostics/representation-scales/${PROBE_RUN_ID}/" \
+     --recursive
+   ```
+
+   If the run ID was not retained, list the diagnostic root before setting `PROBE_RUN_ID`:
+
+   ```bash
+   bash scripts/runpod_s3_project.sh s3 ls \
+     "s3://${PROBE_VOLUME_ID}/diagnostics/representation-scales/"
+   ```
+
+   Each `checkpoint-NNNNNN/probe-<UTC>-<id>/` is an independent diagnostic directory.
+   The newest directory is not necessarily successful; names or timestamps alone do
+   not establish that a result is complete.
+
+2. **Download all diagnostics for that model run.** Checkpoint and probe subdirectories
+   remain separate, preserving multiple attempts. This retrieves only diagnostic
+   artifacts, not model weights or datasets:
+
+   ```bash
+   bash scripts/runpod_s3_project.sh s3 cp \
+     "s3://${PROBE_VOLUME_ID}/diagnostics/representation-scales/${PROBE_RUN_ID}/" \
+     "artifacts/diagnostics/representation-scales/${PROBE_RUN_ID}/" \
+     --recursive
+   ```
+
+   To retrieve **only one diagnostic attempt**, use this command instead. Take the
+   checkpoint name and probe ID from the listing or diagnostic output; a tmux
+   `launch-...` ID is not a substitute for the `probe-...` ID:
+
+   ```bash
+   PROBE_CHECKPOINT="<checkpoint-name>"
+   PROBE_ID="<probe-id>"
+   bash scripts/runpod_s3_project.sh s3 cp \
+     "s3://${PROBE_VOLUME_ID}/diagnostics/representation-scales/${PROBE_RUN_ID}/${PROBE_CHECKPOINT}/${PROBE_ID}/" \
+     "artifacts/diagnostics/representation-scales/${PROBE_RUN_ID}/${PROBE_CHECKPOINT}/${PROBE_ID}/" \
+     --recursive
+   ```
+
+   Downloads live under the already ignored `artifacts/` directory. These are S3 copy
+   commands and **do not accept the training downloader's `--resume` option**. Repeat
+   the same command after interruption; it downloads again and overwrites same-name
+   files without deleting other local files. Keep manually edited reports elsewhere.
+
+3. **Verify the download before reading the report.** Confirm the copy command
+   succeeds, the chosen probe directory contains all seven artifacts listed above,
+   and its `status.json` has `state: complete`. After downloading a whole run, set
+   `PROBE_CHECKPOINT` and `PROBE_ID` from the listing before inspecting one attempt:
+
+   ```bash
+   python3 -m json.tool \
+     "artifacts/diagnostics/representation-scales/${PROBE_RUN_ID}/${PROBE_CHECKPOINT}/${PROBE_ID}/status.json"
+   ```
+
+   The status checkpoint must agree with `report.json.checkpoint.path` and the selected
+   directory. SHA-256 values for `samples.jsonl`, `probes.npz` and
+   `validation_predictions.npz` can be checked against `report.json.artifacts_sha256`;
+   `state: complete` alone does not verify the completeness of the local download.
+   Start with the bilingual `summary.md`, then consult `report.json` for full metrics,
+   sampling settings and provenance. The two `.npz` files preserve numerical arrays;
+   there is no need to load the model locally. Treat `running`, `failed` or incomplete
+   directories as troubleshooting artifacts, not completed diagnostics.
+
+4. **Download the matching tmux logs separately when troubleshooting.** Logs are not
+   part of the diagnostic result directory. List available launches, then use the
+   matching `launch-...` ID printed by the launcher. If that ID was not retained,
+   inspect a candidate launch's `combined.log` and match its `Independent diagnostic
+   output` path to the probe; do not assume the newest launch is the relevant one:
+
+   ```bash
+   bash scripts/runpod_s3_project.sh s3 ls \
+     "s3://${PROBE_VOLUME_ID}/logs/tmux/fin-ts-probe-scales/"
+   PROBE_LAUNCH_ID="<launch-id>"
+   bash scripts/runpod_s3_project.sh s3 cp \
+     "s3://${PROBE_VOLUME_ID}/logs/tmux/fin-ts-probe-scales/${PROBE_LAUNCH_ID}/" \
+     "artifacts/diagnostics/tmux/fin-ts-probe-scales/${PROBE_LAUNCH_ID}/" \
+     --recursive
+   ```
+
+   The tmux `status.json` uses `succeeded` / `failed` / `timed_out`; it is distinct from
+   the numerical diagnostic directory's `state: complete`. Both artifact groups remain
+   downloadable after Pod termination. No diagnostic lifecycle marker is required,
+   so these instructions also cover results produced before diagnostic integration
+   with the local guard.
+
+#### Interpret diagnostic results
 
 `probes.npz` stores `<readout>__feature_mean/feature_scale/coef/intercept`.
 Reconstruction uses `Xz = (X - feature_mean) / feature_scale` and

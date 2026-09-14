@@ -267,6 +267,35 @@ class ProbeTmuxTests(unittest.TestCase):
         self.assertIn("Use bash scripts/runpod_tmux_launch.sh probe-scales", diagnostic_source)
         self.assertNotIn("runpod_workflow.sh probe-scales", diagnostic_source)
 
+    def test_readme_documents_local_downloads_with_matching_bilingual_commands(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        commands_by_language = []
+        for heading in (
+            "#### 在本機下載診斷結果",
+            "#### Download diagnostic results locally",
+        ):
+            with self.subTest(heading=heading):
+                section = readme.split(heading, 1)[1].split("\n#### ", 1)[0]
+                commands = [part.split("```", 1)[0] for part in section.split("```bash\n")[1:]]
+                commands_by_language.append(commands)
+                self.assertEqual(len(commands), 6)
+                self.assertEqual(section.count("bash scripts/runpod_s3_project.sh s3 cp"), 3)
+                self.assertEqual(section.count("bash scripts/runpod_s3_project.sh s3 ls"), 3)
+                self.assertIn("python3 -m json.tool", section)
+                self.assertIn("report.json.artifacts_sha256", section)
+                self.assertIn("state: complete", section)
+                for command in commands:
+                    self.assertNotIn("runpod_tmux_launch.sh", command)
+                    self.assertNotIn("runpod_workflow.sh train", command)
+                    self.assertNotIn("source .env", command)
+                    self.assertNotIn("--resume", command)
+                    self.assertNotIn("--delete", command)
+                    syntax = subprocess.run(
+                        ["bash", "-n"], input=command, capture_output=True, text=True, timeout=5
+                    )
+                    self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        self.assertEqual(*commands_by_language)
+
     def test_success_publishes_signal_then_waits_for_local_guard_while_owning_lease(self) -> None:
         harness = self.harness()
         # An inherited hint must not bypass real lease acquisition in the runner.
