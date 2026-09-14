@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import suppress
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
@@ -123,10 +124,8 @@ class S3Reader:
                 code = process.wait(timeout=COMMAND_TIMEOUT_SECONDS)
             except BaseException:
                 # Terminate the wrapper and its child if it has not reached exec yet.
-                try:
+                with suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
                 process.wait()
                 raise
             if code:

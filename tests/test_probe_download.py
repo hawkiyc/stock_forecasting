@@ -270,20 +270,22 @@ class ProbeDownloadTests(unittest.TestCase):
                 available_bytes=64 * 1024**3, source="fixture"
             ),
         }
-        with patch.object(HELPER["runpy"], "run_path", return_value=resources):
-            with patch.dict(os.environ, {"RUNPOD_PROBE_DOWNLOAD_WORKERS": "3"}):
-                self.assertEqual(HELPER["worker_count"](ROOT), 3)
-                resources["detect_visible_cpu_count"] = lambda: 2
-                self.assertEqual(HELPER["worker_count"](ROOT), 2)
-                resources["detect_available_memory"] = lambda: SimpleNamespace(
-                    available_bytes=1024**3, source="fixture"
-                )
-                self.assertEqual(HELPER["worker_count"](ROOT), 1)
-                resources["detect_available_memory"] = lambda: SimpleNamespace(
-                    available_bytes=1024**2, source="fixture"
-                )
-                with self.assertRaises(MemoryError):
-                    HELPER["worker_count"](ROOT)
+        with (
+            patch.object(HELPER["runpy"], "run_path", return_value=resources),
+            patch.dict(os.environ, {"RUNPOD_PROBE_DOWNLOAD_WORKERS": "3"}),
+        ):
+            self.assertEqual(HELPER["worker_count"](ROOT), 3)
+            resources["detect_visible_cpu_count"] = lambda: 2
+            self.assertEqual(HELPER["worker_count"](ROOT), 2)
+            resources["detect_available_memory"] = lambda: SimpleNamespace(
+                available_bytes=1024**3, source="fixture"
+            )
+            self.assertEqual(HELPER["worker_count"](ROOT), 1)
+            resources["detect_available_memory"] = lambda: SimpleNamespace(
+                available_bytes=1024**2, source="fixture"
+            )
+            with self.assertRaises(MemoryError):
+                HELPER["worker_count"](ROOT)
 
     def test_failed_batch_waits_for_active_writers_without_submitting_more_work(self):
         started = threading.Event()
@@ -303,30 +305,48 @@ class ProbeDownloadTests(unittest.TestCase):
             threading.Event().wait(0.02)
             finished.set()
 
-        with HELPER["ThreadPoolExecutor"](max_workers=2) as executor:
-            with self.assertRaisesRegex(RuntimeError, "fixture worker failure"):
-                list(HELPER["parallel_results"](executor, worker, items(), 2))
+        with (
+            HELPER["ThreadPoolExecutor"](max_workers=2) as executor,
+            self.assertRaisesRegex(RuntimeError, "fixture worker failure"),
+        ):
+            list(HELPER["parallel_results"](executor, worker, items(), 2))
         self.assertEqual(submitted, [0, 1])
         self.assertTrue(finished.is_set())
 
     def test_remote_metadata_read_is_bounded(self):
         reader = HELPER["S3Reader"](ROOT, "fixture-volume")
-        with patch.object(
-            reader, "command", side_effect=lambda args, stream: stream.write(b"x" * 65)
+        with (
+            patch.object(
+                reader, "command", side_effect=lambda args, stream: stream.write(b"x" * 65)
+            ),
+            self.assertRaisesRegex(ValueError, "bounded read limit"),
         ):
-            with self.assertRaisesRegex(ValueError, "bounded read limit"):
-                reader.json_command(["fixture"], limit=64)
+            reader.json_command(["fixture"], limit=64)
 
     def test_transport_timeout_terminates_and_reaps_its_process_group(self):
         reader = HELPER["S3Reader"](ROOT, "fixture-volume")
         process = Mock(pid=123456)
         process.wait.side_effect = [subprocess.TimeoutExpired(["fixture"], 1), 0]
-        with patch.object(HELPER["subprocess"], "Popen", return_value=process):
-            with patch.object(HELPER["os"], "killpg") as kill_group:
-                with tempfile.TemporaryFile() as output:
-                    with self.assertRaises(subprocess.TimeoutExpired):
-                        reader.command(["fixture"], output)
-                kill_group.assert_called_once_with(process.pid, HELPER["signal"].SIGKILL)
+        with (
+            patch.object(HELPER["subprocess"], "Popen", return_value=process),
+            patch.object(HELPER["os"], "killpg") as kill_group,
+        ):
+            with tempfile.TemporaryFile() as output, self.assertRaises(subprocess.TimeoutExpired):
+                reader.command(["fixture"], output)
+            kill_group.assert_called_once_with(process.pid, HELPER["signal"].SIGKILL)
+        self.assertEqual(process.wait.call_count, 2)
+
+    def test_transport_timeout_reaps_an_already_exited_process_group(self):
+        reader = HELPER["S3Reader"](ROOT, "fixture-volume")
+        process = Mock(pid=123456)
+        process.wait.side_effect = [subprocess.TimeoutExpired(["fixture"], 1), 0]
+        with (
+            patch.object(HELPER["subprocess"], "Popen", return_value=process),
+            patch.object(HELPER["os"], "killpg", side_effect=ProcessLookupError) as kill_group,
+        ):
+            with tempfile.TemporaryFile() as output, self.assertRaises(subprocess.TimeoutExpired):
+                reader.command(["fixture"], output)
+            kill_group.assert_called_once_with(process.pid, HELPER["signal"].SIGKILL)
         self.assertEqual(process.wait.call_count, 2)
 
 
