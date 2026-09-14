@@ -1466,7 +1466,8 @@ poetry run fin-ts-infer \
 
    這裡的 `train` 只負責檢查 readiness、配置新 run identity、建立 Pod 與設定期限，
    不會自動啟動訓練。此為沿用既有訓練 Pod 建立入口，並非獨立的診斷 Pod lifecycle。
-3. SSH 登入該 Pod，直接執行下列診斷命令。**不要執行**建立 Pod 後提示的
+3. SSH 登入該 Pod，執行下列診斷命令；命令會自動啟動 detached tmux session。
+   **不要執行**建立 Pod 後提示的
    `runpod_tmux_launch.sh stage1-train`，也不要啟動 `stage1-validate`。
 
 在 GPU Pod 內，不指定 checkpoint 時，自動使用目前掛載 volume 中最新已完成訓練的
@@ -1508,10 +1509,43 @@ model/tokenizer cache 必須仍存在且契約一致；不能直接改指向另�
 若 run 留有未完成的 checkpoint-selection transaction，診斷會先拒絕執行；須由原訓練
 流程完成復原，不會在唯讀診斷中觸發 checkpoint 自動修復或刪除。
 
-命令為前景執行，與訓練 / validation 共用排他 GPU lease。它不建立或終止 Pod，不接入
-`runpod_tmux_launch.sh` 的訓練 lifecycle，不延長 Pod 原有的 hard deadline；執行期間須維持
-終端連線，完成後自行依既有方式關閉不再使用的 Pod；不能把診斷結束視為 Pod 已關閉。
-上述 `--maxRuntime` 屬於 Pod 建立流程的期限設定，不是診斷程式的計時器。
+`probe-scales` 預設轉交既有的 `runpod_tmux_launch.sh probe-scales`，啟動
+`fin-ts-probe-scales` 背景 session。看到 `Detached tmux session started` 後，即可中斷 SSH；
+不需要保持終端連線。也可以直接使用相同 launcher，兩種入口的 checkpoint 與診斷參數相同：
+
+```bash
+bash scripts/runpod_tmux_launch.sh probe-scales \
+  --checkpoint run-20260905T203327Z-270337978
+```
+
+需要查看即時輸出時，在 Pod 仍運行期間重新 SSH 登入後 attach；按 `Ctrl-b d` 可離開畫面而
+不中止工作，不要按 `Ctrl-c` 當作 detach：
+
+```bash
+tmux -L fin-ts-probe-scales attach -t fin-ts-probe-scales
+```
+
+診斷沿用既有的 timeout 與自動終止流程：runner 取得排他 GPU lease 後，持續持有到結果
+狀態保存與 Pod 關機階段；成功、失敗或逾時都會先保存持久化 log / status，再呼叫
+`runpod_self_terminate.sh`。不改寫訓練 / validation 的 lifecycle 完成標記。
+若 session 已存在、啟動前檢查不通過，或 runner 無法取得 GPU lease，會保留 Pod，避免
+中斷既有工作；不會以「診斷失敗」為由關掉正在被其他工作使用的 Pod。
+runner 的 timeout 沿用 Pod 建立時的 `MAX_RUNTIME_SECONDS`（上例為 2 小時），另有
+60 秒強制中止寬限；不延長 Pod 原本已設定的 hard deadline。
+
+launcher 會印出這次工作的確切路徑。執行狀態與診斷數值報告分開保存：
+
+```text
+/runpod-volume/logs/tmux/fin-ts-probe-scales/<launch-id>/
+  combined.log                 # Worker stdout/stderr and shutdown messages
+  status.json                  # Terminal job state: succeeded / failed / timed_out
+  runner.sh                    # Quoted arguments, timeout, lease and finalization
+  pod-shutdown/shutdown.json   # Existing Pod termination audit
+```
+
+`status.json` 在工作結束時發布；tmux 啟動成功不代表模型診斷成功，`succeeded` 也不代表
+RunPod API 已確認終止。關機 API 失敗會沿用既有重試並記錄錯誤，原有外部 hard-limit guard
+繼續生效。Pod 終止後不能再 attach，應從持久化 network volume 讀取 log、status 與報告。
 可用 `probe-scales --help` 查看所有參數。自動選取 run 的 metadata 掃描採有界 thread pool，
 可用 `--selection-workers 1..8` 設定上限；實際數量還會受可見 CPU 與可用記憶體限制，
 不載入所有 run 的模型權重。GPU 記憶體不足時可降低 `--batch-size`，抽樣列不受 batch size 影響。
@@ -1548,7 +1582,8 @@ SSH session 缺少 Pod 環境變數時，腳本會使用既有 allowlist PID 1 i
 
 不覆寫 checkpoint、best pointer、既有 validation 報告或完成標記。失敗留下的 partial
 結果不可當作完成報告；重跑會建立新目錄。現有 `download` 命令仍只處理原本的訓練 / validation
-產物，不會自動下載本診斷目錄；可從 Pod 的 network volume 取回整個診斷目錄。
+產物，不會自動下載本診斷目錄。診斷目錄與 tmux 日誌都在持久化 network volume，Pod 終止後
+仍保留，可透過該 volume 的 S3 介面取回。
 
 `probes.npz` 以 `<readout>__feature_mean/feature_scale/coef/intercept` 儲存探針。
 計算順序為 `Xz = (X - feature_mean) / feature_scale`、
@@ -3295,7 +3330,8 @@ on the local control machine**. Follow this sequence:
    Here, `train` checks readiness, allocates a fresh run identity, creates the Pod and arms
    its deadlines. It does not start training automatically. This reuses the training Pod
    creation route rather than introducing a separate diagnostic Pod lifecycle.
-3. SSH into the Pod and run the diagnostic commands below directly. **Do not execute** the
+3. SSH into the Pod and run the commands below; they automatically start a detached tmux
+   session. **Do not execute** the
    suggested `runpod_tmux_launch.sh stage1-train` command or start `stage1-validate`.
 
 Inside the GPU Pod, omit the checkpoint option to select the latest completed training run
@@ -3341,11 +3377,48 @@ Runs with a pending checkpoint-selection transaction are rejected before shared 
 validation can repair anything. Recover through the original training workflow first;
 the read-only diagnostic never triggers checkpoint reconciliation or deletion.
 
-This foreground command shares the exclusive training/validation GPU lease. It does not
-create or terminate Pods, join the training lifecycle in `runpod_tmux_launch.sh`, or extend
-the Pod's existing hard deadline. Keep the terminal connected and close unused Pods through
-the existing workflow afterward; diagnostic completion does not mean the Pod has stopped.
-The `--maxRuntime` above configures the Pod creation workflow, not a diagnostic runtime timer.
+By default, `probe-scales` delegates to the existing `runpod_tmux_launch.sh probe-scales`
+launcher and starts the detached `fin-ts-probe-scales` session. After
+`Detached tmux session started` appears, SSH may disconnect without stopping the job.
+The launcher can also be used directly with the same checkpoint and probe arguments:
+
+```bash
+bash scripts/runpod_tmux_launch.sh probe-scales \
+  --checkpoint run-20260905T203327Z-270337978
+```
+
+While the Pod is still running, reconnect over SSH and attach to view live output.
+Use `Ctrl-b d` to detach without stopping work; do not use `Ctrl-c` to detach:
+
+```bash
+tmux -L fin-ts-probe-scales attach -t fin-ts-probe-scales
+```
+
+Diagnostics reuse the existing timeout and automatic Pod termination flow. The runner
+holds the exclusive GPU lease through result/status publication and shutdown. Success,
+failure and timeout all persist logs/status before calling `runpod_self_terminate.sh`,
+without rewriting training or validation lifecycle completion markers. An existing
+session, rejected launch preflight or failure to acquire the GPU lease preserves the Pod
+to protect existing work. The runner inherits `MAX_RUNTIME_SECONDS` from Pod creation
+(two hours above), with a further 60-second forced-termination grace period. It never
+extends the Pod's original hard deadline.
+
+The launcher prints the exact paths for this invocation. Execution status is stored
+separately from numerical diagnostic reports:
+
+```text
+/runpod-volume/logs/tmux/fin-ts-probe-scales/<launch-id>/
+  combined.log                 # Worker stdout/stderr and shutdown messages
+  status.json                  # Terminal job state: succeeded / failed / timed_out
+  runner.sh                    # Quoted arguments, timeout, lease and finalization
+  pod-shutdown/shutdown.json   # Existing Pod termination audit
+```
+
+`status.json` is published when the job exits. A launched session does not establish a
+successful diagnostic, and `succeeded` does not establish confirmed Pod termination.
+Shutdown API failures retain the existing retries/error logging and external hard-limit
+guard. After Pod termination, attach is unavailable; retrieve logs, status and reports
+from the persistent network volume instead.
 Use `probe-scales --help` for all options. Automatic run discovery uses a bounded metadata
 thread pool; `--selection-workers 1..8` sets its upper limit, further constrained by visible
 CPUs and available memory. It never loads every run's model weights. Reduce `--batch-size`
@@ -3387,8 +3460,9 @@ Every execution creates a new independent directory:
 Checkpoints, best pointers, existing validation reports and completion markers are not
 overwritten. Partial artifacts from a failed attempt are not completed results; retrying
 creates a new directory. The existing `download` command remains scoped to training and
-validation artifacts and does not automatically retrieve this diagnostic directory;
-retrieve the whole directory from the Pod's network volume.
+validation artifacts and does not automatically retrieve this diagnostic directory.
+Diagnostic outputs and tmux logs survive Pod termination on the persistent network volume
+and can be retrieved through its S3 interface.
 
 `probes.npz` stores `<readout>__feature_mean/feature_scale/coef/intercept`.
 Reconstruction uses `Xz = (X - feature_mean) / feature_scale` and

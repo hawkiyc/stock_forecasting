@@ -25,7 +25,7 @@ Usage:
   bash scripts/runpod_workflow.sh train [--maxRuntime DURATION] [--gpuId GPU_ID]
   bash scripts/runpod_workflow.sh resume [--maxRuntime DURATION] [--gpuId GPU_ID] [RUN_ID]
   bash scripts/runpod_workflow.sh validate [VALIDATION OPTIONS]
-  bash scripts/runpod_workflow.sh probe-scales [--checkpoint RUN_ID] [PROBE OPTIONS]  # existing GPU Pod only
+  bash scripts/runpod_workflow.sh probe-scales [--checkpoint RUN_ID] [PROBE OPTIONS]  # detached tmux in an existing GPU Pod
   bash scripts/runpod_workflow.sh status
   bash scripts/runpod_workflow.sh download [--resume] [--checkpointScope all|best] [RUN_ID]
   bash scripts/runpod_workflow.sh cpu-logs

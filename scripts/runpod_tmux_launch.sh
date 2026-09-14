@@ -5,6 +5,14 @@ set -Eeuo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Help must not import a Pod environment, acquire a lease, or start a session.
+if [[ "${1:-}" == "probe-scales" ]]; then
+    for argument in "$@"; do
+        if [[ "${argument}" == "--help" || "${argument}" == "-h" ]]; then
+            exec bash "${SCRIPT_DIR}/runpod_probe_scales.sh" --help
+        fi
+    done
+fi
 PID1_ENV_HELPER="${SCRIPT_DIR}/runpod_reexec_with_pid1_env.py"
 PID1_IMPORT_PYTHON=/usr/local/bin/python
 if [[ "${RUNPOD_TEST_MODE:-0}" == "1" \
@@ -35,6 +43,10 @@ FINALIZE_LIFECYCLE_ON_EXIT=0
 PROVIDER_WAIT_EXIT_ALLOWED=0
 RUN_DIRECTORY_ID=""
 PRESERVE_POD_ON_LAUNCH_ERROR=0
+if [[ "${1:-}" == "probe-scales" ]]; then
+    # A rejected diagnostic launch must not shut down an existing GPU workload.
+    PRESERVE_POD_ON_LAUNCH_ERROR=1
+fi
 
 terminate_failed_launch() {
     local launch_exit_code=$?
@@ -65,8 +77,8 @@ for path_name in PROJECT_ROOT LOG_ROOT; do
         "${path_value}" "${NETWORK_VOLUME_ROOT}" "${path_name}" NETWORK_VOLUME_ROOT
 done
 
-if [[ $# -ne 1 ]]; then
-    echo "Usage: runpod_tmux_launch.sh cpu-prepare|cpu-finalize|stage1-train|stage1-validate" >&2
+if [[ $# -lt 1 || ( "$1" != "probe-scales" && $# -ne 1 ) ]]; then
+    echo "Usage: runpod_tmux_launch.sh cpu-prepare|cpu-finalize|stage1-train|stage1-validate|probe-scales [PROBE OPTIONS]" >&2
     exit 2
 fi
 if [[ "${LOG_ROOT}" != "${NETWORK_VOLUME_ROOT}/logs" ]]; then
@@ -164,11 +176,21 @@ case "$1" in
             exit 2
         fi
         ;;
+    probe-scales)
+        SESSION_NAME=fin-ts-probe-scales
+        JOB_SCRIPT="${SCRIPT_DIR}/runpod_probe_scales.sh"
+        JOB_ROLE=gpu-probe
+        MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-21600}"
+        JOB_TIMEOUT_GRACE_SECONDS=0
+        FAILURE_LIFECYCLE_MARKER=""
+        FAILURE_LIFECYCLE_KIND=""
+        ;;
     *)
-        echo "Usage: runpod_tmux_launch.sh cpu-prepare|cpu-finalize|stage1-train|stage1-validate" >&2
+        echo "Usage: runpod_tmux_launch.sh cpu-prepare|cpu-finalize|stage1-train|stage1-validate|probe-scales [PROBE OPTIONS]" >&2
         exit 2
         ;;
 esac
+shift
 
 if [[ -z "${RUNPOD_POD_ID:-}" && "${RUNPOD_TEST_MODE:-0}" != "1" ]]; then
     echo "tmux workflows must run inside a RunPod Pod" >&2
@@ -176,9 +198,11 @@ if [[ -z "${RUNPOD_POD_ID:-}" && "${RUNPOD_TEST_MODE:-0}" != "1" ]]; then
 fi
 runpod_validate_path_in_root \
     "${JOB_SCRIPT}" "${PROJECT_ROOT}" JOB_SCRIPT PROJECT_ROOT
-runpod_validate_path_in_root \
-    "${FAILURE_LIFECYCLE_MARKER}" "${NETWORK_VOLUME_ROOT}" \
-    FAILURE_LIFECYCLE_MARKER NETWORK_VOLUME_ROOT
+if [[ -n "${FAILURE_LIFECYCLE_MARKER}" ]]; then
+    runpod_validate_path_in_root \
+        "${FAILURE_LIFECYCLE_MARKER}" "${NETWORK_VOLUME_ROOT}" \
+        FAILURE_LIFECYCLE_MARKER NETWORK_VOLUME_ROOT
+fi
 if [[ ! "${MAX_RUNTIME_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "Workflow runtime limit must be a positive integer" >&2
     exit 2
@@ -210,7 +234,7 @@ else
     JOB_DIR="${LOG_ROOT}/tmux/${SESSION_NAME}/${LAUNCH_ID}"
 fi
 POD_TERMINAL_ROOT=""
-if [[ "${JOB_ROLE}" == gpu-* ]]; then
+if [[ "${JOB_ROLE}" == "gpu-train" || "${JOB_ROLE}" == "gpu-validation" ]]; then
     POD_TERMINAL_ROOT="${NETWORK_VOLUME_ROOT}/lifecycle/runs/${RUN_DIRECTORY_ID}/pods"
 fi
 JOB_LOG="${JOB_DIR}/combined.log"
@@ -242,13 +266,33 @@ mkdir -p "${JOB_DIR}"
         printf 'export VALIDATION_RUN_ID=%q\n' "${RUN_DIRECTORY_ID}"
         printf 'export WANDB_RUN_ID=%q\n' "${RUN_DIRECTORY_ID}"
         printf 'export RUNPOD_RUN_KEY=%q\n' "${RUN_DIRECTORY_ID}"
+    elif [[ "${JOB_ROLE}" == "gpu-probe" ]]; then
+        printf 'export RUNPOD_SCALE_PROBE_TMUX_WORKER=1\n'
     fi
     printf 'exec > >(tee -a %q) 2>&1\n' "${JOB_LOG}"
     printf 'printf '\''[%%s] tmux workflow started\\n'\'' "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)"\n'
     printf 'set +e\n'
-    printf 'timeout --signal=TERM --kill-after=60 %qs bash %q\n' \
+    if [[ "${JOB_ROLE}" == "gpu-probe" ]]; then
+        # Hold the lease in the runner, not only in its model subprocess. It must
+        # survive model exit until status publication and Pod termination finish.
+        printf 'source %q\n' "${SCRIPT_DIR}/lib/runpod_paths.sh"
+        printf 'unset RUNPOD_GPU_WORKFLOW_LEASE_HELD\n'
+        printf 'diagnostic_lease_acquired=0\n'
+        printf 'runpod_acquire_gpu_workflow_lease %q\n' "${NETWORK_VOLUME_ROOT}"
+        printf 'job_exit_code=$?\n'
+        printf 'if [[ ${job_exit_code} -eq 0 ]]; then\n'
+        printf '  diagnostic_lease_acquired=1\n'
+    fi
+    printf 'timeout --signal=TERM --kill-after=60 %qs bash %q' \
         "${JOB_TIMEOUT_SECONDS}" "${JOB_SCRIPT}"
+    if [[ $# -gt 0 ]]; then
+        printf ' %q' "$@"
+    fi
+    printf '\n'
     printf 'job_exit_code=$?\n'
+    if [[ "${JOB_ROLE}" == "gpu-probe" ]]; then
+        printf 'fi\n'
+    fi
     printf 'finalization_exit_code=0\n'
     printf 'terminal_lifecycle_allowed=1\n'
     printf 'if [[ ${job_exit_code} -eq 75 ]]; then terminal_lifecycle_allowed=0; fi\n'
@@ -283,7 +327,7 @@ mkdir -p "${JOB_DIR}"
     printf '  terminal_lifecycle_allowed=0\n'
     printf '  return 1\n'
     printf '}\n'
-    if [[ "${JOB_ROLE}" == gpu-* ]]; then
+    if [[ "${JOB_ROLE}" == "gpu-train" || "${JOB_ROLE}" == "gpu-validation" ]]; then
         printf 'publish_lease_contention_signal() {\n'
         printf '  if [[ ${job_exit_code} -ne 75 ]]; then return 0; fi\n'
         printf '  local pod_id="${RUNPOD_POD_ID:-}"\n'
@@ -346,7 +390,7 @@ mkdir -p "${JOB_DIR}"
     printf '  finalization_exit_code=74\n'
     printf '  if ! publish_failed_status; then :; fi\n'
     printf 'fi\n'
-    if [[ "${JOB_ROLE}" == gpu-* ]]; then
+    if [[ "${JOB_ROLE}" == "gpu-train" || "${JOB_ROLE}" == "gpu-validation" ]]; then
         printf 'if [[ ${job_exit_code} -eq 75 ]]; then\n'
         printf '  if ! publish_lease_contention_signal; then\n'
         printf '    printf '\''Unable to persist GPU lease-contention signal\\n'\'' >&2\n'
@@ -401,6 +445,12 @@ mkdir -p "${JOB_DIR}"
     printf 'fi\n'
     printf 'export RUNPOD_SHUTDOWN_DIR=%q\n' "${JOB_DIR}/pod-shutdown"
     printf 'export RUNPOD_SHUTDOWN_MARKER=%q\n' "${JOB_DIR}/pod-shutdown/shutdown.json"
+    if [[ "${JOB_ROLE}" == "gpu-probe" ]]; then
+        printf 'if [[ ${diagnostic_lease_acquired} -ne 1 ]]; then\n'
+        printf '  printf '\''Diagnostic did not acquire the GPU lease; preserving the Pod and existing work\\n'\''\n'
+        printf '  exit "${job_exit_code}"\n'
+        printf 'fi\n'
+    fi
     printf 'if ! bash %q; then\n' "${SELF_TERMINATE_SCRIPT}"
     printf '  printf '\''Pod self-termination failed; external lifecycle guard remains armed\\n'\'' >&2\n'
     printf 'fi\n'

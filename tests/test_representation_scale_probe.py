@@ -472,7 +472,9 @@ def test_workflow_routes_help_and_blocks_local_checkpoint_execution(tmp_path: Pa
     )
     assert help_result.returncode == 0
     assert "existing CUDA RunPod" in help_result.stdout
-    assert "does not create/terminate" in help_result.stdout
+    assert "does not create a Pod" in help_result.stdout
+    assert "automatically terminates the Pod" in help_result.stdout
+    assert "SSH may disconnect" in help_result.stdout
     assert "[--checkpoint RUN_ID]" in help_result.stdout
     assert "latest completed training run" in help_result.stdout
     for arguments in ([], ["--checkpoint", "run-selected"], ["--checkpoint", str(tmp_path)]):

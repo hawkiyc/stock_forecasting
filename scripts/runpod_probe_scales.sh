@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Run an independent frozen-checkpoint diagnostic in an existing GPU Pod.
+# Launch a detached scale diagnostic, or run its internal tmux worker.
 set -Eeuo pipefail
 umask 077
 
@@ -29,7 +29,12 @@ unfinished runs are excluded. Missing/corrupt selection artifacts fail without a
 Legacy absolute canonical run/checkpoint paths remain supported; relative paths are not accepted.
 The resolved checkpoint config is used, never the active stage selection.
 Results: NETWORK_VOLUME_ROOT/diagnostics/representation-scales/<run>/<checkpoint>/probe-*/
-This foreground command does not create/terminate a Pod or alter lifecycle completion markers.
+This command starts detached tmux session fin-ts-probe-scales; SSH may disconnect afterward.
+It does not create a Pod. The runner automatically terminates the Pod after success/failure/timeout,
+after saving logs/status. Duplicate sessions or failure to acquire the GPU lease preserve the Pod.
+Training/validation lifecycle completion markers are never changed by the diagnostic.
+Logs: NETWORK_VOLUME_ROOT/logs/tmux/fin-ts-probe-scales/<launch-id>/
+Attach: tmux -L fin-ts-probe-scales attach -t fin-ts-probe-scales (detach with Ctrl-b d).
 No test split, W&B run, training optimizer, or checkpoint update is involved.
 EOF
 }
@@ -123,6 +128,9 @@ export RUNPOD_VOLUME_ROOT="${NETWORK_VOLUME_ROOT}"
 # Verify the exact mount and share the existing exclusive GPU lease, but do not run
 # training/validation readiness transitions or rewrite their lifecycle markers.
 bash "${SCRIPT_DIR}/verify_runpod_mounted_readiness.sh" --mount-only
+if [[ "${RUNPOD_SCALE_PROBE_TMUX_WORKER:-0}" != "1" ]]; then
+    exec bash "${SCRIPT_DIR}/runpod_tmux_launch.sh" probe-scales "$@"
+fi
 runpod_acquire_gpu_workflow_lease "${NETWORK_VOLUME_ROOT}"
 
 export HF_HOME="${CACHE_ROOT}/huggingface"
