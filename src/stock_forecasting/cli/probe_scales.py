@@ -196,7 +196,7 @@ def run_probe(
         raise RuntimeError("Checkpoint scale probing must run inside an existing CUDA RunPod Pod")
     if os.environ.get("RUNPOD_GPU_WORKFLOW_LEASE_HELD") != "1":
         raise RuntimeError(
-            "Use bash scripts/runpod_workflow.sh probe-scales to verify the mount and GPU lease"
+            "Use bash scripts/runpod_tmux_launch.sh probe-scales to verify the mount and GPU lease"
         )
     volume = canonical_network_volume_root()
     checkpoint = resolve_probe_checkpoint(

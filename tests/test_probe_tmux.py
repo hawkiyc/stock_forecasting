@@ -188,7 +188,7 @@ class ProbeTmuxTests(unittest.TestCase):
         self.assertFalse((harness.root / "lifecycle-calls").exists())
         self.assertEqual(list((harness.volume / "lifecycle").rglob("*.json")), [])
 
-    def test_public_entrypoints_delegate_once_with_unchanged_arguments(self) -> None:
+    def test_legacy_workflow_alias_delegates_once_with_unchanged_arguments(self) -> None:
         for arguments in ((), ("--checkpoint", "run-selected", "--batch-size", "8")):
             with self.subTest(arguments=arguments):
                 harness = self.harness()
@@ -217,8 +217,34 @@ class ProbeTmuxTests(unittest.TestCase):
         result = harness.command("runpod_tmux_launch.sh", "probe-scales", "--help")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("automatically terminates the Pod", result.stdout)
+        self.assertIn("bash scripts/runpod_tmux_launch.sh probe-scales", result.stdout)
+        self.assertNotIn("runpod_workflow.sh probe-scales", result.stdout)
+        legacy_help = harness.command("runpod_workflow.sh", "probe-scales", "--help")
+        self.assertEqual(legacy_help.returncode, 0, legacy_help.stderr)
+        self.assertEqual(legacy_help.stdout, result.stdout)
+        workflow_help = harness.command("runpod_workflow.sh", "--help")
+        self.assertEqual(workflow_help.returncode, 0, workflow_help.stderr)
+        self.assertNotIn("probe-scales", workflow_help.stdout + workflow_help.stderr)
         self.assertFalse((harness.root / "mount-checks").exists())
         self.assertFalse((harness.root / "tmux-calls").exists())
+
+    def test_readme_only_documents_tmux_for_remote_probe_execution(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for heading in (
+            "### 歷史尺度表徵診斷",
+            "### Historical scale representation diagnostics",
+        ):
+            with self.subTest(heading=heading):
+                section = readme.split(heading, 1)[1].split("\n### ", 1)[0]
+                self.assertIn("bash scripts/runpod_workflow.sh train --maxRuntime 2h", section)
+                self.assertIn("bash scripts/runpod_tmux_launch.sh probe-scales\n", section)
+                self.assertIn("bash scripts/runpod_tmux_launch.sh probe-scales --help", section)
+                self.assertNotIn("runpod_workflow.sh probe-scales", section)
+        diagnostic_source = (ROOT / "src/stock_forecasting/cli/probe_scales.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Use bash scripts/runpod_tmux_launch.sh probe-scales", diagnostic_source)
+        self.assertNotIn("runpod_workflow.sh probe-scales", diagnostic_source)
 
     def test_success_persists_status_then_terminates_while_owning_lease(self) -> None:
         harness = self.harness()

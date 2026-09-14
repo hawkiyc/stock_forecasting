@@ -1455,9 +1455,9 @@ poetry run fin-ts-infer \
 
 `probe-scales` **不會自動建立 GPU Pod，也不能在本機執行模型診斷**。執行順序如下：
 
-1. 在本機先透過 `bash scripts/runpod_workflow.sh sync --apply` 與既有雲端部署流程
+1. **本機控制端：同步程式碼。** 透過 `bash scripts/runpod_workflow.sh sync --apply` 與既有雲端部署流程
    更新程式碼；GPU readiness 必須通過，原始 network volume 中須已有可用的專案環境。
-2. 若已有掛載同一 volume、且未執行訓練或 validation 的 GPU Pod，可直接使用。
+2. **本機控制端：建立 GPU Pod。** 若已有掛載同一 volume、且未執行訓練或 validation 的 GPU Pod，可直接使用。
    若沒有，在本機執行下列既有 GPU Pod 建立入口；可用 `--gpuId` 指定 GPU 型號：
 
    ```bash
@@ -1466,7 +1466,7 @@ poetry run fin-ts-infer \
 
    這裡的 `train` 只負責檢查 readiness、配置新 run identity、建立 Pod 與設定期限，
    不會自動啟動訓練。此為沿用既有訓練 Pod 建立入口，並非獨立的診斷 Pod lifecycle。
-3. SSH 登入該 Pod，執行下列診斷命令；命令會自動啟動 detached tmux session。
+3. **GPU Pod：透過 tmux 啟動診斷。** SSH 登入該 Pod，執行下列診斷命令。
    **不要執行**建立 Pod 後提示的
    `runpod_tmux_launch.sh stage1-train`，也不要啟動 `stage1-validate`。
 
@@ -1475,14 +1475,14 @@ run，並選取該 run 的 validation-selected best checkpoint：
 
 ```bash
 cd /runpod-volume/stock_forecasting
-bash scripts/runpod_workflow.sh probe-scales
+bash scripts/runpod_tmux_launch.sh probe-scales
 ```
 
 指定歷史訓練時，`--checkpoint` 直接填入 **run ID**，不需要完整路徑：
 
 ```bash
 cd /runpod-volume/stock_forecasting
-bash scripts/runpod_workflow.sh probe-scales \
+bash scripts/runpod_tmux_launch.sh probe-scales \
   --checkpoint run-20260905T203327Z-270337978 \
   --train-samples 16384 \
   --validation-samples 4096 \
@@ -1509,14 +1509,10 @@ model/tokenizer cache 必須仍存在且契約一致；不能直接改指向另�
 若 run 留有未完成的 checkpoint-selection transaction，診斷會先拒絕執行；須由原訓練
 流程完成復原，不會在唯讀診斷中觸發 checkpoint 自動修復或刪除。
 
-`probe-scales` 預設轉交既有的 `runpod_tmux_launch.sh probe-scales`，啟動
-`fin-ts-probe-scales` 背景 session。看到 `Detached tmux session started` 後，即可中斷 SSH；
-不需要保持終端連線。也可以直接使用相同 launcher，兩種入口的 checkpoint 與診斷參數相同：
-
-```bash
-bash scripts/runpod_tmux_launch.sh probe-scales \
-  --checkpoint run-20260905T203327Z-270337978
-```
+本機使用 `runpod_workflow.sh` 建立 Pod；Pod 內的診斷一律使用
+`runpod_tmux_launch.sh probe-scales` 啟動，與前述部署及訓練流程一致。
+此命令會啟動 `fin-ts-probe-scales` 背景 session。看到 `Detached tmux session started`
+後，即可中斷 SSH，不需要保持終端連線。
 
 需要查看即時輸出時，在 Pod 仍運行期間重新 SSH 登入後 attach；按 `Ctrl-b d` 可離開畫面而
 不中止工作，不要按 `Ctrl-c` 當作 detach：
@@ -1546,7 +1542,13 @@ launcher 會印出這次工作的確切路徑。執行狀態與診斷數值報�
 `status.json` 在工作結束時發布；tmux 啟動成功不代表模型診斷成功，`succeeded` 也不代表
 RunPod API 已確認終止。關機 API 失敗會沿用既有重試並記錄錯誤，原有外部 hard-limit guard
 繼續生效。Pod 終止後不能再 attach，應從持久化 network volume 讀取 log、status 與報告。
-可用 `probe-scales --help` 查看所有參數。自動選取 run 的 metadata 掃描採有界 thread pool，
+可用下列命令查看所有診斷參數：
+
+```bash
+bash scripts/runpod_tmux_launch.sh probe-scales --help
+```
+
+自動選取 run 的 metadata 掃描採有界 thread pool，
 可用 `--selection-workers 1..8` 設定上限；實際數量還會受可見 CPU 與可用記憶體限制，
 不載入所有 run 的模型權重。GPU 記憶體不足時可降低 `--batch-size`，抽樣列不受 batch size 影響。
 SSH session 缺少 Pod 環境變數時，腳本會使用既有 allowlist PID 1 importer 載入，
@@ -3317,10 +3319,11 @@ and calculates no future alpha labels.
 `probe-scales` **does not create a GPU Pod automatically and cannot run model diagnostics
 on the local control machine**. Follow this sequence:
 
-1. Update source from the control machine using `bash scripts/runpod_workflow.sh sync --apply`
+1. **Local control machine: synchronize source.** Use `bash scripts/runpod_workflow.sh sync --apply`
    and the existing cloud deployment workflow. GPU readiness must pass, and the original
    network volume must already contain a usable project environment.
-2. Reuse an idle GPU Pod mounting that same volume if one is available. Otherwise, run the
+2. **Local control machine: create a GPU Pod.** Reuse an idle GPU Pod mounting that same
+   volume if one is available. Otherwise, run the
    existing GPU Pod creation entry point locally; `--gpuId` can select a GPU model:
 
    ```bash
@@ -3330,8 +3333,8 @@ on the local control machine**. Follow this sequence:
    Here, `train` checks readiness, allocates a fresh run identity, creates the Pod and arms
    its deadlines. It does not start training automatically. This reuses the training Pod
    creation route rather than introducing a separate diagnostic Pod lifecycle.
-3. SSH into the Pod and run the commands below; they automatically start a detached tmux
-   session. **Do not execute** the
+3. **GPU Pod: start diagnostics through tmux.** SSH into the Pod and run the commands below.
+   **Do not execute** the
    suggested `runpod_tmux_launch.sh stage1-train` command or start `stage1-validate`.
 
 Inside the GPU Pod, omit the checkpoint option to select the latest completed training run
@@ -3339,14 +3342,14 @@ on the mounted volume and use that run's validation-selected best checkpoint:
 
 ```bash
 cd /runpod-volume/stock_forecasting
-bash scripts/runpod_workflow.sh probe-scales
+bash scripts/runpod_tmux_launch.sh probe-scales
 ```
 
 To select a historical training run, pass its **run ID** directly, without a full path:
 
 ```bash
 cd /runpod-volume/stock_forecasting
-bash scripts/runpod_workflow.sh probe-scales \
+bash scripts/runpod_tmux_launch.sh probe-scales \
   --checkpoint run-20260905T203327Z-270337978 \
   --train-samples 16384 \
   --validation-samples 4096 \
@@ -3377,15 +3380,11 @@ Runs with a pending checkpoint-selection transaction are rejected before shared 
 validation can repair anything. Recover through the original training workflow first;
 the read-only diagnostic never triggers checkpoint reconciliation or deletion.
 
-By default, `probe-scales` delegates to the existing `runpod_tmux_launch.sh probe-scales`
-launcher and starts the detached `fin-ts-probe-scales` session. After
-`Detached tmux session started` appears, SSH may disconnect without stopping the job.
-The launcher can also be used directly with the same checkpoint and probe arguments:
-
-```bash
-bash scripts/runpod_tmux_launch.sh probe-scales \
-  --checkpoint run-20260905T203327Z-270337978
-```
+Use `runpod_workflow.sh` locally to create the Pod, then use
+`runpod_tmux_launch.sh probe-scales` inside the Pod to start diagnostics, consistently
+with the deployment and training workflows above. This starts the detached
+`fin-ts-probe-scales` session. After `Detached tmux session started` appears,
+SSH may disconnect without stopping the job.
 
 While the Pod is still running, reconnect over SSH and attach to view live output.
 Use `Ctrl-b d` to detach without stopping work; do not use `Ctrl-c` to detach:
@@ -3419,7 +3418,13 @@ successful diagnostic, and `succeeded` does not establish confirmed Pod terminat
 Shutdown API failures retain the existing retries/error logging and external hard-limit
 guard. After Pod termination, attach is unavailable; retrieve logs, status and reports
 from the persistent network volume instead.
-Use `probe-scales --help` for all options. Automatic run discovery uses a bounded metadata
+List all diagnostic options with:
+
+```bash
+bash scripts/runpod_tmux_launch.sh probe-scales --help
+```
+
+Automatic run discovery uses a bounded metadata
 thread pool; `--selection-workers 1..8` sets its upper limit, further constrained by visible
 CPUs and available memory. It never loads every run's model weights. Reduce `--batch-size`
 if extraction runs out of GPU memory; sample membership is batch-size invariant.

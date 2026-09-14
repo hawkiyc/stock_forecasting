@@ -11,7 +11,7 @@ source "${SCRIPT_DIR}/lib/runpod_paths.sh"
 usage() {
     cat <<'EOF'
 Usage (inside an existing CUDA RunPod Pod):
-  bash scripts/runpod_workflow.sh probe-scales [--checkpoint RUN_ID] [OPTIONS]
+  bash scripts/runpod_tmux_launch.sh probe-scales [--checkpoint RUN_ID] [OPTIONS]
 
 Options:
   --checkpoint RUN_ID    Validation-selected best checkpoint from this run
