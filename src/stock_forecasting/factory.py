@@ -7,6 +7,7 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -94,6 +95,7 @@ def build_model_bundle(
     device: torch.device,
     *,
     robust_scales: Sequence[float] | None = None,
+    scale_feature_statistics: dict[str, Any] | None = None,
 ) -> ModelBundle:
     """Build frozen tokenizer/base weights, predictor LoRA, resampler, and quant head."""
 
@@ -161,6 +163,8 @@ def build_model_bundle(
         quantiles=tuple(config.model.alpha_quantiles),
         robust_scales=resolved_scales,
         dropout=config.model.alpha_head_dropout,
+        feature_mode=config.model.feature_mode,
+        fp32_head=config.model.alpha_head_fp32,
     )
     model = QuantForecastModel(
         backbone,
@@ -171,6 +175,16 @@ def build_model_bundle(
     target_dtype = _dtype(config.model.dtype) if device.type == "cuda" else torch.float32
     model.to(device=device, dtype=target_dtype)
     _promote_trainable_parameters_to_fp32(model)
+    # Recreate from calibrated values; float() after a BF16 cast cannot undo rounding.
+    model.alpha_head.robust_scales = torch.tensor(
+        resolved_scales, device=device, dtype=torch.float32,
+    )
+    if model.alpha_head.numeric_branch is not None:
+        branch = model.alpha_head.numeric_branch
+        branch.feature_center = branch.feature_center.float()
+        branch.feature_scale = branch.feature_scale.float()
+        if scale_feature_statistics is not None:
+            branch.set_statistics(scale_feature_statistics)
     return ModelBundle(
         model=model,
         time_series_model_id=config.model.time_series_model_id,

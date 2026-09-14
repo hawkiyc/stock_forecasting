@@ -41,6 +41,11 @@ from stock_forecasting.data.manifest import (
     canonical_json_sha256,
     sha256_file,
 )
+from stock_forecasting.evaluation_protocol import (
+    daily_normalized_pinball,
+    evaluation_sampler,
+    sample_membership,
+)
 from stock_forecasting.factory import ModelBundle, build_model_bundle
 from stock_forecasting.metrics import (
     POSTPROCESS_SIGNAL_NAMES,
@@ -55,6 +60,7 @@ from stock_forecasting.runtime_resources import (
     detect_available_memory,
     detect_visible_cpu_count,
 )
+from stock_forecasting.scale_calibration import resolve_scale_feature_statistics
 from stock_forecasting.tracking import (
     TrackingRun,
     start_tracking,
@@ -1146,18 +1152,8 @@ def build_dataloaders(
         seed=config.training.seed,
         block_size=DATALOADER_SELECTION_BLOCK_SIZE,
     )
-    validation_sampler = BlockwisePermutationSampler(
-        len(validation_dataset),
-        max_samples=config.training.evaluation_max_samples,
-        seed=config.training.seed + 1,
-        block_size=DATALOADER_SELECTION_BLOCK_SIZE,
-    )
-    test_sampler = BlockwisePermutationSampler(
-        len(test_dataset),
-        max_samples=config.training.evaluation_max_samples,
-        seed=config.training.seed + 2,
-        block_size=DATALOADER_SELECTION_BLOCK_SIZE,
-    )
+    validation_sampler = evaluation_sampler(len(validation_dataset), config, "validation")
+    test_sampler = evaluation_sampler(len(test_dataset), config, "test")
     if len(train_sampler) < training_batch_size:
         raise ValueError("Selected training samples do not fill one fixed-size batch")
     train_batch_sampler = ResumableFixedSizeBatchSampler(
@@ -1980,7 +1976,6 @@ def evaluate_loader(
     quantile_array = (
         torch.cat(quantile_predictions).cpu().numpy().astype(np.float32, copy=False)
     )
-    mean_loss = float(torch.stack(losses).mean().cpu()) if losses else None
     horizons = list(config.data.alpha_horizons)
     quantiles = list(config.model.alpha_quantiles)
     robust_scales = [
@@ -2017,13 +2012,23 @@ def evaluate_loader(
         for horizon_index, horizon in enumerate(horizons)
     }
     result = {
-        "loss": mean_loss,
+        "loss": alpha_metrics["aggregate"]["normalized_pinball"] if losses else None,
         "samples": int(target_array.shape[0]),
+        "sample_membership": sample_membership(symbols, cutoff_dates),
+        "evaluation_robust_scales": robust_scales,
+        "daily_normalized_pinball": daily_normalized_pinball(
+            target_array, quantile_array, robust_scales, cutoff_dates,
+        ),
         **alpha_metrics,
         "cross_sectional_by_horizon": cross_sectional,
         "cross_sectional_5d": cross_sectional["5d"],
         "postprocess_signal_distribution": signal_distribution,
         "subgroups": {
+            "month": _subgroup_metrics(
+                targets=target_array, quantile_predictions=quantile_array,
+                horizons=horizons, quantiles=quantiles, robust_scales=robust_scales,
+                values=[value[:7] for value in cutoff_dates],
+            ),
             "asset_type": _subgroup_metrics(
                 targets=target_array,
                 quantile_predictions=quantile_array,
@@ -2065,6 +2070,8 @@ def evaluate_loader(
 def _flatten_metrics(payload: dict[str, Any], prefix: str = "") -> dict[str, float]:
     flattened: dict[str, float] = {}
     for key, value in payload.items():
+        if key in ("sample_membership", "daily_normalized_pinball"):
+            continue
         path = f"{prefix}/{key}" if prefix else key
         if isinstance(value, dict):
             flattened.update(_flatten_metrics(value, path))
@@ -2635,11 +2642,22 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
     robust_scale_result = resolve_runtime_robust_scales(
         train_dataset,
         sample_count=config.data.label_scale_calibration_samples,
-        seed=config.training.seed + 17,
+        seed=config.data.calibration_seed if config.data.fixed_split else config.training.seed + 17,
         worker_plan=worker_plan,
     )
     robust_scales = robust_scale_result.scales
-    bundle = build_model_bundle(config, device, robust_scales=robust_scales)
+    feature_statistics = (
+        resolve_scale_feature_statistics(
+            train_dataset, sample_count=config.data.label_scale_calibration_samples,
+            seed=config.data.calibration_seed,
+            loader_options=_loader_process_options(worker_plan, persistent=False),
+        )
+        if config.model.feature_mode in ("scales", "combined") else None
+    )
+    bundle = build_model_bundle(
+        config, device, robust_scales=robust_scales,
+        scale_feature_statistics=feature_statistics,
+    )
     probe_sample = train_dataset[0]
     batch_plan = (
         RuntimeBatchPlan.from_dict(
@@ -3136,7 +3154,10 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 "runtime_label_calibration": {
                     "source_split": "train",
                     "sample_count": robust_scale_result.sample_count,
-                    "seed": config.training.seed + 17,
+                    "seed": (
+                        config.data.calibration_seed if config.data.fixed_split
+                        else config.training.seed + 17
+                    ),
                     "horizons": config.data.alpha_horizons,
                     "method": "max(iqr,mad_x_1.4826,1e-4)",
                     "robust_scales": list(robust_scales),
@@ -3146,6 +3167,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                     "cache_path": str(robust_scale_result.cache_path),
                     "cache_identity_sha256": robust_scale_result.identity_sha256,
                 },
+                "runtime_scale_features": feature_statistics,
                 "dataloader_worker_plan": worker_plan.as_dict(),
                 "model_architecture_sha256": architecture_digest,
                 "lora_module_names": list(bundle.lora_module_names),

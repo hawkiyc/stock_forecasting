@@ -1031,7 +1031,7 @@ def test_evaluation_restores_training_mode(
     )
     assert "postprocess_signal_distribution" in metrics
     assert "macro_f1" not in repr(metrics).lower()
-    assert set(metrics["subgroups"]) == {"asset_type", "market", "provider", "year"}
+    assert set(metrics["subgroups"]) == {"asset_type", "market", "provider", "year", "month"}
 
 
 class _Predictor(nn.Module):

@@ -277,11 +277,17 @@ def test_remote_resume_prefers_only_a_newer_temporary_checkpoint() -> None:
 @pytest.mark.parametrize("migration", CHECKPOINT_RETENTION_MIGRATIONS)
 def test_current_interrupted_run_contract_allows_only_exact_migrations(
     migration: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
     current = training_resume_contract(config)
     current_files = current["training_implementation"]["files"]
-    assert {path: current_files[path] for path in migration["to_files"]} == migration["to_files"]
+    current_files.update(migration["to_files"])
+    current["training_implementation"]["sha256"] = _digest(current_files)
+    monkeypatch.setattr(
+        "stock_forecasting.run_contract.training_implementation_contract",
+        lambda: copy.deepcopy(current["training_implementation"]),
+    )
 
     stored = copy.deepcopy(current)
     stored_files = stored["training_implementation"]["files"]

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from stock_forecasting.checkpoint_resume_migrations import CHECKPOINT_RETENTION_MIGRATIONS
-from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.config import DataConfig, ExperimentConfig, ModelConfig
 from stock_forecasting.data.manifest import load_dataset_manifest, sha256_file
 from stock_forecasting.models import MODEL_OUTPUT_SCHEMA_VERSION
 from stock_forecasting.run_paths import validate_run_id, validate_training_resume_path
@@ -31,6 +31,7 @@ TRAINING_IMPLEMENTATION_PATHS = (
     "models/outputs.py",
     "models/projector.py",
     "models/quant.py",
+    "models/scale_features.py",
     "preflight.py",
     "run_contract.py",
     "run_paths.py",
@@ -38,6 +39,9 @@ TRAINING_IMPLEMENTATION_PATHS = (
     "training.py",
     "training_paths.py",
     "training_stage_contract.py",
+    "scale_calibration.py",
+    "dataset_identity.py",
+    "evaluation_protocol.py",
 )
 
 
@@ -219,6 +223,44 @@ def training_resume_contract_fingerprint(
         allow_nan=False,
     ).encode("utf-8")
     return contract, hashlib.sha256(encoded).hexdigest()
+
+
+def readonly_checkpoint_contract_digest(
+    config: ExperimentConfig, run_manifest: dict[str, Any],
+) -> str:
+    """Permit legacy inference/probes without authorizing a training-code migration.
+
+    The original model, data, stage, artifacts, and resolved settings must still
+    match. Only a legacy baseline can use this compatibility path; new fixed-date
+    runs retain the strict implementation contract.
+    """
+
+    if config.data.fixed_split is not None or config.model.feature_mode != "baseline":
+        return compatible_training_resume_contract_digest(config, run_manifest)
+    stored = run_manifest.get("training_resume_contract")
+    digest = run_manifest.get("training_resume_contract_sha256")
+    if not isinstance(stored, dict) or _canonical_payload_digest(stored) != digest:
+        raise ValueError("Historical checkpoint has an inconsistent run contract")
+    implementation = stored.get("training_implementation")
+    files = implementation.get("files") if isinstance(implementation, dict) else None
+    if (
+        not isinstance(files, dict) or not files
+        or any(
+            not isinstance(path, str) or not isinstance(value, str) or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for path, value in files.items()
+        )
+        or implementation.get("sha256") != _canonical_payload_digest(files)
+    ):
+        raise ValueError("Historical checkpoint implementation fingerprint is invalid")
+    current = training_resume_contract(config)
+    semantics = {key: value for key, value in stored.items() if key != "training_implementation"}
+    semantics["data"] = DataConfig.model_validate(semantics.get("data")).model_dump(mode="json")
+    semantics["model"] = ModelConfig.model_validate(semantics.get("model")).model_dump(mode="json")
+    expected = {key: value for key, value in current.items() if key != "training_implementation"}
+    if semantics != expected:
+        raise ValueError("Historical checkpoint model, data, or training settings differ")
+    return str(digest)
 
 
 def validate_training_resume_contract(

@@ -13,6 +13,7 @@ from stock_forecasting.data.manifest import (
     validate_dataset_storage_contract,
     validate_training_dataset_manifest,
 )
+from stock_forecasting.dataset_identity import MIN_FIXED_EVALUATION_DATES
 from stock_forecasting.factory import verify_kronos_source_revision
 from stock_forecasting.training_paths import resolve_bar_store_path
 from stock_forecasting.training_stage_contract import PRODUCTION_STAGE_SAMPLE_CONTRACTS
@@ -56,6 +57,7 @@ def run_preflight(
     *,
     require_data: bool = True,
     enforce_runtime_limit: bool = True,
+    allow_historical_inference: bool = False,
 ) -> PreflightReport:
     """Validate paths, immutable Parquet provenance, and numerical model scope."""
 
@@ -97,6 +99,10 @@ def run_preflight(
                     profile=config.data.dataset_profile,
                     raw_path=config.data.raw_path,
                     bar_store_path=bar_store,
+                    require_current_pipeline=not (
+                        allow_historical_inference and config.data.fixed_split is None
+                        and config.model.feature_mode == "baseline"
+                    ),
                 )
             except (FileNotFoundError, ValueError) as error:
                 report.errors.append(str(error))
@@ -111,6 +117,11 @@ def run_preflight(
                             config.data.effective_embargo_trading_days
                         ),
                         max_abs_log_return=config.data.max_abs_log_return,
+                        fixed_split=config.data.fixed_split,
+                        minimum_evaluation_dates=(
+                            MIN_FIXED_EVALUATION_DATES
+                            if config.model.time_series_backend == "kronos" else 0
+                        ),
                     )
                 except ValueError as error:
                     report.errors.append(str(error))

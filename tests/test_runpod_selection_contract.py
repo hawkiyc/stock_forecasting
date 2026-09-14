@@ -37,7 +37,7 @@ def _arguments(**overrides: object) -> argparse.Namespace:
         "data_profile": "tw_only",
         "dataset_revision": "v1",
         "start": "2020-01-01",
-        "end": "2024-01-01",
+        "end": "2026-06-01",
         "h_start": 3,
         "universe": "all",
         "stocks": [],
@@ -518,11 +518,25 @@ def test_selection_defaults_only_cover_dataset_semantics(tmp_path: Path) -> None
         ["create", "--project-root", str(tmp_path)]
     )
 
-    assert arguments.start == "2005-01-01"
+    assert arguments.start == "2016-01-01"
     assert arguments.end is None
-    assert arguments.h_start == 3
+    assert arguments.h_start == 1
+    assert arguments.feature_mode == "combined"
     for name in ("max_api_calls", "eodhd_qps", "taiwan_qps", "max_backoff_seconds"):
         assert not hasattr(arguments, name)
+
+
+def test_feature_mode_changes_selection_but_not_dataset_identity(tmp_path: Path) -> None:
+    root = _project_root(tmp_path)
+    baseline = SELECTION._build_selection(_arguments(feature_mode="baseline"), root)
+    combined = SELECTION._build_selection(_arguments(feature_mode="combined"), root)
+    assert baseline["dataset_request_sha256"] == combined["dataset_request_sha256"]
+    assert baseline["selection_sha256"] != combined["selection_sha256"]
+    assert combined["dataset_request"]["preparation"]["fixed_split"] == {
+        "train_end": "2025-06-01", "validation_end": "2025-12-01", "test_end": "2026-06-01",
+    }
+    with pytest.raises(SELECTION.SelectionError, match="extend through"):
+        SELECTION._build_selection(_arguments(end="2026-04-01"), root)
 
 
 def test_selection_storage_defaults_have_one_dependency_free_source() -> None:

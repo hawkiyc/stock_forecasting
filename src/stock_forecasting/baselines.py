@@ -6,7 +6,7 @@ import copy
 import math
 import random
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from itertools import chain
 from typing import Any, cast
 
@@ -15,12 +15,13 @@ import torch
 from numpy.typing import NDArray
 from sklearn.ensemble import HistGradientBoostingRegressor
 from torch import Tensor, nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from stock_forecasting.data.horizons import (
     DEFAULT_ALPHA_HORIZONS,
     validate_alpha_horizons,
 )
+from stock_forecasting.evaluation_protocol import daily_normalized_pinball, sample_membership
 from stock_forecasting.metrics import cross_sectional_metrics, multi_horizon_alpha_metrics
 
 ALPHA_QUANTILES = (0.1, 0.5, 0.9)
@@ -61,6 +62,39 @@ class BaselineArrays:
     symbols: list[str]
     asset_types: list[str]
     horizons: tuple[int, ...]
+    markets: list[str]
+    providers: list[str]
+
+
+class BaselineRecordDataset(Dataset[dict[str, Any]]):
+    """Keep lazy bar handles in workers; transform bounded batches there."""
+
+    def __init__(self, dataset: Any) -> None:
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        return self.dataset.record_at(index)
+
+
+def concatenate_baseline_batches(batches: Iterable[BaselineArrays]) -> BaselineArrays:
+    collected = list(batches)
+    if not collected:
+        raise ValueError("Baseline records cannot be empty")
+    if any(batch.horizons != collected[0].horizons for batch in collected):
+        raise ValueError("Baseline batches have inconsistent horizons")
+    values: dict[str, Any] = {}
+    for field in fields(BaselineArrays):
+        parts = [getattr(batch, field.name) for batch in collected]
+        if field.name == "horizons":
+            values[field.name] = parts[0]
+        elif isinstance(parts[0], np.ndarray):
+            values[field.name] = np.concatenate(parts, axis=0)
+        else:
+            values[field.name] = list(chain.from_iterable(parts))
+    return BaselineArrays(**values)
 
 
 def _safe_log_return(values: NDArray[np.float64], periods: int) -> float:
@@ -151,6 +185,8 @@ def baseline_arrays(records: Iterable[dict[str, Any]]) -> BaselineArrays:
     dates: list[str] = []
     symbols: list[str] = []
     asset_types: list[str] = []
+    markets: list[str] = []
+    providers: list[str] = []
     first_label = first_record.get("label", {})
     horizons = validate_alpha_horizons(first_label.get("horizons", ()))
     for record in chain((first_record,), iterator):
@@ -180,6 +216,8 @@ def baseline_arrays(records: Iterable[dict[str, Any]]) -> BaselineArrays:
         dates.append(str(record["cutoff_at"]))
         symbols.append(str(record["symbol"]))
         asset_types.append(str(record["asset_type"]))
+        markets.append(str(record.get("metadata", {}).get("market", "unknown")))
+        providers.append(str(record.get("metadata", {}).get("provider", "unknown")))
     sequence_shapes = {value.shape for value in sequences}
     if len(sequence_shapes) != 1:
         raise ValueError("Neural baselines require fixed-length paired windows")
@@ -197,6 +235,8 @@ def baseline_arrays(records: Iterable[dict[str, Any]]) -> BaselineArrays:
         symbols=symbols,
         asset_types=asset_types,
         horizons=horizons,
+        markets=markets,
+        providers=providers,
     )
 
 
@@ -243,23 +283,32 @@ def _evaluate_predictions(
         for horizon_index, horizon in enumerate(arrays.horizons)
     }
     subgroups: dict[str, Any] = {}
-    for asset_type in sorted(set(arrays.asset_types)):
-        indices = np.asarray(
-            [index for index, value in enumerate(arrays.asset_types) if value == asset_type],
-            dtype=np.int64,
-        )
-        subgroups[f"asset_type/{asset_type}"] = {
-            "samples": int(indices.size),
-            **multi_horizon_alpha_metrics(
-                targets=arrays.targets[indices],
-                quantile_predictions=predictions[indices],
-                horizons=list(arrays.horizons),
-                quantiles=list(ALPHA_QUANTILES),
-                robust_scales=robust_scales,
-            ),
-        }
+    for name, values in {
+        "asset_type": arrays.asset_types, "market": arrays.markets,
+        "provider": arrays.providers, "month": [day[:7] for day in arrays.dates],
+        "year": [day[:4] for day in arrays.dates],
+    }.items():
+        groups = {}
+        for group in sorted(set(values)):
+            indices = np.flatnonzero(np.asarray(values) == group)
+            groups[group] = {
+                "samples": int(indices.size),
+                **multi_horizon_alpha_metrics(
+                    targets=arrays.targets[indices],
+                    quantile_predictions=predictions[indices],
+                    horizons=list(arrays.horizons),
+                    quantiles=list(ALPHA_QUANTILES), robust_scales=robust_scales,
+                ),
+            }
+        subgroups[name] = groups
     return {
         **metrics,
+        "samples": len(arrays.targets),
+        "sample_membership": sample_membership(arrays.symbols, arrays.dates),
+        "evaluation_robust_scales": list(robust_scales),
+        "daily_normalized_pinball": daily_normalized_pinball(
+            arrays.targets, predictions, robust_scales, arrays.dates,
+        ),
         "cross_sectional_by_horizon": cross_sectional,
         "cross_sectional_5d": cross_sectional["5d"],
         "subgroups": subgroups,
@@ -344,12 +393,13 @@ def _rule_medians(
 def rule_baseline_suite(
     train: BaselineArrays,
     validation: BaselineArrays,
+    *, robust_scales: list[float] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Calibrate rule distributions on train and evaluate on validation only."""
+    """Calibrate on train and score an untouched validation or holdout split."""
 
     train_medians = _rule_medians(train, train)
     validation_medians = _rule_medians(train, validation)
-    scales = _robust_scales(train.targets)
+    scales = robust_scales if robust_scales is not None else _robust_scales(train.targets)
     results: dict[str, dict[str, Any]] = {}
     for name in RULE_BASELINE_NAMES:
         residual_quantiles = np.quantile(
@@ -374,7 +424,10 @@ class GradientBoostingBaseline:
     robust_scales: list[float]
 
     @classmethod
-    def fit(cls, train: BaselineArrays, seed: int = 42) -> GradientBoostingBaseline:
+    def fit(
+        cls, train: BaselineArrays, seed: int = 42, *,
+        robust_scales: list[float] | None = None,
+    ) -> GradientBoostingBaseline:
         models: list[list[HistGradientBoostingRegressor]] = []
         for horizon_index in range(len(train.horizons)):
             models.append(
@@ -391,7 +444,8 @@ class GradientBoostingBaseline:
                     for quantile in ALPHA_QUANTILES
                 ]
             )
-        return cls(models, _robust_scales(train.targets))
+        scales = robust_scales if robust_scales is not None else _robust_scales(train.targets)
+        return cls(models, scales)
 
     def evaluate(self, arrays: BaselineArrays) -> dict[str, Any]:
         predictions = np.stack(
@@ -525,6 +579,7 @@ def _evaluate_neural(
     robust_scales: list[float],
     *,
     batch_size: int = 256,
+    loader_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     device = next(model.parameters()).device
     model.eval()
@@ -532,8 +587,13 @@ def _evaluate_neural(
         TensorDataset(torch.from_numpy(arrays.sequences)),
         batch_size=batch_size,
         shuffle=False,
+        pin_memory=device.type == "cuda",
+        **(loader_options or {}),
     )
-    predictions = [model(batch[0].to(device)).float().cpu().numpy() for batch in loader]
+    predictions = [
+        model(batch[0].to(device, non_blocking=device.type == "cuda")).float().cpu().numpy()
+        for batch in loader
+    ]
     return _evaluate_predictions(
         arrays,
         np.concatenate(predictions).astype(np.float64),
@@ -551,13 +611,16 @@ def _fit_neural(
     patience: int,
     batch_size: int,
     learning_rate: float,
+    robust_scales: list[float] | None = None,
+    evaluation: BaselineArrays | None = None,
+    loader_options: dict[str, Any] | None = None,
 ) -> tuple[nn.Module, dict[str, Any]]:
     _seed_baseline(seed)
     if min(epochs, patience, batch_size) < 1 or learning_rate <= 0.0:
         raise ValueError("Neural baseline training parameters must be positive")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    scales = _robust_scales(train.targets)
+    scales = robust_scales if robust_scales is not None else _robust_scales(train.targets)
     if hasattr(model, "robust_scales"):
         model.robust_scales = tuple(scales)
     scale_tensor = torch.tensor(scales, dtype=torch.float32, device=device)
@@ -566,7 +629,10 @@ def _fit_neural(
         torch.from_numpy(train.targets.astype(np.float32)),
     )
     generator = torch.Generator().manual_seed(seed)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, generator=generator)
+    loader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, generator=generator,
+        pin_memory=device.type == "cuda", **(loader_options or {}),
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
     best_state: dict[str, Tensor] | None = None
     best_score = math.inf
@@ -574,13 +640,17 @@ def _fit_neural(
     for _epoch in range(epochs):
         model.train()
         for sequences, targets in loader:
-            predictions = model(sequences.to(device))
-            loss = _normalized_pinball_torch(predictions, targets.to(device), scale_tensor)
+            predictions = model(sequences.to(device, non_blocking=device.type == "cuda"))
+            loss = _normalized_pinball_torch(
+                predictions, targets.to(device, non_blocking=device.type == "cuda"), scale_tensor,
+            )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-        metrics = _evaluate_neural(model, validation, scales, batch_size=batch_size)
+        metrics = _evaluate_neural(
+            model, validation, scales, batch_size=batch_size, loader_options=loader_options,
+        )
         score = float(metrics["primary_5d"]["selection_score"])
         if score < best_score:
             best_score = score
@@ -593,7 +663,10 @@ def _fit_neural(
     if best_state is None:
         raise RuntimeError("Neural baseline did not produce a validation checkpoint")
     model.load_state_dict(best_state)
-    return model, _evaluate_neural(model, validation, scales, batch_size=batch_size)
+    return model, _evaluate_neural(
+        model, evaluation if evaluation is not None else validation, scales,
+        batch_size=batch_size, loader_options=loader_options,
+    )
 
 
 def fit_causal_gru(
@@ -605,6 +678,9 @@ def fit_causal_gru(
     patience: int = 5,
     batch_size: int = 64,
     learning_rate: float = 1e-3,
+    robust_scales: list[float] | None = None,
+    evaluation: BaselineArrays | None = None,
+    loader_options: dict[str, Any] | None = None,
 ) -> tuple[CausalGRUBaseline, dict[str, Any]]:
     _seed_baseline(seed)
     model = CausalGRUBaseline(horizons=train.horizons)
@@ -617,6 +693,7 @@ def fit_causal_gru(
         patience=patience,
         batch_size=batch_size,
         learning_rate=learning_rate,
+        robust_scales=robust_scales, evaluation=evaluation, loader_options=loader_options,
     )
     return cast(CausalGRUBaseline, trained), metrics
 
@@ -626,12 +703,16 @@ def evaluate_causal_gru(
     arrays: BaselineArrays,
     *,
     robust_scales: list[float] | None = None,
+    loader_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stored_scales = model.robust_scales
+    if robust_scales is None and stored_scales is None:
+        raise ValueError("Neural evaluation requires train-calibrated robust scales")
     return _evaluate_neural(
         model,
         arrays,
-        robust_scales or list(stored_scales or _robust_scales(arrays.targets)),
+        robust_scales if robust_scales is not None else list(stored_scales or ()),
+        loader_options=loader_options,
     )
 
 
@@ -644,6 +725,9 @@ def fit_dlinear(
     patience: int = 5,
     batch_size: int = 64,
     learning_rate: float = 1e-3,
+    robust_scales: list[float] | None = None,
+    evaluation: BaselineArrays | None = None,
+    loader_options: dict[str, Any] | None = None,
 ) -> tuple[DLinearBaseline, dict[str, Any]]:
     _seed_baseline(seed)
     model = DLinearBaseline(
@@ -659,6 +743,7 @@ def fit_dlinear(
         patience=patience,
         batch_size=batch_size,
         learning_rate=learning_rate,
+        robust_scales=robust_scales, evaluation=evaluation, loader_options=loader_options,
     )
     return cast(DLinearBaseline, trained), metrics
 
@@ -672,6 +757,9 @@ def fit_patchtst(
     patience: int = 5,
     batch_size: int = 64,
     learning_rate: float = 1e-3,
+    robust_scales: list[float] | None = None,
+    evaluation: BaselineArrays | None = None,
+    loader_options: dict[str, Any] | None = None,
 ) -> tuple[PatchTSTBaseline, dict[str, Any]]:
     _seed_baseline(seed)
     model = PatchTSTBaseline(horizons=train.horizons)
@@ -684,5 +772,6 @@ def fit_patchtst(
         patience=patience,
         batch_size=batch_size,
         learning_rate=learning_rate,
+        robust_scales=robust_scales, evaluation=evaluation, loader_options=loader_options,
     )
     return cast(PatchTSTBaseline, trained), metrics

@@ -179,6 +179,9 @@ _PROVIDER_COMPONENTS = {
 }
 
 _BAR_STORE_COMPONENTS = {
+    "dataset_identity.py": (
+        "FIXED_SPLIT_POLICY", "FIXED_EVALUATION_SPLIT", "validated_fixed_split",
+    ),
     "data/schema.py": (
         "REQUIRED_COLUMNS",
         "OPTIONAL_COLUMNS",

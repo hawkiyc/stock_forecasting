@@ -7,7 +7,11 @@ data:
   manifest_path: ${DATA_ROOT:-/runpod-volume/data}/dataset-manifest.json
   dataset_profile: ${FIN_TS_DATASET_PROFILE:-us_tw_eodhd}
   input_length: 128
-  h_start: ${FIN_TS_H_START:-3}
+  h_start: ${FIN_TS_H_START:-1}
+  train_end: "2025-06-01"
+  validation_end: "2025-12-01"
+  test_end: "2026-06-01"
+  calibration_seed: 59
   benchmark_mapping_path: null
   forecast_horizon: 5
   diagnostic_horizons: [1, 20]
@@ -19,7 +23,7 @@ data:
   embargo_trading_days: 5
   effective_embargo_trading_days: 14
   max_samples: null
-  label_scale_calibration_samples: 100000
+  label_scale_calibration_samples: 50000
   require_ready_manifest: true
 
 model:
@@ -45,6 +49,8 @@ model:
   alpha_head_dropout: 0.05
   alpha_quantiles: [0.1, 0.5, 0.9]
   postprocess_alpha_threshold: 0.0
+  feature_mode: ${FIN_TS_FEATURE_MODE:-combined}
+  alpha_head_fp32: true
   lora:
     enabled: true
     rank: 8

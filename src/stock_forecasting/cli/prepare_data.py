@@ -34,7 +34,12 @@ from stock_forecasting.data.manifest import (
     validate_download_manifest,
 )
 from stock_forecasting.data.schema import TRAINING_SECURITY_SCOPE
-from stock_forecasting.dataset_identity import DEFAULT_DATASET_STORAGE_PREPARATION
+from stock_forecasting.dataset_identity import (
+    DEFAULT_DATASET_STORAGE_PREPARATION,
+    FIXED_EVALUATION_SPLIT,
+    MIN_FIXED_EVALUATION_DATES,
+    validate_fixed_split_audit,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,6 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--download-manifest", type=Path)
     parser.add_argument("--dataset-manifest", type=Path)
     parser.add_argument("--benchmark-mapping", type=Path)
+    parser.add_argument(
+        "--fixed-evaluation", action="store_true",
+        help="Use the production 2025-06 / 2025-12 / 2026-06 exclusive boundaries.",
+    )
     parser.add_argument(
         "--window-size",
         type=int,
@@ -172,6 +181,11 @@ def _ready_manifest(
     result: Any,
     benchmark_mapping_sha256: str,
 ) -> dict[str, Any]:
+    validate_fixed_split_audit(
+        result.split_audit,
+        FIXED_EVALUATION_SPLIT if arguments.fixed_evaluation else None,
+        minimum_evaluation_dates=MIN_FIXED_EVALUATION_DATES,
+    )
     preparation_provenance = bar_store_preparation_provenance(
         window_size=arguments.window_size,
         max_horizon=DEFAULT_MAX_HORIZON,
@@ -187,6 +201,7 @@ def _ready_manifest(
         target_horizon=arguments.target_horizon,
         diagnostic_horizons=list(arguments.diagnostic_horizons),
         flat_volatility_multiplier=arguments.flat_volatility_multiplier,
+        fixed_split=FIXED_EVALUATION_SPLIT if arguments.fixed_evaluation else None,
     )
     storage_spec = storage_preparation_spec(preparation_provenance)
     bar_store_payload = json.loads(result.bar_store_manifest_path.read_text(encoding="utf-8"))
@@ -308,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
             validation_fraction=arguments.validation_fraction,
             purge_bars=arguments.purge_bars,
             embargo_bars=arguments.effective_embargo_bars,
+            fixed_split=FIXED_EVALUATION_SPLIT if arguments.fixed_evaluation else None,
             bucket_count=arguments.bucket_count,
             batch_rows=arguments.batch_rows,
             deadline_epoch_seconds=arguments.deadline_epoch_seconds,
@@ -348,6 +364,7 @@ def main(argv: list[str] | None = None) -> int:
                 "dataset_manifest_sha256": sha256_file(dataset_manifest_path),
                 "bar_store_root": str(arguments.output),
                 "split_counts": result.split_counts,
+                "effective_dates_by_market": result.split_audit.get("dates_by_market", {}),
                 "window_materialized": False,
                 "labels_materialized": False,
                 "requested_h_start": arguments.h_start,

@@ -6,12 +6,16 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+import stock_forecasting.validation_benchmark as benchmark_module
 from stock_forecasting.checkpoint_resume_migrations import CHECKPOINT_RETENTION_MIGRATIONS
 from stock_forecasting.config import ExperimentConfig
+from stock_forecasting.dataset_identity import FIXED_EVALUATION_SPLIT
+from stock_forecasting.evaluation_protocol import sample_membership
 from stock_forecasting.run_contract import (
     CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
     training_resume_contract,
@@ -150,6 +154,7 @@ def test_evaluation_contract_keeps_numerical_validation_settings(
 
 def test_validation_setup_accepts_an_allowlisted_training_code_migration(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
     run_id = "run-validation-migrated-code"
@@ -160,10 +165,13 @@ def test_validation_setup_accepts_an_allowlisted_training_code_migration(
     checkpoint.mkdir(parents=True)
     current_contract = training_resume_contract(config)
     migration = CHECKPOINT_RETENTION_MIGRATIONS[0]
-    assert {
-        path: current_contract["training_implementation"]["files"][path]
-        for path in migration["to_files"]
-    } == migration["to_files"]
+    implementation = current_contract["training_implementation"]
+    implementation["files"].update(migration["to_files"])
+    implementation["sha256"] = _canonical_digest(implementation["files"])
+    monkeypatch.setattr(
+        "stock_forecasting.run_contract.training_implementation_contract",
+        lambda: copy.deepcopy(implementation),
+    )
     stored_contract = copy.deepcopy(current_contract)
     stored_files = stored_contract["training_implementation"]["files"]
     stored_files.update(migration["from_files"])
@@ -213,7 +221,7 @@ def test_validation_setup_accepts_an_allowlisted_training_code_migration(
     assert inputs["dataset_artifacts"] == current_contract["dataset_artifacts"]
 
 
-def test_resume_normalizes_legacy_contract_without_rerunning_completed_results(
+def test_resume_rejects_pre_holdout_contract_instead_of_relabelling_validation(
     tmp_path: Path,
 ) -> None:
     config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
@@ -248,9 +256,83 @@ def test_resume_normalizes_legacy_contract_without_rerunning_completed_results(
     benchmark.run_id = "run-validation-contract"
     benchmark.checkpoint = checkpoint
 
-    resumed = benchmark._initial_payload()
+    with pytest.raises(ValueError, match="does not match this run contract"):
+        benchmark._initial_payload()
 
-    assert resumed["state"] == "running"
-    assert resumed["evaluation_contract"] == current_contract
-    assert "resume_contract_normalized_at" in resumed
-    assert resumed["models"]["always_buy"]["state"] == "complete"
+
+def test_fixed_benchmark_scores_holdout_with_shared_scales_not_validation_snapshots(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    config.data = config.data.model_copy(update=FIXED_EVALUATION_SPLIT)
+    benchmark = object.__new__(ValidationBenchmark)
+    benchmark.config = config
+    benchmark.checkpoint = tmp_path
+    benchmark.evaluation_split = "test"
+    benchmark.recompute_full_model = False
+    benchmark.models = ["zero_return", "kronos_full"]
+    benchmark.seeds = [42]
+    benchmark.resume = False
+    benchmark.defer_terminal_lifecycle = False
+    benchmark.worker_plan = SimpleNamespace(as_dict=lambda: {})
+    benchmark.loader_options = {}
+    benchmark.payload = {"models": {}, "test_unlocked": False}
+    monkeypatch.setattr(benchmark, "_publish", lambda: None)
+    monkeypatch.setattr(benchmark, "_publish_lifecycle", lambda *_args, **_kwargs: None)
+    scales = [0.125] * len(config.data.alpha_horizons)
+    monkeypatch.setattr(
+        benchmark_module, "_read_json", lambda _path: {"runtime_robust_scales": scales},
+    )
+    monkeypatch.setattr(benchmark_module, "resolve_bar_store_path", lambda path: path)
+    monkeypatch.setattr(
+        benchmark_module, "LazyFinancialWindowDataset", lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        benchmark_module, "resolve_runtime_robust_scales",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            scales=scales, identity_sha256="a" * 64, sample_count=100,
+        ),
+    )
+    arrays = {
+        split: SimpleNamespace(symbols=["A"], dates=[day]) for split, day in (
+            ("train", "2025-05-01"), ("validation", "2025-09-01"), ("test", "2026-02-01"),
+        )
+    }
+    monkeypatch.setattr(benchmark_module, "_lazy_baseline_arrays", lambda _config, **kwargs: (
+        100, 1, arrays[kwargs["split"]] if kwargs["build_arrays"] else None,
+    ))
+    metrics = {
+        **_validation_metrics(), "evaluation_robust_scales": scales,
+        "sample_membership": sample_membership(arrays["test"].symbols, arrays["test"].dates),
+        "daily_normalized_pinball": {"2026-02-01": 0.2},
+    }
+
+    def rules(train, evaluation, *, robust_scales):
+        assert train is arrays["train"] and evaluation is arrays["test"]
+        assert robust_scales == scales
+        return {"zero_return": metrics}
+
+    def evaluate(_config, _checkpoint, *, split):
+        assert split == "test"
+        return {"metrics": metrics}
+
+    def forbidden(_checkpoint):
+        raise AssertionError("A validation snapshot is never a holdout score")
+
+    monkeypatch.setattr(benchmark_module, "rule_baseline_suite", rules)
+    monkeypatch.setattr(benchmark_module, "evaluate_checkpoint", evaluate)
+    monkeypatch.setattr(benchmark_module, "checkpoint_validation_snapshot", forbidden)
+    result = benchmark.run()
+    assert result["state"] == "ready" and result["test_unlocked"] is True
+    assert result["models"]["kronos_full"]["source"] == "checkpoint_recomputed"
+    assert result["comparison"]["full_minus_baseline_date_paired"]["zero_return"]
+
+
+def test_fixed_benchmark_rejects_mismatched_holdout_membership() -> None:
+    benchmark = object.__new__(ValidationBenchmark)
+    benchmark.payload = {
+        "evaluation_membership": {"ordered_symbol_dates_sha256": "expected"},
+        "models": {"kronos_full": {"metrics": {"sample_membership": {}}}},
+    }
+    with pytest.raises(ValueError, match="different holdout samples"):
+        benchmark._verify_paired_results([1.0] * 14)

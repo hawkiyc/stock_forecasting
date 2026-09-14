@@ -23,7 +23,6 @@ from stock_forecasting.data.horizons import MAX_ALPHA_HORIZON
 from stock_forecasting.dataset_identity import (
     BAR_STORE_KIND,
     BAR_STORE_SCHEMA_VERSION,
-    DATASET_STORAGE_PREPARATION_FIELDS,
     DEFAULT_DATASET_STORAGE_PREPARATION,
 )
 from stock_forecasting.dataset_identity import (
@@ -77,9 +76,7 @@ def _validated_storage_preparation_spec(payload: dict[str, Any]) -> dict[str, An
     if not isinstance(provenance, dict):
         raise ValueError("Dataset manifest has no preparation provenance")
     stored = payload.get("storage_preparation_spec")
-    if not isinstance(stored, dict) or set(stored) != set(
-        DATASET_STORAGE_PREPARATION_FIELDS
-    ):
+    if not isinstance(stored, dict) or set(stored) != set(storage_preparation_spec(provenance)):
         raise ValueError("Dataset manifest storage_preparation_spec is invalid")
     if stored != storage_preparation_spec(provenance):
         raise ValueError(
@@ -314,6 +311,7 @@ def validate_training_dataset_manifest(
     profile: DatasetProfile,
     raw_path: str | Path,
     bar_store_path: str | Path,
+    require_current_pipeline: bool = True,
 ) -> dict[str, Any]:
     """Bind training to immutable raw bars and the lazy bar-store indexes."""
 
@@ -346,7 +344,7 @@ def validate_training_dataset_manifest(
         != content_identity_digest(content_identity)
     ):
         raise ValueError("Dataset manifest data content identity is invalid")
-    if content_identity != dataset_content_identity(selected):
+    if require_current_pipeline and content_identity != dataset_content_identity(selected):
         raise ValueError("Dataset was prepared with different data semantics")
     artifacts = payload.get("artifacts")
     expected_artifacts = {
@@ -430,12 +428,22 @@ def validate_dataset_storage_contract(
     benchmark_mapping_path: str | Path | None,
     effective_embargo_trading_days: int,
     max_abs_log_return: float,
+    fixed_split: dict[str, str] | None = None,
+    minimum_evaluation_dates: int = 0,
 ) -> dict[str, Any]:
     """Bind only persisted bar and cutoff semantics to the current config."""
 
     if max_horizon != MAX_ALPHA_HORIZON:
         raise ValueError("Configured maximum alpha horizon must remain day 14")
     storage_spec = _validated_storage_preparation_spec(payload)
+    if storage_spec.get("fixed_split") != fixed_split:
+        raise ValueError("Dataset fixed dates differ from config; prepare a new dataset namespace")
+    from stock_forecasting.dataset_identity import validate_fixed_split_audit
+
+    validate_fixed_split_audit(
+        payload.get("split_audit"), fixed_split,
+        minimum_evaluation_dates=minimum_evaluation_dates,
+    )
     expected_integers = {
         "window_size": input_length,
         "max_horizon": max_horizon,

@@ -103,6 +103,27 @@ def _restore_runtime_robust_scales(
     current.copy_(restored)
 
 
+def _model_runtime_scale_features(model: torch.nn.Module) -> dict[str, Any] | None:
+    branch = getattr(getattr(model, "alpha_head", None), "numeric_branch", None)
+    if branch is None or branch.scale_projection is None:
+        return None
+    from stock_forecasting.models.scale_features import validate_scale_feature_statistics
+
+    return validate_scale_feature_statistics(branch.statistics)
+
+
+def _restore_runtime_scale_features(
+    model: torch.nn.Module, trainer_state: dict[str, Any], *, require_match: bool,
+) -> None:
+    branch = getattr(getattr(model, "alpha_head", None), "numeric_branch", None)
+    stored = trainer_state.get("runtime_scale_features")
+    if branch is None or branch.scale_projection is None:
+        if stored is not None:
+            raise ValueError("Checkpoint scale features do not match the selected head")
+        return
+    branch.set_statistics(stored, require_match=require_match)
+
+
 def _file_integrity(path: Path) -> dict[str, Any]:
     digest = hashlib.sha256()
     size_bytes = 0
@@ -674,6 +695,7 @@ def _stage_checkpoint(
         "time_series_tokenizer_revision": config.model.time_series_tokenizer_revision,
         "kronos_source_revision": config.model.kronos_source_revision,
         "runtime_robust_scales": _model_runtime_robust_scales(model),
+        "runtime_scale_features": _model_runtime_scale_features(model),
         "selection": selection,
         "rng_state": _capture_rng_state(),
     }
@@ -820,6 +842,7 @@ def save_training_completion_result(
             "early_stopping": early_stopping_state,
             "metrics": metrics,
             "runtime_robust_scales": _model_runtime_robust_scales(model),
+            "runtime_scale_features": _model_runtime_scale_features(model),
             "created_at": datetime.now(UTC).isoformat(),
             "artifact_files": {
                 "adapter.safetensors": _file_integrity(adapter_path),
@@ -1660,10 +1683,17 @@ def load_checkpoint(
     scheduler: Any | None = None,
     *,
     config: ExperimentConfig | None = None,
+    allow_historical_inference: bool = False,
 ) -> dict[str, Any]:
     """Load trainable state and optional optimizer/scheduler state."""
 
     source = Path(checkpoint_dir)
+    if allow_historical_inference and (
+        config is None or optimizer is not None or scheduler is not None
+    ):
+        raise ValueError(
+            "Historical compatibility is only available for configured read-only loading"
+        )
     if (optimizer is None) != (scheduler is None):
         raise ValueError("Training resume requires both optimizer and scheduler state")
     trainer_state = validate_checkpoint_trainer_state(source)
@@ -1672,6 +1702,7 @@ def load_checkpoint(
         trainer_state,
         require_match=optimizer is not None,
     )
+    _restore_runtime_scale_features(model, trainer_state, require_match=optimizer is not None)
     missing = _load_trainable_model_state(
         model,
         load_file(source / "adapter.safetensors"),
@@ -1686,7 +1717,10 @@ def load_checkpoint(
         )
         _restore_rng_state(trainer_state.get("rng_state"))
     if config is not None:
-        _validate_loaded_model_contract(source, trainer_state, config)
+        _validate_loaded_model_contract(
+            source, trainer_state, config,
+            allow_historical_inference=allow_historical_inference,
+        )
     trainer_state["missing_frozen_keys"] = missing
     return trainer_state
 
@@ -1695,6 +1729,7 @@ def _validate_loaded_model_contract(
     checkpoint_dir: Path,
     trainer_state: dict[str, Any],
     config: ExperimentConfig,
+    *, allow_historical_inference: bool = False,
 ) -> None:
     """Reject evaluation or inference under a different model or training stage."""
 
@@ -1703,7 +1738,13 @@ def _validate_loaded_model_contract(
         checkpoint_dir.parent / "run-manifest.json",
         "Run manifest",
     )
-    expected_resume_contract = compatible_training_resume_contract_digest(
+    from stock_forecasting.run_contract import readonly_checkpoint_contract_digest
+
+    contract_validator = (
+        readonly_checkpoint_contract_digest if allow_historical_inference
+        else compatible_training_resume_contract_digest
+    )
+    expected_resume_contract = contract_validator(
         config,
         run_manifest,
     )

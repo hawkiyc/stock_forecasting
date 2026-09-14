@@ -682,6 +682,7 @@ set +e
     --dataset-manifest "${DATASET_MANIFEST_STAGING}" \
     --stride 5 \
     --sample-stride 1 \
+    --fixed-evaluation \
     --h-start "${FIN_TS_H_START}" \
     --target-horizon 5 \
     --diagnostic-horizons 1 20 \

@@ -21,7 +21,7 @@
 
 - `alpha_quantiles`: `[batch, 15-h_start, 3]`。
 - 第二維依序是持有 `h_start`、`h_start+1`、…、14 個交易日；`h_start`
-  只能是 1、2 或 3，預設為 3。
+  只能是 1、2 或 3，生產設定預設為 1。舊 resolved config 保留原 horizon。
 - 第三維固定為 q10、q50、q90。
 - 單位是商品相對其 benchmark 的 adjusted execution log return。
 
@@ -34,17 +34,18 @@ output schema 會被拒絕載入。
 ### 模型架構
 
 ```text
-Adjusted asset OHLCV through close t ─────┐
-                                          ├── shared Kronos-base + LoRA
-Adjusted benchmark OHLCV through close t ─┘              │
-                                                         ▼
-                                           Causal Perceiver Resampler
-                                                         │
-                                                         ▼
-                                           gated benchmark cross-attention
-                                                         │
-                                                         ▼
-                         h_start–14d alpha q10/q50/q90 [B,15-h_start,3]
+Asset + benchmark OHLCV through close t
+  ├─ window normalization → shared Kronos-base + LoRA → resampler
+  │                                                      ├─ benchmark latents ───────┐
+  │                                                      └─ gated conditioning     │
+  │                                                           ↓                    │
+  │                                                    head trunk + horizon        │
+  │                                                           ├──────────────┐     │
+  └─ eight past-only scale statistics → train-calibrated MLP ───┼─ residual fusion ←─┘
+                                                              ↓            │
+                                                     base head + residual ←┘
+                                                              ↓
+                                                     1–14d q10 / q50 / q90
 ```
 
 生產設定使用 `NeoQuasar/Kronos-base` 與
@@ -67,8 +68,38 @@ checkpoint 都會綁定 revisions。
 下游系統可以在這些數值表示之後接入額外的數值模組或跨模態對齊模組，而不改變目前的 alpha 輸出契約。
 
 模型直接學習條件 alpha 分布；不是先預測 raw-return q50 再減 benchmark q50。
-benchmark 的歷史只透過動態 gated cross-attention 影響輸出。benchmark 在收盤 t
+benchmark 的歷史同時透過動態 gated cross-attention 與 resampler latent 直接分支
+影響輸出；尺度分支在 Kronos 視窗標準化前讀取歷史輸入。benchmark 在收盤 t
 之後的資料只供離線 label construction 使用，不會出現在模型輸入。
+
+#### 小型數值特徵分支
+
+生產預設 `combined`，保留原 Kronos-base、LoRA 與 conditioner，不增加 backbone 大小。
+八個尺度特徵的固定順序如下：
+
+| 位置 | 特徵 | 定義 |
+| --- | --- | --- |
+| 1–3 | 個股、benchmark、相對報酬的 20 日波動 | 最近 20 個日 log return 的母體標準差；相對報酬為兩者之差 |
+| 4–6 | 個股、benchmark、相對報酬的 60 日波動 | 同上，視窗為 60 個日 log return |
+| 7–8 | 個股與 benchmark 的歷史價格 CV | 128-bar context 內 adjusted close 的母體標準差除以平均值 |
+
+所有統計僅使用截至 `t` 的共同觀測資料，至少需要 61 個有效 bars；不年化、不使用未來
+報酬，也不使用未來公司行動改寫輸入。每個 feature 先做 `log(x + 1e-8)`，再以 train-only
+calibration sample 的 median／IQR 標準化；IQR 下限 `1e-3`，標準化值裁切至 `[-10, 10]`。
+完整 schema、train dataset 指紋與統計值保存在 checkpoint 的 `runtime_scale_features`，
+推論只恢復統計，不以 validation、holdout 或當次輸入重新 fit。
+
+尺度 MLP 為 `8 → 32 → 16`；benchmark resampler tokens 先 mean pooling，再做 `512 → 16`。
+原 head 的 horizon-conditioned hidden 另做 `512 → 16`；三者串接後經 `48 → 32 → 3`，
+加在原 head 的三個 raw quantile parameters 上，位置在原 head LayerNorm **之後**。
+最後再產生有序 q10／q50／q90。此分支共增加 **18,899** 個可訓練參數；僅 residual 最後
+一層零初始化，讓初始輸出保持原 head 行為。head、特徵轉換與 pinball loss 使用 FP32，
+Kronos 計算仍沿用 BF16 mixed precision。
+
+`configure --feature-mode baseline|scales|benchmark|combined` 使用同一份程式與資料，分別
+關閉兩條新分支、只開尺度、只開 benchmark 直接連接、或兩者都開。這是受控比較開關，
+不是四套部署流程；切換 mode 不改變 dataset namespace，但必須建立新的 training run。
+是否改善預測必須由新訓練的評估結果證明，加入尺度資訊本身不等於已提升 alpha 能力。
 
 ### 為什麼選 Kronos-base
 
@@ -97,8 +128,8 @@ profile；`FIN_TS_DATASET_PROFILE` 是腳本驗證 selection 後傳入 Pod 的�
 EODHD 路徑預設可發現 active 與 delisted 美國股票/ETF，減少只保留存活標的造成的 survivorship bias。若費用或呼叫額度有限，可在 `configure` 使用 `--universe explicit` 搭配 `--stocks`、`--etfs`，或在 all 模式使用 `--symbol-limit` 縮小 universe。輸出 manifest 會列出 profile、實際 provider、market、symbol、asset type、日期範圍與每個 split 的樣本數。
 
 `--universe all` 的 discovery 是準備當下 EODHD 回傳的 active/delisted 清單，並非
-每個歷史交易日各自重建的 point-in-time constituents。以 `--start 2005-01-01
---end 2026-04-30` 為例，日期契約是 `[2005-01-01, 2026-04-30)`：區間中途上市的
+每個歷史交易日各自重建的 point-in-time constituents。以 `--start 2016-01-01
+--end 2026-06-01` 為例，日期契約是 `[2016-01-01, 2026-06-01)`：區間中途上市的
 商品只會從 provider 可取得的第一個交易日開始，區間中途下市的商品只會保留到最後
 可取得日；同時在區間內上市又下市的商品，只要 EODHD delisted discovery 有回傳且
 帳戶有權限，就會納入。`explicit` 只處理明列的 ticker；使用 `--symbol-limit` 時則只
@@ -197,11 +228,29 @@ Lazy DataLoader 動態建立 context/label（完全離線）
 Stage 1 / Stage 2 訓練
 ```
 
-`train`、`validation`、`test` 依全市場共用的交易日期做 70%／15%／15%
-時間順序切分，不做隨機 row split。Train 與 validation 樣本的最晚
-`label.end_at` 必須嚴格早於下一個 split boundary；20 個交易日 purge 與 14 個
-交易日 effective embargo 之外，程式另有直接的 label-boundary guard，避免未來
-調整 horizon 或間隔參數時讓 ground truth 跨界。
+生產 Stage 1／2 固定採用以下 exclusive 日期切分，不依資料量或最早日期重新算比例：
+
+| split | 預測日 `t` 範圍 | 用途 |
+| --- | --- | --- |
+| Train | 起始日（預設 `2016-01-01`）≤ `t` < `2025-06-01` | 訓練、label scale 與 feature scale 校準 |
+| Validation | `2025-06-01` ≤ `t` < `2025-12-01` | 最佳 checkpoint 排名、early stopping |
+| Holdout / test | `2025-12-01` ≤ `t` < `2026-06-01` | 訓練結束後的最終模型及 baseline 評估 |
+
+每筆樣本所有 horizon 的實際 `label.end_at` 都必須嚴格小於所屬 split 的結束日，包括
+holdout 的 `2026-06-01`。因此每段末端約 14 個交易日不會成為完整 horizon 的評分起點；
+固定日期模式不再另外疊加舊的 20 日 purge／14 日 embargo。Validation／holdout 的歷史
+輸入可以向前跨過其起點，因為預測時已可取得那些歷史資料；未來 label 不可跨界。
+`2026-06-01` 之後的日期不會加入這三個 split，6–8 月保留作後續回測。
+
+CPU preparation、readiness 與訓練 preflight 會核對日期契約與每個市場實際保留的日期；
+validation、holdout 各至少須有 **80 個不同預測日期**，不足時在租用 GPU 前拒絕放行。
+`split_audit.dates_by_market` 保存實際日期與數量。80 日是資料覆蓋的工程門檻，不是統計
+顯著性或跨所有行情的保證；大量股票樣本也不能當成同樣多的獨立時間樣本。
+
+日期契約會進入 immutable dataset identity。升級需重新 `configure` 並執行既有 CPU
+prepare 流程建立新 namespace；可重用相同 request 的 raw cache，但不能把舊比例切分的
+ready marker 直接改標成固定日期資料。舊 resolved config、mock fixture 保留其比例切分
+與 purge／embargo 語意，舊報告不會自動變成新 holdout 結果。
 
 資料下載器具備：
 
@@ -292,6 +341,7 @@ poetry run fin-ts-download \
 
 ```bash
 poetry run fin-ts-prepare \
+  --fixed-evaluation --h-start 1 \
   --input data/raw/market.parquet \
   --output data/prepared/bar-store
 ```
@@ -302,6 +352,23 @@ symbol limit 或處理契約變動時會使用新的根目錄，不需要手動�
 把不同範圍的資料誤當成同一份 dataset。
 
 ### 兩階段訓練
+
+Stage 1／2 的 label robust scales 都從完整 **train partition** 的同一個確定性最多
+50,000 筆樣本校準，seed 固定為 59，不隨 Stage 1 的 5% 訓練抽樣縮小。
+尺度特徵的 median／IQR 也使用相同 sample-count／seed 契約，統計快取與 dataset
+manifest SHA 綁定；兩種校準都不讀 validation／holdout。
+
+最終 `validation stage` 是既有工作流程名稱；新固定日期模式實際評估 **holdout/test**。
+完整模型必須重新推論，不能沿用 checkpoint validation snapshot；GRU、DLinear、PatchTST
+僅用 validation 做 early stop，再以選定權重評估 holdout。所有模型共用 holdout sampler、
+20,000 筆上限與 train-calibrated label scales，並驗證有序 symbol/date SHA-256 相同。
+結果 schema 為 `6.0`，明列 `selection_split=validation`、`evaluation_split=test`；只有
+完成配對檢查後才發布 `test_unlocked=true`。舊 schema 的完成結果不能直接續用。
+
+報告包含逐月、逐市場及各 horizon 指標，以及完整模型減去各 baseline 的逐日平均
+normalized pinball 差。95% 區間以預測日期為單位，使用 14 日 circular moving-block
+bootstrap（1,000 次、seed 42），不把同日股票各自當獨立樣本；此區間未作多重比較校正。
+Holdout 排名僅描述結果，不可再用來挑 checkpoint、反覆調參或宣稱已涵蓋所有未來行情。
 
 | 項目                        | Stage 1                                                          | Stage 2                |
 | --------------------------- | ---------------------------------------------------------------- | ---------------------- |
@@ -560,9 +627,10 @@ mapping 也不能繞過此限制。這不保證涵蓋 provider 未回傳或帳�
 | `--stage` | `stage1`、`stage2` | 選擇固定的訓練 config。非互動模式必填 |
 | `--data-profile` | `tw_only`、`us_only_eodhd`、`us_tw_eodhd` | 決定實際使用的 provider 與市場組合。非互動模式必填 |
 | `--dataset-revision` | 1～64 字元；英數開頭，之後可用英數、`.`、`_`、`-`；預設 `v1` | provider 修訂歷史資料時，用新 label 強制建立新的 immutable dataset namespace |
-| `--start` | `YYYY-MM-DD`；預設 `2005-01-01` | 所有選定市場共用的起始日，包含該日；省略時固定使用 `2005-01-01` |
-| `--end` | `YYYY-MM-DD`；無預設值 | 所有選定市場共用的結束邊界，不包含該日；互動與非互動模式都必須由使用者明確提供，避免不知情地改用本機當日 |
-| `--h-start` | `1`、`2`、`3`；預設 `3` | 在 `t` 收盤後同時預測從第幾個持有交易日起至第 14 日的累積 alpha；仍於 `t+1` raw open 評估進場。此值只改變 DataLoader 動態 label 與模型輸出，不改變 raw/bar-store dataset identity |
+| `--start` | `YYYY-MM-DD`；預設 `2016-01-01` | 所有市場共用的 inclusive 起始日，須早於 `2025-06-01` 且留足 context 與 train 資料 |
+| `--end` | `YYYY-MM-DD`；無預設值 | 所有市場共用的 exclusive 結束日，須至少為 `2026-06-01`；超出此日的資料不會進入固定 train／validation／holdout |
+| `--h-start` | `1`、`2`、`3`；預設 `1` | 從第幾個持有交易日起至第 14 日的累積 alpha；仍於 `t+1` raw open 評估進場。只改變 runtime labels 與模型輸出，不改變 dataset identity |
+| `--feature-mode` | `baseline`、`scales`、`benchmark`、`combined`；預設 `combined` | 同一架構的兩條 residual 特徵路徑開關；只改變 training selection／model identity，不改變 dataset namespace |
 | `--universe` | `all`、`explicit` | 控制美國商品選取方式；對 `tw_only` 只能使用 `all`。非互動模式必填 |
 | `--stocks` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的美國普通股／ADR，例如 `"AAPL,BABA"`；會用 EODHD discovery 驗證型別，不影響台股 |
 | `--etfs` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的非槓桿股票型 ETF，例如 `"SPY,QQQ"`；必須在經稽核白名單內，不影響台股 |
@@ -570,12 +638,28 @@ mapping 也不能繞過此限制。這不保證涵蓋 provider 未回傳或帳�
 | `--interactive` | 無值 flag | 明確開啟互動式選單；直接執行 `configure` 而不帶選項時會自動使用此模式 |
 
 互動模式的預設值是 `stage1`、`us_tw_eodhd`、dataset revision `v1`、起始日
-`2005-01-01`、`h_start=3` 與 US universe `all`。`--end` 刻意沒有預設值，提示時若留白會繼續
+`2016-01-01`、`h_start=1`、`feature_mode=combined` 與 US universe `all`。`--end` 刻意沒有預設值，提示時若留白會繼續
 要求輸入，不會自動採用本機當日。Provider acquisition policy 不在 `configure` 設定；
 若在此命令提供 `--max-api-calls`、`--eodhd-qps`、`--taiwan-qps` 或 `--maxBackoff`，
 會以未知選項拒絕，不會建立另一個 selection。
 底層 helper 的 `--project-root` 由 `runpod_workflow.sh` 自動注入，不是使用者
 設定資料範圍的選項，不要自行提供。
+
+固定日期、完整美台市場、Stage 2 的標準設定命令：
+
+```bash
+bash scripts/runpod_workflow.sh configure \
+  --stage stage2 \
+  --data-profile us_tw_eodhd \
+  --start 2016-01-01 \
+  --end 2026-06-01 \
+  --h-start 1 \
+  --feature-mode combined \
+  --universe all
+```
+
+之後沿用本章 `sync`、`cpu prepare`、GPU 建立與 tmux 流程。從舊比例切分升級時，必須
+先完成新 dataset namespace 的 CPU prepare；`cpu-finalize` 不能把舊資料切分轉成新日期。
 
 下列範例的實際資料範圍是：
 
@@ -1407,7 +1491,8 @@ training/validation lifecycle 與 immutable training completion record。`--resu
 
 每個下載的 checkpoint 目錄至少應包含 `adapter.safetensors`、
 `resolved-config.yaml`、`trainer-state.json` 與它所列出的 optimizer/scheduler
-state。`validation-benchmark.json` 是完整數值 validation 與 baseline 比較；
+state。`validation-benchmark.json` 在新固定日期模式是 holdout 與 baseline 比較，
+checkpoint 內的 validation metrics 才是訓練選模分數；
 不要只根據 W&B 畫面或 README 宣稱 run 成功，應同時檢查 lifecycle 的
 `state`、run ID、result path 與本機下載的原始 JSON。
 
@@ -1430,18 +1515,23 @@ state。`validation-benchmark.json` 是完整數值 validation 與 baseline 比�
 - selection ID/SHA、dataset request SHA、stage config SHA 與 requested dataset contract
 - dataset manifest 摘要、architecture digest、Kronos source/model/tokenizer
   revisions 與 bounded training implementation digest
-- validation metrics 與 baseline 比較
+- 訓練選模 validation metrics、最終 holdout 與 baseline 比較
+- 尺度分支啟用時的 `runtime_scale_features` schema、train-only normalization 與指紋
 
 Checkpoint resume 只接受目前的 quant output schema，並且必須通過 RunPod run
 identity、artifact integrity、validation-selection、資料、模型與訓練程式碼契約檢查；
 任何不相容的 schema 都會 fail closed。
+
+唯讀推論與 `probe-scales` 允許舊比例切分、無新分支的 checkpoint 在原 resolved config、
+資料與 artifact hashes 一致時使用歷史實作相容路徑；此例外不適用於 training resume，
+也不允許拿舊 checkpoint 配上新固定日期 config 或把舊報告當作新 holdout 結果。
 
 推論也必須在已建立專案 Poetry environment 且掛載相同 network volume 的 RunPod Pod
 內執行，不在本機載入 checkpoint：
 
 ```bash
 poetry run fin-ts-infer \
-  --config configs/stage2_kronos_base_lora.yaml \
+  --config /runpod-volume/savedModel/<run-id>/<checkpoint>/resolved-config.yaml \
   --checkpoint /runpod-volume/savedModel/<run-id>/<checkpoint> \
   --input "${DATA_ROOT}/raw/market.parquet" \
   --symbol AAPL.US
@@ -1728,7 +1818,8 @@ The only prediction emitted by `MultiHorizonAlphaHead` is:
 
 - `alpha_quantiles`: `[batch, 15-h_start, 3]`.
 - Dimension two contains holding periods `h_start`, `h_start+1`, ..., 14;
-  `h_start` is restricted to 1, 2, or 3 and defaults to 3.
+  `h_start` is restricted to 1, 2, or 3; production defaults to 1. Historical
+  resolved configs retain their original horizons.
 - Dimension three is fixed to q10, q50, and q90.
 - Units are adjusted execution log return relative to the instrument's benchmark.
 
@@ -1742,17 +1833,18 @@ incompatible output schemas fail closed.
 ### Architecture
 
 ```text
-Adjusted asset OHLCV through close t ─────┐
-                                          ├── shared Kronos-base + LoRA
-Adjusted benchmark OHLCV through close t ─┘              │
-                                                         ▼
-                                           Causal Perceiver Resampler
-                                                         │
-                                                         ▼
-                                           gated benchmark cross-attention
-                                                         │
-                                                         ▼
-                         h_start–14d alpha q10/q50/q90 [B,15-h_start,3]
+Asset + benchmark OHLCV through close t
+  ├─ window normalization → shared Kronos-base + LoRA → resampler
+  │                                                      ├─ benchmark latents ───────┐
+  │                                                      └─ gated conditioning     │
+  │                                                           ↓                    │
+  │                                                    head trunk + horizon        │
+  │                                                           ├──────────────┐     │
+  └─ eight past-only scale statistics → train-calibrated MLP ───┼─ residual fusion ←─┘
+                                                              ↓            │
+                                                     base head + residual ←┘
+                                                              ↓
+                                                     1–14d q10 / q50 / q90
 ```
 
 Production configs use `NeoQuasar/Kronos-base` and
@@ -1779,9 +1871,46 @@ alpha-output contract.
 
 The model predicts the conditional alpha distribution directly; it does not
 predict a raw-return q50 and subtract a benchmark q50. Historical benchmark
-state affects predictions through dynamic gated cross-attention. Benchmark data
+state affects predictions through both gated cross-attention and a direct
+resampler-latent branch. Historical scales are extracted before Kronos window
+normalization. Benchmark data
 after close t is used only for offline label construction and never enters the
 model input.
+
+#### Small numerical feature branch
+
+Production defaults to `combined`, retaining Kronos-base, LoRA, and the conditioner
+without enlarging the backbone. The eight features have a fixed order:
+
+| Positions | Features | Definition |
+| --- | --- | --- |
+| 1–3 | Asset, benchmark, relative 20-day volatility | Population standard deviation of the last 20 daily log returns; relative returns are asset minus benchmark |
+| 4–6 | Asset, benchmark, relative 60-day volatility | Same definition over the last 60 daily log returns |
+| 7–8 | Asset and benchmark context price CV | Population standard deviation of adjusted closes divided by their mean over the 128-bar context |
+
+Statistics use only aligned observations available through `t`, require at least
+61 valid bars, and are not annualized. Future returns and future corporate actions
+never enter features. Each value is transformed by `log(x + 1e-8)`, normalized with
+train-only median/IQR statistics (IQR floor `1e-3`), and clipped to `[-10, 10]`.
+Checkpoints bind the feature schema, training dataset fingerprint, and aggregates
+in `runtime_scale_features`. Inference restores them without refitting on
+validation, holdout, or the inference batch.
+
+The scale MLP is `8 → 32 → 16`. Mean-pooled benchmark resampler latents use
+`512 → 16`; the original horizon-conditioned head hidden state uses another
+`512 → 16`. Concatenated features pass through `48 → 32 → 3` and are added to
+the original raw quantile parameters **after** the head LayerNorm, before the
+ordered q10/q50/q90 transformation. This adds **18,899** trainable parameters.
+Only the final residual layer starts at zero, preserving initial base-head outputs.
+The head, feature transformations, and pinball loss use FP32; Kronos computation
+retains BF16 mixed precision.
+
+`configure --feature-mode baseline|scales|benchmark|combined` disables both new
+branches, enables scales only, enables the direct benchmark only, or enables both.
+These are controlled variants of one implementation and deployment workflow.
+Changing the mode preserves the dataset namespace but requires a new training run.
+Predictive improvement must be demonstrated by new evaluation results; adding
+scale information alone is not evidence of improved alpha forecasting.
 
 ### Why Kronos-base
 
@@ -1820,8 +1949,8 @@ symbols, asset types, date range, and per-split sample counts.
 
 Discovery under `--universe all` is the active/delisted snapshot returned by
 EODHD at preparation time, not point-in-time constituents reconstructed for
-every historical session. For `--start 2005-01-01 --end 2026-04-30`, the date
-contract is `[2005-01-01, 2026-04-30)`: an instrument listed during the range
+every historical session. For `--start 2016-01-01 --end 2026-06-01`, the date
+contract is `[2016-01-01, 2026-06-01)`: an instrument listed during the range
 starts at its first provider-available session, and one delisted during the
 range ends at its last available session. An instrument both listed and
 delisted inside the range is included when EODHD delisted discovery returns it
@@ -1947,12 +2076,36 @@ Lazy DataLoader builds contexts/labels on demand (fully offline)
 Stage 1 / Stage 2 training
 ```
 
-The `train`, `validation`, and `test` partitions use global market-calendar
-boundaries in chronological 70%/15%/15% order rather than random row splits.
-The latest `label.end_at` for every train and validation sample must be strictly
-earlier than the next split boundary. In addition to the 20-trading-day purge
-and 14-trading-day effective embargo, a direct label-boundary guard prevents a
-future horizon or spacing change from moving ground truth across partitions.
+Production Stage 1/2 use fixed exclusive dates, independent of dataset size or its
+earliest observation:
+
+| Split | Forecast date `t` | Purpose |
+| --- | --- | --- |
+| Train | Start (default `2016-01-01`) ≤ `t` < `2025-06-01` | Training and label/feature scale calibration |
+| Validation | `2025-06-01` ≤ `t` < `2025-12-01` | Checkpoint ranking and early stopping |
+| Holdout / test | `2025-12-01` ≤ `t` < `2026-06-01` | Final post-training model and baseline evaluation |
+
+Every horizon's actual `label.end_at` must be strictly before its split end,
+including the holdout end `2026-06-01`. Approximately the final 14 trading dates
+of each interval therefore cannot be full-horizon forecast origins. Fixed-date
+mode does not additionally apply the legacy 20-day purge/14-day embargo.
+Historical inputs may cross a validation/holdout start because those observations
+were already available at prediction time; forward labels may not cross the end.
+Dates from `2026-06-01` onward are excluded from all three splits, reserving
+June–August for subsequent backtests.
+
+CPU preparation, readiness, and training preflight validate the exact contract
+and require at least **80 distinct forecast dates per market in each evaluation
+split**, failing before GPU admission when coverage is insufficient.
+`split_audit.dates_by_market` records actual dates and counts. This is an
+engineering coverage floor, not a guarantee of significance or all-regime
+generalization. Many stocks are not equally many independent time observations.
+
+Fixed dates enter immutable dataset identity. Upgrade with `configure` and the
+existing CPU prepare workflow to create a new namespace. Matching raw request
+caches remain reusable, but an old proportional-split ready marker cannot simply
+be relabelled. Legacy resolved configs and mock fixtures retain their proportional
+split and purge/embargo semantics; old reports are not new holdout results.
 
 The downloader provides:
 
@@ -2058,6 +2211,7 @@ Build or resume the lazy symbol bar store (no window/label files):
 
 ```bash
 poetry run fin-ts-prepare \
+  --fixed-evaluation --h-start 1 \
   --input data/raw/market.parquet \
   --output data/prepared/bar-store
 ```
@@ -2069,6 +2223,29 @@ manual `DATA_ROOT` is required, and different data ranges cannot be mistaken
 for the same dataset.
 
 ### Two training stages
+
+Stage 1/2 calibrate label robust scales on the same deterministic, at-most-50,000
+sample from the full **train partition**, using seed 59 rather than shrinking it
+with Stage 1's 5% training subset. Feature median/IQR calibration uses the same
+sample-count/seed contract. Aggregate caches bind the training dataset manifest
+SHA; neither calibration reads validation or holdout.
+
+The existing workflow name `validation stage` now scores **holdout/test** for
+fixed-date runs. The full model must recompute predictions rather than reuse a
+checkpoint validation snapshot. GRU, DLinear, and PatchTST select early stopping
+on validation and then score holdout with selected weights. All models share the
+holdout sampler, 20,000-row cap, train-calibrated label scales, and verified ordered
+symbol/date SHA-256. Result schema `6.0` explicitly records
+`selection_split=validation` and `evaluation_split=test`; `test_unlocked=true`
+is published only after paired checks pass. Old-schema completed scores cannot
+be reused.
+
+Reports include month, market, and horizon breakdowns plus full-model-minus-baseline
+differences in mean daily normalized pinball. The 95% interval uses a 14-date
+circular moving-block bootstrap (1,000 draws, seed 42), not independent stock-row
+resampling. Intervals are not adjusted for multiple comparisons. Holdout rankings
+are descriptive, never a source for checkpoint selection or repeated tuning,
+and do not establish coverage of every future market regime.
 
 | Item                  | Stage 1                                                                 | Stage 2                                     |
 | --------------------- | ----------------------------------------------------------------------- | ------------------------------------------- |
@@ -2361,9 +2538,10 @@ All user-facing `configure` options are:
 | `--stage` | `stage1`, `stage2` | Select the fixed training config. Required in non-interactive mode |
 | `--data-profile` | `tw_only`, `us_only_eodhd`, `us_tw_eodhd` | Select the actual provider and market combination. Required in non-interactive mode |
 | `--dataset-revision` | 1-64 characters; start with an alphanumeric character, followed by alphanumerics, `.`, `_`, or `-`; default `v1` | Use a new label to force a new immutable dataset namespace after a provider revises historical data |
-| `--start` | `YYYY-MM-DD`; default `2005-01-01` | Inclusive start date shared by every selected market; omission always selects `2005-01-01` |
-| `--end` | `YYYY-MM-DD`; no default | Exclusive end boundary shared by every selected market; both interactive and non-interactive modes require an explicit user value instead of silently selecting the local current date |
-| `--h-start` | `1`, `2`, or `3`; default `3` | First cumulative holding-day alpha horizon predicted after the close at `t`, through fixed day 14; entry remains the raw open of `t+1`. It changes only runtime DataLoader labels and model output, not raw/bar-store dataset identity |
+| `--start` | `YYYY-MM-DD`; default `2016-01-01` | Inclusive start shared by all markets; must precede `2025-06-01` and leave enough context/training history |
+| `--end` | `YYYY-MM-DD`; no default | Exclusive end shared by all markets; must be at least `2026-06-01`. Later rows never enter the fixed train/validation/holdout splits |
+| `--h-start` | `1`, `2`, or `3`; default `1` | First cumulative holding-day horizon through day 14; entry stays at the `t+1` raw open. Changes runtime labels and model output, not dataset identity |
+| `--feature-mode` | `baseline`, `scales`, `benchmark`, `combined`; default `combined` | Controlled residual-branch switches; changes training selection/model identity, not the dataset namespace |
 | `--universe` | `all`, `explicit` | Select the US-instrument strategy; `tw_only` accepts only `all`. Required in non-interactive mode |
 | `--stocks` | Comma- or space-separated US tickers; repeatable | US common stocks/ADRs in `explicit` mode, such as `"AAPL,BABA"`; provider type is verified against EODHD discovery and does not affect Taiwan data |
 | `--etfs` | Comma- or space-separated US tickers; repeatable | Unleveraged US equity ETFs in `explicit` mode, such as `"SPY,QQQ"`; each ticker must be in the audited allowlist and does not affect Taiwan data |
@@ -2371,13 +2549,30 @@ All user-facing `configure` options are:
 | `--interactive` | Flag with no value | Explicitly open the interactive prompts; invoking `configure` with no options enables this mode automatically |
 
 Interactive defaults are `stage1`, `us_tw_eodhd`, dataset revision `v1`, start
-date `2005-01-01`, `h_start=3`, and US universe `all`. `--end` intentionally has no default:
+date `2016-01-01`, `h_start=1`, `feature_mode=combined`, and US universe `all`. `--end` intentionally has no default:
 leaving its prompt blank asks again instead of selecting the local current date.
 Provider acquisition policy is not configured here. Supplying `--max-api-calls`,
 `--eodhd-qps`, `--taiwan-qps`, or `--maxBackoff` to this command is rejected as
 an unknown option instead of creating another selection. The lower-level helper's
 `--project-root` is injected by `runpod_workflow.sh`; it is not a user-facing
 dataset-scope option and should not be supplied manually.
+
+Standard Stage 2 configuration for fixed dates and the complete US/Taiwan scope:
+
+```bash
+bash scripts/runpod_workflow.sh configure \
+  --stage stage2 \
+  --data-profile us_tw_eodhd \
+  --start 2016-01-01 \
+  --end 2026-06-01 \
+  --h-start 1 \
+  --feature-mode combined \
+  --universe all
+```
+
+Continue with this chapter's existing sync, CPU prepare, GPU creation, and tmux
+workflow. Upgrading proportional splits requires CPU preparation of the new
+dataset namespace; `cpu-finalize` cannot convert the old split into fixed dates.
 
 The following example has this exact scope:
 
@@ -3318,8 +3513,9 @@ prune local files.
 
 Each downloaded checkpoint directory should contain at least `adapter.safetensors`,
 `resolved-config.yaml`, `trainer-state.json`, and the optimizer/scheduler state
-listed by that trainer state. `validation-benchmark.json` is the complete
-numerical validation and baseline comparison. Do not claim run success from a
+listed by that trainer state. For new fixed-date runs, `validation-benchmark.json`
+contains holdout and baseline comparisons; checkpoint validation metrics remain
+the training model-selection scores. Do not claim run success from a
 W&B chart or README alone; inspect the lifecycle `state`, run ID, result path,
 and downloaded raw JSON together.
 
@@ -3343,19 +3539,26 @@ Each run stores at least:
 - Selection ID/SHA, dataset request SHA, stage-config SHA, and requested dataset contract
 - Dataset-manifest summary, architecture digest, Kronos source/model/tokenizer
   revisions, and bounded training-implementation digest
-- Validation metrics and baseline comparisons
+- Training-selection validation metrics and final holdout/baseline comparisons
+- `runtime_scale_features` schema, train-only normalization and fingerprint when enabled
 
 Checkpoint resume accepts only the current quant output schema and must pass
 the RunPod run-identity, artifact-integrity, validation-selection, dataset,
 model, and training-source contract checks. Any incompatible schema fails
 closed.
 
+Read-only inference and `probe-scales` permit historical proportional-split
+checkpoints without the new branches when their original resolved settings,
+dataset, and artifact hashes still agree. This exception never authorizes training
+resume, loading an old checkpoint under a new fixed-date config, or relabelling
+old scores as new holdout results.
+
 Inference also runs inside a RunPod Pod with the project Poetry environment and
 the same network volume mounted; do not load the checkpoint locally:
 
 ```bash
 poetry run fin-ts-infer \
-  --config configs/stage2_kronos_base_lora.yaml \
+  --config /runpod-volume/savedModel/<run-id>/<checkpoint>/resolved-config.yaml \
   --checkpoint /runpod-volume/savedModel/<run-id>/<checkpoint> \
   --input "${DATA_ROOT}/raw/market.parquet" \
   --symbol AAPL.US

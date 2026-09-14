@@ -17,7 +17,10 @@ from stock_forecasting.data.horizons import (
     MAX_ALPHA_HORIZON,
     alpha_horizons_from_start,
 )
-from stock_forecasting.dataset_identity import DEFAULT_DATASET_STORAGE_PREPARATION
+from stock_forecasting.dataset_identity import (
+    DEFAULT_DATASET_STORAGE_PREPARATION,
+    validated_fixed_split,
+)
 from stock_forecasting.dataset_profiles import DatasetProfile, selected_datasets
 from stock_forecasting.training_stage_contract import PRODUCTION_STAGE_SAMPLE_CONTRACTS
 
@@ -82,6 +85,7 @@ class DataConfig(StrictModel):
     test_end: str | None = None
     max_samples: int | None = Field(default=None, ge=1)
     label_scale_calibration_samples: int = Field(default=50_000, ge=4)
+    calibration_seed: int = Field(default=59, ge=0, lt=2**32)
     require_ready_manifest: bool = True
 
     @field_validator("h_start", mode="before")
@@ -101,7 +105,17 @@ class DataConfig(StrictModel):
             raise ValueError("Stable RunPod readiness requires stride=5 and embargo=5 sentinels")
         if self.sample_stride != 1:
             raise ValueError("Conditional alpha windows require sample_stride=1")
+        _ = self.fixed_split
         return self
+
+    @property
+    def fixed_split(self) -> dict[str, str] | None:
+        values = {
+            "train_end": self.train_end,
+            "validation_end": self.validation_end,
+            "test_end": self.test_end,
+        }
+        return validated_fixed_split(values if any(values.values()) else None)
 
     @property
     def alpha_horizons(self) -> list[int]:
@@ -183,6 +197,8 @@ class ModelConfig(StrictModel):
     alpha_head_dropout: float = Field(default=0.05, ge=0.0, lt=1.0)
     alpha_quantiles: list[float] = Field(default_factory=lambda: [0.1, 0.5, 0.9])
     postprocess_alpha_threshold: float = Field(default=0.0, ge=0.0)
+    feature_mode: Literal["baseline", "scales", "benchmark", "combined"] = "baseline"
+    alpha_head_fp32: bool = False
     lora: KronosLoRAConfig = Field(default_factory=KronosLoRAConfig)
 
     @model_validator(mode="after")
@@ -227,8 +243,14 @@ class ModelConfig(StrictModel):
     def architecture_digest(self) -> str:
         """Hash only model semantics so Stage 1 and Stage 2 can be compared."""
 
+        semantics = json.loads(self.model_dump_json())
+        # Preserve the architecture digest of existing baseline checkpoints.
+        if self.feature_mode == "baseline":
+            semantics.pop("feature_mode")
+        if not self.alpha_head_fp32:
+            semantics.pop("alpha_head_fp32")
         payload = json.dumps(
-            json.loads(self.model_dump_json()),
+            semantics,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -447,6 +469,13 @@ class ExperimentConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_stage_contract(self) -> ExperimentConfig:
+        if self.model.feature_mode in ("scales", "combined") and self.data.input_length < 61:
+            raise ValueError("The scale branch requires at least 61 observed bars")
+        if self.data.fixed_split and (
+            self.training.evaluation_max_samples
+            != self.validation.baseline_max_samples_per_split
+        ):
+            raise ValueError("Fixed-split model and baseline evaluation sample limits must match")
         sample_contract = PRODUCTION_STAGE_SAMPLE_CONTRACTS[self.training.stage]
         expected_fraction = float(sample_contract["train_fraction"])
         if abs(self.data.train_fraction - expected_fraction) > 1e-12:

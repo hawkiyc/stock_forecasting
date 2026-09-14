@@ -69,6 +69,7 @@ ignore = ["B008"]
 
 [tool.ruff.lint.per-file-ignores]
 # Keep control-plane scripts compatible with older system Python interpreters.
+"src/stock_forecasting/dataset_identity.py" = ["UP017"]
 "scripts/runpod_readiness.py" = ["UP017"]
 "scripts/runpod_selection.py" = ["UP006", "UP007", "UP017", "UP035", "UP045"]
 "scripts/utc_deadline.py" = ["UP017"]

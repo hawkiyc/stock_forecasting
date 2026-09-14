@@ -265,7 +265,7 @@ def infer_observation(
     checkpoint: str | Path,
     observation: CausalObservation,
 ) -> dict[str, Any]:
-    report = run_preflight(config, require_data=True)
+    report = run_preflight(config, require_data=True, allow_historical_inference=True)
     report.require_success()
     set_global_seed(config.training.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -278,6 +278,7 @@ def infer_observation(
         resolved_checkpoint,
         bundle.model,
         config=config,
+        allow_historical_inference=True,
     )
     bundle.model.eval()
     with _autocast_context(config, device):

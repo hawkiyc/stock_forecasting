@@ -8,6 +8,7 @@ from torch import Tensor, nn
 from .forecast import GatedBenchmarkConditioner, MultiHorizonAlphaHead
 from .outputs import QuantEncoderOutput, QuantForecastOutput
 from .projector import CausalPerceiverResampler
+from .scale_features import historical_scale_features
 
 
 class QuantForecastModel(nn.Module):
@@ -62,6 +63,19 @@ class QuantForecastModel(nn.Module):
         benchmark_timestamps: Tensor | None = None,
         target_alpha: Tensor | None = None,
     ) -> QuantForecastOutput:
+        scales = None
+        branch = self.alpha_head.numeric_branch
+        if branch is not None and branch.scale_projection is not None:
+            if (asset_attention_mask is None) != (benchmark_attention_mask is None):
+                raise ValueError("Scale branch requires aligned asset and benchmark masks")
+            if asset_attention_mask is not None and not torch.equal(
+                asset_attention_mask, benchmark_attention_mask
+            ):
+                raise ValueError("Scale branch requires aligned asset and benchmark masks")
+            with torch.autocast(device_type=asset_ohlcv.device.type, enabled=False):
+                scales = historical_scale_features(
+                    asset_ohlcv, benchmark_ohlcv, mask=asset_attention_mask,
+                )
         can_fuse_pair = (
             asset_ohlcv.shape == benchmark_ohlcv.shape
             and (asset_attention_mask is None) == (benchmark_attention_mask is None)
@@ -115,7 +129,10 @@ class QuantForecastModel(nn.Module):
             asset_encoded.latent_tokens,
             benchmark_encoded.latent_tokens,
         )
-        alpha_quantiles = self.alpha_head(conditioned).float()
+        alpha_quantiles = self.alpha_head(
+            conditioned, scale_features=scales,
+            benchmark_tokens=benchmark_encoded.latent_tokens,
+        ).float()
         pinball_loss = (
             None
             if target_alpha is None

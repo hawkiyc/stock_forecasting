@@ -46,7 +46,9 @@ from stock_forecasting.dataset_identity import (
     BAR_STORE_KIND,
     BAR_STORE_SCHEMA_VERSION,
     DEFAULT_DATASET_STORAGE_PREPARATION,
+    FIXED_SPLIT_POLICY,
     PREPARATION_PROVENANCE_SCHEMA_VERSION,
+    validated_fixed_split,
 )
 from stock_forecasting.runtime_resources import (
     detect_available_memory,
@@ -1846,7 +1848,19 @@ def _split_boundaries(
     validation_fraction: float,
     purge_bars: int,
     embargo_bars: int,
+    fixed_split: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
+    fixed = validated_fixed_split(fixed_split)
+    if fixed is not None:
+        return {
+            "fixed_split": fixed,
+            "train_boundary": pd.Timestamp(fixed["train_end"], tz="UTC"),
+            "validation_boundary": pd.Timestamp(fixed["validation_end"], tz="UTC"),
+            "test_boundary": pd.Timestamp(fixed["test_end"], tz="UTC"),
+            "observed_index": {
+                timestamp.value: index for index, timestamp in enumerate(observed_dates)
+            },
+        }
     if not 0.0 < train_fraction < 1.0:
         raise ValueError("train_fraction must be between 0 and 1")
     if not 0.0 < validation_fraction < 1.0:
@@ -1911,6 +1925,22 @@ def _split_codes(
     label_end_ns = timestamp_ns[indices + max_horizon]
     codes = np.zeros(len(indices), dtype=np.int8)
     dropped: Counter[str] = Counter()
+
+    if boundaries.get("fixed_split") is not None:
+        start = np.iinfo(np.int64).min
+        for code, split, boundary_name in (
+            (1, "train", "train_boundary"),
+            (2, "validation", "validation_boundary"),
+            (3, "test", "test_boundary"),
+        ):
+            stop = pd.Timestamp(boundaries[boundary_name]).value
+            region = (cutoff_ns >= start) & (cutoff_ns < stop)
+            accepted = region & (label_end_ns < stop)
+            codes[accepted] = code
+            dropped[f"label_crosses_{split}_boundary"] += int((region & ~accepted).sum())
+            start = stop
+        dropped["after_test_end"] += int((cutoff_ns >= start).sum())
+        return codes, dropped
 
     train_region = observed_positions < int(boundaries["train_stop"])
     train_ok = train_region & (label_end_ns < pd.Timestamp(boundaries["train_boundary"]).value)
@@ -1986,6 +2016,7 @@ def _split_bucket_records(
     boundaries: Mapping[str, Any],
     max_horizon: int,
     check_symbol: Callable[[str], None] | None = None,
+    date_audit: dict[str, dict[str, set[int]]] | None = None,
 ) -> tuple[list[dict[str, Any]], Counter[str]]:
     """Assign and compress one bucket's logical chronological split records."""
 
@@ -2013,6 +2044,13 @@ def _split_bucket_records(
                 max_horizon=max_horizon,
             )
             dropped.update(candidate_dropped)
+            if date_audit is not None:
+                market = str(index_by_symbol[symbol_text]["market"])
+                market_dates = date_audit.setdefault(market, {})
+                for code, split in ((1, "train"), (2, "validation"), (3, "test")):
+                    market_dates.setdefault(split, set()).update(
+                        timestamp_ns[indices[codes == code]].tolist()
+                    )
             output.extend(
                 _split_range_records(
                     symbol=symbol_text,
@@ -2048,6 +2086,7 @@ def _build_split_bucket(
     candidates = pd.read_parquet(candidate_part)
 
     try:
+        date_audit: dict[str, dict[str, set[int]]] = {}
         output, dropped = _split_bucket_records(
             candidates=candidates,
             index_by_symbol=index_by_symbol,
@@ -2057,6 +2096,7 @@ def _build_split_bucket(
             check_symbol=lambda symbol: deadline.check(
                 f"split assignment for {symbol}"
             ),
+            date_audit=date_audit if boundaries.get("fixed_split") else None,
         )
         if output:
             ranges = _ordered_split_ranges(pd.DataFrame(output))
@@ -2070,6 +2110,10 @@ def _build_split_bucket(
                 "bucket": int(bucket_name.removeprefix("bucket-")),
                 "range_rows": len(output),
                 "dropped_counts_by_reason": dict(sorted(dropped.items())),
+                "cutoff_dates_by_market": {
+                    market: {split: sorted(dates) for split, dates in splits.items()}
+                    for market, splits in sorted(date_audit.items())
+                },
             },
         )
         _atomic_directory(staging, destination)
@@ -2162,6 +2206,7 @@ def _assign_split_ranges(
         )
     )
     dropped: Counter[str] = Counter()
+    dates_by_market: dict[str, dict[str, set[int]]] = {}
     for checkpoint_path in sorted((work_root / "split-ranges").glob("bucket-*/checkpoint.json")):
         checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         if checkpoint.get("algorithm") != SPLIT_ASSIGNMENT_ALGORITHM:
@@ -2172,6 +2217,10 @@ def _assign_split_ranges(
                 for key, value in checkpoint.get("dropped_counts_by_reason", {}).items()
             }
         )
+        for market, splits in checkpoint.get("cutoff_dates_by_market", {}).items():
+            market_dates = dates_by_market.setdefault(market, {})
+            for split, dates in splits.items():
+                market_dates.setdefault(split, set()).update(dates)
 
     train_boundary = pd.Timestamp(boundaries["train_boundary"])
     validation_boundary = pd.Timestamp(boundaries["validation_boundary"])
@@ -2198,7 +2247,7 @@ def _assign_split_ranges(
         raise RuntimeError("Validation labels cross the global validation boundary")
     split_audit = {
         "schema_version": "causal-split-audit-v1",
-        "policy": SPLIT_POLICY,
+        "policy": FIXED_SPLIT_POLICY if boundaries.get("fixed_split") else SPLIT_POLICY,
         "comparison": "label.end_at < next_split_start",
         "violations": 0,
         "train_boundary_exclusive": train_boundary.isoformat(),
@@ -2212,6 +2261,28 @@ def _assign_split_ranges(
         "dropped_counts_by_reason": dict(sorted(dropped.items())),
         "splits": summaries,
     }
+    if boundaries.get("fixed_split"):
+        test_boundary = pd.Timestamp(boundaries["test_boundary"])
+        if pd.Timestamp(summaries["test"]["label_end_max_at"]) >= test_boundary:
+            raise RuntimeError("Holdout labels cross the exclusive test end")
+        split_audit.update({
+            "fixed_split": dict(boundaries["fixed_split"]),
+            "test_boundary_exclusive": test_boundary.isoformat(),
+            "additional_purge_embargo_applied": False,
+            "dates_by_market": {
+                market: {
+                    split: {
+                        "unique_cutoff_count": len(dates),
+                        "cutoff_dates": [
+                            pd.Timestamp(value, tz="UTC").date().isoformat()
+                            for value in sorted(dates)
+                        ],
+                    }
+                    for split, dates in splits.items()
+                }
+                for market, splits in sorted(dates_by_market.items())
+            },
+        })
     return ranges, split_audit, plan
 
 
@@ -2265,6 +2336,7 @@ def build_symbol_bar_store(
     validation_fraction: float = DEFAULT_VALIDATION_FRACTION,
     purge_bars: int = DEFAULT_PURGE_BARS,
     embargo_bars: int = DEFAULT_EFFECTIVE_EMBARGO_BARS,
+    fixed_split: Mapping[str, str] | None = None,
     bucket_count: int = DEFAULT_BUCKET_COUNT,
     batch_rows: int = DEFAULT_BATCH_ROWS,
     deadline_epoch_seconds: float | None = None,
@@ -2338,6 +2410,9 @@ def build_symbol_bar_store(
         "effective_embargo_bars": embargo_bars,
         "benchmark_mapping_sha256": canonical_json_sha256(mapping),
     }
+    fixed = validated_fixed_split(fixed_split)
+    if fixed is not None:
+        identity["fixed_split"] = fixed
     identity_sha256 = canonical_json_sha256(identity)
     checkpoint_identity = {
         "schema_version": BAR_STORE_BUILD_CHECKPOINT_SCHEMA_VERSION,
@@ -2583,6 +2658,7 @@ def build_symbol_bar_store(
         validation_fraction=validation_fraction,
         purge_bars=purge_bars,
         embargo_bars=embargo_bars,
+        fixed_split=fixed,
     )
     ranges, split_audit, split_plan = _assign_split_ranges(
         output_root=root,
@@ -2743,9 +2819,11 @@ def bar_store_preparation_provenance(
     target_horizon: int,
     diagnostic_horizons: list[int],
     flat_volatility_multiplier: float,
+    fixed_split: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Describe preparation for audit without defining dataset identity."""
 
+    fixed = validated_fixed_split(fixed_split)
     return {
         "schema_version": PREPARATION_PROVENANCE_SCHEMA_VERSION,
         "processed_schema_version": "4.0",
@@ -2767,7 +2845,8 @@ def bar_store_preparation_provenance(
         "exit_timing": "regular_session_close_t_plus_h",
         "input_adjustment": "point_in_time_total_return_ohlc_split_adjusted_volume",
         "training_security_scope": TRAINING_SECURITY_SCOPE,
-        "split_policy": SPLIT_POLICY,
+        "split_policy": FIXED_SPLIT_POLICY if fixed else SPLIT_POLICY,
+        **({"fixed_split": fixed} if fixed else {}),
         "benchmark_mapping_sha256": benchmark_mapping_sha256,
         "target_horizon": target_horizon,
         "diagnostic_horizons": diagnostic_horizons,

@@ -14,6 +14,7 @@ ALLOWED_NAMES = frozenset(
         "FIN_TS_DATASET_PROFILE",
         "FIN_TS_DATALOADER_WORKERS",
         "FIN_TS_H_START",
+        "FIN_TS_FEATURE_MODE",
         "HF_TOKEN",
         "LOG_ROOT",
         "MAX_RUNTIME_SECONDS",

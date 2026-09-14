@@ -44,6 +44,7 @@ dataset_request_identity_payload = _DATASET_IDENTITY_CONTRACT[
 DEFAULT_DATASET_STORAGE_PREPARATION = _DATASET_IDENTITY_CONTRACT[
     "DEFAULT_DATASET_STORAGE_PREPARATION"
 ]
+FIXED_EVALUATION_SPLIT = _DATASET_IDENTITY_CONTRACT["FIXED_EVALUATION_SPLIT"]
 ACTIVE_POINTER_SCHEMA_VERSION = 1
 SELECTION_ID_PATTERN = re.compile(r"selection-[0-9a-f]{16}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -91,7 +92,8 @@ _BASE_PREPARATION_CONTRACT = {
     "training_security_scope": (
         "common_stock_adr_tdr_and_allowlisted_unleveraged_equity_etf_v1"
     ),
-    "split_policy": "global_chronological_cutoff_with_purge_embargo_and_label_end_guard_v1",
+    "split_policy": _DATASET_IDENTITY_CONTRACT["FIXED_SPLIT_POLICY"],
+    "fixed_split": FIXED_EVALUATION_SPLIT,
     "eodhd_split_policy": "per_symbol_full_historical_splits_reconstruct_unadjusted_volume_v2",
     "us_symbol_limit_policy": (
         "up_to_n_allowlisted_unleveraged_equity_etfs_and_n_stocks_"
@@ -139,6 +141,7 @@ EXPORT_KEYS = (
     "DATA_ROOT",
     "FIN_TS_DATASET_PROFILE",
     "FIN_TS_H_START",
+    "FIN_TS_FEATURE_MODE",
     "STAGE1_US_SYMBOLS",
     "STAGE1_US_ETF_SYMBOLS",
     "STAGE1_SYMBOL_LIMIT",
@@ -361,6 +364,8 @@ def _validate_selection(
     expected_config_path = STAGE_CONFIGS[stage["name"]]
     if stage.get("config_path") != expected_config_path:
         _fail("Training stage does not map to the approved config")
+    if stage.get("feature_mode") not in ("baseline", "scales", "benchmark", "combined"):
+        _fail("Training feature mode is unsupported; configure the selection again")
     config_sha256 = stage.get("config_sha256")
     if not isinstance(config_sha256, str) or not SHA256_PATTERN.fullmatch(config_sha256):
         _fail("Training config digest is invalid")
@@ -409,6 +414,8 @@ def _validate_selection(
     end = _parse_date(str(date_range.get("end_exclusive", "")), "end_exclusive")
     if start >= end:
         _fail("Dataset start date must precede its exclusive end date")
+    if start >= FIXED_EVALUATION_SPLIT["train_end"] or end < FIXED_EVALUATION_SPLIT["test_end"]:
+        _fail("Production data must start before 2025-06-01 and extend through 2026-06-01")
 
     universe = request.get("universe")
     if not isinstance(universe, dict) or universe.get("mode") not in {"all", "explicit"}:
@@ -529,6 +536,7 @@ def _build_selection(arguments: argparse.Namespace, project_root: Path) -> Dict[
             "name": stage_name,
             "config_path": STAGE_CONFIGS[stage_name],
             "config_sha256": _file_sha256(config_path),
+            "feature_mode": getattr(arguments, "feature_mode", "combined"),
         },
         "dataset_request": request,
         "dataset_request_sha256": _payload_sha256(_dataset_request_core(request)),
@@ -594,10 +602,13 @@ def _populate_interactive(arguments: argparse.Namespace) -> None:
         "us_tw_eodhd",
     )
     arguments.dataset_revision = _prompt_text("Dataset revision label", "v1")
-    arguments.start = _prompt_text("Dataset start date (inclusive)", "2005-01-01")
+    arguments.start = _prompt_text("Dataset start date (inclusive)", "2016-01-01")
     arguments.end = _prompt_required_text("Dataset end date (exclusive)")
     arguments.h_start = int(
-        _prompt_choice("First holding-day forecast horizon", ("1", "2", "3"), "3")
+        _prompt_choice("First holding-day forecast horizon", ("1", "2", "3"), "1")
+    )
+    arguments.feature_mode = _prompt_choice(
+        "Forecast feature mode", ("combined", "baseline", "scales", "benchmark"), "combined"
     )
     if arguments.data_profile == "tw_only":
         arguments.universe = "all"
@@ -640,6 +651,7 @@ def _selection_exports(selection_path: Path, payload: Dict[str, Any]) -> Dict[st
         "DATA_ROOT": f"/runpod-volume/datasets/{digest}",
         "FIN_TS_DATASET_PROFILE": request["profile"],
         "FIN_TS_H_START": str(request["preparation"]["h_start"]),
+        "FIN_TS_FEATURE_MODE": payload["stage"]["feature_mode"],
         "STAGE1_US_SYMBOLS": " ".join(universe["us_stocks"]),
         "STAGE1_US_ETF_SYMBOLS": " ".join(universe["us_etfs"]),
         "STAGE1_SYMBOL_LIMIT": (
@@ -851,6 +863,7 @@ def _verify_environment(
             "RUNPOD_STAGE_CONFIG_SHA256",
             "FIN_TS_DATASET_PROFILE",
             "FIN_TS_H_START",
+            "FIN_TS_FEATURE_MODE",
             "STAGE1_US_SYMBOLS",
             "STAGE1_US_ETF_SYMBOLS",
             "STAGE1_SYMBOL_LIMIT",
@@ -888,6 +901,8 @@ def command_create(arguments: argparse.Namespace) -> int:
         )
     )
     print(f"First forecast horizon: {request['preparation']['h_start']}d")
+    print(f"Feature mode: {payload['stage']['feature_mode']}")
+    print("Fixed splits: train < 2025-06-01; validation < 2025-12-01; holdout < 2026-06-01")
     print(f"Dataset request SHA-256: {payload['dataset_request_sha256']}")
     print(f"Selection file: {path}")
     return 0
@@ -995,16 +1010,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     create.add_argument(
         "--start",
-        default="2005-01-01",
-        help="Inclusive market-data start date (default: 2005-01-01).",
+        default="2016-01-01",
+        help="Inclusive market-data start date (default: 2016-01-01).",
     )
     create.add_argument("--end", help="Exclusive market-data end date (YYYY-MM-DD).")
     create.add_argument(
         "--h-start",
         type=int,
         choices=(1, 2, 3),
-        default=3,
+        default=1,
         help="First cumulative holding-day alpha horizon; maximum remains day 14.",
+    )
+    create.add_argument(
+        "--feature-mode", choices=("baseline", "scales", "benchmark", "combined"),
+        default="combined", help="Use the same dataset for the four controlled head variants.",
     )
     create.add_argument("--universe", choices=("all", "explicit"))
     create.add_argument(

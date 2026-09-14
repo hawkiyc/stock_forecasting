@@ -14,6 +14,7 @@ from stock_forecasting.data.horizons import (
     DEFAULT_ALPHA_HORIZONS,
     validate_alpha_horizons,
 )
+from stock_forecasting.models.scale_features import NumericalResidualBranch
 
 
 class GatedBenchmarkConditioner(nn.Module):
@@ -83,6 +84,8 @@ class MultiHorizonAlphaHead(nn.Module):
         quantiles: Sequence[float] = (0.1, 0.5, 0.9),
         robust_scales: Sequence[float] | None = None,
         dropout: float = 0.0,
+        feature_mode: str = "baseline",
+        fp32_head: bool = False,
     ) -> None:
         super().__init__()
         ordered_horizons = validate_alpha_horizons(horizons)
@@ -109,13 +112,30 @@ class MultiHorizonAlphaHead(nn.Module):
             nn.Dropout(dropout),
         )
         self.quantile_parameters = nn.Linear(hidden_dim, 3)
+        self.fp32_head = fp32_head or feature_mode != "baseline"
+        self.numeric_branch = (
+            None if feature_mode == "baseline"
+            else NumericalResidualBranch(hidden_dim, input_dim, feature_mode)
+        )
         self.register_buffer(
             "robust_scales",
             torch.tensor(scales, dtype=torch.float32),
             persistent=False,
         )
 
-    def forward(self, conditioned_tokens: Tensor) -> Tensor:
+    def forward(
+        self, conditioned_tokens: Tensor, *,
+        scale_features: Tensor | None = None, benchmark_tokens: Tensor | None = None,
+    ) -> Tensor:
+        if self.fp32_head:
+            with torch.autocast(device_type=conditioned_tokens.device.type, enabled=False):
+                return self._forward(conditioned_tokens.float(), scale_features, benchmark_tokens)
+        return self._forward(conditioned_tokens, scale_features, benchmark_tokens)
+
+    def _forward(
+        self, conditioned_tokens: Tensor, scale_features: Tensor | None,
+        benchmark_tokens: Tensor | None,
+    ) -> Tensor:
         if conditioned_tokens.ndim != 3 or conditioned_tokens.shape[-1] != self.input_dim:
             raise ValueError(
                 f"conditioned_tokens must have shape [batch, tokens, {self.input_dim}]"
@@ -127,13 +147,17 @@ class MultiHorizonAlphaHead(nn.Module):
             dtype=torch.long,
         )
         horizon_inputs = pooled[:, None, :] + self.horizon_embeddings(horizon_ids)[None, :, :]
-        raw = self.quantile_parameters(self.trunk(horizon_inputs))
+        hidden = self.trunk(horizon_inputs)
+        raw = self.quantile_parameters(hidden)
+        if self.numeric_branch is not None:
+            raw = raw + self.numeric_branch(hidden, scale_features, benchmark_tokens)
         median = raw[..., 1]
         lower = median - F.softplus(raw[..., 0])
         upper = median + F.softplus(raw[..., 2])
         return torch.stack([lower, median, upper], dim=-1)
 
     def pinball_loss(self, predictions: Tensor, target: Tensor) -> Tensor:
+        predictions = predictions.float()
         expected = (predictions.shape[0], len(self.horizons), len(self.quantiles))
         if tuple(predictions.shape) != expected:
             raise ValueError(f"alpha_quantiles must have shape {expected}")

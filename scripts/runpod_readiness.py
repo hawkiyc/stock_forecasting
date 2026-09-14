@@ -101,12 +101,14 @@ _TRAINING_STAGE_CONTRACT = runpy.run_path(
 DATASET_REQUEST_SCHEMA_VERSION = _DATASET_IDENTITY_CONTRACT[
     "DATASET_REQUEST_SCHEMA_VERSION"
 ]
-DATASET_STORAGE_PREPARATION_FIELDS = _DATASET_IDENTITY_CONTRACT[
-    "DATASET_STORAGE_PREPARATION_FIELDS"
+MIN_FIXED_EVALUATION_DATES = _DATASET_IDENTITY_CONTRACT[
+    "MIN_FIXED_EVALUATION_DATES"
 ]
 DEFAULT_DATASET_STORAGE_PREPARATION = _DATASET_IDENTITY_CONTRACT[
     "DEFAULT_DATASET_STORAGE_PREPARATION"
 ]
+storage_preparation_spec = _DATASET_IDENTITY_CONTRACT["storage_preparation_spec"]
+validate_fixed_split_audit = _DATASET_IDENTITY_CONTRACT["validate_fixed_split_audit"]
 BAR_STORE_SCHEMA_VERSION = _DATASET_IDENTITY_CONTRACT["BAR_STORE_SCHEMA_VERSION"]
 BAR_STORE_KIND = _DATASET_IDENTITY_CONTRACT["BAR_STORE_KIND"]
 dataset_request_identity_payload = _DATASET_IDENTITY_CONTRACT[
@@ -1055,10 +1057,10 @@ def _validate_quant_dataset_payload(
     storage_preparation = payload.get("storage_preparation_spec")
     if (
         not isinstance(storage_preparation, dict)
-        or set(storage_preparation) != set(DATASET_STORAGE_PREPARATION_FIELDS)
+        or set(storage_preparation) != set(storage_preparation_spec(preparation_provenance))
         or any(
             preparation_provenance.get(field) != storage_preparation.get(field)
-            for field in DATASET_STORAGE_PREPARATION_FIELDS
+            for field in storage_preparation
         )
     ):
         raise ValueError("Dataset readiness storage preparation provenance is invalid")
@@ -1122,11 +1124,15 @@ def _validate_quant_dataset_payload(
     requested_preparation = requested_dataset.get("preparation")
     if not isinstance(requested_preparation, dict):
         raise ValueError("Dataset readiness requested preparation contract is invalid")
-    for field in DATASET_STORAGE_PREPARATION_FIELDS:
+    for field in storage_preparation:
         if storage_preparation.get(field) != requested_preparation.get(field):
             raise ValueError(
                 f"Dataset readiness storage field {field} disagrees with its request"
             )
+    validate_fixed_split_audit(
+        payload.get("split_audit"), storage_preparation.get("fixed_split"),
+        minimum_evaluation_dates=MIN_FIXED_EVALUATION_DATES,
+    )
     training_security_scope = payload.get("training_security_scope")
     if (
         not isinstance(training_security_scope, str)
