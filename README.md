@@ -1457,7 +1457,10 @@ poetry run fin-ts-infer \
 
 1. **本機控制端：同步程式碼。** 透過 `bash scripts/runpod_workflow.sh sync --apply` 與既有雲端部署流程
    更新程式碼；GPU readiness 必須通過，原始 network volume 中須已有可用的專案環境。
+   本機與 volume 必須同時更新至支援診斷 lifecycle 的版本，再建立 Pod 與本機 guard；
+   更新檔案不會替已在運行的舊 guard 加上新的監控項目。
 2. **本機控制端：建立 GPU Pod。** 若已有掛載同一 volume、且未執行訓練或 validation 的 GPU Pod，可直接使用。
+   沿用既有 Pod 時，須確認其本機 guard 已支援診斷 lifecycle 且仍在運行。
    若沒有，在本機執行下列既有 GPU Pod 建立入口；可用 `--gpuId` 指定 GPU 型號：
 
    ```bash
@@ -1521,27 +1524,39 @@ model/tokenizer cache 必須仍存在且契約一致；不能直接改指向另�
 tmux -L fin-ts-probe-scales attach -t fin-ts-probe-scales
 ```
 
-診斷沿用既有的 timeout 與自動終止流程：runner 取得排他 GPU lease 後，持續持有到結果
-狀態保存與 Pod 關機階段；成功、失敗或逾時都會先保存持久化 log / status，再呼叫
-`runpod_self_terminate.sh`。不改寫訓練 / validation 的 lifecycle 完成標記。
+診斷沿用既有的 timeout 與**本機監控終止**流程：runner 取得排他 GPU lease 後，先發布
+獨立的 running 標記；成功、失敗或逾時後，先保存持久化 log / status，再發布診斷終態。
+本機 `terminate_runpod_after.sh` 透過 S3 讀取標記，驗證 Pod ID、Pod 建立時的 owner run ID、
+launch ID 與狀態後，使用本機 `runpodctl_project.sh pod delete` 終止該 Pod。
+owner run ID 是本次 Pod 的識別，不是 `--checkpoint` 指定的歷史模型 run ID。
+診斷不呼叫 Pod 端終止 API，也不需要將本機 RunPod API key 放入 Pod。
+不改寫訓練 / validation 的 lifecycle 完成標記。
 若 session 已存在、啟動前檢查不通過，或 runner 無法取得 GPU lease，會保留 Pod，避免
-中斷既有工作；不會以「診斷失敗」為由關掉正在被其他工作使用的 Pod。
+中斷既有工作；這些情況不發布診斷終止訊號，既有 hard deadline 仍生效。
 runner 的 timeout 沿用 Pod 建立時的 `MAX_RUNTIME_SECONDS`（上例為 2 小時），另有
 60 秒強制中止寬限；不延長 Pod 原本已設定的 hard deadline。
+看到 `awaiting Pod termination by the local guard` 表示診斷計算已結束，正等待本機 guard
+下一次成功輪詢；runner 在等待期間繼續持有 GPU lease，避免其他工作在終止前插入。
+**SSH 可以斷線，但執行 guard 的本機必須保持開機、連網，且 guard 程序不可中止。**
 
 launcher 會印出這次工作的確切路徑。執行狀態與診斷數值報告分開保存：
 
 ```text
 /runpod-volume/logs/tmux/fin-ts-probe-scales/<launch-id>/
-  combined.log                 # Worker stdout/stderr and shutdown messages
+  combined.log                 # Worker stdout/stderr and local-guard handoff messages
   status.json                  # Terminal job state: succeeded / failed / timed_out
-  runner.sh                    # Quoted arguments, timeout, lease and finalization
-  pod-shutdown/shutdown.json   # Existing Pod termination audit
+  runner.sh                    # Quoted arguments, timeout, lease and local-guard handoff
+
+/runpod-volume/lifecycle/diagnostics/representation-scales/<pod-id>.json
+                               # running / succeeded / failed / timed_out; Pod and owner identity
 ```
 
 `status.json` 在工作結束時發布；tmux 啟動成功不代表模型診斷成功，`succeeded` 也不代表
-RunPod API 已確認終止。關機 API 失敗會沿用既有重試並記錄錯誤，原有外部 hard-limit guard
-繼續生效。Pod 終止後不能再 attach，應從持久化 network volume 讀取 log、status 與報告。
+RunPod API 已確認終止。終止請求與重試記錄位於**本機**的
+`~/.local/state/runpod-guards/<pod-id>.log`（或建立 Pod 時印出的自訂 Guard log 路徑），
+不是 Pod 內的 `pod-shutdown` 目錄；仍須以 RunPod 的 Pod 狀態確認是否已終止。
+無法讀取終態時，沿用既有 hard-limit 保護。Pod 終止後不能再 attach，應從持久化
+network volume 讀取 log、status 與報告。
 可用下列命令查看所有診斷參數：
 
 ```bash
@@ -3322,8 +3337,12 @@ on the local control machine**. Follow this sequence:
 1. **Local control machine: synchronize source.** Use `bash scripts/runpod_workflow.sh sync --apply`
    and the existing cloud deployment workflow. GPU readiness must pass, and the original
    network volume must already contain a usable project environment.
+   Update both the local checkout and volume to support the diagnostic lifecycle before
+   creating the Pod and local guard. Updating files does not add monitoring to an already
+   running older guard process.
 2. **Local control machine: create a GPU Pod.** Reuse an idle GPU Pod mounting that same
-   volume if one is available. Otherwise, run the
+   volume only if its local guard supports the diagnostic lifecycle and is still running.
+   Otherwise, run the
    existing GPU Pod creation entry point locally; `--gpuId` can select a GPU model:
 
    ```bash
@@ -3393,31 +3412,47 @@ Use `Ctrl-b d` to detach without stopping work; do not use `Ctrl-c` to detach:
 tmux -L fin-ts-probe-scales attach -t fin-ts-probe-scales
 ```
 
-Diagnostics reuse the existing timeout and automatic Pod termination flow. The runner
-holds the exclusive GPU lease through result/status publication and shutdown. Success,
-failure and timeout all persist logs/status before calling `runpod_self_terminate.sh`,
-without rewriting training or validation lifecycle completion markers. An existing
-session, rejected launch preflight or failure to acquire the GPU lease preserves the Pod
-to protect existing work. The runner inherits `MAX_RUNTIME_SECONDS` from Pod creation
+Diagnostics reuse the existing timeout and **local monitoring/termination** flow. After
+acquiring the exclusive GPU lease, the runner publishes an independent running marker.
+Success, failure and timeout persist logs/status before publishing a terminal diagnostic
+signal. The local `terminate_runpod_after.sh` reads it over S3, validates its Pod ID,
+Pod-creation owner run ID, launch ID and state, then invokes the local
+`runpodctl_project.sh pod delete`. The owner run ID identifies this Pod allocation, not
+the historical model run selected by `--checkpoint`. Diagnostics do not call the Pod-side
+termination API or require the local RunPod API key inside the Pod. Training and validation
+lifecycle completion markers remain unchanged. An existing session, rejected launch
+preflight or failure to acquire the GPU lease emits no diagnostic termination signal,
+protecting existing work; the original hard deadline still applies.
+The runner inherits `MAX_RUNTIME_SECONDS` from Pod creation
 (two hours above), with a further 60-second forced-termination grace period. It never
 extends the Pod's original hard deadline.
+`awaiting Pod termination by the local guard` means computation has finished and the
+runner is waiting for the next successful local guard poll. It retains the GPU lease
+while waiting so another job cannot start just before termination.
+**SSH may disconnect, but the local guard host must remain powered on, online, and keep
+the guard process running.**
 
 The launcher prints the exact paths for this invocation. Execution status is stored
 separately from numerical diagnostic reports:
 
 ```text
 /runpod-volume/logs/tmux/fin-ts-probe-scales/<launch-id>/
-  combined.log                 # Worker stdout/stderr and shutdown messages
+  combined.log                 # Worker stdout/stderr and local-guard handoff messages
   status.json                  # Terminal job state: succeeded / failed / timed_out
-  runner.sh                    # Quoted arguments, timeout, lease and finalization
-  pod-shutdown/shutdown.json   # Existing Pod termination audit
+  runner.sh                    # Quoted arguments, timeout, lease and local-guard handoff
+
+/runpod-volume/lifecycle/diagnostics/representation-scales/<pod-id>.json
+                               # running / succeeded / failed / timed_out; Pod and owner identity
 ```
 
 `status.json` is published when the job exits. A launched session does not establish a
 successful diagnostic, and `succeeded` does not establish confirmed Pod termination.
-Shutdown API failures retain the existing retries/error logging and external hard-limit
-guard. After Pod termination, attach is unavailable; retrieve logs, status and reports
-from the persistent network volume instead.
+Termination requests and retries are recorded **locally** in
+`~/.local/state/runpod-guards/<pod-id>.log` (or the custom Guard log path printed at Pod
+creation), not a Pod-side `pod-shutdown` directory. Confirm termination from RunPod's
+actual Pod state. Unreadable terminal signals retain the existing hard-limit fallback.
+After Pod termination, attach is unavailable; retrieve logs, status and reports from the
+persistent network volume instead.
 List all diagnostic options with:
 
 ```bash

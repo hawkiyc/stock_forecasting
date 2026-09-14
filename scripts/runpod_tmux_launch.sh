@@ -37,6 +37,8 @@ NETWORK_VOLUME_ROOT="${NETWORK_VOLUME_ROOT:-${RUNPOD_VOLUME_ROOT:-/runpod-volume
 PROJECT_ROOT="${PROJECT_ROOT:-${NETWORK_VOLUME_ROOT}/stock_forecasting}"
 LOG_ROOT="${LOG_ROOT:-${NETWORK_VOLUME_ROOT}/logs}"
 READINESS_HELPER="${SCRIPT_DIR}/runpod_readiness.py"
+PROBE_LIFECYCLE_HELPER="${SCRIPT_DIR}/runpod_probe_lifecycle.py"
+PROBE_OWNER_RUN_ID=""
 SELF_TERMINATE_SCRIPT="${SCRIPT_DIR}/runpod_self_terminate.sh"
 RUNPOD_IMAGE_PYTHON="${RUNPOD_PYTHON_BIN:-/usr/local/bin/python}"
 FINALIZE_LIFECYCLE_ON_EXIT=0
@@ -184,6 +186,22 @@ case "$1" in
         JOB_TIMEOUT_GRACE_SECONDS=0
         FAILURE_LIFECYCLE_MARKER=""
         FAILURE_LIFECYCLE_KIND=""
+        for run_id_name in VALIDATION_RUN_ID WANDB_RUN_ID RUNPOD_RUN_KEY; do
+            run_id_value="${!run_id_name:-}"
+            if [[ -n "${run_id_value}" ]]; then
+                if [[ ! "${run_id_value}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$ \
+                    || "${run_id_value}" == *--* \
+                    || ( -n "${PROBE_OWNER_RUN_ID}" && "${PROBE_OWNER_RUN_ID}" != "${run_id_value}" ) ]]; then
+                    echo "Diagnostic Pod owner IDs must identify the same canonical run" >&2
+                    exit 2
+                fi
+                PROBE_OWNER_RUN_ID="${run_id_value}"
+            fi
+        done
+        if [[ -z "${PROBE_OWNER_RUN_ID}" || ! -r "${PROBE_LIFECYCLE_HELPER}" ]]; then
+            echo "Diagnostic requires the Pod owner run ID and local-guard lifecycle helper" >&2
+            exit 2
+        fi
         ;;
     *)
         echo "Usage: runpod_tmux_launch.sh cpu-prepare|cpu-finalize|stage1-train|stage1-validate|probe-scales [PROBE OPTIONS]" >&2
@@ -276,12 +294,23 @@ mkdir -p "${JOB_DIR}"
         # Hold the lease in the runner, not only in its model subprocess. It must
         # survive model exit until status publication and Pod termination finish.
         printf 'source %q\n' "${SCRIPT_DIR}/lib/runpod_paths.sh"
+        printf 'publish_probe_state() {\n'
+        printf '  local attempt=1\n'
+        printf '  while [[ ${attempt} -le 3 ]]; do\n'
+        printf '    if %q %q write-state --network-volume-root %q --pod-id %q --owner-run-id %q --launch-id %q --state "$1" --exit-code "$2"; then return 0; fi\n' \
+            "${RUNPOD_IMAGE_PYTHON}" "${PROBE_LIFECYCLE_HELPER}" "${NETWORK_VOLUME_ROOT}" \
+            "${RUNPOD_POD_ID:-}" "${PROBE_OWNER_RUN_ID}" "${LAUNCH_ID}"
+        printf '    attempt=$((attempt + 1))\n'
+        printf '  done\n'
+        printf '  return 74\n'
+        printf '}\n'
         printf 'unset RUNPOD_GPU_WORKFLOW_LEASE_HELD\n'
         printf 'diagnostic_lease_acquired=0\n'
         printf 'runpod_acquire_gpu_workflow_lease %q\n' "${NETWORK_VOLUME_ROOT}"
         printf 'job_exit_code=$?\n'
         printf 'if [[ ${job_exit_code} -eq 0 ]]; then\n'
         printf '  diagnostic_lease_acquired=1\n'
+        printf '  if publish_probe_state running 0; then\n'
     fi
     printf 'timeout --signal=TERM --kill-after=60 %qs bash %q' \
         "${JOB_TIMEOUT_SECONDS}" "${JOB_SCRIPT}"
@@ -291,6 +320,7 @@ mkdir -p "${JOB_DIR}"
     printf '\n'
     printf 'job_exit_code=$?\n'
     if [[ "${JOB_ROLE}" == "gpu-probe" ]]; then
+        printf '  else job_exit_code=74; fi\n'
         printf 'fi\n'
     fi
     printf 'finalization_exit_code=0\n'
@@ -443,17 +473,29 @@ mkdir -p "${JOB_DIR}"
     printf 'if [[ ${finalization_exit_code} -ne 0 ]]; then\n'
     printf '  if [[ ${job_exit_code} -eq 0 ]]; then job_exit_code=${finalization_exit_code}; fi\n'
     printf 'fi\n'
-    printf 'export RUNPOD_SHUTDOWN_DIR=%q\n' "${JOB_DIR}/pod-shutdown"
-    printf 'export RUNPOD_SHUTDOWN_MARKER=%q\n' "${JOB_DIR}/pod-shutdown/shutdown.json"
     if [[ "${JOB_ROLE}" == "gpu-probe" ]]; then
         printf 'if [[ ${diagnostic_lease_acquired} -ne 1 ]]; then\n'
         printf '  printf '\''Diagnostic did not acquire the GPU lease; preserving the Pod and existing work\\n'\''\n'
         printf '  exit "${job_exit_code}"\n'
         printf 'fi\n'
+        printf 'probe_terminal_state=failed\n'
+        printf 'if [[ ${job_exit_code} -eq 0 ]]; then probe_terminal_state=succeeded; fi\n'
+        printf 'if [[ ${job_exit_code} -eq 124 ]]; then probe_terminal_state=timed_out; fi\n'
+        printf 'if ! publish_probe_state "${probe_terminal_state}" "${job_exit_code}"; then\n'
+        printf '  printf '\''Diagnostic terminal signal could not be saved; local guard hard limit remains the fallback\\n'\'' >&2\n'
+        printf '  if [[ ${job_exit_code} -eq 0 ]]; then job_exit_code=74; fi\n'
+        printf 'fi\n'
+        printf 'printf '\''Diagnostic finished; awaiting Pod termination by the local guard\\n'\''\n'
+        # Retain the GPU lease until the local guard removes the Pod; another
+        # workload must not start between terminal publication and local polling.
+        printf 'while sleep 60; do :; done\n'
+    else
+        printf 'export RUNPOD_SHUTDOWN_DIR=%q\n' "${JOB_DIR}/pod-shutdown"
+        printf 'export RUNPOD_SHUTDOWN_MARKER=%q\n' "${JOB_DIR}/pod-shutdown/shutdown.json"
+        printf 'if ! bash %q; then\n' "${SELF_TERMINATE_SCRIPT}"
+        printf '  printf '\''Pod self-termination failed; external lifecycle guard remains armed\\n'\'' >&2\n'
+        printf 'fi\n'
     fi
-    printf 'if ! bash %q; then\n' "${SELF_TERMINATE_SCRIPT}"
-    printf '  printf '\''Pod self-termination failed; external lifecycle guard remains armed\\n'\'' >&2\n'
-    printf 'fi\n'
     printf 'exit "${job_exit_code}"\n'
 } > "${RUNNER_TMP}"
 mv "${RUNNER_TMP}" "${RUNNER}"

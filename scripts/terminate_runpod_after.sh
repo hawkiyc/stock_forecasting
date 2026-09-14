@@ -9,6 +9,7 @@ LOCAL_PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RUNPODCTL_WRAPPER="${SCRIPT_DIR}/runpodctl_project.sh"
 RUNPOD_S3_WRAPPER="${SCRIPT_DIR}/runpod_s3_project.sh"
 RUNPOD_READINESS_HELPER="${SCRIPT_DIR}/runpod_readiness.py"
+PROBE_LIFECYCLE_HELPER="${SCRIPT_DIR}/runpod_probe_lifecycle.py"
 # shellcheck source=lib/runpod_project_env.sh
 source "${SCRIPT_DIR}/lib/runpod_project_env.sh"
 
@@ -138,6 +139,7 @@ printf '[%s] guard armed for Pod %s; terminate after %s seconds\n' \
 termination_reason="hard-limit"
 last_marker_json='{}'
 matching_run_lifecycle_observed=0
+diagnostic_workflow_observed=0
 pod_terminal_key=""
 case "${LIFECYCLE_KEY}" in
     lifecycle/stage1/training.json|lifecycle/stage1/validation.json)
@@ -159,12 +161,39 @@ if [[ -n "${LIFECYCLE_KEY}" ]]; then
         && [[ "${volume_id}" =~ ^[A-Za-z0-9_-]+$ ]]; then
         printf '[%s] lifecycle monitor armed for %s\n' \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${LIFECYCLE_KEY}" >> "${LOG_FILE}"
+        if [[ -n "${pod_terminal_key}" && -r "${PROBE_LIFECYCLE_HELPER}" ]]; then
+            printf '[%s] diagnostic monitor armed for lifecycle/diagnostics/representation-scales/%s.json\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${POD_ID}" >> "${LOG_FILE}"
+        fi
         publish_guard_ready
         guard_started=${SECONDS}
         while [[ $((SECONDS - guard_started)) -lt ${DELAY_SECONDS} ]]; do
             terminal_state=""
             terminal_key=""
-            if [[ -n "${pod_terminal_key}" ]]; then
+            diagnostic_state=""
+            if [[ -n "${pod_terminal_key}" && -r "${PROBE_LIFECYCLE_HELPER}" ]]; then
+                diagnostic_key="lifecycle/diagnostics/representation-scales/${POD_ID}.json"
+                # Stream into the bounded validator and reject transport failures,
+                # even if a failed S3 command emitted apparently valid JSON first.
+                if diagnostic_state="$(
+                    set -o pipefail
+                    runpod_guard_s3 s3 cp \
+                        "s3://${volume_id}/${diagnostic_key}" - --only-show-errors 2>/dev/null | \
+                        python3 "${PROBE_LIFECYCLE_HELPER}" guard-state \
+                            --network-volume-root "${RUNPOD_GUARD_VOLUME_ROOT}" \
+                            --pod-id "${POD_ID}" --owner-run-id "${RUNPOD_GUARD_RUN_ID}" \
+                            2>/dev/null
+                )"; then
+                    diagnostic_workflow_observed=1
+                    if [[ "${diagnostic_state}" != "running" ]]; then
+                        terminal_state="${diagnostic_state}"
+                        terminal_key="${diagnostic_key}"
+                    fi
+                else
+                    diagnostic_state=""
+                fi
+            fi
+            if [[ -n "${pod_terminal_key}" && "${diagnostic_workflow_observed}" != "1" ]]; then
                 pod_terminal_json=""
                 expected_terminal_lifecycle_kind=stage1-training
                 if [[ "${LIFECYCLE_KEY}" == "lifecycle/stage1/validation.json" ]]; then
@@ -209,7 +238,7 @@ raise SystemExit(0 if valid else 2)' \
                 matching_run_lifecycle_observed=0
             fi
             for lifecycle_candidate in "${LIFECYCLE_KEYS[@]}"; do
-                if [[ -n "${terminal_state}" ]]; then
+                if [[ -n "${terminal_state}" || "${diagnostic_workflow_observed}" == "1" ]]; then
                     break
                 fi
                 marker_json=""
@@ -312,6 +341,7 @@ else
 fi
 
 if [[ "${termination_reason}" == "hard-limit" \
+    && "${diagnostic_workflow_observed}" != "1" \
     && ( "${LIFECYCLE_KEY}" == "lifecycle/stage1/training.json" \
         || "${LIFECYCLE_KEY}" == "lifecycle/stage1/validation.json" ) \
     && "${volume_id:-}" =~ ^[A-Za-z0-9_-]+$ \

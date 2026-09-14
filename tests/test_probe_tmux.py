@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -29,6 +31,7 @@ class ProbeHarness:
         for name in (
             "runpod_tmux_launch.sh",
             "runpod_workflow.sh",
+            "runpod_probe_lifecycle.py",
             "lib/runpod_paths.sh",
             "lib/runpod_cli.sh",
         ):
@@ -39,6 +42,7 @@ class ProbeHarness:
             "HARNESS_ROOT": str(self.root),
             "RUNPOD_SSH_ENV_IMPORTED": "1",
             "RUNPOD_POD_ID": "probe-fixture",
+            "WANDB_RUN_ID": "run-pod-owner",
             "NETWORK_VOLUME_ROOT": str(self.volume),
             "RUNPOD_VOLUME_ROOT": str(self.volume),
             "PROJECT_ROOT": str(self.project),
@@ -99,10 +103,24 @@ class ProbeHarness:
         )
         self.write_script(
             self.bin / "readiness-stub",
-            r"""
+            'if [[ "$1" == */runpod_probe_lifecycle.py ]]; then exec '
+            + shlex.quote(sys.executable)
+            + ' "$@"; fi\n'
+            + r"""
             printf '%s\n' "$*" >> "${HARNESS_ROOT}/lifecycle-calls"
             if [[ "$2" == training-phase-completed ]]; then exit 1; fi
             exit 0
+            """,
+        )
+        self.write_script(
+            self.bin / "sleep",
+            r"""
+            if [[ "$1" == 60 ]]; then
+                [[ "${RUNPOD_GPU_WORKFLOW_LEASE_HELD:-0}" == 1 && -e /dev/fd/9 ]] || exit 99
+                printf 'lease-held\n' > "${HARNESS_ROOT}/waiting-for-local-guard"
+                exit 1
+            fi
+            exec /bin/sleep "$@"
             """,
         )
         for name in (
@@ -177,6 +195,9 @@ class ProbeHarness:
     def status(self) -> dict:
         return json.loads((self.runners()[0].parent / "status.json").read_text(encoding="utf-8"))
 
+    def diagnostic_marker(self) -> Path:
+        return self.volume / "lifecycle/diagnostics/representation-scales/probe-fixture.json"
+
 
 class ProbeTmuxTests(unittest.TestCase):
     def harness(self) -> ProbeHarness:
@@ -186,7 +207,7 @@ class ProbeTmuxTests(unittest.TestCase):
 
     def assert_no_training_markers(self, harness: ProbeHarness) -> None:
         self.assertFalse((harness.root / "lifecycle-calls").exists())
-        self.assertEqual(list((harness.volume / "lifecycle").rglob("*.json")), [])
+        self.assertEqual(list((harness.volume / "lifecycle/stage1").rglob("*.json")), [])
 
     def test_legacy_workflow_alias_delegates_once_with_unchanged_arguments(self) -> None:
         for arguments in ((), ("--checkpoint", "run-selected", "--batch-size", "8")):
@@ -216,7 +237,7 @@ class ProbeTmuxTests(unittest.TestCase):
         harness.environment.pop("RUNPOD_SSH_ENV_IMPORTED")
         result = harness.command("runpod_tmux_launch.sh", "probe-scales", "--help")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("automatically terminates the Pod", result.stdout)
+        self.assertIn("local guard terminates the Pod", result.stdout)
         self.assertIn("bash scripts/runpod_tmux_launch.sh probe-scales", result.stdout)
         self.assertNotIn("runpod_workflow.sh probe-scales", result.stdout)
         legacy_help = harness.command("runpod_workflow.sh", "probe-scales", "--help")
@@ -246,7 +267,7 @@ class ProbeTmuxTests(unittest.TestCase):
         self.assertIn("Use bash scripts/runpod_tmux_launch.sh probe-scales", diagnostic_source)
         self.assertNotIn("runpod_workflow.sh probe-scales", diagnostic_source)
 
-    def test_success_persists_status_then_terminates_while_owning_lease(self) -> None:
+    def test_success_publishes_signal_then_waits_for_local_guard_while_owning_lease(self) -> None:
         harness = self.harness()
         # An inherited hint must not bypass real lease acquisition in the runner.
         harness.environment["RUNPOD_GPU_WORKFLOW_LEASE_HELD"] = "1"
@@ -267,11 +288,16 @@ class ProbeTmuxTests(unittest.TestCase):
         self.assertEqual(harness.status()["state"], "succeeded")
         self.assertEqual(harness.status()["exit_code"], 0)
         self.assertEqual(harness.status()["finalization_exit_code"], 0)
-        self.assertEqual(json.loads(harness.read("status-at-shutdown.json")), harness.status())
-        self.assertEqual(harness.read("shutdown-called"), "gpu-probe\n")
+        marker = json.loads(harness.diagnostic_marker().read_text())
+        self.assertEqual(marker["state"], "succeeded")
+        self.assertEqual(marker["owner_run_id"], "run-pod-owner")
+        self.assertEqual(marker["pod_id"], "probe-fixture")
+        self.assertEqual(marker["status_path"], str(harness.runners()[0].parent / "status.json"))
+        self.assertEqual(harness.read("waiting-for-local-guard"), "lease-held\n")
+        self.assertFalse((harness.root / "shutdown-called").exists())
         self.assertEqual(harness.read("timeout-options").splitlines()[-1], "120s")
         self.assertIn("fixture worker finished", Path(harness.status()["log_path"]).read_text())
-        self.assertTrue((harness.runners()[0].parent / "pod-shutdown/shutdown.json").is_file())
+        self.assertFalse((harness.runners()[0].parent / "pod-shutdown/shutdown.json").exists())
         self.assert_no_training_markers(harness)
 
     def test_probe_arguments_are_quoted_not_executed_as_shell_code(self) -> None:
@@ -288,7 +314,7 @@ class ProbeTmuxTests(unittest.TestCase):
         )
         self.assertFalse(sentinel.exists())
 
-    def test_failure_and_timeout_publish_terminal_status_before_termination(self) -> None:
+    def test_failure_and_timeout_publish_signals_for_local_termination(self) -> None:
         for environment, state, exit_code in (
             ({"HARNESS_JOB_EXIT": "7"}, "failed", 7),
             ({"HARNESS_TIMEOUT": "1"}, "timed_out", 124),
@@ -302,10 +328,11 @@ class ProbeTmuxTests(unittest.TestCase):
                 self.assertEqual(runner.returncode, exit_code, runner.stdout + runner.stderr)
                 self.assertEqual(harness.status()["state"], state)
                 self.assertEqual(harness.status()["exit_code"], exit_code)
-                self.assertEqual(
-                    json.loads(harness.read("status-at-shutdown.json")), harness.status()
-                )
-                self.assertTrue((harness.root / "shutdown-called").is_file())
+                marker = json.loads(harness.diagnostic_marker().read_text())
+                self.assertEqual(marker["state"], state)
+                self.assertEqual(marker["exit_code"], exit_code)
+                self.assertTrue((harness.root / "waiting-for-local-guard").is_file())
+                self.assertFalse((harness.root / "shutdown-called").exists())
                 self.assert_no_training_markers(harness)
 
     def test_contended_lease_preserves_pod_without_running_probe(self) -> None:
@@ -323,6 +350,7 @@ class ProbeTmuxTests(unittest.TestCase):
         self.assertFalse((harness.root / "worker-args").exists())
         self.assertFalse((harness.root / "timeout-options").exists())
         self.assertFalse((harness.root / "shutdown-called").exists())
+        self.assertFalse(harness.diagnostic_marker().exists())
         self.assert_no_training_markers(harness)
 
     def test_duplicate_session_or_rejected_preflight_never_terminates_pod(self) -> None:
@@ -346,7 +374,7 @@ class ProbeTmuxTests(unittest.TestCase):
                 self.assertEqual(harness.runners(), [])
                 self.assert_no_training_markers(harness)
 
-    def test_shutdown_failure_is_not_confused_with_failed_diagnostic(self) -> None:
+    def test_probe_does_not_invoke_pod_side_termination(self) -> None:
         harness = self.harness()
         harness.environment["HARNESS_SHUTDOWN_EXIT"] = "4"
         result = harness.command("runpod_tmux_launch.sh", "probe-scales")
@@ -354,11 +382,35 @@ class ProbeTmuxTests(unittest.TestCase):
         runner = harness.run_worker()
         self.assertEqual(runner.returncode, 0, runner.stdout + runner.stderr)
         self.assertEqual(harness.status()["state"], "succeeded")
-        self.assertIn(
-            "Pod self-termination failed; external lifecycle guard remains armed", runner.stdout
-        )
-        self.assertTrue((harness.root / "shutdown-called").is_file())
+        self.assertIn("awaiting Pod termination by the local guard", runner.stdout)
+        self.assertNotIn("self-termination", runner.stdout + runner.stderr)
+        self.assertFalse((harness.root / "shutdown-called").exists())
         self.assert_no_training_markers(harness)
+
+    def test_missing_or_conflicting_owner_identity_rejects_launch(self) -> None:
+        for updates in ({"WANDB_RUN_ID": ""}, {"VALIDATION_RUN_ID": "another-run"}):
+            with self.subTest(updates=updates):
+                harness = self.harness()
+                harness.environment.update(updates)
+                result = harness.command("runpod_tmux_launch.sh", "probe-scales")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse((harness.root / "shutdown-called").exists())
+                self.assertFalse(harness.diagnostic_marker().exists())
+                self.assertEqual(harness.runners(), [])
+
+    def test_failed_running_signal_prevents_model_execution_and_waits_for_guard(self) -> None:
+        harness = self.harness()
+        blocker = harness.volume / "lifecycle/diagnostics"
+        blocker.parent.mkdir(parents=True)
+        blocker.write_text("fixture-not-a-directory", encoding="utf-8")
+        result = harness.command("runpod_tmux_launch.sh", "probe-scales")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runner = harness.run_worker()
+        self.assertEqual(runner.returncode, 74, runner.stdout + runner.stderr)
+        self.assertEqual(harness.status()["state"], "failed")
+        self.assertFalse((harness.root / "worker-args").exists())
+        self.assertFalse((harness.root / "shutdown-called").exists())
+        self.assertTrue((harness.root / "waiting-for-local-guard").is_file())
 
     def test_existing_workflows_keep_timeout_roles_and_lifecycle_finalization(self) -> None:
         for workflow, role, duration in (

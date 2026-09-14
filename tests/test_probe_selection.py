@@ -267,7 +267,7 @@ class ProbeShellTests(unittest.TestCase):
         self.assertIn("[--checkpoint RUN_ID]", result.stdout)
         self.assertIn("latest completed training run", result.stdout)
         self.assertIn("does not create a Pod", result.stdout)
-        self.assertIn("automatically terminates the Pod", result.stdout)
+        self.assertIn("local guard terminates the Pod", result.stdout)
         self.assertIn("SSH may disconnect", result.stdout)
 
     def test_local_execution_is_blocked_with_or_without_a_selector(self) -> None:

@@ -30,10 +30,12 @@ Legacy absolute canonical run/checkpoint paths remain supported; relative paths 
 The resolved checkpoint config is used, never the active stage selection.
 Results: NETWORK_VOLUME_ROOT/diagnostics/representation-scales/<run>/<checkpoint>/probe-*/
 This command starts detached tmux session fin-ts-probe-scales; SSH may disconnect afterward.
-It does not create a Pod. The runner automatically terminates the Pod after success/failure/timeout,
-after saving logs/status. Duplicate sessions or failure to acquire the GPU lease preserve the Pod.
+It does not create a Pod. The local guard terminates the Pod after success/failure/timeout,
+after the runner saves logs/status and its diagnostic signal. Keep the local guard host online.
+Duplicate sessions or failure to acquire the GPU lease do not publish a termination signal.
 Training/validation lifecycle completion markers are never changed by the diagnostic.
 Logs: NETWORK_VOLUME_ROOT/logs/tmux/fin-ts-probe-scales/<launch-id>/
+Guard signal: NETWORK_VOLUME_ROOT/lifecycle/diagnostics/representation-scales/<pod-id>.json
 Attach: tmux -L fin-ts-probe-scales attach -t fin-ts-probe-scales (detach with Ctrl-b d).
 No test split, W&B run, training optimizer, or checkpoint update is involved.
 EOF
