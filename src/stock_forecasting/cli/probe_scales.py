@@ -26,6 +26,7 @@ from stock_forecasting.data.dataset import LazyFinancialWindowDataset
 from stock_forecasting.data.manifest import provenance_summary, sha256_file
 from stock_forecasting.factory import build_model_bundle
 from stock_forecasting.preflight import run_preflight
+from stock_forecasting.probe_selection import MAX_SELECTION_WORKERS, probe_source_path
 from stock_forecasting.representation_scale_probe import (
     READOUT_DESCRIPTIONS,
     TARGET_NAMES,
@@ -34,6 +35,7 @@ from stock_forecasting.representation_scale_probe import (
     extract_probe_split,
     fit_scale_probes,
 )
+from stock_forecasting.run_contract import CHECKPOINT_ARTIFACT_SCHEMA_VERSION
 from stock_forecasting.run_paths import canonical_network_volume_root, validate_training_output_root
 from stock_forecasting.training import set_global_seed
 
@@ -42,12 +44,20 @@ LOGGER = logging.getLogger(__name__)
 
 def build_parser() -> argparse.ArgumentParser:
     defaults = ScaleProbeSettings()
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument(
         "--checkpoint",
-        required=True,
-        type=Path,
-        help="Canonical retained checkpoint or run directory with a validated best pointer.",
+        metavar="RUN_ID",
+        help=(
+            "Run ID whose validation-selected best checkpoint is probed. Omit to select "
+            "the latest completed training run. Legacy canonical absolute paths are accepted."
+        ),
+    )
+    parser.add_argument(
+        "--selection-workers",
+        type=int,
+        choices=range(1, MAX_SELECTION_WORKERS + 1),
+        help="Completion-metadata I/O workers (default: auto, bounded by CPU/memory and 8).",
     )
     parser.add_argument("--train-samples", type=int, default=defaults.train_samples)
     parser.add_argument("--validation-samples", type=int, default=defaults.validation_samples)
@@ -65,11 +75,21 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     )
 
 
-def resolve_probe_checkpoint(path: Path, *, saved_model_root: Path) -> Path:
+def resolve_probe_checkpoint(
+    path: str | Path | None,
+    *,
+    saved_model_root: Path,
+    selection_workers: int | None = None,
+) -> Path:
     """Reject pending transactions before shared selection can reconcile them."""
 
-    source = path.expanduser().resolve(strict=False)
     root = saved_model_root.expanduser().resolve(strict=False)
+    source = probe_source_path(
+        path,
+        saved_model_root=root,
+        schema_version=CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
+        selection_workers=selection_workers,
+    )
     run = source.parent if (source / "adapter.safetensors").is_file() else source
     if run.parent != root:
         raise ValueError("Probe checkpoints must belong to a canonical saved-model run")
@@ -164,7 +184,12 @@ def render_summary(report: dict[str, Any]) -> str:
     )
 
 
-def run_probe(checkpoint_path: Path, settings: ScaleProbeSettings) -> Path:
+def run_probe(
+    checkpoint_path: str | Path | None,
+    settings: ScaleProbeSettings,
+    *,
+    selection_workers: int | None = None,
+) -> Path:
     """Run on an existing GPU Pod, without mutating training/evaluation lifecycle state."""
 
     if not os.environ.get("RUNPOD_POD_ID") or not torch.cuda.is_available():
@@ -174,7 +199,12 @@ def run_probe(checkpoint_path: Path, settings: ScaleProbeSettings) -> Path:
             "Use bash scripts/runpod_workflow.sh probe-scales to verify the mount and GPU lease"
         )
     volume = canonical_network_volume_root()
-    checkpoint = resolve_probe_checkpoint(checkpoint_path, saved_model_root=volume / "savedModel")
+    checkpoint = resolve_probe_checkpoint(
+        checkpoint_path,
+        saved_model_root=volume / "savedModel",
+        selection_workers=selection_workers,
+    )
+    LOGGER.info("Resolved scale-probe checkpoint: %s", checkpoint)
     config = ExperimentConfig.from_yaml(checkpoint / "resolved-config.yaml")
     validate_training_output_root(config.training.output_root)
     if config.model.time_series_backend != "kronos":
@@ -310,7 +340,11 @@ def run_probe(checkpoint_path: Path, settings: ScaleProbeSettings) -> Path:
             },
             "diagnostic_source_sha256": {
                 name: sha256_file(Path(__file__).resolve().parents[1] / name)
-                for name in ("representation_scale_probe.py", "cli/probe_scales.py")
+                for name in (
+                    "representation_scale_probe.py",
+                    "probe_selection.py",
+                    "cli/probe_scales.py",
+                )
             },
             "artifacts_sha256": {
                 name: sha256_file(output / name)
@@ -342,7 +376,7 @@ def main() -> None:
         ridge_alpha=args.ridge_alpha,
         seed=args.seed,
     )
-    output = run_probe(args.checkpoint, settings)
+    output = run_probe(args.checkpoint, settings, selection_workers=args.selection_workers)
     print(json.dumps({"state": "complete", "output": str(output)}, ensure_ascii=False))
 
 

@@ -354,6 +354,10 @@ def test_mock_checkpoint_extraction_preserves_weights_and_checkpoint_files(
     assert checkpoint is not None
     assert resolve_probe_checkpoint(run, saved_model_root=config.training.output_root) == checkpoint
     assert (
+        resolve_probe_checkpoint(run.name, saved_model_root=config.training.output_root)
+        == checkpoint
+    )
+    assert (
         resolve_probe_checkpoint(checkpoint, saved_model_root=config.training.output_root)
         == checkpoint
     )
@@ -399,14 +403,24 @@ def test_mock_checkpoint_extraction_preserves_weights_and_checkpoint_files(
     assert "feature_dim" in json.dumps(result.metrics, allow_nan=False)
 
 
-def test_cli_has_no_test_or_config_override_and_refuses_local_execution(tmp_path: Path) -> None:
+def test_cli_has_no_test_or_config_override_and_refuses_local_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RUNPOD_POD_ID", raising=False)
     parser = build_parser()
+    assert parser.parse_args([]).checkpoint is None
+    selected = parser.parse_args(["--batch-size", "8", "--checkpoint", "run-selected"])
+    assert selected.checkpoint == "run-selected"
+    assert selected.batch_size == 8
     args = parser.parse_args(["--checkpoint", str(tmp_path)])
     assert args.train_samples == 16_384
     with pytest.raises(SystemExit):
         parser.parse_args(["--checkpoint", str(tmp_path), "--split", "test"])
     with pytest.raises(SystemExit):
         parser.parse_args(["--checkpoint", str(tmp_path), "--config", "new-config.yaml"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--selection-workers", "0"])
     with pytest.raises(RuntimeError, match="existing CUDA RunPod"):
         run_probe(tmp_path, ScaleProbeSettings())
     assert not list(tmp_path.iterdir())
@@ -417,6 +431,7 @@ def test_direct_cli_cannot_bypass_the_script_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RUNPOD_POD_ID", "probe-fixture")
+    monkeypatch.delenv("RUNPOD_GPU_WORKFLOW_LEASE_HELD", raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     with pytest.raises(RuntimeError, match="verify the mount and GPU lease"):
         run_probe(tmp_path, ScaleProbeSettings())
@@ -451,19 +466,95 @@ def test_workflow_routes_help_and_blocks_local_checkpoint_execution(tmp_path: Pa
     command = ["bash", str(ROOT / "scripts/runpod_workflow.sh"), "probe-scales"]
     # Do not import the real Pod environment when these tests run on cloud hardware.
     environment = {**os.environ, "RUNPOD_TEST_MODE": "1"}
+    environment.pop("RUNPOD_POD_ID", None)
     help_result = subprocess.run(
         [*command, "--help"], env=environment, capture_output=True, text=True, check=False
     )
     assert help_result.returncode == 0
     assert "existing CUDA RunPod" in help_result.stdout
     assert "does not create/terminate" in help_result.stdout
+    assert "[--checkpoint RUN_ID]" in help_result.stdout
+    assert "latest completed training run" in help_result.stdout
+    for arguments in ([], ["--checkpoint", "run-selected"], ["--checkpoint", str(tmp_path)]):
+        result = subprocess.run(
+            [*command, *arguments],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 2
+        assert "no local model execution" in result.stderr
+    assert not list(tmp_path.iterdir())
+
+
+def test_auto_selection_validates_only_the_latest_run_without_older_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "savedModel"
+    for name, timestamp in (("run-old", "2026-09-01"), ("run-new", "2026-09-02")):
+        marker = root / name / "completion-result" / "training-result.json"
+        marker.parent.mkdir(parents=True)
+        marker.write_text(
+            json.dumps(
+                {
+                    "schema_version": CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
+                    "kind": "training-completion-result",
+                    "run_id": name,
+                    "run_key": name,
+                    "stop_reason": "early_stopping",
+                    "created_at": timestamp + "T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+    calls = []
+
+    def missing_best(source: Path, **_kwargs: Any) -> Path:
+        calls.append(source)
+        raise FileNotFoundError("Best-checkpoint pointer is missing")
+
+    monkeypatch.setattr(probe_cli, "resolve_checkpoint", missing_best)
+    with pytest.raises(FileNotFoundError, match="Best-checkpoint pointer"):
+        resolve_probe_checkpoint(None, saved_model_root=root, selection_workers=2)
+    assert calls == [root / "run-new"]
+    (root / "run-new" / CHECKPOINT_TRANSACTION).write_text("{}", encoding="utf-8")
+    calls.clear()
+    with pytest.raises(ValueError, match="pending selection transaction"):
+        resolve_probe_checkpoint(None, saved_model_root=root, selection_workers=2)
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--checkpoint"],
+        ["--checkpoint", ""],
+        ["--checkpoint", "../run-unsafe"],
+        ["--checkpoint=run-a", "--checkpoint", "run-b"],
+    ],
+)
+def test_workflow_rejects_invalid_run_selectors_before_readiness(
+    arguments: list[str],
+    tmp_path: Path,
+) -> None:
+    environment = {
+        **os.environ,
+        "RUNPOD_TEST_MODE": "1",
+        "RUNPOD_POD_ID": "probe-shell-fixture",
+        "NETWORK_VOLUME_ROOT": str(tmp_path),
+        "PROJECT_ROOT": str(tmp_path / "project"),
+        "CACHE_ROOT": str(tmp_path / "cache"),
+        "SAVED_MODEL_ROOT": str(tmp_path / "savedModel"),
+    }
     result = subprocess.run(
-        [*command, "--checkpoint", str(tmp_path)],
+        ["bash", str(ROOT / "scripts/runpod_workflow.sh"), "probe-scales", *arguments],
         env=environment,
         capture_output=True,
         text=True,
         check=False,
     )
     assert result.returncode == 2
-    assert "no local model execution" in result.stderr
+    assert "--checkpoint" in result.stderr
     assert not list(tmp_path.iterdir())

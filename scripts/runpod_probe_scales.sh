@@ -8,12 +8,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/runpod_paths.sh
 source "${SCRIPT_DIR}/lib/runpod_paths.sh"
 
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+usage() {
     cat <<'EOF'
 Usage (inside an existing CUDA RunPod Pod):
-  bash scripts/runpod_workflow.sh probe-scales --checkpoint /runpod-volume/savedModel/<run-id> [OPTIONS]
+  bash scripts/runpod_workflow.sh probe-scales [--checkpoint RUN_ID] [OPTIONS]
 
 Options:
+  --checkpoint RUN_ID    Validation-selected best checkpoint from this run
+                         (default: latest completed training run on the mounted volume)
+  --selection-workers N  Completion-metadata I/O threads, 1-8 (default: CPU/memory-bounded auto)
   --train-samples N       Maximum probe train cutoffs (default: 16384)
   --validation-samples N  Maximum validation cutoffs (default: 4096)
   --batch-size N          Frozen extraction batch size (default: 16)
@@ -21,14 +24,22 @@ Options:
   --ridge-alpha X         Fixed positive ridge penalty (default: 10)
   --seed N                Reproducible probe seed (default: 42)
 
-Use a canonical run directory (validation-selected best) or exact retained checkpoint.
+Latest means the newest completion-result/training-result.json created_at, including early stop;
+unfinished runs are excluded. Missing/corrupt selection artifacts fail without an older fallback.
+Legacy absolute canonical run/checkpoint paths remain supported; relative paths are not accepted.
 The resolved checkpoint config is used, never the active stage selection.
 Results: NETWORK_VOLUME_ROOT/diagnostics/representation-scales/<run>/<checkpoint>/probe-*/
 This foreground command does not create/terminate a Pod or alter lifecycle completion markers.
 No test split, W&B run, training optimizer, or checkpoint update is involved.
 EOF
-    exit 0
-fi
+}
+
+for argument in "$@"; do
+    if [[ "${argument}" == "--help" || "${argument}" == "-h" ]]; then
+        usage
+        exit 0
+    fi
+done
 
 # SSH sessions may omit the Pod environment. Reuse the existing allowlisted
 # importer, without executing Python on the local macOS control machine.
@@ -47,10 +58,36 @@ if [[ -z "${RUNPOD_POD_ID:-}" ]]; then
     echo "Scale probing must run inside an existing CUDA RunPod Pod; no local model execution" >&2
     exit 2
 fi
-if [[ $# -lt 2 || "$1" != "--checkpoint" ]]; then
-    echo "Pass --checkpoint /runpod-volume/savedModel/<run-id> first; use --help for options" >&2
-    exit 2
-fi
+
+# Inspect the selector without changing argument order; argparse validates probe options.
+checkpoint_selector=""
+checkpoint_provided=0
+read_checkpoint_selector() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --checkpoint|--checkpoint=*)
+                if [[ ${checkpoint_provided} -eq 1 ]]; then
+                    echo "Pass --checkpoint at most once" >&2
+                    exit 2
+                fi
+                checkpoint_provided=1
+                if [[ "$1" == --checkpoint=* ]]; then
+                    checkpoint_selector="${1#--checkpoint=}"
+                else
+                    [[ $# -ge 2 ]] || { echo "--checkpoint requires a RUN_ID" >&2; exit 2; }
+                    checkpoint_selector="$2"
+                    shift
+                fi
+                [[ -n "${checkpoint_selector}" ]] || {
+                    echo "--checkpoint requires a RUN_ID; omit the option to select the latest run" >&2
+                    exit 2
+                }
+                ;;
+        esac
+        shift
+    done
+}
+read_checkpoint_selector "$@"
 
 NETWORK_VOLUME_ROOT="${NETWORK_VOLUME_ROOT:-${RUNPOD_VOLUME_ROOT:-/runpod-volume}}"
 PROJECT_ROOT="${PROJECT_ROOT:-${NETWORK_VOLUME_ROOT}/stock_forecasting}"
@@ -70,7 +107,16 @@ if [[ "${SAVED_MODEL_ROOT}" != "${NETWORK_VOLUME_ROOT}/savedModel" ]]; then
     echo "SAVED_MODEL_ROOT must equal NETWORK_VOLUME_ROOT/savedModel" >&2
     exit 2
 fi
-runpod_validate_path_in_root "$2" "${SAVED_MODEL_ROOT}" CHECKPOINT SAVED_MODEL_ROOT
+if [[ ${checkpoint_provided} -eq 1 ]]; then
+    if [[ "${checkpoint_selector}" == /* ]]; then
+        runpod_validate_path_in_root \
+            "${checkpoint_selector}" "${SAVED_MODEL_ROOT}" CHECKPOINT SAVED_MODEL_ROOT
+    elif [[ ! "${checkpoint_selector}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$ \
+        || "${checkpoint_selector}" == *--* ]]; then
+        echo "--checkpoint must be a safe RUN_ID, not a relative path; use --help" >&2
+        exit 2
+    fi
+fi
 export NETWORK_VOLUME_ROOT PROJECT_ROOT CACHE_ROOT SAVED_MODEL_ROOT
 export RUNPOD_VOLUME_ROOT="${NETWORK_VOLUME_ROOT}"
 

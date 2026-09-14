@@ -1453,14 +1453,36 @@ poetry run fin-ts-infer \
 模型，也不會新增尺度特徵分支。此功能沿用 checkpoint 原有的 train / validation
 資料切分，不修改日期邊界，不建立 test loader，不計算未來 alpha 標籤。
 
-先透過既有 `sync --apply` / 雲端程式碼部署流程更新程式碼。下列命令**在已掛載原始
-network volume、具備既有專案環境與 CUDA 的 RunPod GPU Pod 內執行**；本機只負責同步
-與下載，不載入 checkpoint。該 Pod 不應同時執行訓練或 validation 工作：
+`probe-scales` **不會自動建立 GPU Pod，也不能在本機執行模型診斷**。執行順序如下：
+
+1. 在本機先透過 `bash scripts/runpod_workflow.sh sync --apply` 與既有雲端部署流程
+   更新程式碼；GPU readiness 必須通過，原始 network volume 中須已有可用的專案環境。
+2. 若已有掛載同一 volume、且未執行訓練或 validation 的 GPU Pod，可直接使用。
+   若沒有，在本機執行下列既有 GPU Pod 建立入口；可用 `--gpuId` 指定 GPU 型號：
+
+   ```bash
+   bash scripts/runpod_workflow.sh train --maxRuntime 2h
+   ```
+
+   這裡的 `train` 只負責檢查 readiness、配置新 run identity、建立 Pod 與設定期限，
+   不會自動啟動訓練。此為沿用既有訓練 Pod 建立入口，並非獨立的診斷 Pod lifecycle。
+3. SSH 登入該 Pod，直接執行下列診斷命令。**不要執行**建立 Pod 後提示的
+   `runpod_tmux_launch.sh stage1-train`，也不要啟動 `stage1-validate`。
+
+在 GPU Pod 內，不指定 checkpoint 時，自動使用目前掛載 volume 中最新已完成訓練的
+run，並選取該 run 的 validation-selected best checkpoint：
+
+```bash
+cd /runpod-volume/stock_forecasting
+bash scripts/runpod_workflow.sh probe-scales
+```
+
+指定歷史訓練時，`--checkpoint` 直接填入 **run ID**，不需要完整路徑：
 
 ```bash
 cd /runpod-volume/stock_forecasting
 bash scripts/runpod_workflow.sh probe-scales \
-  --checkpoint /runpod-volume/savedModel/<run-id> \
+  --checkpoint run-20260905T203327Z-270337978 \
   --train-samples 16384 \
   --validation-samples 4096 \
   --batch-size 16 \
@@ -1468,8 +1490,19 @@ bash scripts/runpod_workflow.sh probe-scales \
   --seed 42
 ```
 
-Run 目錄會使用經完整性驗證的 validation-selected best checkpoint；也可指定完整的
-`<run-id>/checkpoint-NNNNNN` 路徑。設定一律取自所選 checkpoint 的 `resolved-config.yaml`，
+「最新完成」依各 run 已正式發布的 `completion-result/training-result.json` 中
+`created_at` 判定，包含正常完成與 early stopping；不依目錄修改時間、run ID 的字串
+順序、目前 active selection 或最高 checkpoint step 判定。沒有完成紀錄的中途訓練不會
+被自動選中；完成時間相同時以 run ID 作固定排序。選取最新 run 後，會驗證其
+`best-checkpoint.json` 與保留的 checkpoint；若資料損壞、缺少最佳 checkpoint 或存在
+未完成的 selection transaction，就明確失敗，不會悄悄改用較舊模型。
+完成紀錄本身格式不合法時也會停止掃描；可明確指定其他 run，或先處理損壞的產物。
+
+`--checkpoint RUN_ID` 使用該 run 經完整性驗證的最佳 checkpoint；明確指定 run 不要求
+訓練已完成，但 checkpoint 必須已完整提交且 GPU lease 可取得。為相容既有命令，仍接受
+完整的 `/runpod-volume/savedModel/<run-id>` 或其 `checkpoint-NNNNNN` 絕對路徑；
+不接受相對路徑、路徑跳脫或 symlink。
+設定一律取自所選 checkpoint 的 `resolved-config.yaml`，
 不採用目前 active Stage 設定。原 checkpoint 綁定的 bar store、dataset manifest 與
 model/tokenizer cache 必須仍存在且契約一致；不能直接改指向另一個資料版本。
 若 run 留有未完成的 checkpoint-selection transaction，診斷會先拒絕執行；須由原訓練
@@ -1477,8 +1510,11 @@ model/tokenizer cache 必須仍存在且契約一致；不能直接改指向另�
 
 命令為前景執行，與訓練 / validation 共用排他 GPU lease。它不建立或終止 Pod，不接入
 `runpod_tmux_launch.sh` 的訓練 lifecycle，不延長 Pod 原有的 hard deadline；執行期間須維持
-終端連線，完成後自行依既有方式關閉不再使用的 Pod。可用 `probe-scales --help` 查看
-所有參數。GPU 記憶體不足時可降低 `--batch-size`，抽樣列不受 batch size 影響。
+終端連線，完成後自行依既有方式關閉不再使用的 Pod；不能把診斷結束視為 Pod 已關閉。
+上述 `--maxRuntime` 屬於 Pod 建立流程的期限設定，不是診斷程式的計時器。
+可用 `probe-scales --help` 查看所有參數。自動選取 run 的 metadata 掃描採有界 thread pool，
+可用 `--selection-workers 1..8` 設定上限；實際數量還會受可見 CPU 與可用記憶體限制，
+不載入所有 run 的模型權重。GPU 記憶體不足時可降低 `--batch-size`，抽樣列不受 batch size 影響。
 SSH session 缺少 Pod 環境變數時，腳本會使用既有 allowlist PID 1 importer 載入，
 不需要手動重設 Stage、volume 或 credential 變數。
 
@@ -3243,15 +3279,39 @@ not retrain the forecasting model or add a numerical feature branch. It preserve
 checkpoint's train/validation split membership and date boundaries, creates no test loader,
 and calculates no future alpha labels.
 
-Update source through the existing `sync --apply` / cloud code-deployment workflow first.
-Run the following **inside an existing CUDA RunPod GPU Pod with the original network volume
-and project environment mounted**, not on the local control machine. The Pod should not be
-running training or validation concurrently:
+`probe-scales` **does not create a GPU Pod automatically and cannot run model diagnostics
+on the local control machine**. Follow this sequence:
+
+1. Update source from the control machine using `bash scripts/runpod_workflow.sh sync --apply`
+   and the existing cloud deployment workflow. GPU readiness must pass, and the original
+   network volume must already contain a usable project environment.
+2. Reuse an idle GPU Pod mounting that same volume if one is available. Otherwise, run the
+   existing GPU Pod creation entry point locally; `--gpuId` can select a GPU model:
+
+   ```bash
+   bash scripts/runpod_workflow.sh train --maxRuntime 2h
+   ```
+
+   Here, `train` checks readiness, allocates a fresh run identity, creates the Pod and arms
+   its deadlines. It does not start training automatically. This reuses the training Pod
+   creation route rather than introducing a separate diagnostic Pod lifecycle.
+3. SSH into the Pod and run the diagnostic commands below directly. **Do not execute** the
+   suggested `runpod_tmux_launch.sh stage1-train` command or start `stage1-validate`.
+
+Inside the GPU Pod, omit the checkpoint option to select the latest completed training run
+on the mounted volume and use that run's validation-selected best checkpoint:
+
+```bash
+cd /runpod-volume/stock_forecasting
+bash scripts/runpod_workflow.sh probe-scales
+```
+
+To select a historical training run, pass its **run ID** directly, without a full path:
 
 ```bash
 cd /runpod-volume/stock_forecasting
 bash scripts/runpod_workflow.sh probe-scales \
-  --checkpoint /runpod-volume/savedModel/<run-id> \
+  --checkpoint run-20260905T203327Z-270337978 \
   --train-samples 16384 \
   --validation-samples 4096 \
   --batch-size 16 \
@@ -3259,8 +3319,21 @@ bash scripts/runpod_workflow.sh probe-scales \
   --seed 42
 ```
 
-A run directory resolves its integrity-validated, validation-selected best checkpoint;
-an exact `<run-id>/checkpoint-NNNNNN` path is also supported. Configuration always comes
+"Latest completed" uses `created_at` in each atomically published
+`completion-result/training-result.json`, including normal completion and early stopping.
+It does not use directory modification times, run-ID chronology, the active selection or
+the highest checkpoint step. In-progress runs without completion metadata are excluded;
+equal completion timestamps are deterministically ordered by run ID. The selected run's
+`best-checkpoint.json` and retained checkpoint must pass integrity checks. Missing/corrupt
+selection artifacts or pending transactions fail explicitly, without falling back to an
+older model. Malformed completion metadata also stops discovery; select another run
+explicitly or address the damaged artifacts first.
+
+`--checkpoint RUN_ID` selects that run's integrity-validated best checkpoint. Explicit
+selection does not require completed training, but the checkpoint must be fully committed
+and the GPU lease must be available. For compatibility, canonical absolute
+`/runpod-volume/savedModel/<run-id>` and exact `checkpoint-NNNNNN` paths remain supported;
+relative paths, path traversal and symlinks are rejected. Configuration always comes
 from that checkpoint's `resolved-config.yaml`, never the current active stage selection.
 The original bound bar store, dataset manifest and model/tokenizer cache must still exist
 and pass compatibility checks; do not substitute another dataset version.
@@ -3271,8 +3344,12 @@ the read-only diagnostic never triggers checkpoint reconciliation or deletion.
 This foreground command shares the exclusive training/validation GPU lease. It does not
 create or terminate Pods, join the training lifecycle in `runpod_tmux_launch.sh`, or extend
 the Pod's existing hard deadline. Keep the terminal connected and close unused Pods through
-the existing workflow afterward. Use `probe-scales --help` for all options. Reduce
-`--batch-size` if extraction runs out of GPU memory; sample membership is batch-size invariant.
+the existing workflow afterward; diagnostic completion does not mean the Pod has stopped.
+The `--maxRuntime` above configures the Pod creation workflow, not a diagnostic runtime timer.
+Use `probe-scales --help` for all options. Automatic run discovery uses a bounded metadata
+thread pool; `--selection-workers 1..8` sets its upper limit, further constrained by visible
+CPUs and available memory. It never loads every run's model weights. Reduce `--batch-size`
+if extraction runs out of GPU memory; sample membership is batch-size invariant.
 For SSH sessions, the script reuses the existing allowlisted PID 1 environment importer;
 no manual stage, volume or credential exports are required.
 
