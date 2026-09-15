@@ -303,14 +303,25 @@ def test_missing_required_pod_environment_value_remains_fail_closed(
         SELECTION._verify_environment(selection_path, selection, environment)
 
 
-def test_date_or_universe_changes_dataset_request_identity(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("start", "end"),
+    (
+        pytest.param("2016-01-01", "2026-06-01", id="longer-training-history"),
+        pytest.param("2020-01-01", "2026-07-01", id="later-acquisition-end"),
+    ),
+)
+def test_date_or_universe_changes_dataset_request_identity(
+    tmp_path: Path,
+    start: str,
+    end: str,
+) -> None:
     project_root = _project_root(tmp_path)
     baseline = SELECTION._build_selection(
         _arguments(data_profile="us_tw_eodhd", universe="all"),
         project_root,
     )
     different_dates = SELECTION._build_selection(
-        _arguments(data_profile="us_tw_eodhd", universe="all", end="2023-01-01"),
+        _arguments(data_profile="us_tw_eodhd", universe="all", start=start, end=end),
         project_root,
     )
     explicit_universe = SELECTION._build_selection(
@@ -325,6 +336,27 @@ def test_date_or_universe_changes_dataset_request_identity(tmp_path: Path) -> No
 
     assert baseline["dataset_request_sha256"] != different_dates["dataset_request_sha256"]
     assert baseline["dataset_request_sha256"] != explicit_universe["dataset_request_sha256"]
+
+
+@pytest.mark.parametrize("stage", ("stage1", "stage2"))
+@pytest.mark.parametrize(
+    ("start", "end"),
+    (
+        pytest.param("2020-01-01", "2023-01-01", id="legacy-short-range"),
+        pytest.param("2020-01-01", "2026-05-31", id="incomplete-holdout"),
+        pytest.param("2025-06-01", "2026-06-01", id="no-training-dates"),
+    ),
+)
+def test_selection_rejects_ranges_that_do_not_cover_fixed_evaluation(
+    tmp_path: Path,
+    stage: str,
+    start: str,
+    end: str,
+) -> None:
+    project_root = _project_root(tmp_path)
+
+    with pytest.raises(SELECTION.SelectionError, match="Production data must start before"):
+        SELECTION._build_selection(_arguments(stage=stage, start=start, end=end), project_root)
 
 
 def test_h_start_changes_training_selection_but_reuses_the_same_bar_store_namespace(
@@ -454,8 +486,13 @@ def test_eodhd_volume_semantics_are_part_of_the_immutable_dataset_contract() -> 
         "common_stock_adr_tdr_and_allowlisted_unleveraged_equity_etf_v1"
     )
     assert SELECTION.PREPARATION_CONTRACT["split_policy"] == (
-        "global_chronological_cutoff_with_purge_embargo_and_label_end_guard_v1"
+        "fixed_dates_with_exact_label_end_guard_v1"
     )
+    assert SELECTION.PREPARATION_CONTRACT["fixed_split"] == {
+        "train_end": "2025-06-01",
+        "validation_end": "2025-12-01",
+        "test_end": "2026-06-01",
+    }
 
 
 def test_provider_acquisition_values_cannot_change_selection_identity(tmp_path: Path) -> None:
