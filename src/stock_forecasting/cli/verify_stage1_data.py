@@ -24,6 +24,7 @@ from stock_forecasting.data.manifest import (
     validate_dataset_storage_contract,
     validate_training_dataset_manifest,
 )
+from stock_forecasting.dataset_identity import MIN_FIXED_EVALUATION_DATES
 from stock_forecasting.training_paths import resolve_bar_store_path
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -231,6 +232,11 @@ def build_readiness_manifest(
         benchmark_mapping_path=config.data.benchmark_mapping_path,
         effective_embargo_trading_days=config.data.effective_embargo_trading_days,
         max_abs_log_return=config.data.max_abs_log_return,
+        fixed_split=config.data.fixed_split,
+        minimum_evaluation_dates=(
+            MIN_FIXED_EVALUATION_DATES
+            if config.model.time_series_backend == "kronos" else 0
+        ),
     )
     if dataset.get("selected_datasets") != sorted(config.data.selected_datasets):
         raise ValueError("Dataset providers differ from the selected data profile")
