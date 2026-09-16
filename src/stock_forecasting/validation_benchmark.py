@@ -41,6 +41,7 @@ from stock_forecasting.evaluation_protocol import (
     paired_block_comparison,
     sample_membership,
 )
+from stock_forecasting.evaluation_resume_migrations import EVALUATION_RESUME_MIGRATIONS
 from stock_forecasting.run_contract import (
     training_resume_contract,
     validate_training_resume_contract,
@@ -234,7 +235,26 @@ def _evaluation_contracts_are_resume_compatible(
 
     stored_view = _evaluation_contract_resume_view(stored)
     current_view = _evaluation_contract_resume_view(current)
-    return stored_view is not None and stored_view == current_view
+    if stored_view is None or current_view is None:
+        return False
+    if stored_view == current_view:
+        return True
+    stored_files = stored_view.pop("evaluation_implementation")
+    current_files = current_view.pop("evaluation_implementation")
+    if (
+        stored_view != current_view
+        or not isinstance(stored_files, dict)
+        or not isinstance(current_files, dict)
+        or set(stored_files) != set(current_files)
+    ):
+        return False
+    changed_files = {name for name in stored_files if stored_files[name] != current_files[name]}
+    return any(
+        changed_files == set(migration["from_files"]) == set(migration["to_files"])
+        and all(stored_files[name] == value for name, value in migration["from_files"].items())
+        and all(current_files[name] == value for name, value in migration["to_files"].items())
+        for migration in EVALUATION_RESUME_MIGRATIONS
+    )
 
 
 def build_evaluation_contract(

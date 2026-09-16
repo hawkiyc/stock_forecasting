@@ -22,6 +22,7 @@ from stock_forecasting.preflight import run_preflight
 from stock_forecasting.run_paths import validate_checkpoint_path, validate_run_id
 from stock_forecasting.training import (
     RuntimeBatchPlan,
+    _checkpoint_runtime_execution_plan,
     build_dataloaders,
     evaluate_loader,
     set_global_seed,
@@ -132,7 +133,12 @@ def evaluate_checkpoint(
     progress = checkpoint_state.get("training_progress")
     if not isinstance(progress, dict):
         raise ValueError("Checkpoint has no runtime training progress")
-    batch_plan = RuntimeBatchPlan.from_dict(progress.get("runtime_batch_plan"))
+    execution_plan = _checkpoint_runtime_execution_plan(checkpoint_state)
+    batch_plan = (
+        execution_plan.batch_plan
+        if execution_plan is not None
+        else RuntimeBatchPlan.from_dict(progress.get("runtime_batch_plan"))
+    )
     _train_loader, validation_loader, test_loader = build_dataloaders(
         config,
         batch_plan=batch_plan,

@@ -16,6 +16,7 @@ from stock_forecasting.checkpoint_resume_migrations import CHECKPOINT_RETENTION_
 from stock_forecasting.config import ExperimentConfig
 from stock_forecasting.dataset_identity import FIXED_EVALUATION_SPLIT
 from stock_forecasting.evaluation_protocol import sample_membership
+from stock_forecasting.evaluation_resume_migrations import EVALUATION_RESUME_MIGRATIONS
 from stock_forecasting.run_contract import (
     CHECKPOINT_ARTIFACT_SCHEMA_VERSION,
     training_resume_contract,
@@ -24,6 +25,7 @@ from stock_forecasting.training import _flatten_metrics
 from stock_forecasting.validation_benchmark import (
     VALIDATION_BENCHMARK_SCHEMA_VERSION,
     ValidationBenchmark,
+    _evaluation_contracts_are_resume_compatible,
     _unflatten_validation_metrics,
     build_evaluation_contract,
     checkpoint_validation_snapshot,
@@ -150,6 +152,81 @@ def test_evaluation_contract_keeps_numerical_validation_settings(
     second_contract = _evaluation_contract(second, tmp_path / "checkpoint")
 
     assert first_contract != second_contract
+
+
+def _runtime_plan_reader_contracts(tmp_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    current = _evaluation_contract(config, tmp_path / "checkpoint")
+    stored = copy.deepcopy(current)
+    migration = EVALUATION_RESUME_MIGRATIONS[0]
+    for name, fingerprint in migration["to_files"].items():
+        assert current["inputs"]["evaluation_implementation"][name] == fingerprint
+    stored["inputs"]["evaluation_implementation"].update(copy.deepcopy(migration["from_files"]))
+    stored["digest"] = _canonical_digest({"version": stored["version"], "inputs": stored["inputs"]})
+    return stored, current
+
+
+def test_runtime_plan_reader_fix_preserves_completed_baselines_on_resume(tmp_path: Path) -> None:
+    stored, current = _runtime_plan_reader_contracts(tmp_path)
+    before = copy.deepcopy(stored)
+    assert _evaluation_contracts_are_resume_compatible(stored, current)
+    assert stored == before
+    models = {"always_buy": {"state": "complete", "metrics": _validation_metrics()}}
+    output = tmp_path / "validation-benchmark.json"
+    output.write_text(
+        json.dumps({
+            "schema_version": VALIDATION_BENCHMARK_SCHEMA_VERSION,
+            "evaluation_contract": stored,
+            "state": "failed",
+            "error": "ValueError: Checkpoint runtime batch plan must be a mapping",
+            "run_id": current["inputs"]["run_id"],
+            "checkpoint": current["inputs"]["checkpoint"]["path"],
+            "models": models,
+        }),
+        encoding="utf-8",
+    )
+    benchmark = object.__new__(ValidationBenchmark)
+    benchmark.resume = True
+    benchmark.recompute_full_model = True
+    benchmark.output = output
+    benchmark.evaluation_contract = current
+    benchmark.run_id = current["inputs"]["run_id"]
+    benchmark.checkpoint = Path(current["inputs"]["checkpoint"]["path"])
+    benchmark.payload = benchmark._initial_payload()
+
+    assert benchmark.payload["models"] == models
+    assert benchmark.payload["evaluation_contract"] == current
+    assert benchmark.payload["state"] == "running"
+    assert "error" not in benchmark.payload
+    assert benchmark._completed("always_buy")
+    assert not benchmark._completed("kronos_full")
+
+
+@pytest.mark.parametrize("side", ["stored", "current"])
+@pytest.mark.parametrize("name", ["cli/evaluate.py", "validation_benchmark.py", "metrics.py"])
+def test_runtime_plan_reader_migration_rejects_unapproved_code(
+    tmp_path: Path, side: str, name: str,
+) -> None:
+    stored, current = _runtime_plan_reader_contracts(tmp_path)
+    target = stored if side == "stored" else current
+    target["inputs"]["evaluation_implementation"][name]["sha256"] = "0" * 64
+    assert not _evaluation_contracts_are_resume_compatible(stored, current)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "dataset_artifacts", "checkpoint", "evaluation_protocol", "models", "seeds",
+        "model_architecture_sha256", "training_resume_contract_sha256",
+        "validation_numerical_config",
+    ],
+)
+def test_runtime_plan_reader_migration_rejects_changed_numerical_inputs(
+    tmp_path: Path, field: str,
+) -> None:
+    stored, current = _runtime_plan_reader_contracts(tmp_path)
+    stored["inputs"][field] = {"changed": True}
+    assert not _evaluation_contracts_are_resume_compatible(stored, current)
 
 
 def test_validation_setup_accepts_an_allowlisted_training_code_migration(
