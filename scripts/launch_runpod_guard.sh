@@ -82,7 +82,8 @@ PID_FILE="${LOG_FILE%.log}.pid"
 CAFFEINATE_PID_FILE="${LOG_FILE%.log}.caffeinate.pid"
 KEEP_AWAKE_FILE="${LOG_FILE%.log}.keep-awake.json"
 ready_tmp="${READY_FILE}.tmp.$$"
-printf '{"state":"launching","pod_id":"%s"}\n' "${POD_ID}" > "${ready_tmp}"
+printf '{"state":"launching","pod_id":"%s","delay_seconds":%d}\n' \
+    "${POD_ID}" "${DELAY_SECONDS}" > "${ready_tmp}"
 mv "${ready_tmp}" "${READY_FILE}"
 
 nohup env -i \

@@ -1263,6 +1263,34 @@ Secret reference，並啟動獨立 hard-limit guard。本機 guard 在 macOS 會
 `caffeinate -is -w <guard-pid>` 防止控制端睡眠，並把 guard、caffeinate 與
 keep-awake 狀態寫在提示的 guard log 同目錄；不要關閉 guard process 或讓本機
 斷電。Pod 端仍會自行終止，RunPod 的 `--terminate-after` 是第三層上限。
+
+##### 本機休眠或關機後恢復 guard
+
+本機控制端休眠或關機時，本機 guard 無法執行；重新喚醒或開機並恢復網路後，
+先執行唯讀檢查：
+
+```bash
+bash scripts/runpod_workflow.sh recover
+```
+
+`recover` 會列出同一個 RunPod network volume 下仍為啟動狀態的本專案 Pod，
+讀取遠端 lifecycle marker，並將 `preparing`、`finalizing` 或 CPU 的
+`downloaded` 中間狀態視為仍有 workflow 在執行。若本機 guard 已不存在且原本的
+hard-limit 尚未到期，會在 `--apply` 模式下以原本剩餘時間重新啟動 guard；不會
+把整個時間上限重新計算，避免休眠造成額外租用時間。
+
+確認輸出正確後，才使用會改變遠端狀態的模式：
+
+```bash
+bash scripts/runpod_workflow.sh recover --apply
+```
+
+`--apply` 需要兩次一致的 RunPod/API 與 S3 lifecycle 觀測，並且在任何 mutation
+前再做一次最新觀測。只有明確驗證為 `ready`、`failed`、`timed_out` 或 CPU
+terminal `downloaded` 的 Pod 才會被 terminate。`runtimeStatus=initializing`、
+查詢錯誤、marker 不存在、marker 無法驗證或狀態不明時都會保留 Pod，因此
+「無法證明閒置」不會被當成「閒置」。這個功能不會終止不屬於本 network volume
+或不含本專案角色的 Pod。
 由 Console SSH 登入後執行：
 
 ```bash
@@ -3260,6 +3288,37 @@ writes guard, caffeinate, and keep-awake state beside the reported guard log.
 Do not stop the guard process or power off the control machine. Pod-side
 self-termination remains primary, and RunPod `--terminate-after` is a third
 deadline. SSH through the Console and run:
+
+##### Recovering the guard after local sleep or shutdown
+
+While the local control machine is asleep or powered off, its guard cannot
+poll RunPod. After the machine wakes or boots and the network is available,
+run the read-only check first:
+
+```bash
+bash scripts/runpod_workflow.sh recover
+```
+
+`recover` lists active Pods attached to this project's RunPod network volume,
+reads the remote lifecycle marker, and treats `preparing`, `finalizing`, and
+the CPU `downloaded` intermediate state as an active workflow. With `--apply`,
+an active workload whose local guard is missing is re-armed using its original
+remaining hard-limit time; the full limit is not restarted after sleep.
+
+After reviewing the dry-run output, use the mutating mode:
+
+```bash
+bash scripts/runpod_workflow.sh recover --apply
+```
+
+The mutating mode requires two consistent RunPod/API and S3 lifecycle
+observations, followed by one final observation immediately before mutation.
+A Pod is terminated only when its lifecycle is explicitly verified as `ready`,
+`failed`, `timed_out`, or CPU terminal `downloaded`. Pods with
+`runtimeStatus=initializing`, query failures, a missing marker, an unverifiable
+marker, or an unknown state are retained because inability to prove idleness is
+not treated as idleness. Pods that are not attached to this network volume or
+do not carry an approved project role are ignored.
 
 ```bash
 cd /runpod-volume/stock_forecasting

@@ -26,6 +26,7 @@ Usage:
   bash scripts/runpod_workflow.sh resume [--maxRuntime DURATION] [--gpuId GPU_ID] [RUN_ID]
   bash scripts/runpod_workflow.sh validate [VALIDATION OPTIONS]
   bash scripts/runpod_workflow.sh status
+  bash scripts/runpod_workflow.sh recover [--apply] [--pod-id POD_ID]
   bash scripts/runpod_workflow.sh download [--resume] [--checkpointScope all|best] [RUN_ID]
   bash scripts/runpod_workflow.sh download-probes [PROBE_RUN_ID]
   bash scripts/runpod_workflow.sh cpu-logs
@@ -396,6 +397,9 @@ EOF
     status)
         [[ $# -eq 0 ]] || { usage; exit 2; }
         exec bash "${SCRIPT_DIR}/show_runpod_status.sh"
+        ;;
+    recover)
+        exec python3 "${SCRIPT_DIR}/recover_runpod_after_wake.py" "$@"
         ;;
     download)
         exec bash "${SCRIPT_DIR}/download_runpod_results.sh" "$@"
