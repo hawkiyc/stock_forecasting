@@ -93,6 +93,105 @@ def test_guard_permission_error_is_not_reported_as_missing(
     assert RECOVERY.guard_alive("recovery-pod", tmp_path) is True
 
 
+def test_guard_from_previous_boot_is_reported_as_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "recovery-pod.pid").write_text("1234\n", encoding="utf-8")
+    (tmp_path / "recovery-pod.ready.json").write_text(
+        json.dumps(
+            {
+                "state": "armed",
+                "pod_id": "recovery-pod",
+                "pid": 1234,
+                "host_boot_id": "darwin-old-boot",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        RECOVERY, "host_boot_identity", lambda: ("darwin-current-boot", 200)
+    )
+
+    assert RECOVERY.guard_alive("recovery-pod", tmp_path) is False
+
+
+def test_legacy_guard_armed_before_current_boot_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "recovery-pod.pid").write_text("1234\n", encoding="utf-8")
+    (tmp_path / "recovery-pod.ready.json").write_text(
+        json.dumps(
+            {
+                "state": "armed",
+                "pod_id": "recovery-pod",
+                "pid": 1234,
+                "armed_at": "2026-01-01T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    current_boot = int(datetime(2026, 1, 2, tzinfo=UTC).timestamp())
+    monkeypatch.setattr(
+        RECOVERY, "host_boot_identity", lambda: ("darwin-current-boot", current_boot)
+    )
+
+    assert RECOVERY.guard_alive("recovery-pod", tmp_path) is False
+
+
+def test_rearm_disables_emergency_termination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(RECOVERY.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(RECOVERY.os, "access", lambda path, mode: True)
+    monkeypatch.setattr(
+        RECOVERY, "host_boot_identity", lambda: ("darwin-current-boot", 200)
+    )
+
+    def run_guard(*args: object, **kwargs: object) -> object:
+        captured["env"] = kwargs["env"]
+        return RECOVERY.subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(RECOVERY.subprocess, "run", run_guard)
+
+    RECOVERY.rearm_guard(_pod(), 300, tmp_path)
+
+    command_env = captured["env"]
+    assert isinstance(command_env, dict)
+    assert command_env["RUNPOD_GUARD_EMERGENCY_TERMINATE_ON_STARTUP_FAILURE"] == "0"
+
+
+def test_guard_pid_must_still_belong_to_the_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "recovery-pod.pid").write_text("1234\n", encoding="utf-8")
+    (tmp_path / "recovery-pod.ready.json").write_text(
+        json.dumps(
+            {
+                "state": "armed",
+                "pod_id": "recovery-pod",
+                "pid": 1234,
+                "host_boot_id": "darwin-current-boot",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        RECOVERY, "host_boot_identity", lambda: ("darwin-current-boot", 200)
+    )
+    monkeypatch.setattr(RECOVERY.os, "kill", lambda pid, signal: None)
+    monkeypatch.setattr(
+        RECOVERY.subprocess,
+        "run",
+        lambda *args, **kwargs: RECOVERY.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="unrelated-process", stderr=""
+        ),
+    )
+
+    assert RECOVERY.guard_alive("recovery-pod", tmp_path) is False
+
+
 def test_unknown_lifecycle_state_is_not_a_termination_signal() -> None:
     class Readiness:
         @staticmethod

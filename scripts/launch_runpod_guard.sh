@@ -24,6 +24,7 @@ STARTUP_TIMEOUT_SECONDS="${RUNPOD_GUARD_STARTUP_TIMEOUT_SECONDS:-15}"
 RUNPOD_GUARD_VOLUME_ROOT="${RUNPOD_GUARD_VOLUME_ROOT:-/runpod-volume}"
 RUNPOD_GUARD_RUN_ID="${RUNPOD_GUARD_RUN_ID:-}"
 RUNPOD_GUARD_KEEP_AWAKE="${RUNPOD_GUARD_KEEP_AWAKE:-auto}"
+RUNPOD_GUARD_EMERGENCY_TERMINATE_ON_STARTUP_FAILURE="${RUNPOD_GUARD_EMERGENCY_TERMINATE_ON_STARTUP_FAILURE:-1}"
 
 if [[ ! "${POD_ID}" =~ ^[A-Za-z0-9_-]+$ \
     || ! "${DELAY_SECONDS}" =~ ^[1-9][0-9]*$ \
@@ -35,6 +36,11 @@ if [[ "${RUNPOD_GUARD_KEEP_AWAKE}" != "auto" \
     && "${RUNPOD_GUARD_KEEP_AWAKE}" != "0" \
     && "${RUNPOD_GUARD_KEEP_AWAKE}" != "1" ]]; then
     echo "RUNPOD_GUARD_KEEP_AWAKE must be auto, 0, or 1" >&2
+    exit 2
+fi
+if [[ "${RUNPOD_GUARD_EMERGENCY_TERMINATE_ON_STARTUP_FAILURE}" != "0" \
+    && "${RUNPOD_GUARD_EMERGENCY_TERMINATE_ON_STARTUP_FAILURE}" != "1" ]]; then
+    echo "RUNPOD_GUARD_EMERGENCY_TERMINATE_ON_STARTUP_FAILURE must be 0 or 1" >&2
     exit 2
 fi
 if [[ ! "${RUNPOD_GUARD_VOLUME_ROOT}" =~ ^/[A-Za-z0-9._/-]+$ \
@@ -76,14 +82,34 @@ runpod_assert_project_env_file "${LOCAL_PROJECT_ROOT}"
 RUNPOD_ENV_FILE="$(runpod_project_env_file "${LOCAL_PROJECT_ROOT}")"
 export RUNPOD_ENV_FILE
 
+HOST_BOOT_ID=""
+if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+    IFS= read -r linux_boot_id < /proc/sys/kernel/random/boot_id || true
+    if [[ "${linux_boot_id:-}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        HOST_BOOT_ID="linux-${linux_boot_id}"
+    fi
+elif [[ -x /usr/sbin/sysctl ]] || command -v sysctl >/dev/null 2>&1; then
+    sysctl_command="$(command -v sysctl 2>/dev/null || true)"
+    sysctl_command="${sysctl_command:-/usr/sbin/sysctl}"
+    boot_info="$("${sysctl_command}" -n kern.boottime 2>/dev/null || true)"
+    if [[ "${boot_info}" =~ sec[[:space:]]*=[[:space:]]*([0-9]+) ]]; then
+        HOST_BOOT_ID="darwin-${BASH_REMATCH[1]}"
+    fi
+fi
+if [[ "${RUNPOD_GUARD_EMERGENCY_TERMINATE_ON_STARTUP_FAILURE}" == "0" \
+    && -z "${HOST_BOOT_ID}" ]]; then
+    echo "Guard recovery cannot establish the current host boot identity" >&2
+    exit 2
+fi
+
 mkdir -p "$(dirname "${LOG_FILE}")"
 READY_FILE="${LOG_FILE%.log}.ready.json"
 PID_FILE="${LOG_FILE%.log}.pid"
 CAFFEINATE_PID_FILE="${LOG_FILE%.log}.caffeinate.pid"
 KEEP_AWAKE_FILE="${LOG_FILE%.log}.keep-awake.json"
 ready_tmp="${READY_FILE}.tmp.$$"
-printf '{"state":"launching","pod_id":"%s","delay_seconds":%d}\n' \
-    "${POD_ID}" "${DELAY_SECONDS}" > "${ready_tmp}"
+printf '{"state":"launching","pod_id":"%s","delay_seconds":%d,"host_boot_id":"%s"}\n' \
+    "${POD_ID}" "${DELAY_SECONDS}" "${HOST_BOOT_ID}" > "${ready_tmp}"
 mv "${ready_tmp}" "${READY_FILE}"
 
 nohup env -i \
@@ -99,6 +125,7 @@ nohup env -i \
     "RUNPOD_GUARD_LIFECYCLE_KEY=${LIFECYCLE_KEY}" \
     "RUNPOD_GUARD_RUN_ID=${RUNPOD_GUARD_RUN_ID}" \
     "RUNPOD_GUARD_VOLUME_ROOT=${RUNPOD_GUARD_VOLUME_ROOT}" \
+    "RUNPOD_GUARD_HOST_BOOT_ID=${HOST_BOOT_ID}" \
     "RUNPOD_GUARD_READY_FILE=${READY_FILE}" \
     "RUNPOD_GUARD_REQUIRE_LIFECYCLE=1" \
     "RUNPOD_TEST_MODE=${RUNPOD_TEST_MODE:-0}" \
@@ -161,14 +188,20 @@ if kill -0 "${GUARD_PID}" 2>/dev/null; then
     kill "${GUARD_PID}" 2>/dev/null || true
     wait "${GUARD_PID}" 2>/dev/null || true
 fi
-printf '[%s] guard startup handshake failed; requesting emergency Pod termination\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${LOG_FILE}"
-if bash "${RUNPODCTL_WRAPPER}" pod delete "${POD_ID}" >> "${LOG_FILE}" 2>&1; then
-    printf '[%s] emergency termination request succeeded\n' \
+if [[ "${RUNPOD_GUARD_EMERGENCY_TERMINATE_ON_STARTUP_FAILURE}" == "1" ]]; then
+    printf '[%s] guard startup handshake failed; requesting emergency Pod termination\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${LOG_FILE}"
+    if bash "${RUNPODCTL_WRAPPER}" pod delete "${POD_ID}" >> "${LOG_FILE}" 2>&1; then
+        printf '[%s] emergency termination request succeeded\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${LOG_FILE}"
+    else
+        printf '[%s] emergency termination failed; manual intervention is required\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${LOG_FILE}"
+    fi
+    echo "External guard failed to arm; the newly created Pod was sent an emergency delete request" >&2
 else
-    printf '[%s] emergency termination failed; manual intervention is required\n' \
+    printf '[%s] guard startup handshake failed; emergency termination disabled; Pod left running\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${LOG_FILE}"
+    echo "External guard failed to arm; the existing Pod was left running" >&2
 fi
-echo "External guard failed to arm; the newly created Pod was sent an emergency delete request" >&2
 exit 4

@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -91,6 +92,48 @@ def parse_timestamp(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return None
     return parsed.astimezone(UTC)
+
+
+def host_boot_identity() -> tuple[str, int | None]:
+    """Return a stable boot identifier and boot epoch when the host exposes them."""
+
+    boot_id_path = Path("/proc/sys/kernel/random/boot_id")
+    boot_epoch: int | None = None
+    try:
+        boot_id = boot_id_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        boot_id = ""
+    if boot_id and re.fullmatch(r"[A-Za-z0-9._-]+", boot_id):
+        try:
+            for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+                if line.startswith("btime "):
+                    boot_epoch = int(line.split()[1])
+                    break
+        except (OSError, ValueError, IndexError):
+            boot_epoch = None
+        return f"linux-{boot_id}", boot_epoch
+
+    sysctl_path = shutil.which("sysctl")
+    if sysctl_path is None and Path("/usr/sbin/sysctl").is_file():
+        sysctl_path = "/usr/sbin/sysctl"
+    if sysctl_path is None:
+        return "", None
+    try:
+        result = subprocess.run(
+            [sysctl_path, "-n", "kern.boottime"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return "", None
+    if result.returncode != 0:
+        return "", None
+    match = re.search(r"\bsec\s*=\s*([0-9]+)", result.stdout)
+    if match is None:
+        return "", None
+    boot_epoch = int(match.group(1))
+    return f"darwin-{boot_epoch}", boot_epoch
 
 
 def load_readiness_module() -> Any:
@@ -282,6 +325,15 @@ def guard_alive(pod_id: str, guard_dir: Path) -> bool:
             or ready.get("pid") != pid
         ):
             return False
+        current_boot_id, current_boot_epoch = host_boot_identity()
+        recorded_boot_id = ready.get("host_boot_id")
+        if isinstance(recorded_boot_id, str) and recorded_boot_id:
+            if current_boot_id and recorded_boot_id != current_boot_id:
+                return False
+        elif current_boot_epoch is not None:
+            armed_at = parse_timestamp(ready.get("armed_at"))
+            if armed_at is not None and armed_at.timestamp() < current_boot_epoch:
+                return False
         os.kill(pid, 0)
     except PermissionError:
         # A permission error means the process exists but cannot be probed here.
@@ -290,6 +342,22 @@ def guard_alive(pod_id: str, guard_dir: Path) -> bool:
     except ProcessLookupError:
         return False
     except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    try:
+        process = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return True
+    if process.returncode == 0:
+        command = process.stdout.strip()
+        return "terminate_runpod_after.sh" in command and pod_id in command
+    if "operation not permitted" in process.stderr.lower():
+        return True
+    if not process.stdout.strip() and not process.stderr.strip():
         return False
     return True
 
@@ -303,6 +371,23 @@ def rearm_guard(pod: dict[str, Any], remaining: int, guard_dir: Path) -> None:
     if expected is None:
         raise RuntimeError("Pod role has no approved lifecycle mapping")
     _, lifecycle_key = expected
+    required_commands = ["bash", "python3", "runpodctl", "aws"]
+    if sys.platform == "darwin":
+        required_commands.append("caffeinate")
+    missing_commands = [name for name in required_commands if shutil.which(name) is None]
+    if missing_commands:
+        raise RuntimeError(
+            "guard re-arm prerequisites are missing: " + ", ".join(missing_commands)
+        )
+    required_files = [GUARD_LAUNCHER, RUNPODCTL, S3, READINESS]
+    unavailable_files = [str(path) for path in required_files if not os.access(path, os.R_OK)]
+    if unavailable_files:
+        raise RuntimeError(
+            "guard re-arm project files are unavailable: " + ", ".join(unavailable_files)
+        )
+    current_boot_id, _ = host_boot_identity()
+    if not current_boot_id:
+        raise RuntimeError("guard re-arm cannot establish the current host boot identity")
     env = pod.get("env", {})
     run_id = str(env.get("WANDB_RUN_ID", "")) if isinstance(env, dict) else ""
     guard_log = guard_dir / f"{pod['id']}.log"
@@ -311,6 +396,7 @@ def rearm_guard(pod: dict[str, Any], remaining: int, guard_dir: Path) -> None:
         env.get("NETWORK_VOLUME_ROOT", env.get("RUNPOD_VOLUME_ROOT", "/runpod-volume"))
     )
     command_env["RUNPOD_GUARD_RUN_ID"] = run_id
+    command_env["RUNPOD_GUARD_EMERGENCY_TERMINATE_ON_STARTUP_FAILURE"] = "0"
     result = subprocess.run(
         [
             "bash",

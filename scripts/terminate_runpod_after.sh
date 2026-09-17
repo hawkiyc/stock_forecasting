@@ -29,6 +29,7 @@ READY_FILE="${RUNPOD_GUARD_READY_FILE:-}"
 REQUIRE_LIFECYCLE="${RUNPOD_GUARD_REQUIRE_LIFECYCLE:-0}"
 RUNPOD_GUARD_VOLUME_ROOT="${RUNPOD_GUARD_VOLUME_ROOT:-/runpod-volume}"
 RUNPOD_GUARD_RUN_ID="${RUNPOD_GUARD_RUN_ID:-}"
+RUNPOD_GUARD_HOST_BOOT_ID="${RUNPOD_GUARD_HOST_BOOT_ID:-}"
 GUARD_S3_CONNECT_TIMEOUT="${RUNPOD_GUARD_S3_CONNECT_TIMEOUT:-5}"
 GUARD_S3_READ_TIMEOUT="${RUNPOD_GUARD_S3_READ_TIMEOUT:-15}"
 GUARD_S3_MAX_ATTEMPTS="${RUNPOD_GUARD_S3_MAX_ATTEMPTS:-1}"
@@ -80,6 +81,11 @@ if [[ -n "${RUNPOD_GUARD_RUN_ID}" \
     echo "RUNPOD_GUARD_RUN_ID must be a safe 1-120 character run ID" >&2
     exit 2
 fi
+if [[ -n "${RUNPOD_GUARD_HOST_BOOT_ID}" \
+    && ! "${RUNPOD_GUARD_HOST_BOOT_ID}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "RUNPOD_GUARD_HOST_BOOT_ID must use safe characters" >&2
+    exit 2
+fi
 if [[ -n "${READY_FILE}" ]]; then
     if [[ "${READY_FILE}" != /* || "$(dirname "${READY_FILE}")" != "$(dirname "${LOG_FILE}")" ]]; then
         echo "Guard readiness file must be an absolute sibling of the guard log" >&2
@@ -126,8 +132,9 @@ publish_guard_ready() {
         return 0
     fi
     local ready_tmp="${READY_FILE}.tmp.$$"
-    printf '{"state":"armed","pid":%d,"pod_id":"%s","run_id":"%s","lifecycle_key":"%s","armed_at":"%s"}\n' \
+    printf '{"state":"armed","pid":%d,"pod_id":"%s","run_id":"%s","lifecycle_key":"%s","delay_seconds":%d,"host_boot_id":"%s","armed_at":"%s"}\n' \
         "$$" "${POD_ID}" "${RUNPOD_GUARD_RUN_ID}" "${LIFECYCLE_KEY}" \
+        "${DELAY_SECONDS}" "${RUNPOD_GUARD_HOST_BOOT_ID}" \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         > "${ready_tmp}"
     mv "${ready_tmp}" "${READY_FILE}"

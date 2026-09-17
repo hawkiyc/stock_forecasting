@@ -1290,7 +1290,10 @@ bash scripts/runpod_workflow.sh recover --apply
 terminal `downloaded` 的 Pod 才會被 terminate。`runtimeStatus=initializing`、
 查詢錯誤、marker 不存在、marker 無法驗證或狀態不明時都會保留 Pod，因此
 「無法證明閒置」不會被當成「閒置」。這個功能不會終止不屬於本 network volume
-或不含本專案角色的 Pod。
+或不含本專案角色的 Pod。Recovery 重新啟動 guard 時會停用新建 Pod 專用的
+startup emergency termination；若本機工具或 guard handshake 失敗，既有 Pod
+會保持執行並回報錯誤。Readiness 會記錄本機 boot identity，重新開機前遺留的
+PID 不會被誤認為目前仍存活的 guard。
 由 Console SSH 登入後執行：
 
 ```bash
@@ -3318,7 +3321,11 @@ A Pod is terminated only when its lifecycle is explicitly verified as `ready`,
 `runtimeStatus=initializing`, query failures, a missing marker, an unverifiable
 marker, or an unknown state are retained because inability to prove idleness is
 not treated as idleness. Pods that are not attached to this network volume or
-do not carry an approved project role are ignored.
+do not carry an approved project role are ignored. Guard recovery disables the
+new-Pod startup emergency termination path: if local prerequisites or the guard
+handshake fail, the existing Pod is left running and the error is reported.
+Guard readiness also records the host boot identity so a PID left by an earlier
+boot cannot be mistaken for a live guard after restart.
 
 ```bash
 cd /runpod-volume/stock_forecasting
