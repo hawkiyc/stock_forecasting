@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Quant-only OHLCV forecasting with a finance-pretrained time-series foundation model."
 authors = [{ name = "Project Contributors" }]
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "einops>=0.8.1,<1.0",

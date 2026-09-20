@@ -2,6 +2,18 @@
 
 ## 中文
 
+### 授權與版本
+
+本專案自有程式碼及明示發布的模型新增部分，僅限自然人免費研究、學習、實驗、
+非商業 hobby project，以及使用本人資金進行個人交易。**公司、法人、基金、量化
+交易公司、任何組織用途、商業產品與付費服務均不獲授權**，也不得代管第三方資金。
+完整條文見 [LICENSE](LICENSE) 與 [MODEL_LICENSE](MODEL_LICENSE)。這是
+source-available 個人用途授權，不是 OSI 定義的開源授權。
+
+Kronos 原始碼、預訓練權重與 tokenizer 保留原有 MIT 授權；本專案不限制上游獨立
+授予的權利。詳見 [第三方聲明](THIRD_PARTY_NOTICES.md)。GitHub 可能將自訂授權顯示
+為 Other；以授權全文為準。架構與報告快照見 [版本紀錄](RELEASES.md)。
+
 ### 專案定位
 
 本專案以美國與台灣普通股、ADR／TDR，以及經稽核且可映射的非槓桿股票型 ETF
@@ -1825,6 +1837,22 @@ Stage 1 只證明腳本與契約可運作，不用來宣稱模型具備 alpha。
 ---
 
 ## English
+
+### License and versions
+
+Project-owned code and expressly released model additions are available only to
+individuals for free personal research, learning, experimentation, non-commercial
+hobby projects, and trading with their own personal funds. **Companies, legal
+entities, funds, quantitative trading firms, all organizational uses, commercial
+products, and paid services are not licensed.** Managing third-party capital is
+also prohibited. See [LICENSE](LICENSE) and [MODEL_LICENSE](MODEL_LICENSE).
+This is source-available personal-use software, not OSI open-source software.
+
+Kronos source, pretrained weights, and tokenizer retain their original MIT terms.
+This project does not restrict rights independently granted upstream. See
+[third-party notices](THIRD_PARTY_NOTICES.md). GitHub may show a custom license as
+Other; the complete text controls. See [release history](RELEASES.md) for
+architecture and report snapshots.
 
 ### Project scope
 

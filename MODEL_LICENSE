@@ -1,0 +1,34 @@
+中文
+
+本專案明示發布的原創 LoRA／adapter 參數、head 參數、模型修改與 checkpoint 成果，
+在發布者依法享有的權利範圍內，適用根目錄 LICENSE 的「Stock Forecasting 個人非商業
+使用授權 1.0」。自然人可使用本人資金交易；組織使用、第三方資金管理及商業用途禁止。
+
+Kronos-base、Kronos-Tokenizer-base、Kronos 原始碼及其他上游元件仍適用原有授權。
+本文件不將原始 Kronos MIT 元件重新授權，也不撤銷其商業使用權。混合 checkpoint
+若包含上游內容，應同時保留上游通知；本專案限制僅及於本專案有權授權的新增部分。
+參見 THIRD_PARTY_NOTICES.md 及 src/stock_forecasting/_vendor/kronos/LICENSE。
+
+本授權不涵蓋資料供應商的行情資料再散布權，不表示所有模型權重或輸出在每個司法
+管轄區均享有著作權，也不主張使用者自行產生之資料或成果的所有權。
+重新發布本專案成果時，必須一併提供 LICENSE、MODEL_LICENSE 及適用的第三方通知。
+
+English
+
+Original LoRA/adapter parameters, head parameters, model modifications, and
+checkpoint artifacts expressly released by this project are subject to the
+Stock Forecasting Personal Non-Commercial License 1.0 in LICENSE, to the extent
+of rights legally held by the releaser. Individual own-funds trading is permitted;
+organizational use, management of third-party capital, and commercial use are not.
+
+Kronos-base, Kronos-Tokenizer-base, Kronos source, and other upstream components
+retain their original licenses. This notice neither relicenses original MIT
+Kronos components nor revokes their commercial-use rights. Combined checkpoints
+containing upstream material must retain upstream notices. Project restrictions
+cover only additions the project has the right to license. See
+THIRD_PARTY_NOTICES.md and src/stock_forecasting/_vendor/kronos/LICENSE.
+
+No market-data redistribution rights are granted. No claim is made that all
+weights or outputs are copyrightable in every jurisdiction, or that the project
+owns users' independently produced data or results. Redistributions of project
+artifacts must include LICENSE, MODEL_LICENSE, and applicable third-party notices.

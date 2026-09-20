@@ -1,0 +1,132 @@
+Stock Forecasting 個人非商業使用授權 1.0
+Copyright (c) 2026 hawkiyc 及各自的專案貢獻者。保留所有未明示授予的權利。
+
+中文
+
+1. 範圍
+本授權適用於本專案著作權人以本授權發布的原創程式碼、文件，以及明示採用本授權的
+模型增量與其他成果（合稱「本材料」）。第三方程式碼、預訓練權重、tokenizer、套件與
+市場資料不在本授權範圍內，仍適用其各自條款。本授權不縮減第三方已授予的權利。
+
+2. 獲准的個人用途
+在遵守本授權的前提下，僅授予以自己名義、為自己利益行事的自然人，免費、非專屬、
+全球性的下載、重製、執行、研究、修改及非商業分享本材料之權利。獲准用途限於個人
+研究、自主學習、實驗、回測、非商業 hobby project，以及僅以本人所有資金、為本人
+帳戶進行的交易。此種個人交易即使產生獲利，仍屬本授權明示允許的例外。
+個人可租用一般雲端運算或儲存資源執行上述用途；這不授予服務供應商獨立利用本材料
+的權利，也不允許個人透過雲端向他人提供被禁止的服務。
+
+3. 禁止的用途
+本授權不授予任何組織使用權。禁止公司、法人、合夥、基金、金融機構、量化交易公司、
+自營交易公司及其他組織使用本材料；也禁止任何人代表上述組織、履行工作職責，或為
+其業務、研究、交易及其他組織利益使用本材料，包括組織內部使用與免費試用。
+禁止任何商業用途，包括商業產品、付費或以廣告等方式獲利的服務、SaaS、API、付費
+訊號、諮詢、分析、軟體或模型銷售、商業轉授權，以及替他人交易、管理第三方資金或
+提供資產管理服務。個人商業經營同樣受禁止。第 2 條的本人資金交易是唯一明示的交易
+獲利例外，不延伸至組織帳戶、客戶資金、募資、代操或分潤服務。
+
+4. 分享與修改
+獲准的個人可免費分享原始或修改後的本材料，但必須完整保留本授權、著作權聲明及
+第三方聲明，清楚標示修改，並使接收者受相同用途限制約束。不得以其他授權重新授予
+本材料的商業或組織使用權，亦不得暗示原作者背書。接收者對本材料的權利直接來自
+本授權，而非可任意擴張的轉授權。這些要求不改變可分離第三方元件的原有授權。
+
+5. 權利邊界
+未明示授予的權利均予保留；本授權不授予商標、資料供應商資料再散布或第三方專利
+權利，也不限制法律另行允許且不得排除的行為。第三方元件與市場資料必須另外取得
+適當權利。模型及輸出僅在專案著作權人依法享有、且已明示依本授權發布的權利範圍內
+受本授權涵蓋；本授權不主張取得使用者原有資料或第三方內容的所有權。
+
+6. 違反與終止
+違反任何條款時，本授權所授予的權利立即終止。使用者必須停止依本授權進行的使用及
+散布；本條不撤銷第三方自行授予的權利。只有著作權人明確書面恢復，才可恢復本授權
+權利。本授權本身不提供商業或組織用途的許可。
+
+7. 免責與責任限制
+在適用法律允許的最大範圍內，本材料依「現狀」提供，不附任何明示或默示保證，包括
+適售性、特定目的適用性、不侵權、正確性、可用性或獲利能力。著作權人及貢獻者不對
+使用本材料造成的請求、損失、交易虧損或其他責任負責。本材料不是投資、法律或稅務
+建議，亦不保證交易結果。法律不得排除的責任不受本條排除。
+
+8. 解釋
+本授權是可閱覽原始碼的個人用途授權，不是 OSI 定義的開源授權。中文與英文描述相同
+政策；如兩者不一致，以英文條文為準，但不得排除適用法律的強制規定。
+
+English
+
+Stock Forecasting Personal Non-Commercial License 1.0
+Copyright (c) 2026 hawkiyc and the respective project contributors.
+All rights not expressly granted are reserved.
+
+1. Scope
+This license covers original source code, documentation, and model additions or
+other artifacts expressly released under this license by the project's copyright
+holders (the "Materials"). Third-party source, pretrained weights, tokenizers,
+dependencies, and market data are excluded and remain governed by their own
+terms. This license does not reduce rights granted by third parties.
+
+2. Permitted personal use
+Subject to these terms, a natural person acting solely in their own capacity and
+for their own benefit receives a free, non-exclusive, worldwide license to
+download, reproduce, run, study, modify, and share the Materials non-commercially.
+Permitted purposes are limited to personal research, self-education, experiments,
+backtesting, non-commercial hobby projects, and trading solely with that person's
+own funds for that person's own account. Profit from this personal-account
+trading is expressly permitted as an exception to the non-commercial restriction.
+An individual may rent general-purpose cloud compute or storage for these uses.
+This does not grant the provider an independent right to exploit the Materials
+or permit the individual to offer prohibited services through that infrastructure.
+
+3. Prohibited uses
+No organizational-use rights are granted. Use by companies, corporations, legal
+entities, partnerships, funds, financial institutions, quantitative trading firms,
+proprietary trading firms, or other organizations is prohibited. Use by anyone
+on their behalf, as part of employment duties, or for their business, research,
+trading, or other organizational benefit is also prohibited, including internal
+use and unpaid trials.
+All commercial use is prohibited, including commercial products; paid,
+advertising-supported, or otherwise monetized services; SaaS; APIs; paid signals;
+consulting; analytics; software or model sales; commercial sublicensing; trading
+for others; managing third-party capital; and asset-management services. An
+individual's commercial business is equally prohibited. The own-funds trading
+exception in section 2 does not cover organizational accounts, client capital,
+pooled funds, managed accounts, or revenue-sharing services.
+
+4. Sharing and modifications
+Permitted individuals may distribute original or modified Materials without
+charge if they retain this entire license, copyright notices, and third-party
+notices; clearly identify modifications; and preserve the same use restrictions
+for recipients. They may not relicense the Materials to grant commercial or
+organizational rights or imply endorsement by the original authors. Recipients
+receive rights directly under this license, not an expandable sublicense. These
+conditions do not alter the original licenses of separable third-party components.
+
+5. Rights boundaries
+All ungranted rights are reserved. No trademark rights, market-data redistribution
+rights, or third-party patent rights are granted. This license does not restrict
+acts independently permitted by mandatory law. Users must separately obtain
+appropriate rights to third-party components and data. Models and outputs are
+covered only to the extent of rights legally held by the project's copyright
+holders and expressly released under this license. No ownership of users'
+pre-existing data or third-party content is claimed.
+
+6. Breach and termination
+Rights granted here terminate immediately upon breach of any term. The user must
+stop use and distribution relying on this license. Termination does not revoke
+rights independently granted by third parties. Reinstatement requires express
+written authorization from the copyright holder. This license itself grants no
+commercial or organizational permission.
+
+7. Disclaimer and limitation of liability
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE MATERIALS ARE PROVIDED
+"AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTIES, INCLUDING MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, ACCURACY, AVAILABILITY, OR
+PROFITABILITY. COPYRIGHT HOLDERS AND CONTRIBUTORS ARE NOT LIABLE FOR CLAIMS,
+LOSSES, TRADING LOSSES, OR OTHER LIABILITY ARISING FROM THE MATERIALS OR THEIR
+USE. THE MATERIALS ARE NOT INVESTMENT, LEGAL, OR TAX ADVICE AND DO NOT GUARANTEE
+TRADING RESULTS. LIABILITY THAT CANNOT LAWFULLY BE EXCLUDED IS NOT EXCLUDED.
+
+8. Interpretation
+This is a source-available personal-use license, not an OSI open-source license.
+The Chinese and English texts describe the same policy. The English terms control
+in a conflict, subject to mandatory applicable law.
