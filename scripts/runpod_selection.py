@@ -15,32 +15,18 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple, Union
 
 _DATASET_IDENTITY_CONTRACT = runpy.run_path(
-    str(
-        Path(__file__).resolve().parents[1]
-        / "src"
-        / "stock_forecasting"
-        / "dataset_identity.py"
-    )
+    str(Path(__file__).resolve().parents[1] / "src" / "stock_forecasting" / "dataset_identity.py")
 )
 _DATASET_PROFILE_CONTRACT = runpy.run_path(
-    str(
-        Path(__file__).resolve().parents[1]
-        / "src"
-        / "stock_forecasting"
-        / "dataset_profiles.py"
-    )
+    str(Path(__file__).resolve().parents[1] / "src" / "stock_forecasting" / "dataset_profiles.py")
 )
 
 SELECTION_SCHEMA_VERSION = 3
-DATASET_REQUEST_SCHEMA_VERSION = _DATASET_IDENTITY_CONTRACT[
-    "DATASET_REQUEST_SCHEMA_VERSION"
-]
+DATASET_REQUEST_SCHEMA_VERSION = _DATASET_IDENTITY_CONTRACT["DATASET_REQUEST_SCHEMA_VERSION"]
 DATASET_STORAGE_PREPARATION_FIELDS = _DATASET_IDENTITY_CONTRACT[
     "DATASET_STORAGE_PREPARATION_FIELDS"
 ]
-dataset_request_identity_payload = _DATASET_IDENTITY_CONTRACT[
-    "dataset_request_identity_payload"
-]
+dataset_request_identity_payload = _DATASET_IDENTITY_CONTRACT["dataset_request_identity_payload"]
 DEFAULT_DATASET_STORAGE_PREPARATION = _DATASET_IDENTITY_CONTRACT[
     "DEFAULT_DATASET_STORAGE_PREPARATION"
 ]
@@ -76,9 +62,7 @@ STAGE_RUNTIME = {
 # subset defined in dataset_identity.py participates in the durable dataset
 # namespace.
 _BASE_PREPARATION_CONTRACT = {
-    "schema_version": _DATASET_IDENTITY_CONTRACT[
-        "PREPARATION_PROVENANCE_SCHEMA_VERSION"
-    ],
+    "schema_version": _DATASET_IDENTITY_CONTRACT["PREPARATION_PROVENANCE_SCHEMA_VERSION"],
     "processed_schema_version": "4.0",
     **DEFAULT_DATASET_STORAGE_PREPARATION,
     "stride": 5,
@@ -89,9 +73,7 @@ _BASE_PREPARATION_CONTRACT = {
     "entry_day_counts_as_holding_day_one": True,
     "exit_timing": "regular_session_close_t_plus_h",
     "input_adjustment": "point_in_time_total_return_ohlc_split_adjusted_volume",
-    "training_security_scope": (
-        "common_stock_adr_tdr_and_allowlisted_unleveraged_equity_etf_v1"
-    ),
+    "training_security_scope": ("common_stock_adr_tdr_and_allowlisted_unleveraged_equity_etf_v1"),
     "split_policy": _DATASET_IDENTITY_CONTRACT["FIXED_SPLIT_POLICY"],
     "fixed_split": FIXED_EVALUATION_SPLIT,
     "eodhd_split_policy": "per_symbol_full_historical_splits_reconstruct_unadjusted_volume_v2",
@@ -725,9 +707,7 @@ def _verify_unbound_marker(marker: Dict[str, Any], selection: Dict[str, Any]) ->
         marker.get("selected_datasets"), request["selected_datasets"], "dataset providers"
     )
     _assert_equal(marker.get("date_range"), request["date_range"], "dataset date range")
-    expected_storage = dataset_request_identity_payload(request)[
-        "storage_preparation"
-    ]
+    expected_storage = dataset_request_identity_payload(request)["storage_preparation"]
     _assert_equal(
         marker.get("storage_preparation_spec"),
         expected_storage,
@@ -882,6 +862,24 @@ def _verify_environment(
 
 def command_create(arguments: argparse.Namespace) -> int:
     project_root = _validate_project_root(arguments.project_root)
+    previous_request_sha = None
+    if getattr(arguments, "reuse_current", False):
+        if arguments.interactive:
+            _fail("--reuse-current cannot be combined with --interactive")
+        _, previous = _resolve_selection_path(project_root, None, validate_local_config=False)
+        request = previous["dataset_request"]
+        previous_request_sha = previous["dataset_request_sha256"]
+        arguments.stage = previous["stage"]["name"]
+        arguments.feature_mode = previous["stage"]["feature_mode"]
+        arguments.data_profile = request["profile"]
+        arguments.dataset_revision = request["revision"]
+        arguments.start = request["date_range"]["start_inclusive"]
+        arguments.end = request["date_range"]["end_exclusive"]
+        arguments.h_start = request["preparation"]["h_start"]
+        arguments.universe = request["universe"]["mode"]
+        arguments.stocks = request["universe"]["us_stocks"]
+        arguments.etfs = request["universe"]["us_etfs"]
+        arguments.symbol_limit = request["universe"]["symbol_limit"]
     if arguments.interactive:
         _populate_interactive(arguments)
     required = ("stage", "data_profile", "start", "end", "universe")
@@ -889,6 +887,11 @@ def command_create(arguments: argparse.Namespace) -> int:
     if missing:
         _fail(f"Missing required selection options: {', '.join(missing)}")
     payload = _build_selection(arguments, project_root)
+    if (
+        previous_request_sha is not None
+        and payload["dataset_request_sha256"] != previous_request_sha
+    ):
+        _fail("Refreshing configuration would change the dataset; active selection was not changed")
     path = _activate_selection(project_root, payload)
     request = payload["dataset_request"]
     print(f"Active selection: {payload['selection_id']}")
@@ -1001,6 +1004,11 @@ def build_parser() -> argparse.ArgumentParser:
     create = subparsers.add_parser("create")
     create.add_argument("--project-root", required=True)
     create.add_argument("--interactive", action="store_true")
+    create.add_argument(
+        "--reuse-current",
+        action="store_true",
+        help="Refresh the model config while preserving every active dataset identity field.",
+    )
     create.add_argument("--stage", choices=tuple(STAGE_CONFIGS))
     create.add_argument("--data-profile", choices=tuple(PROFILE_DATASETS))
     create.add_argument(
@@ -1022,8 +1030,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="First cumulative holding-day alpha horizon; maximum remains day 14.",
     )
     create.add_argument(
-        "--feature-mode", choices=("baseline", "scales", "benchmark", "combined"),
-        default="combined", help="Use the same dataset for the four controlled head variants.",
+        "--feature-mode",
+        choices=("baseline", "scales", "benchmark", "combined"),
+        default="combined",
+        help="Use the same dataset for the four controlled head variants.",
     )
     create.add_argument("--universe", choices=("all", "explicit"))
     create.add_argument(

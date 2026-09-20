@@ -199,6 +199,10 @@ class ModelConfig(StrictModel):
     postprocess_alpha_threshold: float = Field(default=0.0, ge=0.0)
     feature_mode: Literal["baseline", "scales", "benchmark", "combined"] = "baseline"
     alpha_head_fp32: bool = False
+    market_aware: bool = False
+    explicit_output_scale: bool = False
+    ranking_loss_weight: float = Field(default=0.0, ge=0.0, le=0.2)
+    ranking_max_pairs: int = Field(default=256, ge=1, le=4096)
     lora: KronosLoRAConfig = Field(default_factory=KronosLoRAConfig)
 
     @model_validator(mode="after")
@@ -209,6 +213,8 @@ class ModelConfig(StrictModel):
             raise ValueError("encoder_dim must be divisible by benchmark_conditioner_heads")
         if self.alpha_quantiles != [0.1, 0.5, 0.9]:
             raise ValueError("alpha_quantiles are fixed at [0.1, 0.5, 0.9]")
+        if self.explicit_output_scale and self.feature_mode not in ("scales", "combined"):
+            raise ValueError("explicit_output_scale requires feature_mode=scales or combined")
         if self.time_series_backend == "mock" and self.lora.enabled:
             raise ValueError("The mock backbone does not expose Kronos LoRA targets")
         if self.time_series_backend == "kronos":
@@ -249,6 +255,14 @@ class ModelConfig(StrictModel):
             semantics.pop("feature_mode")
         if not self.alpha_head_fp32:
             semantics.pop("alpha_head_fp32")
+        for name, default in (
+            ("market_aware", False),
+            ("explicit_output_scale", False),
+            ("ranking_loss_weight", 0.0),
+            ("ranking_max_pairs", 256),
+        ):
+            if semantics[name] == default:
+                semantics.pop(name)
         payload = json.dumps(
             semantics,
             ensure_ascii=False,
@@ -294,7 +308,12 @@ class TrainingConfig(StrictModel):
     resume_checkpoint: Path | None = None
     mixed_precision: Literal["no", "bf16"] = "bf16"
     num_workers: int | Literal["auto"] = "auto"
-    evaluation_max_samples: int = Field(default=20_000, ge=32)
+    evaluation_max_samples: int | None = Field(default=None, ge=32)
+    learning_rate_schedule: Literal["cosine", "validation_plateau"] = "cosine"
+    plateau_patience_evaluations: int = Field(default=2, ge=1)
+    plateau_factor: float = Field(default=0.3, gt=0, lt=1)
+    plateau_min_ratio: float = Field(default=0.09, gt=0, lt=1)
+    plateau_min_low_lr_evaluations: int = Field(default=2, ge=1)
 
     @field_validator(
         "batch_size",
@@ -330,9 +349,7 @@ class TrainingConfig(StrictModel):
         if self.auto_batch_min_size > self.auto_batch_max_size:
             raise ValueError("auto_batch_min_size cannot exceed auto_batch_max_size")
         if self.auto_batch_max_size > self.target_effective_batch_size:
-            raise ValueError(
-                "auto_batch_max_size cannot exceed target_effective_batch_size"
-            )
+            raise ValueError("auto_batch_max_size cannot exceed target_effective_batch_size")
         automatic_sizes = (
             self.target_effective_batch_size,
             self.auto_batch_min_size,
@@ -346,9 +363,7 @@ class TrainingConfig(StrictModel):
                 "auto_evaluation_batch_max_size cannot be smaller than auto_batch_min_size"
             )
         minimum_evaluation_capacity = (
-            self.auto_batch_max_size
-            if self.batch_size == "auto"
-            else self.batch_size
+            self.auto_batch_max_size if self.batch_size == "auto" else self.batch_size
         )
         if (
             self.evaluation_batch_size == "auto"
@@ -359,9 +374,7 @@ class TrainingConfig(StrictModel):
                 "training batch size"
             )
         if self.batch_size == "auto" and self.gradient_accumulation_steps != "auto":
-            raise ValueError(
-                "Automatic batch sizing requires automatic gradient accumulation"
-            )
+            raise ValueError("Automatic batch sizing requires automatic gradient accumulation")
         if (
             isinstance(self.batch_size, int)
             and self.gradient_accumulation_steps == "auto"
@@ -438,7 +451,8 @@ class ValidationConfig(StrictModel):
     neural_learning_rate: float = Field(default=1e-3, gt=0.0)
     recompute_full_model: bool = False
     resume_completed_models: bool = True
-    baseline_max_samples_per_split: int = Field(default=20_000, ge=32)
+    baseline_max_samples_per_split: int | None = Field(default=None, ge=32)
+    require_prebuilt_baselines: bool = False
 
     @model_validator(mode="after")
     def validate_benchmark_plan(self) -> ValidationConfig:
@@ -472,8 +486,7 @@ class ExperimentConfig(StrictModel):
         if self.model.feature_mode in ("scales", "combined") and self.data.input_length < 61:
             raise ValueError("The scale branch requires at least 61 observed bars")
         if self.data.fixed_split and (
-            self.training.evaluation_max_samples
-            != self.validation.baseline_max_samples_per_split
+            self.training.evaluation_max_samples != self.validation.baseline_max_samples_per_split
         ):
             raise ValueError("Fixed-split model and baseline evaluation sample limits must match")
         sample_contract = PRODUCTION_STAGE_SAMPLE_CONTRACTS[self.training.stage]
@@ -486,8 +499,7 @@ class ExperimentConfig(StrictModel):
             expected_max_samples = sample_contract["max_samples"]
             if self.data.max_samples != expected_max_samples:
                 raise ValueError(
-                    f"{self.training.stage} requires "
-                    f"data.max_samples={expected_max_samples}"
+                    f"{self.training.stage} requires data.max_samples={expected_max_samples}"
                 )
             expected_epochs = 2 if self.training.stage == "stage1" else 5
             expected_early_stopping_epoch = 2 if self.training.stage == "stage1" else 1
@@ -517,6 +529,8 @@ class ExperimentConfig(StrictModel):
                     "Production Stage 1/2 requires five consecutive non-improving "
                     "validations for early stopping"
                 )
+            if self.training.learning_rate_schedule == "validation_plateau":
+                expected_early_stopping_epoch = 1
             if self.training.early_stopping_start_epoch != expected_early_stopping_epoch:
                 raise ValueError(
                     f"{self.training.stage} requires early_stopping_start_epoch="

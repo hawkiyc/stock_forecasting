@@ -297,8 +297,13 @@ def build_evaluation_contract(
             "evaluation_implementation": {
                 name: _file_fingerprint(Path(__file__).parent / name)
                 for name in (
-                    "validation_benchmark.py", "baselines.py", "evaluation_protocol.py",
-                    "metrics.py", "cli/evaluate.py",
+                    "validation_benchmark.py",
+                    "baselines.py",
+                    "evaluation_protocol.py",
+                    "metrics.py",
+                    "cli/evaluate.py",
+                    "evaluation_store.py",
+                    "baseline_contract.py",
                 )
             },
         },
@@ -502,12 +507,16 @@ def _lazy_baseline_arrays(
     )
     maximum = config.validation.baseline_max_samples_per_split
     if split == "train" and config.data.max_samples is not None:
-        maximum = min(maximum, config.data.max_samples)
+        maximum = min(maximum or len(dataset), config.data.max_samples)
     sampler = (
-        evaluation_sampler(len(dataset), config, split) if split != "train" else
-        BlockwisePermutationSampler(
-            len(dataset), fraction=config.data.train_fraction,
-            max_samples=maximum, seed=seed, block_size=128,
+        evaluation_sampler(len(dataset), config, split)
+        if split != "train"
+        else BlockwisePermutationSampler(
+            len(dataset),
+            fraction=config.data.train_fraction,
+            max_samples=maximum,
+            seed=seed,
+            block_size=128,
         )
     )
     if build_arrays:
@@ -521,10 +530,17 @@ def _lazy_baseline_arrays(
                 "use a larger-memory evaluation Pod without changing sample membership"
             )
     arrays = (
-        concatenate_baseline_batches(DataLoader(
-            BaselineRecordDataset(dataset), batch_size=128, sampler=sampler,
-            collate_fn=baseline_arrays, **(loader_options or {}),
-        )) if build_arrays else None
+        concatenate_baseline_batches(
+            DataLoader(
+                BaselineRecordDataset(dataset),
+                batch_size=128,
+                sampler=sampler,
+                collate_fn=baseline_arrays,
+                **(loader_options or {}),
+            )
+        )
+        if build_arrays
+        else None
     )
     return len(dataset), len(sampler), arrays
 
@@ -691,8 +707,8 @@ class ValidationBenchmark:
                 "test_policy": (
                     "Holdout is scored only after validation selects checkpoints; "
                     "it never drives training, early stopping, or checkpoint selection."
-                    if self.evaluation_split == "test" else
-                    "Legacy fraction-split report: validation only, not a holdout result."
+                    if self.evaluation_split == "test"
+                    else "Legacy fraction-split report: validation only, not a holdout result."
                 ),
                 "classification": (
                     "No classifier is trained; signals are distribution post-processing."
@@ -788,7 +804,9 @@ class ValidationBenchmark:
             started_at = time.perf_counter()
             if name == "gbdt":
                 metrics = GradientBoostingBaseline.fit(
-                    train, seed=seed, robust_scales=robust_scales,
+                    train,
+                    seed=seed,
+                    robust_scales=robust_scales,
                 ).evaluate(evaluation)
             elif name == "gru":
                 model, metrics = fit_causal_gru(
@@ -799,7 +817,8 @@ class ValidationBenchmark:
                     patience=self.config.validation.neural_patience,
                     batch_size=self.config.validation.neural_batch_size,
                     learning_rate=self.config.validation.neural_learning_rate,
-                    robust_scales=robust_scales, evaluation=evaluation,
+                    robust_scales=robust_scales,
+                    evaluation=evaluation,
                     loader_options=self.loader_options,
                 )
                 del model
@@ -812,7 +831,8 @@ class ValidationBenchmark:
                     patience=self.config.validation.neural_patience,
                     batch_size=self.config.validation.neural_batch_size,
                     learning_rate=self.config.validation.neural_learning_rate,
-                    robust_scales=robust_scales, evaluation=evaluation,
+                    robust_scales=robust_scales,
+                    evaluation=evaluation,
                     loader_options=self.loader_options,
                 )
                 del model
@@ -825,7 +845,8 @@ class ValidationBenchmark:
                     patience=self.config.validation.neural_patience,
                     batch_size=self.config.validation.neural_batch_size,
                     learning_rate=self.config.validation.neural_learning_rate,
-                    robust_scales=robust_scales, evaluation=evaluation,
+                    robust_scales=robust_scales,
+                    evaluation=evaluation,
                     loader_options=self.loader_options,
                 )
                 del model
@@ -848,16 +869,21 @@ class ValidationBenchmark:
         self._publish_lifecycle("preparing")
         self._publish()
         try:
+            if self.config.validation.require_prebuilt_baselines:
+                return self._run_prebuilt()
             robust_scales = None
             if self.config.data.fixed_split:
                 calibration_dataset = LazyFinancialWindowDataset(
-                    resolve_bar_store_path(self.config.data.bar_store_path), split="train",
-                    window_size=self.config.data.input_length, h_start=self.config.data.h_start,
+                    resolve_bar_store_path(self.config.data.bar_store_path),
+                    split="train",
+                    window_size=self.config.data.input_length,
+                    h_start=self.config.data.h_start,
                 )
                 calibration = resolve_runtime_robust_scales(
                     calibration_dataset,
                     sample_count=self.config.data.label_scale_calibration_samples,
-                    seed=self.config.data.calibration_seed, worker_plan=self.worker_plan,
+                    seed=self.config.data.calibration_seed,
+                    worker_plan=self.worker_plan,
                 )
                 robust_scales = np.asarray(calibration.scales, dtype=np.float32).tolist()
                 stored_scales = _read_json(self.checkpoint / "trainer-state.json").get(
@@ -866,9 +892,11 @@ class ValidationBenchmark:
                 if stored_scales != robust_scales:
                     raise ValueError("Checkpoint and benchmark train-calibration scales differ")
                 self.payload["label_scale_calibration"] = {
-                    "split": "train", "identity_sha256": calibration.identity_sha256,
+                    "split": "train",
+                    "identity_sha256": calibration.identity_sha256,
                     "sample_count": calibration.sample_count,
-                    "seed": self.config.data.calibration_seed, "scales": robust_scales,
+                    "seed": self.config.data.calibration_seed,
+                    "scales": robust_scales,
                 }
             arrays: dict[str, BaselineArrays] = {}
             raw_counts: dict[str, int] = {}
@@ -894,13 +922,16 @@ class ValidationBenchmark:
             }
             evaluation = arrays[self.evaluation_split]
             self.payload["evaluation_membership"] = sample_membership(
-                evaluation.symbols, evaluation.dates,
+                evaluation.symbols,
+                evaluation.dates,
             )
             requested_rules = [name for name in RULE_BASELINE_NAMES if name in self.models]
             if requested_rules and any(not self._completed(name) for name in requested_rules):
                 started_at = time.perf_counter()
                 rule_results = rule_baseline_suite(
-                    arrays["train"], evaluation, robust_scales=robust_scales,
+                    arrays["train"],
+                    evaluation,
+                    robust_scales=robust_scales,
                 )
                 duration = time.perf_counter() - started_at
                 for name in requested_rules:
@@ -909,7 +940,11 @@ class ValidationBenchmark:
             for name in LEARNED_BASELINES:
                 if name in self.models and not self._completed(name):
                     self._run_learned_baseline(
-                        name, arrays["train"], arrays["validation"], evaluation, robust_scales,
+                        name,
+                        arrays["train"],
+                        arrays["validation"],
+                        evaluation,
+                        robust_scales,
                     )
             if FULL_MODEL_NAME in self.models and not self._completed(FULL_MODEL_NAME):
                 started_at = time.perf_counter()
@@ -961,6 +996,46 @@ class ValidationBenchmark:
             )
             raise
 
+    def _run_prebuilt(self) -> dict[str, Any]:
+        from stock_forecasting.baseline_contract import require_baselines
+
+        cached = require_baselines(self.config)
+        scales = cached["robust_scales"]
+        stored = _read_json(self.checkpoint / "trainer-state.json").get("runtime_robust_scales")
+        if stored != scales:
+            raise ValueError("Checkpoint and prebuilt baseline use different train scales")
+        self.payload["baseline_identity"] = cached["identity"]
+        self.payload["baseline_reused"] = True
+        self.payload["sample_counts"] = cached["sample_counts"]
+        self.payload["raw_sample_counts"] = cached["sample_counts"]
+        self.payload["evaluation_membership"] = cached["evaluation_membership"]
+        for name in self.models:
+            if name != FULL_MODEL_NAME:
+                if name not in cached["models"]:
+                    raise ValueError(f"Required baseline is missing: {name}")
+                self.payload["models"][name] = cached["models"][name]
+        if FULL_MODEL_NAME in self.models and not self._completed(FULL_MODEL_NAME):
+            started = time.perf_counter()
+            result = evaluate_checkpoint(self.config, self.checkpoint, split="test")
+            self._record_single(
+                FULL_MODEL_NAME,
+                result["metrics"],
+                "checkpoint_recomputed",
+                time.perf_counter() - started,
+            )
+        self.payload["comparison"] = _comparison_summary(self.payload["models"])
+        self._verify_paired_results(scales)
+        self.payload["test_unlocked"] = True
+        self.payload["comparison"]["ranking_role"] = (
+            "Descriptive full-holdout comparison only; never checkpoint selection."
+        )
+        self.payload.pop("error", None)
+        self.payload["state"] = "ready"
+        self.payload["completed_at"] = _utc_now()
+        self._publish()
+        self._publish_lifecycle("finalizing" if self.defer_terminal_lifecycle else "ready")
+        return self.payload
+
     def _verify_paired_results(self, robust_scales: list[float] | None) -> None:
         """Fail closed on stale scores or mismatched sample membership/scaling."""
 
@@ -981,8 +1056,10 @@ class ValidationBenchmark:
                 scores = result.get("seed_results") or {"single": result["metrics"]}
                 comparisons[name] = {
                     seed: paired_block_comparison(
-                        full["daily_normalized_pinball"], metrics["daily_normalized_pinball"],
-                    ) for seed, metrics in scores.items()
+                        full["daily_normalized_pinball"],
+                        metrics["daily_normalized_pinball"],
+                    )
+                    for seed, metrics in scores.items()
                 }
         self.payload["comparison"]["full_minus_baseline_date_paired"] = comparisons
 

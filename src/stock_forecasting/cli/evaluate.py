@@ -142,6 +142,7 @@ def evaluate_checkpoint(
     _train_loader, validation_loader, test_loader = build_dataloaders(
         config,
         batch_plan=batch_plan,
+        ranking_sampling=False,
     )
     loader = validation_loader if split == "validation" else test_loader
     bundle.model.eval()

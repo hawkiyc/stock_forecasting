@@ -24,6 +24,7 @@ from stock_forecasting.data.schema import normalize_ohlcv_frame, read_market_dat
 from stock_forecasting.factory import build_model_bundle
 from stock_forecasting.metrics import POSTPROCESS_SIGNAL_NAMES, postprocess_alpha_signal
 from stock_forecasting.models import MODEL_OUTPUT_SCHEMA_VERSION
+from stock_forecasting.models.ranking import market_ids
 from stock_forecasting.preflight import run_preflight
 from stock_forecasting.training import _autocast_context, set_global_seed
 
@@ -289,6 +290,7 @@ def infer_observation(
             benchmark_attention_mask=observation.benchmark_attention_mask.to(device),
             asset_timestamps=observation.asset_timestamp_features.to(device),
             benchmark_timestamps=observation.benchmark_timestamp_features.to(device),
+            market_ids=market_ids([observation.metadata.get("market", "")], device),
         )
     training_data = provenance_summary(config.data.resolved_manifest_path)
     return {

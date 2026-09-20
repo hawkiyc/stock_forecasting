@@ -7,23 +7,29 @@ import json
 from typing import Any
 
 import numpy as np
+from torch.utils.data import SequentialSampler
 
 from stock_forecasting.config import ExperimentConfig
 from stock_forecasting.data.dataset import BlockwisePermutationSampler
 
-EVALUATION_PROTOCOL_VERSION = "paired-fixed-holdout-v1"
+EVALUATION_PROTOCOL_VERSION = "full-fixed-holdout-v2"
 EVALUATION_SELECTION_BLOCK_SIZE = 128
 EVALUATION_SELECTION_SEED = 42
 
 
 def evaluation_sampler(
-    count: int, config: ExperimentConfig, split: str,
-) -> BlockwisePermutationSampler:
+    count: int,
+    config: ExperimentConfig,
+    split: str,
+) -> BlockwisePermutationSampler | SequentialSampler:
     if split not in ("validation", "test"):
         raise ValueError("Evaluation membership is only defined for validation and test")
+    if config.training.evaluation_max_samples is None:
+        return SequentialSampler(range(count))
     seed = EVALUATION_SELECTION_SEED if config.data.fixed_split else config.training.seed
     return BlockwisePermutationSampler(
-        count, max_samples=config.training.evaluation_max_samples,
+        count,
+        max_samples=config.training.evaluation_max_samples,
         seed=seed + (1 if split == "validation" else 2),
         block_size=EVALUATION_SELECTION_BLOCK_SIZE,
     )
@@ -32,19 +38,34 @@ def evaluation_sampler(
 def sample_membership(symbols: list[str], dates: list[str]) -> dict[str, Any]:
     if len(symbols) != len(dates) or not dates:
         raise ValueError("Evaluation symbols and dates must be nonempty and aligned")
-    rows = list(zip(symbols, dates, strict=True))
-    if len(set(rows)) != len(rows):
-        raise ValueError("Evaluation must not contain duplicated symbol-date samples")
-    encoded = json.dumps(rows, separators=(",", ":"), ensure_ascii=False).encode()
+    digest = hashlib.sha256(b"[")
+    # Legacy in-memory callers use this helper; full splits use EvaluationStore.
+    date_symbols: dict[str, set[str]] = {}
+    for index, (symbol, day) in enumerate(zip(symbols, dates, strict=True)):
+        members = date_symbols.setdefault(str(day), set())
+        if str(symbol) in members:
+            raise ValueError("Evaluation must not contain duplicated symbol-date samples")
+        members.add(str(symbol))
+        if index:
+            digest.update(b",")
+        digest.update(
+            json.dumps([str(symbol), str(day)], separators=(",", ":"), ensure_ascii=False).encode()
+        )
+    digest.update(b"]")
     return {
-        "ordered_symbol_dates_sha256": hashlib.sha256(encoded).hexdigest(),
-        "samples": len(rows), "unique_dates": len(set(dates)),
-        "cutoff_start": min(dates), "cutoff_end": max(dates),
+        "ordered_symbol_dates_sha256": digest.hexdigest(),
+        "samples": len(dates),
+        "unique_dates": len(date_symbols),
+        "cutoff_start": min(dates),
+        "cutoff_end": max(dates),
     }
 
 
 def daily_normalized_pinball(
-    targets: np.ndarray, predictions: np.ndarray, scales: list[float], dates: list[str],
+    targets: np.ndarray,
+    predictions: np.ndarray,
+    scales: list[float],
+    dates: list[str],
 ) -> dict[str, float]:
     errors = (targets[..., None] - predictions) / np.asarray(scales)[None, :, None]
     levels = np.asarray([0.1, 0.5, 0.9])
@@ -55,8 +76,12 @@ def daily_normalized_pinball(
 
 
 def paired_block_comparison(
-    candidate: dict[str, float], reference: dict[str, float], *,
-    block_length: int = 14, replicates: int = 1000, seed: int = 42,
+    candidate: dict[str, float],
+    reference: dict[str, float],
+    *,
+    block_length: int = 14,
+    replicates: int = 1000,
+    seed: int = 42,
 ) -> dict[str, Any]:
     """Bootstrap contiguous forecast-date blocks, never individual stock rows.
 
@@ -75,8 +100,10 @@ def paired_block_comparison(
     result: dict[str, Any] = {
         "mean_daily_loss_difference": float(delta.mean()),
         "negative_favors_candidate": True,
-        "dates": len(dates), "block_length": block_length,
-        "replicates": replicates, "seed": seed,
+        "dates": len(dates),
+        "block_length": block_length,
+        "replicates": replicates,
+        "seed": seed,
         "method": "circular_moving_block_bootstrap_by_forecast_date",
         "confidence_interval_95": None,
     }
@@ -90,7 +117,9 @@ def paired_block_comparison(
         size = min(64, replicates - offset)
         starts = rng.integers(0, len(delta), size=(size, blocks))
         indices = (starts[..., None] + np.arange(block_length)) % len(delta)
-        draws[offset:offset + size] = delta[indices.reshape(size, -1)[:, :len(delta)]].mean(axis=1)
+        draws[offset : offset + size] = delta[indices.reshape(size, -1)[:, : len(delta)]].mean(
+            axis=1
+        )
     result["confidence_interval_95"] = np.quantile(draws, [0.025, 0.975]).tolist()
     result["status"] = "estimated_not_multiple_comparison_adjusted"
     return result

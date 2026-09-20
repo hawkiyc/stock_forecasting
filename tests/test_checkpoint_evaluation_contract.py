@@ -132,7 +132,7 @@ def test_evaluation_reads_saved_runtime_plan_without_rewriting_checkpoint(
 
     selected_loader = case.loaders[1 if split == "validation" else 2]
     case.stubs["build_dataloaders"].assert_called_once_with(
-        case.config, batch_plan=case.batch_plan,
+        case.config, batch_plan=case.batch_plan, ranking_sampling=False,
     )
     case.stubs["evaluate_loader"].assert_called_once_with(
         case.bundle, selected_loader, case.config, torch.device("cpu"),

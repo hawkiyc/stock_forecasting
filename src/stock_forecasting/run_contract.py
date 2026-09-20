@@ -42,6 +42,11 @@ TRAINING_IMPLEMENTATION_PATHS = (
     "scale_calibration.py",
     "dataset_identity.py",
     "evaluation_protocol.py",
+    "evaluation_store.py",
+    "optimization_policy.py",
+    "date_market_sampler.py",
+    "models/ranking.py",
+    "baseline_contract.py",
 )
 
 
@@ -226,7 +231,8 @@ def training_resume_contract_fingerprint(
 
 
 def readonly_checkpoint_contract_digest(
-    config: ExperimentConfig, run_manifest: dict[str, Any],
+    config: ExperimentConfig,
+    run_manifest: dict[str, Any],
 ) -> str:
     """Permit legacy inference/probes without authorizing a training-code migration.
 
@@ -244,9 +250,12 @@ def readonly_checkpoint_contract_digest(
     implementation = stored.get("training_implementation")
     files = implementation.get("files") if isinstance(implementation, dict) else None
     if (
-        not isinstance(files, dict) or not files
+        not isinstance(files, dict)
+        or not files
         or any(
-            not isinstance(path, str) or not isinstance(value, str) or len(value) != 64
+            not isinstance(path, str)
+            or not isinstance(value, str)
+            or len(value) != 64
             or any(character not in "0123456789abcdef" for character in value)
             for path, value in files.items()
         )

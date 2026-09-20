@@ -51,10 +51,14 @@ model:
   postprocess_alpha_threshold: 0.0
   feature_mode: ${FIN_TS_FEATURE_MODE:-combined}
   alpha_head_fp32: true
+  market_aware: true
+  explicit_output_scale: true
+  ranking_loss_weight: 0.05
+  ranking_max_pairs: 256
   lora:
     enabled: true
-    rank: 8
-    alpha: 16.0
+    rank: 32
+    alpha: 64.0
     dropout: 0.05
     target_modules: [q_proj, k_proj, v_proj, out_proj, w1, w2, w3]
 
@@ -77,6 +81,11 @@ training:
   lora_learning_rate: 0.00001
   weight_decay: 0.01
   warmup_ratio: 0.03
+  learning_rate_schedule: validation_plateau
+  plateau_patience_evaluations: 2
+  plateau_factor: 0.3
+  plateau_min_ratio: 0.09
+  plateau_min_low_lr_evaluations: 2
   max_grad_norm: 1.0
   loss_log_points_per_epoch: 250
   evaluations_per_epoch: 5
@@ -91,7 +100,7 @@ training:
   resume_checkpoint: null
   mixed_precision: bf16
   num_workers: auto
-  evaluation_max_samples: 20000
+  evaluation_max_samples: null
 
 wandb:
   enabled: true
@@ -124,13 +133,14 @@ validation:
     - patchtst
     - kronos_full
   seeds: [42]
-  neural_epochs: 30
+  neural_epochs: 5
   neural_patience: 5
-  neural_batch_size: 64
+  neural_batch_size: 256
   neural_learning_rate: 0.001
   recompute_full_model: false
   resume_completed_models: true
-  baseline_max_samples_per_split: 20000
+  baseline_max_samples_per_split: null
+  require_prebuilt_baselines: true
 
 runtime:
   max_runtime_seconds: ${MAX_RUNTIME_SECONDS:-21600}

@@ -89,9 +89,10 @@ append_manifest_file() {
 
 # Poetry lock resolution is intentionally remote-only.  Do not upload or
 # fingerprint poetry.lock because the remote Python/platform determines it.
-for root_file in README.md pyproject.toml; do
+for root_file in README.md pyproject.toml LICENSE MODEL_LICENSE THIRD_PARTY_NOTICES.md RELEASES.md; do
     append_manifest_file "${root_file}"
 done
+append_manifest_file "configs/baseline.json"
 append_manifest_file "src/stock_forecasting/_vendor/kronos/LICENSE"
 for relay_file in \
     cloudrun/tpex-relay/package.json \
@@ -298,6 +299,22 @@ for item in payload.get("CommonPrefixes", []):
 }
 
 scan_remote_prefix "${REMOTE_PROJECT_DIR}/"
+
+# A training-only configuration refresh must not require another CPU Pod merely
+# to publish the immutable selection. Dataset readiness is verified separately.
+if [[ -f "${LOCAL_PROJECT_ROOT}/.runpod/active-selection.json" ]]; then
+    source "${SCRIPT_DIR}/lib/runpod_selection.sh"
+    runpod_load_active_selection "${LOCAL_PROJECT_ROOT}"
+    runpod_s3_retry_command "${S3_WRAPPER}" "publish active training selection" s3 cp \
+        "${RUNPOD_SELECTION_FILE}" \
+        "s3://${RUNPOD_NETWORK_VOLUME_ID}/${RUNPOD_REMOTE_SELECTION_RELATIVE_PATH}" \
+        --only-show-errors
+    REMOTE_SELECTION_JSON="$(runpod_s3_retry_capture "${S3_WRAPPER}" "verify active selection" s3 cp \
+        "s3://${RUNPOD_NETWORK_VOLUME_ID}/${RUNPOD_REMOTE_SELECTION_RELATIVE_PATH}" - --only-show-errors)"
+    printf '%s\n' "${REMOTE_SELECTION_JSON}" | python3 "${SCRIPT_DIR}/runpod_selection.py" \
+        verify-selection-copy --project-root "${LOCAL_PROJECT_ROOT}" \
+        --selection "${RUNPOD_SELECTION_FILE}" --candidate -
+fi
 
 # Publish ready only after every source object and safety check has passed.
 READY_CODE_MANIFEST="$(render_code_manifest ready)"

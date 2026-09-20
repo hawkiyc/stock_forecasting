@@ -165,19 +165,25 @@ def build_model_bundle(
         dropout=config.model.alpha_head_dropout,
         feature_mode=config.model.feature_mode,
         fp32_head=config.model.alpha_head_fp32,
+        market_aware=config.model.market_aware,
+        explicit_output_scale=config.model.explicit_output_scale,
     )
     model = QuantForecastModel(
         backbone,
         resampler,
         benchmark_conditioner,
         alpha_head,
+        ranking_loss_weight=config.model.ranking_loss_weight,
+        ranking_max_pairs=config.model.ranking_max_pairs,
     )
     target_dtype = _dtype(config.model.dtype) if device.type == "cuda" else torch.float32
     model.to(device=device, dtype=target_dtype)
     _promote_trainable_parameters_to_fp32(model)
     # Recreate from calibrated values; float() after a BF16 cast cannot undo rounding.
     model.alpha_head.robust_scales = torch.tensor(
-        resolved_scales, device=device, dtype=torch.float32,
+        resolved_scales,
+        device=device,
+        dtype=torch.float32,
     )
     if model.alpha_head.numeric_branch is not None:
         branch = model.alpha_head.numeric_branch

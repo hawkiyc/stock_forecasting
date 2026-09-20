@@ -86,6 +86,8 @@ class MultiHorizonAlphaHead(nn.Module):
         dropout: float = 0.0,
         feature_mode: str = "baseline",
         fp32_head: bool = False,
+        market_aware: bool = False,
+        explicit_output_scale: bool = False,
     ) -> None:
         super().__init__()
         ordered_horizons = validate_alpha_horizons(horizons)
@@ -112,10 +114,23 @@ class MultiHorizonAlphaHead(nn.Module):
             nn.Dropout(dropout),
         )
         self.quantile_parameters = nn.Linear(hidden_dim, 3)
+        self.explicit_output_scale = explicit_output_scale
+        if explicit_output_scale and feature_mode not in ("scales", "combined"):
+            raise ValueError("Explicit output scale requires historical scale features")
+        self.market_embedding = nn.Embedding(4, input_dim) if market_aware else None
+        if self.market_embedding is not None:
+            nn.init.zeros_(self.market_embedding.weight)
+        self.scale_gate = nn.Linear(hidden_dim, 1) if explicit_output_scale else None
+        if self.scale_gate is not None:
+            nn.init.zeros_(self.scale_gate.weight)
+            nn.init.zeros_(self.scale_gate.bias)
         self.fp32_head = fp32_head or feature_mode != "baseline"
         self.numeric_branch = (
-            None if feature_mode == "baseline"
-            else NumericalResidualBranch(hidden_dim, input_dim, feature_mode)
+            None
+            if feature_mode == "baseline"
+            else NumericalResidualBranch(
+                hidden_dim, input_dim, feature_mode, extended=explicit_output_scale
+            )
         )
         self.register_buffer(
             "robust_scales",
@@ -124,23 +139,36 @@ class MultiHorizonAlphaHead(nn.Module):
         )
 
     def forward(
-        self, conditioned_tokens: Tensor, *,
-        scale_features: Tensor | None = None, benchmark_tokens: Tensor | None = None,
+        self,
+        conditioned_tokens: Tensor,
+        *,
+        scale_features: Tensor | None = None,
+        benchmark_tokens: Tensor | None = None,
+        market_ids: Tensor | None = None,
     ) -> Tensor:
         if self.fp32_head:
             with torch.autocast(device_type=conditioned_tokens.device.type, enabled=False):
-                return self._forward(conditioned_tokens.float(), scale_features, benchmark_tokens)
-        return self._forward(conditioned_tokens, scale_features, benchmark_tokens)
+                return self._forward(
+                    conditioned_tokens.float(), scale_features, benchmark_tokens, market_ids
+                )
+        return self._forward(conditioned_tokens, scale_features, benchmark_tokens, market_ids)
 
     def _forward(
-        self, conditioned_tokens: Tensor, scale_features: Tensor | None,
+        self,
+        conditioned_tokens: Tensor,
+        scale_features: Tensor | None,
         benchmark_tokens: Tensor | None,
+        market_ids: Tensor | None = None,
     ) -> Tensor:
         if conditioned_tokens.ndim != 3 or conditioned_tokens.shape[-1] != self.input_dim:
             raise ValueError(
                 f"conditioned_tokens must have shape [batch, tokens, {self.input_dim}]"
             )
         pooled = conditioned_tokens.mean(dim=1)
+        if self.market_embedding is not None:
+            if market_ids is None:
+                raise ValueError("Market-aware forecasts require explicit market IDs")
+            pooled = pooled + self.market_embedding(market_ids)
         horizon_ids = torch.arange(
             len(self.horizons),
             device=conditioned_tokens.device,
@@ -154,7 +182,18 @@ class MultiHorizonAlphaHead(nn.Module):
         median = raw[..., 1]
         lower = median - F.softplus(raw[..., 0])
         upper = median + F.softplus(raw[..., 2])
-        return torch.stack([lower, median, upper], dim=-1)
+        quantiles = torch.stack([lower, median, upper], dim=-1)
+        if self.scale_gate is not None:
+            if scale_features is None:
+                raise ValueError("Output scale requires past-only relative volatility")
+            # A strictly positive historical anchor controls both location and interval widths.
+            horizon = quantiles.new_tensor(self.horizons).sqrt()
+            anchor = scale_features[:, 2:3] * horizon[None, :]
+            floor = self.robust_scales[None, :] * 0.1
+            anchor = torch.minimum(torch.maximum(anchor, floor), self.robust_scales[None, :] * 10)
+            multiplier = (math.log(4) * torch.tanh(self.scale_gate(hidden))).exp()
+            quantiles = quantiles * anchor[..., None] * multiplier
+        return quantiles
 
     def pinball_loss(self, predictions: Tensor, target: Tensor) -> Tensor:
         predictions = predictions.float()

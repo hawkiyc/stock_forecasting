@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "models": ["always_buy", "zero_return", "momentum_5d", "reversal_5d", "ma_crossover", "rsi", "macd", "volatility_scaled", "gbdt", "gru", "dlinear", "patchtst"],
+  "seeds": [42],
+  "epochs": 5,
+  "batch_size": 256,
+  "learning_rate": 0.001,
+  "weight_decay": 0.01,
+  "warmup_ratio": 0.03,
+  "evaluations_per_epoch": 5,
+  "early_stopping_patience_evaluations": 5,
+  "early_stopping_min_delta": 0.0,
+  "early_stopping_start_epoch": 1,
+  "plateau_patience_evaluations": 2,
+  "plateau_factor": 0.3,
+  "plateau_min_ratio": 0.09,
+  "plateau_min_low_lr_evaluations": 2,
+  "label_scale_calibration_samples": 50000,
+  "calibration_seed": 59,
+  "gbdt": {"max_iter": 200, "validation_every": 8, "learning_rate": 0.05, "max_leaf_nodes": 31, "l2_regularization": 1.0},
+  "resources": {"max_gpu_experiments": 2, "max_cpu_experiments": 1, "gpu_memory_fraction": 0.8, "gpu_bytes_per_experiment": 4294967296, "host_memory_fraction": 0.65, "host_bytes_per_gpu_experiment": 4294967296, "worker_bytes": 536870912, "max_loader_workers_per_experiment": 4, "prefetch_factor": 2, "timeout_seconds": 172800}
+}

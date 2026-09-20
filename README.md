@@ -2,6 +2,10 @@
 
 ## 中文
 
+目前分支包含尚待完整雲端驗收的全量評估／baseline 改版，**不是正式訓練發佈版**。
+已標記的歷史架構快照為 `v0.1.0`；實際驗證結果與未完成項目見
+[驗收狀態](docs/performance_workflow_validation.md)。
+
 ### 授權與版本
 
 本專案自有程式碼及明示發布的模型新增部分，僅限自然人免費研究、學習、實驗、
@@ -53,7 +57,7 @@ Asset + benchmark OHLCV through close t
   │                                                           ↓                    │
   │                                                    head trunk + horizon        │
   │                                                           ├──────────────┐     │
-  └─ eight past-only scale statistics → train-calibrated MLP ───┼─ residual fusion ←─┘
+  └─ 20 past-only scale/market statistics → calibrated MLP ────┼─ residual fusion ←─┘
                                                               ↓            │
                                                      base head + residual ←┘
                                                               ↓
@@ -86,32 +90,48 @@ benchmark 的歷史同時透過動態 gated cross-attention 與 resampler latent
 
 #### 小型數值特徵分支
 
-生產預設 `combined`，保留原 Kronos-base、LoRA 與 conditioner，不增加 backbone 大小。
-八個尺度特徵的固定順序如下：
+生產預設 `combined`，保留 Kronos-base 與 conditioner，不增加 backbone 大小；LoRA
+使用 rank 32、alpha 64（縮放比例仍為 2），target modules 不變。新版有 20 個數值特徵：
 
 | 位置 | 特徵 | 定義 |
 | --- | --- | --- |
 | 1–3 | 個股、benchmark、相對報酬的 20 日波動 | 最近 20 個日 log return 的母體標準差；相對報酬為兩者之差 |
 | 4–6 | 個股、benchmark、相對報酬的 60 日波動 | 同上，視窗為 60 個日 log return |
 | 7–8 | 個股與 benchmark 的歷史價格 CV | 128-bar context 內 adjusted close 的母體標準差除以平均值 |
+| 9–14 | 個股、benchmark、相對報酬的 5／20 日平均 log return | 只使用歷史日報酬 |
+| 15–16 | 60 日相關係數與 beta | 個股與 benchmark 的歷史共變異數及波動 |
+| 17 | 相對報酬 20 日 downside deviation | 負報酬平方平均的平方根 |
+| 18–19 | 個股、benchmark 的當日／20 日平均成交量比 | `log((volume_t + 1) / (mean_volume_20 + 1))` |
+| 20 | benchmark 60 日回撤 | 當下 close 相對歷史視窗最高 close 的 log ratio |
 
 所有統計僅使用截至 `t` 的共同觀測資料，至少需要 61 個有效 bars；不年化、不使用未來
-報酬，也不使用未來公司行動改寫輸入。每個 feature 先做 `log(x + 1e-8)`，再以 train-only
+報酬，也不使用未來公司行動改寫輸入。前八個 feature 使用 `log(x + 1e-8)`，其餘使用
+可保留正負號的 `asinh`，再以 train-only
 calibration sample 的 median／IQR 標準化；IQR 下限 `1e-3`，標準化值裁切至 `[-10, 10]`。
 完整 schema、train dataset 指紋與統計值保存在 checkpoint 的 `runtime_scale_features`，
 推論只恢復統計，不以 validation、holdout 或當次輸入重新 fit。
 
-尺度 MLP 為 `8 → 32 → 16`；benchmark resampler tokens 先 mean pooling，再做 `512 → 16`。
+尺度 MLP 為 `20 → 32 → 16`；benchmark resampler tokens 先 mean pooling，再做 `512 → 16`。
 原 head 的 horizon-conditioned hidden 另做 `512 → 16`；三者串接後經 `48 → 32 → 3`，
 加在原 head 的三個 raw quantile parameters 上，位置在原 head LayerNorm **之後**。
-最後再產生有序 q10／q50／q90。此分支共增加 **18,899** 個可訓練參數；僅 residual 最後
-一層零初始化，讓初始輸出保持原 head 行為。head、特徵轉換與 pinball loss 使用 FP32，
+head 另接入 US／TWSE／TPEx／unknown 的市場 embedding。輸出不再只有加法 residual：
+以歷史相對報酬 20 日波動乘 `sqrt(horizon)` 作為正尺度，限制於各 horizon train robust
+scale 的 0.1–10 倍，再乘上可學習的 0.25–4 倍正值 gate；q10／q50／q90 同步縮放，
+因此始終保持分位數順序。市場 embedding、residual 輸出層與 scale gate 零初始化；
+gate 的初始倍率為 1，但新版的初始輸出尺度與 v0.1.0 不同。head、特徵轉換與 pinball loss 使用 FP32，
 Kronos 計算仍沿用 BF16 mixed precision。
 
-`configure --feature-mode baseline|scales|benchmark|combined` 使用同一份程式與資料，分別
-關閉兩條新分支、只開尺度、只開 benchmark 直接連接、或兩者都開。這是受控比較開關，
-不是四套部署流程；切換 mode 不改變 dataset namespace，但必須建立新的 training run。
+新版 production config 啟用 `explicit_output_scale`，因此 feature mode 必須為 `scales`
+或 `combined`。舊版四種 feature-mode 實驗可在 `v0.1.0` 重現；新版如需移除尺度路徑，
+必須同步關閉明確尺度控制。切換 mode 不改變 dataset namespace，但必須建立新的 training run。
 是否改善預測必須由新訓練的評估結果證明，加入尺度資訊本身不等於已提升 alpha 能力。
+
+訓練目標為原 normalized pinball 加上權重 `0.05` 的 pairwise logistic ranking loss。
+排序只比較同一截止日、同一市場的不同股票，排除重複 padding 與近乎相同的標籤；
+每個 microbatch 最多 256 對，loss 仍涵蓋所有 forecast horizons。runtime-only date/market
+索引改善同組股票在 batch 中相遇的機會，保留 Stage 2 全部 train windows；不改 bar-store。
+checkpoint 選擇與 early stopping 仍只看完整 validation 的 normalized pinball，不使用
+ranking loss 或 holdout 來選模。本版本不做 prediction／parameter ensemble。
 
 ### 為什麼選 Kronos-base
 
@@ -371,9 +391,29 @@ Stage 1／2 的 label robust scales 都從完整 **train partition** 的同一�
 manifest SHA 綁定；兩種校準都不讀 validation／holdout。
 
 最終 `validation stage` 是既有工作流程名稱；新固定日期模式實際評估 **holdout/test**。
-完整模型必須重新推論，不能沿用 checkpoint validation snapshot；GRU、DLinear、PatchTST
-僅用 validation 做 early stop，再以選定權重評估 holdout。所有模型共用 holdout sampler、
-20,000 筆上限與 train-calibrated label scales，並驗證有序 symbol/date SHA-256 相同。
+完整模型必須重新推論，不能沿用 checkpoint validation snapshot。所有例行 validation
+與最終 test 都使用完整 split，`evaluation_max_samples` 與 `baseline_max_samples_per_split`
+固定為 `null`；沒有 20,000 筆上限。指標按完整資料的樣本數加權，預測分批移出 GPU 並使用
+磁碟暫存，逐塊彙總。所有模型使用相同 train-calibrated label scales，並驗證完整有序
+symbol/date SHA-256 相同。不同資料來源或 universe 仍必須比對這個指紋，不能只比日期。
+
+baseline 是主模型之前的獨立流程，所有 rule、GBDT、GRU、DLinear、PatchTST 使用完整
+train／validation／test。神經模型每 epoch 做五次完整 validation，以相同 normalized pinball
+與五次未改善 patience 選擇 checkpoint；最多五個 epochs。GBDT 每八輪新增樹後，評估完整
+validation 的跨 horizon／quantile 平均 normalized pinball，最多 200 輪；停用 sklearn 內部
+validation 抽樣。固定規則沒有可 early-stop 的 optimizer，其 residual quantiles 以完整 train
+校準。完整資料相同不代表不同架構的 FLOPs 或訓練時間相同。
+
+神經訓練採 warmup 後的 validation-driven plateau 排程：兩次未改善即將 LR 乘 0.3，最低為
+初始 LR 的 0.09；到達最低 LR 後，必須再完成兩次 validation 間隔的訓練，才允許 early stop。
+checkpoint 保存 plateau 狀態，resume／更換 batch plan 不會把已降低的 LR 重設。
+
+完成的 baseline 權重、規則參數、最佳 validation 指標、完整 test 預測與指標保存在
+`/runpod-volume/baselines/<baseline-id>/`，最後才發布 `complete.json`。主模型 training 有前置
+檢查，testing 只讀此處的 baseline 指標，**不會再次訓練或推論 baseline**。快取依資料期間、
+資料／universe／horizon 語意與 baseline 訓練程式和 `configs/baseline.json` 數值參數識別；
+修改主模型、README、部署腳本或資源並行上限不會使其失效。不可把不同資料內容只因日期相同
+就視為同一份 baseline。若完整 GBDT 無法放進記憶體預算，流程會拒絕執行，不會退回抽樣。
 結果 schema 為 `6.0`，明列 `selection_split=validation`、`evaluation_split=test`；只有
 完成配對檢查後才發布 `test_unlocked=true`。舊 schema 的完成結果不能直接續用。
 
@@ -386,11 +426,11 @@ Holdout 排名僅描述結果，不可再用來挑 checkpoint、反覆調參或�
 | --------------------------- | ---------------------------------------------------------------- | ---------------------- |
 | 目的                        | 驗證資料、模型、loss、checkpoint、評估與 RunPod 腳本             | 完整資料微調與正式評估 |
 | train 樣本                  | O(1) blockwise sampler 固定取 5%，最多 500,000 個；每個 epoch 僅改變順序 | 100% valid train cutoffs |
-| epoch 上限                  | 2；至少進入第 2 個 epoch 才允許 early stop                        | 5                        |
+| epoch 上限                  | 2                                                               | 5                        |
 | validation cadence         | 每個 epoch 的 20%／40%／60%／80%／100%，共 5 次                  | 同左                     |
-| early stopping             | validation normalized pinball loss 連續 5 次未改善；第 2 epoch 起生效 | 同一 loss 與 patience；第 1 epoch 起生效 |
+| early stopping             | normalized pinball 連續 5 次未改善，且完成最低 LR 的兩個間隔；第 1 epoch 起生效 | 同左 |
 | 保存結果                    | validation 最佳 5 個完整 checkpoints，加上訓練完成時的精簡權重結果 | 同左                     |
-| validation / test           | 完整 split 保留於 cutoff ranges；例行評估依 config 確定性限量     | 同左                   |
+| validation / test           | 每次均使用完整 split，不抽樣、不 padding、不 drop_last           | 同左                   |
 | 架構                        | Kronos-base + 同一組 LoRA + resampler + conditioner + alpha head | 完全相同               |
 | 初始化                      | 原始 pretrained base                                             | 原始 pretrained base   |
 | 是否接續 Stage 1 checkpoint | 否                                                               | 否                     |
@@ -642,7 +682,7 @@ mapping 也不能繞過此限制。這不保證涵蓋 provider 未回傳或帳�
 | `--start` | `YYYY-MM-DD`；預設 `2016-01-01` | 所有市場共用的 inclusive 起始日，須早於 `2025-06-01` 且留足 context 與 train 資料 |
 | `--end` | `YYYY-MM-DD`；無預設值 | 所有市場共用的 exclusive 結束日，須至少為 `2026-06-01`；超出此日的資料不會進入固定 train／validation／holdout |
 | `--h-start` | `1`、`2`、`3`；預設 `1` | 從第幾個持有交易日起至第 14 日的累積 alpha；仍於 `t+1` raw open 評估進場。只改變 runtime labels 與模型輸出，不改變 dataset identity |
-| `--feature-mode` | `baseline`、`scales`、`benchmark`、`combined`；預設 `combined` | 同一架構的兩條 residual 特徵路徑開關；只改變 training selection／model identity，不改變 dataset namespace |
+| `--feature-mode` | 新版 production 使用 `scales` 或 `combined`；預設 `combined` | 其他模式只適用關閉 explicit output scale 的自訂／舊設定；不改變 dataset namespace |
 | `--universe` | `all`、`explicit` | 控制美國商品選取方式；對 `tw_only` 只能使用 `all`。非互動模式必填 |
 | `--stocks` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的美國普通股／ADR，例如 `"AAPL,BABA"`；會用 EODHD discovery 驗證型別，不影響台股 |
 | `--etfs` | 逗號或空白分隔的美國 ticker；可重複提供 | `explicit` 模式中的非槓桿股票型 ETF，例如 `"SPY,QQQ"`；必須在經稽核白名單內，不影響台股 |
@@ -1200,7 +1240,7 @@ Stage 2 會從相同 pretrained base 開始，不接續 Stage 1 checkpoint。切
    `status` 必須顯示 dataset ready，且 `readiness --gpu` 必須成功。Finalization 完成前，
    dataset marker 暫時仍顯示舊 Stage 1 selection ID 是正常的；不要以此判定資料需要重建。
 
-7. **本機控制端：列出 GPU 並建立 Stage 2 training Pod。** `gpuId` 必須使用清單中的
+7. **本機控制端：先完成下節「獨立 baseline 與既有資料升級」的 baseline 流程，再列出 GPU 並建立 Stage 2 training Pod。** `gpuId` 必須使用清單中的
    完整名稱；`--maxRuntime` 同時涵蓋訓練與自動 validation：
 
    ```bash
@@ -1232,6 +1272,66 @@ Stage 2 會從相同 pretrained base 開始，不接續 Stage 1 checkpoint。切
    ```bash
    bash scripts/runpod_workflow.sh status
    ```
+
+#### 獨立 baseline 與既有資料升級
+
+已完成 CPU prepare／finalize 的 dataset，升級本版只需刷新 training selection；
+`--reuse-current` 保留 active selection 的日期、profile、universe、revision、horizon、stage
+與 feature mode，並強制檢查 dataset request SHA 不變。**不要重跑 `cpu prepare`、
+`cpu-finalize` 或 download-data；不會新增行情 API call。** 新 dataset 則先按前節完成既有
+CPU 流程。以下命令在本機專案目錄執行：
+
+```bash
+bash scripts/runpod_workflow.sh configure --reuse-current
+bash scripts/runpod_workflow.sh selection show
+bash scripts/runpod_workflow.sh sync --dry-run
+bash scripts/runpod_workflow.sh sync --apply
+bash scripts/runpod_workflow.sh readiness --gpu
+bash scripts/runpod_workflow.sh gpu-list
+bash scripts/runpod_workflow.sh baseline --maxRuntime 24h --gpuId "NVIDIA GeForce RTX 5090"
+```
+
+`baseline` 自動讀 `.env` 的 network volume 與 active selection。在本機檢查完成 manifest
+和所有輸出物件大小；完全匹配就顯示 cache hit 並結束，**不建立 Pod**。若建立 Pod，使用
+Console 提供的 SSH 連線後執行：
+
+```bash
+cd /runpod-volume/stock_forecasting
+bash scripts/runpod_tmux_launch.sh baseline
+```
+
+工作由 detached tmux 執行；不需要持續維持 SSH。查看即時 log：
+
+```bash
+tmux -L fin-ts-baseline attach -t fin-ts-baseline
+```
+
+按 `Ctrl-b d` 離開不會中斷工作。完成／失敗／逾時後由**本機 guard**終止 Pod，
+因此本機須保持開機與網路；baseline 不依賴 Pod 自我終止。回到本機確認：
+
+```bash
+bash scripts/runpod_workflow.sh baseline --maxRuntime 24h --gpuId "NVIDIA GeForce RTX 5090"
+```
+
+若先前已完整完成，這次應直接命中快取；若逾時或失敗，會建立新 Pod，SSH 後仍執行同一個
+tmux baseline 命令，接續已保存的 job／checkpoint。完整 baseline 可能超過單次 24 小時，
+此參數是單次 workload 上限，不是完成時間保證。確認 cache hit 後才建立主模型 Pod：
+
+```bash
+bash scripts/runpod_workflow.sh train --maxRuntime 24h --gpuId "NVIDIA GeForce RTX 5090"
+```
+
+主模型 Pod SSH 後執行 `bash scripts/runpod_tmux_launch.sh stage1-train`；名稱保留相容性，
+實際使用 active stage。`train` 在本機找不到匹配完整 baseline 就拒絕建立 Pod，不會自動
+偷偷訓練 baseline。不同 train 年份的 A／B dataset 各建立一份，之後同 dataset 的主模型共用。
+
+baseline 以 `configs/baseline.json` 管理參數及資源：預設同張 GPU 最多兩個 deep jobs，
+另有一個 CPU rule／GBDT job；先按 CPU、cgroup 記憶體、GPU 可用記憶體與 `/dev/shm`
+計算可准入數量，並限制 DataLoader workers、prefetch、原生 BLAS threads 與 job deadline。
+神經模型與 CPU job 在預算允許時同時執行，資源不足會明確降並行度或拒絕執行。
+完整 GBDT 所需 RAM 及全量 validation 成本遠高於舊 20,000 筆方案；請以 resource-plan
+與進度 log 判斷硬體需求，不要以降低資料量繞過檢查。`.pt`／`.pkl` 是本專案受信任的
+hash-scoped 輸出，勿載入第三方不可信權重。
 
 #### 4. 建立 GPU Pod 並訓練
 
@@ -1799,7 +1899,7 @@ cd /runpod-volume/stock_forecasting
 
 PoC 最低驗收條件：
 
-1. Stage 1 固定選取 `min(full train samples × 5%, 500,000)` 個 train samples，規劃 2 epochs，每個 epoch 僅改變順序，且至少進入第 2 epoch 才能 early stop；完整 validation/test 保留不變，並能完成 forward/backward、checkpoint reload 與 inference smoke test。
+1. Stage 1 固定選取 `min(full train samples × 5%, 500,000)` 個 train samples，規劃 2 epochs，每個 epoch 僅改變順序，early stop 必須完成最低 LR 的兩個訓練／validation 間隔；使用完整 validation/test，並能完成 forward/backward、checkpoint reload 與 inference smoke test。
 2. Stage 2 與 Stage 1 architecture digest 相同，且由相同 pretrained base 重新開始。
 3. 所有 run 都可追溯到 immutable Parquet、dataset profile、provider、symbols、日期範圍與 split counts。
 4. CPU marker 與 active training selection 必須在 stage、config SHA、profile、日期、requested universe 與 dataset request SHA 完全一致；例如 CPU `tw_only` 對 GPU `us_tw_eodhd` 必須在 Pod 建立前 fail closed。
@@ -1837,6 +1937,11 @@ Stage 1 只證明腳本與契約可運作，不用來宣稱模型具備 alpha。
 ---
 
 ## English
+
+This branch includes the full-evaluation/baseline revision pending complete cloud
+acceptance; **it is not a production training release**. The tagged historical
+architecture snapshot is `v0.1.0`. See the [acceptance status](docs/performance_workflow_validation.md)
+for actual verification results and outstanding checks.
 
 ### License and versions
 
@@ -1899,7 +2004,7 @@ Asset + benchmark OHLCV through close t
   │                                                           ↓                    │
   │                                                    head trunk + horizon        │
   │                                                           ├──────────────┐     │
-  └─ eight past-only scale statistics → train-calibrated MLP ───┼─ residual fusion ←─┘
+  └─ 20 past-only numerical features → train-calibrated MLP ────┼─ residual fusion ←─┘
                                                               ↓            │
                                                      base head + residual ←┘
                                                               ↓
@@ -1938,38 +2043,57 @@ model input.
 
 #### Small numerical feature branch
 
-Production defaults to `combined`, retaining Kronos-base, LoRA, and the conditioner
-without enlarging the backbone. The eight features have a fixed order:
+Production defaults to `combined`, retaining Kronos-base and the conditioner.
+LoRA uses rank 32 / alpha 64 (the scaling ratio remains 2), with unchanged target
+modules. The extended numerical branch has 20 features in a fixed order:
 
 | Positions | Features | Definition |
 | --- | --- | --- |
 | 1–3 | Asset, benchmark, relative 20-day volatility | Population standard deviation of the last 20 daily log returns; relative returns are asset minus benchmark |
 | 4–6 | Asset, benchmark, relative 60-day volatility | Same definition over the last 60 daily log returns |
 | 7–8 | Asset and benchmark context price CV | Population standard deviation of adjusted closes divided by their mean over the 128-bar context |
+| 9–14 | Asset, benchmark, relative 5/20-day mean log return | Historical daily returns only |
+| 15–16 | 60-day correlation and beta | Historical asset/benchmark covariance and volatility |
+| 17 | Relative 20-day downside deviation | Root mean squared negative return |
+| 18–19 | Asset/benchmark current-to-20-day mean volume ratio | `log((volume_t + 1) / (mean_volume_20 + 1))` |
+| 20 | Benchmark 60-day drawdown | Log ratio of current close to the historical window peak |
 
 Statistics use only aligned observations available through `t`, require at least
 61 valid bars, and are not annualized. Future returns and future corporate actions
-never enter features. Each value is transformed by `log(x + 1e-8)`, normalized with
+never enter features. The first eight values use `log(x + 1e-8)`; the others use
+signed `asinh`. Values are normalized with
 train-only median/IQR statistics (IQR floor `1e-3`), and clipped to `[-10, 10]`.
 Checkpoints bind the feature schema, training dataset fingerprint, and aggregates
 in `runtime_scale_features`. Inference restores them without refitting on
 validation, holdout, or the inference batch.
 
-The scale MLP is `8 → 32 → 16`. Mean-pooled benchmark resampler latents use
+The scale MLP is `20 → 32 → 16`. Mean-pooled benchmark resampler latents use
 `512 → 16`; the original horizon-conditioned head hidden state uses another
 `512 → 16`. Concatenated features pass through `48 → 32 → 3` and are added to
 the original raw quantile parameters **after** the head LayerNorm, before the
-ordered q10/q50/q90 transformation. This adds **18,899** trainable parameters.
-Only the final residual layer starts at zero, preserving initial base-head outputs.
-The head, feature transformations, and pinball loss use FP32; Kronos computation
-retains BF16 mixed precision.
+ordered q10/q50/q90 transformation. A US/TWSE/TPEx/unknown market embedding
+conditions the head. Historical relative 20-day volatility times `sqrt(horizon)`
+explicitly controls output scale, bounded to 0.1–10 times each horizon's train
+robust scale, with an additional learned positive multiplier bounded to 0.25–4.
+All three quantiles share the multiplier, preserving their ordering. The market
+embedding, residual output layer, and scale gate start at zero; the gate initially
+multiplies by one, but initial output scales differ from v0.1.0. The head, feature
+transforms and pinball loss use FP32; Kronos retains BF16 mixed precision.
 
-`configure --feature-mode baseline|scales|benchmark|combined` disables both new
-branches, enables scales only, enables the direct benchmark only, or enables both.
-These are controlled variants of one implementation and deployment workflow.
-Changing the mode preserves the dataset namespace but requires a new training run.
+Production `explicit_output_scale` requires `scales` or `combined` feature mode.
+The four original feature-mode experiments are reproducible at v0.1.0; removing
+the scale branch in new configurations also requires disabling explicit scale
+control. Changing the mode preserves the dataset namespace but requires a new run.
 Predictive improvement must be demonstrated by new evaluation results; adding
 scale information alone is not evidence of improved alpha forecasting.
+
+Training adds pairwise logistic ranking loss with weight `0.05` to normalized
+pinball. Pairs must share the cutoff date and market and represent different
+securities; duplicate padding and nearly tied labels are excluded. Each microbatch
+uses at most 256 pairs across all forecast horizons. A runtime-only date/market
+index improves within-group batch membership while retaining every Stage 2 train
+window; it does not modify the prepared bar store. Checkpoint selection remains
+pure full-validation normalized pinball. No prediction ensemble is used.
 
 ### Why Kronos-base
 
@@ -2289,12 +2413,35 @@ with Stage 1's 5% training subset. Feature median/IQR calibration uses the same
 sample-count/seed contract. Aggregate caches bind the training dataset manifest
 SHA; neither calibration reads validation or holdout.
 
-The existing workflow name `validation stage` now scores **holdout/test** for
-fixed-date runs. The full model must recompute predictions rather than reuse a
-checkpoint validation snapshot. GRU, DLinear, and PatchTST select early stopping
-on validation and then score holdout with selected weights. All models share the
-holdout sampler, 20,000-row cap, train-calibrated label scales, and verified ordered
-symbol/date SHA-256. Result schema `6.0` explicitly records
+The existing workflow name `validation stage` scores **holdout/test** for fixed-date
+runs. The full model recomputes predictions rather than reusing checkpoint validation.
+Every routine validation and final test visits its entire split, with
+`evaluation_max_samples` and `baseline_max_samples_per_split` set to `null`.
+Predictions leave the GPU batch by batch and use disk-backed aggregation with exact
+sample weighting. All models share train-calibrated label scales and verified ordered
+symbol/date SHA-256. Matching dates alone does not guarantee matching universes.
+
+Baselines are an independent prerequisite. Rules, GBDT, GRU, DLinear and PatchTST
+use full train/validation/test. Neural models validate five times per epoch with
+the same normalized-pinball criterion and five-evaluation patience, for at most
+five epochs. GBDT evaluates full validation jointly across horizons/quantiles every
+eight added boosting rounds, up to 200, with sklearn's internal validation split
+disabled. Fixed rules have no iterative optimizer to early-stop; their residual
+quantiles use all train rows. Equal data is not equal FLOPs or wall-clock cost.
+
+After warmup, two non-improving validations multiply neural learning rates by 0.3,
+down to 0.09 of their original values. Early stopping additionally requires two
+completed training/validation intervals at the minimum rate. Checkpoints preserve
+the plateau state; resuming or changing runtime batch plans never resets reductions.
+
+Baseline weights/rule parameters, best-validation metrics, complete test predictions
+and metrics live under `/runpod-volume/baselines/<baseline-id>/`, with `complete.json`
+published last. Main training requires this cache; main testing reads its metrics
+without retraining or re-running baseline inference. Identity covers data periods,
+universe/horizon/preparation semantics, baseline code and numerical parameters in
+`configs/baseline.json`, not unrelated model/README/deployment edits or concurrency
+limits. A full GBDT job that exceeds the host-memory budget fails before fitting;
+it never silently subsamples. Result schema `6.0` explicitly records
 `selection_split=validation` and `evaluation_split=test`; `test_unlocked=true`
 is published only after paired checks pass. Old-schema completed scores cannot
 be reused.
@@ -2310,11 +2457,11 @@ and do not establish coverage of every future market regime.
 | --------------------- | ----------------------------------------------------------------------- | ------------------------------------------- |
 | Purpose               | Validate data, model, loss, checkpoints, evaluation, and RunPod scripts | Full-data fine-tuning and formal evaluation |
 | Train samples         | One fixed 5% set capped at 500,000; only traversal order changes between epochs | 100% of valid train cutoffs                  |
-| Epoch limit           | 2; early stopping is disabled until epoch 2 begins                       | 5                                            |
+| Epoch limit           | 2                                                                       | 5                                            |
 | Validation cadence    | Five times per epoch at 20%/40%/60%/80%/100%                             | Same                                         |
-| Early stopping        | Five consecutive non-improving normalized-pinball validations; active from epoch 2 | Same loss and patience; active from epoch 1 |
+| Early stopping        | Five non-improving normalized-pinball validations plus two intervals at minimum LR; active from epoch 1 | Same |
 | Stored results        | Best five full validation-ranked checkpoints plus compact completion weights | Same                                      |
-| Validation / test     | Full splits remain in cutoff ranges; routine evaluation is deterministically capped by config | Same                                         |
+| Validation / test     | Complete eligible stock-date populations, without sampling               | Same                                         |
 | Architecture          | Kronos-base + the same LoRA + resampler + conditioner + alpha head      | Identical                                   |
 | Initialization        | Original pretrained base                                                | Original pretrained base                    |
 | Continue from Stage 1 | No                                                                      | No                                          |
@@ -2600,7 +2747,7 @@ All user-facing `configure` options are:
 | `--start` | `YYYY-MM-DD`; default `2016-01-01` | Inclusive start shared by all markets; must precede `2025-06-01` and leave enough context/training history |
 | `--end` | `YYYY-MM-DD`; no default | Exclusive end shared by all markets; must be at least `2026-06-01`. Later rows never enter the fixed train/validation/holdout splits |
 | `--h-start` | `1`, `2`, or `3`; default `1` | First cumulative holding-day horizon through day 14; entry stays at the `t+1` raw open. Changes runtime labels and model output, not dataset identity |
-| `--feature-mode` | `baseline`, `scales`, `benchmark`, `combined`; default `combined` | Controlled residual-branch switches; changes training selection/model identity, not the dataset namespace |
+| `--feature-mode` | Production uses `scales` or `combined`; default `combined` | Other modes require custom/legacy configs with explicit output scale disabled; dataset namespace is unchanged |
 | `--universe` | `all`, `explicit` | Select the US-instrument strategy; `tw_only` accepts only `all`. Required in non-interactive mode |
 | `--stocks` | Comma- or space-separated US tickers; repeatable | US common stocks/ADRs in `explicit` mode, such as `"AAPL,BABA"`; provider type is verified against EODHD discovery and does not affect Taiwan data |
 | `--etfs` | Comma- or space-separated US tickers; repeatable | Unleveraged US equity ETFs in `explicit` mode, such as `"SPY,QQQ"`; each ticker must be in the audited allowlist and does not affect Taiwan data |
@@ -3237,7 +3384,7 @@ Follow this sequence and do not skip the dataset request SHA comparison:
    finalization completes, it is normal for the dataset marker to retain the old
    Stage 1 selection ID; that alone is not a rebuild signal.
 
-7. **Local control machine: list GPUs and create the Stage 2 training Pod.** Use
+7. **Local control machine: complete the independent baseline workflow below, then list GPUs and create the Stage 2 training Pod.** Use
    one complete `gpuId` from the current list. `--maxRuntime` covers training and
    the automatic validation workflow together:
 
@@ -3272,6 +3419,72 @@ Follow this sequence and do not skip the dataset request SHA comparison:
    ```bash
    bash scripts/runpod_workflow.sh status
    ```
+
+#### Independent baselines and upgrading an existing dataset
+
+For datasets with completed CPU preparation/finalization, refresh only the training
+selection. `--reuse-current` retains its dates, profile, universe, revision, horizon,
+stage and feature mode, and refuses any dataset-request SHA change. **Do not rerun
+`cpu prepare`, `cpu-finalize`, or data downloads. No new market-data API call is
+required.** A genuinely new dataset still follows the existing CPU workflow first.
+Run these commands in the local project directory:
+
+```bash
+bash scripts/runpod_workflow.sh configure --reuse-current
+bash scripts/runpod_workflow.sh selection show
+bash scripts/runpod_workflow.sh sync --dry-run
+bash scripts/runpod_workflow.sh sync --apply
+bash scripts/runpod_workflow.sh readiness --gpu
+bash scripts/runpod_workflow.sh gpu-list
+bash scripts/runpod_workflow.sh baseline --maxRuntime 24h --gpuId "NVIDIA GeForce RTX 5090"
+```
+
+`baseline` reads the volume from `.env` and uses the active selection. It checks the
+complete manifest and artifact sizes **locally before allocating a paid Pod**.
+A complete matching cache exits immediately without a Pod. Otherwise connect with
+the Console's SSH command, then run:
+
+```bash
+cd /runpod-volume/stock_forecasting
+bash scripts/runpod_tmux_launch.sh baseline
+```
+
+The detached tmux job survives SSH disconnection. To observe progress:
+
+```bash
+tmux -L fin-ts-baseline attach -t fin-ts-baseline
+```
+
+Detach with `Ctrl-b d`. The **local guard** terminates the Pod after completion,
+failure or timeout; keep the local host powered and connected. Baselines do not
+depend on Pod self-termination. Back on the local host, run:
+
+```bash
+bash scripts/runpod_workflow.sh baseline --maxRuntime 24h --gpuId "NVIDIA GeForce RTX 5090"
+```
+
+Successful completion returns a cache hit. An incomplete build instead creates a
+new Pod; launch the same remote baseline tmux command to resume saved jobs and
+checkpoints. Full baselines may take longer than 24 hours; this is a per-Pod workload
+limit, not a completion-time guarantee. After a cache hit, start main training:
+
+```bash
+bash scripts/runpod_workflow.sh train --maxRuntime 24h --gpuId "NVIDIA GeForce RTX 5090"
+```
+
+Inside that Pod, run `bash scripts/runpod_tmux_launch.sh stage1-train`; the name is
+retained for compatibility while the active stage determines the config. A missing
+baseline causes `train` to refuse Pod creation, never to train baselines implicitly.
+A/B datasets with different training histories each build their own reusable cache.
+
+`configs/baseline.json` controls numerical parameters and resource limits. Defaults
+allow two deep-model experiments on one GPU plus one CPU rule/GBDT job. Admission
+uses CPU count, cgroup memory, free GPU memory and `/dev/shm`; DataLoader workers,
+prefetch, native BLAS threads and job deadlines are bounded. GPU and CPU jobs overlap
+when budgets permit. Insufficient resources explicitly reduce concurrency or reject
+execution. Full GBDT RAM and full-validation cost can be much higher than the former
+20,000-row workflow; inspect resource plans/logs instead of bypassing checks through
+subsampling. Load `.pt`/`.pkl` only from trusted project-generated hash-scoped output.
 
 #### 4. Create a GPU Pod and train
 
@@ -3918,7 +4131,7 @@ Minimum PoC acceptance:
 
 1. Stage 1 selects one fixed `min(full train samples * 5%, 500,000)` train set
    for up to two epochs and changes only its traversal order between epochs.
-   Early stopping cannot activate before epoch 2 begins. Full validation/test
+   Under the validation-plateau policy, early stopping additionally requires two completed validation intervals at the minimum learning rate. Full validation/test
    remain intact, and forward/backward, checkpoint reload, and inference smoke
    tests complete.
 2. Stage 2 has the same architecture digest and starts again from the same

@@ -44,8 +44,14 @@ case "${RUNPOD_GPU_WORKFLOW}" in
         RUNPOD_GUARD_LIFECYCLE_KEY=lifecycle/stage1/validation.json
         RUNPOD_TMUX_WORKFLOW=stage1-validate
         ;;
+    baseline)
+        RUNPOD_POD_NAME="${RUNPOD_POD_NAME:-fin-ts-baseline}"
+        RUNPOD_GPU_ROLE=gpu-baseline
+        RUNPOD_GUARD_LIFECYCLE_KEY=lifecycle/stage1/baseline.json
+        RUNPOD_TMUX_WORKFLOW=baseline
+        ;;
     *)
-        echo "RUNPOD_GPU_WORKFLOW must be train or validation" >&2
+        echo "RUNPOD_GPU_WORKFLOW must be train, validation, or baseline" >&2
         exit 2
         ;;
 esac
@@ -84,6 +90,10 @@ if [[ "${VALIDATION_FORCE_RECOMPUTE}" == "1" ]]; then
     VALIDATION_RECOMPUTE_FULL_MODEL=1
 fi
 
+if [[ "${RUNPOD_GPU_WORKFLOW}" == "baseline" && ( -n "${RESUME_CHECKPOINT}" || -n "${VALIDATION_RUN_ID}" || -n "${VALIDATION_CHECKPOINT}" ) ]]; then
+    echo "Baseline Pods resume their own hash-scoped jobs, not main-model checkpoints" >&2
+    exit 2
+fi
 if [[ "${RUNPOD_GPU_WORKFLOW}" == "validation" ]]; then
     if [[ -n "${WANDB_RUN_ID}" || -n "${RESUME_CHECKPOINT}" ]]; then
         echo "Validation Pods must not carry a training resume identity" >&2
@@ -286,6 +296,21 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 127
 fi
 
+if [[ "${RUNPOD_TEST_MODE:-0}" != "1" ]]; then
+    if [[ "${RUNPOD_GPU_WORKFLOW}" == "baseline" ]]; then
+        BASELINE_CACHE_STATUS="$(python3 "${SCRIPT_DIR}/runpod_baseline_cache.py" check)"
+        if [[ "$(printf '%s' "${BASELINE_CACHE_STATUS}" | python3 -c 'import json,sys; print(int(json.load(sys.stdin)["complete"]))')" == "1" ]]; then
+            echo "Matching full-data baselines are complete; skipped without creating a GPU Pod."
+            exit 0
+        fi
+    elif [[ "${RUNPOD_GPU_WORKFLOW}" == "train" ]]; then
+        python3 "${SCRIPT_DIR}/runpod_baseline_cache.py" require >/dev/null
+    fi
+fi
+if [[ "${RUNPOD_GPU_WORKFLOW}" == "baseline" ]]; then
+    WANDB_RUN_ID="baseline-run-$(date -u +%Y%m%dT%H%M%SZ)-${RANDOM}"
+fi
+
 if [[ "${RUNPOD_TEST_READINESS_READY:-0}" == "1" ]]; then
     if [[ "${RUNPOD_TEST_MODE:-0}" != "1" ]]; then
         echo "RUNPOD_TEST_READINESS_READY is allowed only in test mode" >&2
@@ -323,10 +348,14 @@ verify_no_active_gpu_workflow() {
         --output text)"
     for lifecycle_key in \
         lifecycle/stage1/training.json \
-        lifecycle/stage1/validation.json; do
+        lifecycle/stage1/validation.json \
+        lifecycle/stage1/baseline.json; do
         lifecycle_kind=stage1-training
         if [[ "${lifecycle_key}" == "lifecycle/stage1/validation.json" ]]; then
             lifecycle_kind=stage1-validation
+        fi
+        if [[ "${lifecycle_key}" == "lifecycle/stage1/baseline.json" ]]; then
+            lifecycle_kind=stage1-baseline
         fi
         for listed_key in ${lifecycle_keys}; do
             if [[ "${listed_key}" != "${lifecycle_key}" ]]; then

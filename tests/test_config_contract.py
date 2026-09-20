@@ -64,7 +64,7 @@ def test_stage_configs_share_one_model_architecture_and_start_fresh() -> None:
     assert stage1.data.train_fraction == pytest.approx(0.05)
     assert stage1.data.max_samples == 500_000
     assert stage1.training.epochs == 2
-    assert stage1.training.early_stopping_start_epoch == 2
+    assert stage1.training.early_stopping_start_epoch == 1
     assert stage2.training.stage == "stage2"
     assert stage2.data.train_fraction == pytest.approx(1.0)
     assert stage2.data.max_samples is None
@@ -171,9 +171,7 @@ def test_h_start_changes_model_and_training_contract_identity() -> None:
     assert first_day.model == third_day.model
     assert first_day.model.architecture_digest() == third_day.model.architecture_digest()
     assert first_day.model_architecture_digest() != third_day.model_architecture_digest()
-    assert training_resume_contract_digest(first_day) != training_resume_contract_digest(
-        third_day
-    )
+    assert training_resume_contract_digest(first_day) != training_resume_contract_digest(third_day)
 
 
 def test_stage_fraction_contract_fails_closed() -> None:
@@ -293,7 +291,7 @@ def test_automatic_evaluation_batch_can_cover_the_training_search_range() -> Non
             0.001,
             "five consecutive non-improving validations",
         ),
-        ("early_stopping_start_epoch", 1, "early_stopping_start_epoch=2"),
+        ("early_stopping_start_epoch", 2, "early_stopping_start_epoch=1"),
     ],
 )
 def test_stage1_training_control_contract_fails_closed(

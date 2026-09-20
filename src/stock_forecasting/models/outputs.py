@@ -61,3 +61,4 @@ class QuantForecastOutput(OutputMapping):
     benchmark_latent_tokens: Tensor
     conditioned_latent_tokens: Tensor
     conditioning_gate: Tensor
+    ranking_loss: Tensor | None = None

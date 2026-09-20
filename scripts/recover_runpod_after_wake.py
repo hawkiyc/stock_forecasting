@@ -28,6 +28,7 @@ PROJECT_ROLES = {
 GPU_ROLES = {
     "gpu-train": ("stage1-training", "lifecycle/stage1/training.json"),
     "gpu-validation": ("stage1-validation", "lifecycle/stage1/validation.json"),
+    "gpu-baseline": ("stage1-baseline", "lifecycle/stage1/baseline.json"),
 }
 ACTIVE_RUNTIME_STATES = {"running", "initializing", "unknown"}
 ACTIVE_LIFECYCLE_STATES = {"preparing", "finalizing", "downloaded_active"}
@@ -316,9 +317,7 @@ def guard_deadline(pod_id: str, guard_dir: Path) -> tuple[int, int] | None:
 def guard_alive(pod_id: str, guard_dir: Path) -> bool:
     try:
         pid = int((guard_dir / f"{pod_id}.pid").read_text(encoding="utf-8").strip())
-        ready = json.loads(
-            (guard_dir / f"{pod_id}.ready.json").read_text(encoding="utf-8")
-        )
+        ready = json.loads((guard_dir / f"{pod_id}.ready.json").read_text(encoding="utf-8"))
         if (
             ready.get("state") != "armed"
             or ready.get("pod_id") != pod_id
@@ -357,9 +356,7 @@ def guard_alive(pod_id: str, guard_dir: Path) -> bool:
         return "terminate_runpod_after.sh" in command and pod_id in command
     if "operation not permitted" in process.stderr.lower():
         return True
-    if not process.stdout.strip() and not process.stderr.strip():
-        return False
-    return True
+    return bool(process.stdout.strip() or process.stderr.strip())
 
 
 def safe_delete(pod_id: str) -> None:
@@ -376,9 +373,7 @@ def rearm_guard(pod: dict[str, Any], remaining: int, guard_dir: Path) -> None:
         required_commands.append("caffeinate")
     missing_commands = [name for name in required_commands if shutil.which(name) is None]
     if missing_commands:
-        raise RuntimeError(
-            "guard re-arm prerequisites are missing: " + ", ".join(missing_commands)
-        )
+        raise RuntimeError("guard re-arm prerequisites are missing: " + ", ".join(missing_commands))
     required_files = [GUARD_LAUNCHER, RUNPODCTL, S3, READINESS]
     unavailable_files = [str(path) for path in required_files if not os.access(path, os.R_OK)]
     if unavailable_files:
@@ -485,9 +480,7 @@ def main() -> int:
         "--guard-dir",
         type=Path,
         default=Path(
-            os.environ.get(
-                "RUNPOD_GUARD_LOG_DIR", Path.home() / ".local/state/runpod-guards"
-            )
+            os.environ.get("RUNPOD_GUARD_LOG_DIR", Path.home() / ".local/state/runpod-guards")
         ),
     )
     arguments = parser.parse_args()
@@ -535,9 +528,7 @@ def main() -> int:
         except (CommandError, RuntimeError) as error:
             print(f"Recovery confirmation failed closed: {error}", file=sys.stderr)
             return 2
-        confirmed_actions = {
-            str(item["pod"]["id"]): item["action"] for item in confirmed
-        }
+        confirmed_actions = {str(item["pod"]["id"]): item["action"] for item in confirmed}
         if first_actions != confirmed_actions:
             print(
                 f"Recovery observations changed at confirmation {confirmation_number + 1}; "

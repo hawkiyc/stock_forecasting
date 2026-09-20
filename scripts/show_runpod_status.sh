@@ -224,5 +224,6 @@ summarize_marker lifecycle/stage1/cpu-preparation.json cpu_prepare
 summarize_marker lifecycle/stage1/dataset.json dataset
 summarize_download_progress
 summarize_marker lifecycle/stage1/training.json training
+summarize_marker lifecycle/stage1/baseline.json baseline
 summarize_marker lifecycle/stage1/validation.json validation
 summarize_wandb

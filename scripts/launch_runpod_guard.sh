@@ -58,14 +58,15 @@ fi
 case "${LIFECYCLE_KEY}" in
     lifecycle/stage1/cpu-preparation.json|\
         lifecycle/stage1/mixed-finalization.json|\
-        lifecycle/stage1/training.json|lifecycle/stage1/validation.json) ;;
+        lifecycle/stage1/training.json|lifecycle/stage1/validation.json|lifecycle/stage1/baseline.json) ;;
     *)
         echo "Unsupported lifecycle marker key" >&2
         exit 2
         ;;
 esac
 if [[ ( "${LIFECYCLE_KEY}" == "lifecycle/stage1/training.json" \
-        || "${LIFECYCLE_KEY}" == "lifecycle/stage1/validation.json" ) \
+        || "${LIFECYCLE_KEY}" == "lifecycle/stage1/validation.json" \
+        || "${LIFECYCLE_KEY}" == "lifecycle/stage1/baseline.json" ) \
     && -z "${RUNPOD_GUARD_RUN_ID}" ]]; then
     echo "GPU lifecycle guards require RUNPOD_GUARD_RUN_ID" >&2
     exit 2

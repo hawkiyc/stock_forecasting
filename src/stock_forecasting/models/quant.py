@@ -8,6 +8,7 @@ from torch import Tensor, nn
 from .forecast import GatedBenchmarkConditioner, MultiHorizonAlphaHead
 from .outputs import QuantEncoderOutput, QuantForecastOutput
 from .projector import CausalPerceiverResampler
+from .ranking import same_date_ranking_loss
 from .scale_features import historical_scale_features
 
 
@@ -20,12 +21,16 @@ class QuantForecastModel(nn.Module):
         resampler: CausalPerceiverResampler,
         benchmark_conditioner: GatedBenchmarkConditioner,
         alpha_head: MultiHorizonAlphaHead,
+        ranking_loss_weight: float = 0.0,
+        ranking_max_pairs: int = 256,
     ) -> None:
         super().__init__()
         self.backbone = backbone
         self.resampler = resampler
         self.benchmark_conditioner = benchmark_conditioner
         self.alpha_head = alpha_head
+        self.ranking_loss_weight = ranking_loss_weight
+        self.ranking_max_pairs = ranking_max_pairs
 
     def encode_ohlcv(
         self,
@@ -62,6 +67,9 @@ class QuantForecastModel(nn.Module):
         asset_timestamps: Tensor | None = None,
         benchmark_timestamps: Tensor | None = None,
         target_alpha: Tensor | None = None,
+        market_ids: Tensor | None = None,
+        ranking_group_ids: Tensor | None = None,
+        security_ids: Tensor | None = None,
     ) -> QuantForecastOutput:
         scales = None
         branch = self.alpha_head.numeric_branch
@@ -74,7 +82,10 @@ class QuantForecastModel(nn.Module):
                 raise ValueError("Scale branch requires aligned asset and benchmark masks")
             with torch.autocast(device_type=asset_ohlcv.device.type, enabled=False):
                 scales = historical_scale_features(
-                    asset_ohlcv, benchmark_ohlcv, mask=asset_attention_mask,
+                    asset_ohlcv,
+                    benchmark_ohlcv,
+                    mask=asset_attention_mask,
+                    extended=self.alpha_head.explicit_output_scale,
                 )
         can_fuse_pair = (
             asset_ohlcv.shape == benchmark_ohlcv.shape
@@ -130,16 +141,37 @@ class QuantForecastModel(nn.Module):
             benchmark_encoded.latent_tokens,
         )
         alpha_quantiles = self.alpha_head(
-            conditioned, scale_features=scales,
+            conditioned,
+            scale_features=scales,
             benchmark_tokens=benchmark_encoded.latent_tokens,
+            market_ids=market_ids,
         ).float()
         pinball_loss = (
             None
             if target_alpha is None
             else self.alpha_head.pinball_loss(alpha_quantiles, target_alpha)
         )
+        ranking_loss = None
+        if self.training and self.ranking_loss_weight and target_alpha is not None:
+            if ranking_group_ids is None or security_ids is None:
+                raise ValueError(
+                    "Ranking training requires same-date/market and security identities"
+                )
+            ranking_loss = same_date_ranking_loss(
+                alpha_quantiles,
+                target_alpha,
+                self.alpha_head.robust_scales,
+                ranking_group_ids,
+                security_ids,
+                self.ranking_max_pairs,
+            )
+        total_loss = (
+            pinball_loss
+            if ranking_loss is None
+            else pinball_loss + self.ranking_loss_weight * ranking_loss
+        )
         return QuantForecastOutput(
-            loss=pinball_loss,
+            loss=total_loss,
             pinball_loss=pinball_loss,
             alpha_quantiles=alpha_quantiles,
             asset_last_hidden_state=asset_encoded.last_hidden_state,
@@ -150,4 +182,5 @@ class QuantForecastModel(nn.Module):
             benchmark_latent_tokens=benchmark_encoded.latent_tokens,
             conditioned_latent_tokens=conditioned,
             conditioning_gate=gate,
+            ranking_loss=ranking_loss,
         )

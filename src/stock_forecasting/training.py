@@ -42,16 +42,11 @@ from stock_forecasting.data.manifest import (
     sha256_file,
 )
 from stock_forecasting.evaluation_protocol import (
-    daily_normalized_pinball,
     evaluation_sampler,
-    sample_membership,
 )
 from stock_forecasting.factory import ModelBundle, build_model_bundle
 from stock_forecasting.metrics import (
-    POSTPROCESS_SIGNAL_NAMES,
-    cross_sectional_metrics,
     multi_horizon_alpha_metrics,
-    postprocess_alpha_signal,
 )
 from stock_forecasting.preflight import run_preflight
 from stock_forecasting.runtime_resources import (
@@ -127,9 +122,7 @@ class DataLoaderWorkerPlan:
             "visible_cpu_count": self.visible_cpu_count,
             "available_memory_bytes": self.available_memory_bytes,
             "available_memory_source": self.available_memory_source,
-            "available_memory_observations_bytes": dict(
-                self.available_memory_observations
-            ),
+            "available_memory_observations_bytes": dict(self.available_memory_observations),
             "worker_memory_budget_bytes": self.worker_memory_budget_bytes,
             "effective_workers": self.effective_workers,
             "active_persistent_pools": self.active_persistent_pools,
@@ -143,9 +136,7 @@ class DataLoaderWorkerPlan:
             "prefetch_factor": self.prefetch_factor,
             "prefetched_batches_per_pool": self.prefetched_batches_per_pool,
             "prefetch_memory_budget_bytes": self.prefetch_memory_budget_bytes,
-            "estimated_peak_prefetch_memory_bytes": (
-                self.estimated_peak_prefetch_memory_bytes
-            ),
+            "estimated_peak_prefetch_memory_bytes": (self.estimated_peak_prefetch_memory_bytes),
             "native_threads_per_worker": 1,
         }
 
@@ -184,12 +175,16 @@ class DataLoaderWorkerPlan:
         ):
             raise ValueError("Checkpoint DataLoader worker labels are invalid")
         observations = payload["available_memory_observations_bytes"]
-        if not isinstance(observations, dict) or not observations or any(
-            not isinstance(key, str)
-            or not isinstance(value, int)
-            or isinstance(value, bool)
-            or value < 1
-            for key, value in observations.items()
+        if (
+            not isinstance(observations, dict)
+            or not observations
+            or any(
+                not isinstance(key, str)
+                or not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 1
+                for key, value in observations.items()
+            )
         ):
             raise ValueError("Checkpoint memory observations are invalid")
         integer_fields = (
@@ -253,9 +248,7 @@ class DataLoaderWorkerPlan:
         ):
             raise ValueError("Checkpoint DataLoader worker-memory total is inconsistent")
         expected_prefetched_batches = (
-            0
-            if plan.prefetch_factor is None
-            else plan.effective_workers * plan.prefetch_factor
+            0 if plan.prefetch_factor is None else plan.effective_workers * plan.prefetch_factor
         )
         if plan.prefetched_batches_per_pool != expected_prefetched_batches:
             raise ValueError("Checkpoint DataLoader prefetch count is inconsistent")
@@ -495,8 +488,7 @@ class CanonicalTrainingSchedule:
             self.configured_optimizer_steps,
         )
         if any(
-            not isinstance(value, int) or isinstance(value, bool) or value < 1
-            for value in values
+            not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in values
         ):
             raise ValueError("Canonical training schedule is invalid")
         if self.configured_optimizer_steps != self.epochs * self.optimizer_steps_per_epoch:
@@ -581,9 +573,7 @@ class RuntimeExecutionPlan:
             raise ValueError("Checkpoint runtime execution plan is incomplete")
         if payload["schema_version"] != RUNTIME_EXECUTION_PLAN_SCHEMA_VERSION:
             raise ValueError("Checkpoint runtime execution plan version is unsupported")
-        if not isinstance(payload["source"], str) or not isinstance(
-            payload["replan_reason"], str
-        ):
+        if not isinstance(payload["source"], str) or not isinstance(payload["replan_reason"], str):
             raise ValueError("Checkpoint runtime execution plan labels are invalid")
         counters = tuple(
             payload[name]
@@ -595,19 +585,15 @@ class RuntimeExecutionPlan:
             )
         )
         if any(
-            not isinstance(value, int) or isinstance(value, bool) or value < 0
-            for value in counters
+            not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in counters
         ):
             raise ValueError("Checkpoint runtime execution counters are invalid")
         if payload["optimizer_steps_per_epoch"] < 1:
             raise ValueError("Checkpoint runtime optimizer-step count must be positive")
         if (
             payload["configured_optimizer_steps"] < payload["optimizer_steps_per_epoch"]
-            or payload["configured_optimizer_steps"]
-            % payload["optimizer_steps_per_epoch"]
-            != 0
-            or payload["resume_runtime_global_step"]
-            > payload["configured_optimizer_steps"]
+            or payload["configured_optimizer_steps"] % payload["optimizer_steps_per_epoch"] != 0
+            or payload["resume_runtime_global_step"] > payload["configured_optimizer_steps"]
         ):
             raise ValueError("Checkpoint runtime optimizer-step budget is inconsistent")
         return cls(
@@ -615,9 +601,7 @@ class RuntimeExecutionPlan:
             replan_reason=payload["replan_reason"],
             hardware=RuntimeHardwareSnapshot.from_dict(payload["hardware"]),
             batch_plan=RuntimeBatchPlan.from_dict(payload["batch_plan"]),
-            worker_plan=DataLoaderWorkerPlan.from_dict(
-                payload["dataloader_worker_plan"]
-            ),
+            worker_plan=DataLoaderWorkerPlan.from_dict(payload["dataloader_worker_plan"]),
             optimizer_steps_per_epoch=payload["optimizer_steps_per_epoch"],
             configured_optimizer_steps=payload["configured_optimizer_steps"],
             resume_canonical_global_step=payload["resume_canonical_global_step"],
@@ -725,18 +709,10 @@ def _host_memory_capacity() -> tuple[int, str]:
 
     candidates: list[tuple[str, int]] = []
     cgroup_v2 = _read_positive_integer(Path("/sys/fs/cgroup/memory.max"))
-    if (
-        cgroup_v2 is not None
-        and cgroup_v2 < CGROUP_V1_UNLIMITED_THRESHOLD_BYTES
-    ):
+    if cgroup_v2 is not None and cgroup_v2 < CGROUP_V1_UNLIMITED_THRESHOLD_BYTES:
         candidates.append(("cgroup_v2_limit", cgroup_v2))
-    cgroup_v1 = _read_positive_integer(
-        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-    )
-    if (
-        cgroup_v1 is not None
-        and cgroup_v1 < CGROUP_V1_UNLIMITED_THRESHOLD_BYTES
-    ):
+    cgroup_v1 = _read_positive_integer(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+    if cgroup_v1 is not None and cgroup_v1 < CGROUP_V1_UNLIMITED_THRESHOLD_BYTES:
         candidates.append(("cgroup_v1_limit", cgroup_v1))
     linux_total = _linux_total_memory_bytes()
     if linux_total is not None:
@@ -781,11 +757,7 @@ def _requested_dataloader_workers(config: ExperimentConfig) -> tuple[int, str]:
         return config.training.num_workers, "training_config"
     if value == "auto":
         return DATALOADER_AUTO_MAX_WORKERS, "runpod_auto"
-    if (
-        not value.isascii()
-        or not value.isdigit()
-        or int(value) > DATALOADER_AUTO_MAX_WORKERS
-    ):
+    if not value.isascii() or not value.isdigit() or int(value) > DATALOADER_AUTO_MAX_WORKERS:
         raise ValueError(
             "FIN_TS_DATALOADER_WORKERS must be auto or an integer from 0 to "
             f"{DATALOADER_AUTO_MAX_WORKERS}"
@@ -807,15 +779,8 @@ def plan_dataloader_workers(
         or requested_workers < 0
         or requested_workers > DATALOADER_AUTO_MAX_WORKERS
     ):
-        raise ValueError(
-            "requested_workers must be between 0 and "
-            f"{DATALOADER_AUTO_MAX_WORKERS}"
-        )
-    cpu_count = (
-        detect_visible_cpu_count()
-        if visible_cpu_count is None
-        else visible_cpu_count
-    )
+        raise ValueError(f"requested_workers must be between 0 and {DATALOADER_AUTO_MAX_WORKERS}")
+    cpu_count = detect_visible_cpu_count() if visible_cpu_count is None else visible_cpu_count
     memory_estimate = (
         detect_available_memory()
         if available_memory_bytes is None
@@ -870,12 +835,8 @@ def plan_dataloader_workers(
         effective_workers=effective_workers,
         active_persistent_pools=DATALOADER_ACTIVE_PERSISTENT_POOLS,
         symbol_cache_size_per_worker=symbol_cache_size,
-        prefetch_factor=(
-            DATALOADER_INITIAL_PREFETCH_FACTOR if effective_workers else None
-        ),
-        prefetched_batches_per_pool=(
-            effective_workers * DATALOADER_INITIAL_PREFETCH_FACTOR
-        ),
+        prefetch_factor=(DATALOADER_INITIAL_PREFETCH_FACTOR if effective_workers else None),
+        prefetched_batches_per_pool=(effective_workers * DATALOADER_INITIAL_PREFETCH_FACTOR),
         prefetch_memory_budget_bytes=0,
         estimated_peak_prefetch_memory_bytes=0,
     )
@@ -898,25 +859,18 @@ def plan_runtime_prefetch(
 ) -> DataLoaderWorkerPlan:
     """Size the worker queue from measured GPU demand and host-memory headroom."""
 
-    if (
-        isinstance(largest_host_batch_bytes, bool)
-        or largest_host_batch_bytes < 1
-    ):
+    if isinstance(largest_host_batch_bytes, bool) or largest_host_batch_bytes < 1:
         raise ValueError("largest_host_batch_bytes must be a positive integer")
     workers = worker_plan.effective_workers
     if workers == 0:
         return replace(worker_plan, prefetch_factor=None)
     queue_budget = max(
         largest_host_batch_bytes * worker_plan.active_persistent_pools,
-        int(
-            worker_plan.available_memory_bytes
-            * DATALOADER_PREFETCH_MEMORY_FRACTION
-        ),
+        int(worker_plan.available_memory_bytes * DATALOADER_PREFETCH_MEMORY_FRACTION),
     )
     memory_worker_limit = max(
         1,
-        queue_budget
-        // (largest_host_batch_bytes * worker_plan.active_persistent_pools),
+        queue_budget // (largest_host_batch_bytes * worker_plan.active_persistent_pools),
     )
     workers = min(workers, int(memory_worker_limit))
     seconds_per_batch = batch_plan.seconds_per_training_batch
@@ -928,9 +882,7 @@ def plan_runtime_prefetch(
         )
         demand_limit = max(2, math.ceil(buffered_batches / workers))
     per_factor_bytes = max(
-        largest_host_batch_bytes
-        * workers
-        * worker_plan.active_persistent_pools,
+        largest_host_batch_bytes * workers * worker_plan.active_persistent_pools,
         1,
     )
     memory_limit = max(1, queue_budget // per_factor_bytes)
@@ -949,10 +901,7 @@ def plan_runtime_prefetch(
         prefetched_batches_per_pool=workers * int(factor),
         prefetch_memory_budget_bytes=queue_budget,
         estimated_peak_prefetch_memory_bytes=(
-            largest_host_batch_bytes
-            * workers
-            * int(factor)
-            * worker_plan.active_persistent_pools
+            largest_host_batch_bytes * workers * int(factor) * worker_plan.active_persistent_pools
         ),
     )
 
@@ -981,8 +930,7 @@ def runtime_resource_plan_reuse_reason(
     if stored_workers.effective_workers > current_worker_plan.effective_workers:
         return "current_host_memory_headroom_is_lower"
     current_prefetch_limit = int(
-        current_worker_plan.available_memory_bytes
-        * DATALOADER_PREFETCH_MEMORY_FRACTION
+        current_worker_plan.available_memory_bytes * DATALOADER_PREFETCH_MEMORY_FRACTION
     )
     if stored_workers.estimated_peak_prefetch_memory_bytes > current_prefetch_limit:
         return "current_prefetch_memory_headroom_is_lower"
@@ -1004,14 +952,9 @@ def reuse_dataloader_worker_plan(
         prefetched_batches_per_pool=stored_plan.prefetched_batches_per_pool,
         prefetch_memory_budget_bytes=max(
             stored_plan.estimated_peak_prefetch_memory_bytes,
-            int(
-                current_plan.available_memory_bytes
-                * DATALOADER_PREFETCH_MEMORY_FRACTION
-            ),
+            int(current_plan.available_memory_bytes * DATALOADER_PREFETCH_MEMORY_FRACTION),
         ),
-        estimated_peak_prefetch_memory_bytes=(
-            stored_plan.estimated_peak_prefetch_memory_bytes
-        ),
+        estimated_peak_prefetch_memory_bytes=(stored_plan.estimated_peak_prefetch_memory_bytes),
     )
 
 
@@ -1099,12 +1042,8 @@ def _explicit_runtime_batch_plan(config: ExperimentConfig) -> RuntimeBatchPlan:
         or not isinstance(config.training.evaluation_batch_size, int)
         or not isinstance(config.training.gradient_accumulation_steps, int)
     ):
-        raise ValueError(
-            "Automatic batch controls require a resolved RuntimeBatchPlan"
-        )
-    effective_batch_size = (
-        config.training.batch_size * config.training.gradient_accumulation_steps
-    )
+        raise ValueError("Automatic batch controls require a resolved RuntimeBatchPlan")
+    effective_batch_size = config.training.batch_size * config.training.gradient_accumulation_steps
     return RuntimeBatchPlan(
         source="explicit_config",
         training_batch_size=config.training.batch_size,
@@ -1126,6 +1065,7 @@ def build_dataloaders(
     *,
     worker_plan: DataLoaderWorkerPlan | None = None,
     batch_plan: RuntimeBatchPlan | None = None,
+    ranking_sampling: bool = True,
     datasets: tuple[
         LazyFinancialWindowDataset,
         LazyFinancialWindowDataset,
@@ -1139,9 +1079,7 @@ def build_dataloaders(
     if batch_plan is None:
         batch_plan = _explicit_runtime_batch_plan(config)
     train_source, validation_dataset, test_dataset = (
-        datasets
-        if datasets is not None
-        else build_lazy_datasets(config, worker_plan=worker_plan)
+        datasets if datasets is not None else build_lazy_datasets(config, worker_plan=worker_plan)
     )
     training_batch_size = batch_plan.training_batch_size
     evaluation_batch_size = batch_plan.evaluation_batch_size
@@ -1152,6 +1090,17 @@ def build_dataloaders(
         seed=config.training.seed,
         block_size=DATALOADER_SELECTION_BLOCK_SIZE,
     )
+    if ranking_sampling and config.model.ranking_loss_weight:
+        from stock_forecasting.date_market_sampler import DateMarketSampler
+
+        train_sampler = DateMarketSampler(
+            train_source,
+            requested_workers=max(1, worker_plan.effective_workers),
+            fraction=config.data.train_fraction,
+            max_samples=config.data.max_samples,
+            seed=config.training.seed,
+            block_size=DATALOADER_SELECTION_BLOCK_SIZE,
+        )
     validation_sampler = evaluation_sampler(len(validation_dataset), config, "validation")
     test_sampler = evaluation_sampler(len(test_dataset), config, "test")
     if len(train_sampler) < training_batch_size:
@@ -1494,8 +1443,11 @@ def forward_batch(
     config: ExperimentConfig,
     device: torch.device,
 ) -> Any:
-    del config
-    del device
+    from stock_forecasting.models.ranking import market_ids, ranking_groups
+
+    groups, securities = ranking_groups(
+        batch["cutoff_at"], batch["markets"], batch["symbols"], device
+    )
     return bundle.model(
         batch["asset_series"],
         batch["benchmark_series"],
@@ -1504,6 +1456,9 @@ def forward_batch(
         asset_timestamps=batch["asset_timestamps"],
         benchmark_timestamps=batch["benchmark_timestamps"],
         target_alpha=batch["target_alpha"],
+        market_ids=market_ids(batch["markets"], device),
+        ranking_group_ids=groups,
+        security_ids=securities,
     )
 
 
@@ -1522,8 +1477,7 @@ def _batch_candidates(minimum: int, maximum: int) -> tuple[int, ...]:
 
 def _is_cuda_out_of_memory(error: BaseException) -> bool:
     return isinstance(error, torch.cuda.OutOfMemoryError) or (
-        isinstance(error, RuntimeError)
-        and "out of memory" in str(error).lower()
+        isinstance(error, RuntimeError) and "out of memory" in str(error).lower()
     )
 
 
@@ -1567,13 +1521,9 @@ def _measure_cuda_batch(
         for _ in range(config.training.auto_batch_probe_steps):
             run_once(device_batch)
         torch.cuda.synchronize(device)
-        seconds_per_batch = (
-            time.perf_counter() - started
-        ) / config.training.auto_batch_probe_steps
+        seconds_per_batch = (time.perf_counter() - started) / config.training.auto_batch_probe_steps
         peak_allocated = int(torch.cuda.max_memory_allocated(device))
-        projected_peak = peak_allocated + (
-            optimizer_state_reserve_bytes if training else 0
-        )
+        projected_peak = peak_allocated + (optimizer_state_reserve_bytes if training else 0)
         accepted = projected_peak <= device_memory_limit_bytes
         return BatchProbeMeasurement(
             batch_size=batch_size,
@@ -1608,12 +1558,8 @@ def _select_batch_measurement(
 ) -> BatchProbeMeasurement:
     accepted = [measurement for measurement in measurements if measurement.accepted]
     if not accepted:
-        raise RuntimeError(
-            "No automatic batch candidate fit the configured CUDA memory guard"
-        )
-    best_throughput = max(
-        cast(float, measurement.samples_per_second) for measurement in accepted
-    )
+        raise RuntimeError("No automatic batch candidate fit the configured CUDA memory guard")
+    best_throughput = max(cast(float, measurement.samples_per_second) for measurement in accepted)
     threshold = best_throughput * (1.0 - AUTO_BATCH_THROUGHPUT_TOLERANCE)
     near_optimal = [
         measurement
@@ -1635,11 +1581,7 @@ def _hardware_batch_expansion_maximum(
         raise ValueError("Automatic batch expansion inputs must be positive")
     memory_multiplier = max(
         1,
-        (
-            device_total_memory_bytes
-            + AUTO_BATCH_EXPANSION_MEMORY_QUANTUM_BYTES
-            - 1
-        )
+        (device_total_memory_bytes + AUTO_BATCH_EXPANSION_MEMORY_QUANTUM_BYTES - 1)
         // AUTO_BATCH_EXPANSION_MEMORY_QUANTUM_BYTES,
     )
     return min(
@@ -1661,12 +1603,8 @@ def _next_adaptive_batch_candidate(
     if not latest.accepted or latest.batch_size >= expansion_maximum:
         return None
     accepted = [measurement for measurement in measurements if measurement.accepted]
-    best_throughput = max(
-        cast(float, measurement.samples_per_second) for measurement in accepted
-    )
-    threshold = best_throughput * (
-        1.0 - AUTO_BATCH_EXPANSION_THROUGHPUT_TOLERANCE
-    )
+    best_throughput = max(cast(float, measurement.samples_per_second) for measurement in accepted)
+    threshold = best_throughput * (1.0 - AUTO_BATCH_EXPANSION_THROUGHPUT_TOLERANCE)
     if cast(float, latest.samples_per_second) < threshold:
         return None
     return min(latest.batch_size * 2, expansion_maximum)
@@ -1681,9 +1619,7 @@ def _automatic_gradient_accumulation_steps(
 
     if training_batch_size < target_effective_batch_size:
         if target_effective_batch_size % training_batch_size != 0:
-            raise ValueError(
-                "The selected automatic batch must divide target_effective_batch_size"
-            )
+            raise ValueError("The selected automatic batch must divide target_effective_batch_size")
         return target_effective_batch_size // training_batch_size
     return 1
 
@@ -1723,10 +1659,7 @@ def _probe_cuda_candidates(
             measurements.append(measurement)
             if measurement.outcome in {"cuda_out_of_memory", "memory_guard"}:
                 break
-            if (
-                expansion_maximum is not None
-                and candidate_index == len(pending_candidates) - 1
-            ):
+            if expansion_maximum is not None and candidate_index == len(pending_candidates) - 1:
                 next_candidate = _next_adaptive_batch_candidate(
                     measurements,
                     expansion_maximum=expansion_maximum,
@@ -1754,9 +1687,7 @@ def resolve_runtime_batch_plan(
     device_total_memory_bytes = 0
     device_memory_limit_bytes = 0
     training_expansion_maximum = config.training.auto_batch_max_size
-    evaluation_expansion_maximum = (
-        config.training.auto_evaluation_batch_max_size
-    )
+    evaluation_expansion_maximum = config.training.auto_evaluation_batch_max_size
     optimizer_state_reserve_bytes = sum(
         parameter.numel() * parameter.element_size() * 2
         for parameter in bundle.model.parameters()
@@ -1773,12 +1704,8 @@ def resolve_runtime_batch_plan(
         free_memory_bytes, _total_memory_bytes = torch.cuda.mem_get_info(device)
         allocated_memory_bytes = int(torch.cuda.memory_allocated(device))
         device_memory_limit_bytes = min(
-            int(
-                device_total_memory_bytes
-                * config.training.auto_batch_memory_fraction
-            ),
-            allocated_memory_bytes
-            + int(free_memory_bytes * CUDA_FREE_MEMORY_FRACTION),
+            int(device_total_memory_bytes * config.training.auto_batch_memory_fraction),
+            allocated_memory_bytes + int(free_memory_bytes * CUDA_FREE_MEMORY_FRACTION),
         )
         training_expansion_maximum = _hardware_batch_expansion_maximum(
             configured_maximum=config.training.auto_batch_max_size,
@@ -1794,16 +1721,12 @@ def resolve_runtime_batch_plan(
             json.dumps(
                 {
                     "cuda_batch_search": {
-                        "adaptive_evaluation_maximum": (
-                            evaluation_expansion_maximum
-                        ),
+                        "adaptive_evaluation_maximum": (evaluation_expansion_maximum),
                         "adaptive_training_maximum": training_expansion_maximum,
                         "configured_evaluation_maximum": (
                             config.training.auto_evaluation_batch_max_size
                         ),
-                        "configured_training_maximum": (
-                            config.training.auto_batch_max_size
-                        ),
+                        "configured_training_maximum": (config.training.auto_batch_max_size),
                         "device_allocated_memory_bytes": allocated_memory_bytes,
                         "device_free_memory_bytes": int(free_memory_bytes),
                         "device_memory_limit_bytes": device_memory_limit_bytes,
@@ -1856,9 +1779,7 @@ def resolve_runtime_batch_plan(
 
     if config.training.gradient_accumulation_steps == "auto":
         accumulation_steps = _automatic_gradient_accumulation_steps(
-            target_effective_batch_size=(
-                config.training.target_effective_batch_size
-            ),
+            target_effective_batch_size=(config.training.target_effective_batch_size),
             training_batch_size=training_batch_size,
         )
     else:
@@ -1945,126 +1866,38 @@ def evaluate_loader(
     config: ExperimentConfig,
     device: torch.device,
 ) -> dict[str, Any]:
+    from tempfile import TemporaryDirectory
+
+    from stock_forecasting.evaluation_store import EvaluationStore
+
     was_training = bundle.model.training
     bundle.model.eval()
-    targets: list[Tensor] = []
-    quantile_predictions: list[Tensor] = []
-    losses: list[Tensor] = []
-    cutoff_dates: list[str] = []
-    years: list[str] = []
-    symbols: list[str] = []
-    asset_types: list[str] = []
-    markets: list[str] = []
-    providers: list[str] = []
-
-    for batch in iter_device_batches(loader, device):
-        with _autocast_context(config, device):
-            output = forward_batch(bundle, batch, config, device)
-        if output.loss is not None:
-            losses.append(output.loss.detach().float())
-        targets.append(batch["target_alpha"].detach().float())
-        quantile_predictions.append(output.alpha_quantiles.detach().float())
-        batch_cutoffs = [str(value) for value in batch["cutoff_at"]]
-        cutoff_dates.extend(batch_cutoffs)
-        years.extend(value[:4] for value in batch_cutoffs)
-        symbols.extend(str(value) for value in batch["symbols"])
-        asset_types.extend(str(value) for value in batch["asset_types"])
-        markets.extend(str(value) for value in batch["markets"])
-        providers.extend(str(value) for value in batch["providers"])
-
-    target_array = torch.cat(targets).cpu().numpy().astype(np.float32, copy=False)
-    quantile_array = (
-        torch.cat(quantile_predictions).cpu().numpy().astype(np.float32, copy=False)
-    )
-    horizons = list(config.data.alpha_horizons)
-    quantiles = list(config.model.alpha_quantiles)
-    robust_scales = [
-        float(value)
-        for value in bundle.model.alpha_head.robust_scales.detach().float().cpu().tolist()
-    ]
-    alpha_metrics = multi_horizon_alpha_metrics(
-        targets=target_array,
-        quantile_predictions=quantile_array,
-        horizons=horizons,
-        quantiles=quantiles,
-        robust_scales=robust_scales,
-    )
-    median_index = quantiles.index(0.5)
-    cross_sectional = {
-        f"{horizon}d": cross_sectional_metrics(
-            targets=target_array[:, horizon_index],
-            signals=quantile_array[:, horizon_index, median_index],
-            dates=cutoff_dates,
-            symbols=symbols,
-            annualization_horizon=horizon,
-        )
-        for horizon_index, horizon in enumerate(horizons)
-    }
-    signal_codes = postprocess_alpha_signal(
-        quantile_array,
-        threshold=config.model.postprocess_alpha_threshold,
-    )
-    signal_distribution = {
-        f"{horizon}d": {
-            name: int((signal_codes[:, horizon_index] == code).sum())
-            for code, name in enumerate(POSTPROCESS_SIGNAL_NAMES)
-        }
-        for horizon_index, horizon in enumerate(horizons)
-    }
-    result = {
-        "loss": alpha_metrics["aggregate"]["normalized_pinball"] if losses else None,
-        "samples": int(target_array.shape[0]),
-        "sample_membership": sample_membership(symbols, cutoff_dates),
-        "evaluation_robust_scales": robust_scales,
-        "daily_normalized_pinball": daily_normalized_pinball(
-            target_array, quantile_array, robust_scales, cutoff_dates,
-        ),
-        **alpha_metrics,
-        "cross_sectional_by_horizon": cross_sectional,
-        "cross_sectional_5d": cross_sectional["5d"],
-        "postprocess_signal_distribution": signal_distribution,
-        "subgroups": {
-            "month": _subgroup_metrics(
-                targets=target_array, quantile_predictions=quantile_array,
-                horizons=horizons, quantiles=quantiles, robust_scales=robust_scales,
-                values=[value[:7] for value in cutoff_dates],
-            ),
-            "asset_type": _subgroup_metrics(
-                targets=target_array,
-                quantile_predictions=quantile_array,
-                horizons=horizons,
-                quantiles=quantiles,
-                robust_scales=robust_scales,
-                values=asset_types,
-            ),
-            "market": _subgroup_metrics(
-                targets=target_array,
-                quantile_predictions=quantile_array,
-                horizons=horizons,
-                quantiles=quantiles,
-                robust_scales=robust_scales,
-                values=markets,
-            ),
-            "provider": _subgroup_metrics(
-                targets=target_array,
-                quantile_predictions=quantile_array,
-                horizons=horizons,
-                quantiles=quantiles,
-                robust_scales=robust_scales,
-                values=providers,
-            ),
-            "year": _subgroup_metrics(
-                targets=target_array,
-                quantile_predictions=quantile_array,
-                horizons=horizons,
-                quantiles=quantiles,
-                robust_scales=robust_scales,
-                values=years,
-            ),
-        },
-    }
-    bundle.model.train(was_training)
-    return result
+    scales = [float(v) for v in bundle.model.alpha_head.robust_scales.float().cpu().tolist()]
+    scratch = config.runtime.log_root / "evaluation-scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    try:
+        with TemporaryDirectory(prefix="full-", dir=scratch) as directory:
+            store = EvaluationStore(
+                Path(directory), len(loader.sampler), list(config.data.alpha_horizons), scales
+            )
+            try:
+                for batch in iter_device_batches(loader, device):
+                    with _autocast_context(config, device):
+                        output = forward_batch(bundle, batch, config, device)
+                    store.append(
+                        batch["target_alpha"].detach().float().cpu().numpy(),
+                        output.alpha_quantiles.detach().float().cpu().numpy(),
+                        symbols=batch["symbols"],
+                        dates=batch["cutoff_at"],
+                        markets=batch["markets"],
+                        asset_types=batch["asset_types"],
+                        providers=batch["providers"],
+                    )
+                return store.finish(signal_threshold=config.model.postprocess_alpha_threshold)
+            finally:
+                store.close()
+    finally:
+        bundle.model.train(was_training)
 
 
 def _flatten_metrics(payload: dict[str, Any], prefix: str = "") -> dict[str, float]:
@@ -2121,7 +1954,18 @@ def _learning_rate_multiplier(step: int, warmup_steps: int, total_steps: int) ->
     return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
-def _scheduler(optimizer: AdamW, warmup_steps: int, total_steps: int) -> LambdaLR:
+def _scheduler(optimizer: AdamW, warmup_steps: int, total_steps: int, config=None):
+    if config is not None and config.training.learning_rate_schedule == "validation_plateau":
+        from stock_forecasting.optimization_policy import ValidationPlateauScheduler
+
+        return ValidationPlateauScheduler(
+            optimizer,
+            warmup_steps,
+            patience=config.training.plateau_patience_evaluations,
+            factor=config.training.plateau_factor,
+            min_ratio=config.training.plateau_min_ratio,
+            low_lr_evaluations=config.training.plateau_min_low_lr_evaluations,
+        )
     return LambdaLR(
         optimizer,
         lambda step: _learning_rate_multiplier(step, warmup_steps, total_steps),
@@ -2139,6 +1983,9 @@ def _realign_scheduler(
 
     if runtime_global_step < 0 or total_steps < 1:
         raise ValueError("Scheduler resume coordinates are invalid")
+    if hasattr(scheduler, "realign"):
+        scheduler.realign(runtime_global_step, warmup_steps)
+        return
     multiplier = _learning_rate_multiplier(
         runtime_global_step,
         warmup_steps,
@@ -2239,12 +2086,8 @@ def _canonical_training_schedule(
     if not isinstance(progress, dict):
         raise ValueError("Checkpoint training progress must be a mapping")
     if progress.get("schema_version") == TRAINING_PROGRESS_SCHEMA_VERSION:
-        schedule = CanonicalTrainingSchedule.from_dict(
-            progress.get("canonical_schedule")
-        )
-        if schedule.epochs != epochs or schedule.evaluations_per_epoch != (
-            evaluations_per_epoch
-        ):
+        schedule = CanonicalTrainingSchedule.from_dict(progress.get("canonical_schedule"))
+        if schedule.epochs != epochs or schedule.evaluations_per_epoch != (evaluations_per_epoch):
             raise ValueError("Checkpoint canonical schedule differs from the selected config")
         return schedule
 
@@ -2341,8 +2184,7 @@ def resume_coordinates(
         )[boundary_index]
 
     runtime_global_step = (
-        starting_epoch * runtime_optimizer_steps_per_epoch
-        + runtime_step_within_epoch
+        starting_epoch * runtime_optimizer_steps_per_epoch + runtime_step_within_epoch
     )
     resume_batch_index = min(
         runtime_batch_count,
@@ -2531,9 +2373,7 @@ def _restore_training_progress(
         }
         if set(payload) != expected:
             raise ValueError("Checkpoint training progress is incomplete")
-        stored_schedule = CanonicalTrainingSchedule.from_dict(
-            payload["canonical_schedule"]
-        )
+        stored_schedule = CanonicalTrainingSchedule.from_dict(payload["canonical_schedule"])
         if stored_schedule != canonical_schedule:
             raise ValueError("Checkpoint canonical schedule changed during resume")
         RuntimeExecutionPlan.from_dict(payload["runtime_execution_plan"])
@@ -2601,6 +2441,10 @@ def train(config: ExperimentConfig) -> TrainingResult:
 
 
 def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
+    if config.validation.require_prebuilt_baselines:
+        from stock_forecasting.baseline_contract import require_baselines
+
+        require_baselines(config)
     preflight = run_preflight(config, require_data=True)
     preflight.require_success()
     set_global_seed(config.training.seed)
@@ -2608,9 +2452,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
     resume_preview: dict[str, Any] | None = None
     stored_execution_plan: RuntimeExecutionPlan | None = None
     if config.training.resume_checkpoint is not None:
-        resume_preview = validate_checkpoint_trainer_state(
-            config.training.resume_checkpoint
-        )
+        resume_preview = validate_checkpoint_trainer_state(config.training.resume_checkpoint)
         stored_execution_plan = _checkpoint_runtime_execution_plan(resume_preview)
 
     hardware = runtime_hardware_snapshot(device)
@@ -2648,14 +2490,19 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
     robust_scales = robust_scale_result.scales
     feature_statistics = (
         resolve_scale_feature_statistics(
-            train_dataset, sample_count=config.data.label_scale_calibration_samples,
+            train_dataset,
+            sample_count=config.data.label_scale_calibration_samples,
             seed=config.data.calibration_seed,
             loader_options=_loader_process_options(worker_plan, persistent=False),
+            extended=config.model.explicit_output_scale,
         )
-        if config.model.feature_mode in ("scales", "combined") else None
+        if config.model.feature_mode in ("scales", "combined")
+        else None
     )
     bundle = build_model_bundle(
-        config, device, robust_scales=robust_scales,
+        config,
+        device,
+        robust_scales=robust_scales,
         scale_feature_statistics=feature_statistics,
     )
     probe_sample = train_dataset[0]
@@ -2674,12 +2521,8 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
     )
     collator = FinancialBatchCollator()
     largest_host_batch_bytes = max(
-        _batch_tensor_bytes(
-            collator([probe_sample] * batch_plan.training_batch_size)
-        ),
-        _batch_tensor_bytes(
-            collator([probe_sample] * batch_plan.evaluation_batch_size)
-        ),
+        _batch_tensor_bytes(collator([probe_sample] * batch_plan.training_batch_size)),
+        _batch_tensor_bytes(collator([probe_sample] * batch_plan.evaluation_batch_size)),
     )
     if not reuse_checkpoint_plan:
         worker_plan = plan_runtime_prefetch(
@@ -2745,9 +2588,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
         for runtime_step, canonical_step in aligned_epoch_event_steps(
             epoch_index,
             runtime_optimizer_steps_per_epoch=optimizer_steps_per_epoch,
-            canonical_optimizer_steps_per_epoch=(
-                canonical_schedule.optimizer_steps_per_epoch
-            ),
+            canonical_optimizer_steps_per_epoch=(canonical_schedule.optimizer_steps_per_epoch),
             points_per_epoch=config.training.evaluations_per_epoch,
         )
     }
@@ -2767,9 +2608,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
         for runtime_step, canonical_step in aligned_epoch_event_steps(
             epoch_index,
             runtime_optimizer_steps_per_epoch=optimizer_steps_per_epoch,
-            canonical_optimizer_steps_per_epoch=(
-                canonical_schedule.optimizer_steps_per_epoch
-            ),
+            canonical_optimizer_steps_per_epoch=(canonical_schedule.optimizer_steps_per_epoch),
             points_per_epoch=actual_loss_points,
         )
     }
@@ -2777,12 +2616,8 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
         "requested_points_per_epoch": config.training.loss_log_points_per_epoch,
         "actual_points_per_epoch": actual_loss_points,
         "runtime_optimizer_steps_per_epoch": optimizer_steps_per_epoch,
-        "canonical_optimizer_steps_per_epoch": (
-            canonical_schedule.optimizer_steps_per_epoch
-        ),
-        "runtime_nominal_interval_steps": math.ceil(
-            optimizer_steps_per_epoch / actual_loss_points
-        ),
+        "canonical_optimizer_steps_per_epoch": (canonical_schedule.optimizer_steps_per_epoch),
+        "runtime_nominal_interval_steps": math.ceil(optimizer_steps_per_epoch / actual_loss_points),
     }
     print(
         json.dumps(
@@ -2795,13 +2630,12 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
         ),
         flush=True,
     )
-    runtime_warmup_steps = int(
-        runtime_configured_steps * config.training.warmup_ratio
-    )
+    runtime_warmup_steps = int(runtime_configured_steps * config.training.warmup_ratio)
     scheduler = _scheduler(
         optimizer,
         runtime_warmup_steps,
         runtime_configured_steps,
+        config=config,
     )
     tracking: TrackingRun = start_tracking(config)
     runtime_execution_plan_path = atomic_write_json(
@@ -2826,6 +2660,8 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
     best_checkpoint: Path | None = None
     last_ranking: dict[str, Any] = {}
     accumulated_loss_sum: Tensor | None = None
+    accumulated_pinball_sum: Tensor | None = None
+    accumulated_ranking_sum: Tensor | None = None
     accumulated_loss_count = 0
     accumulated_microbatch_samples = 0
     processed_train_samples = 0
@@ -2867,9 +2703,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 schedule=canonical_schedule,
                 runtime_optimizer_steps_per_epoch=optimizer_steps_per_epoch,
                 runtime_batch_count=len(train_loader),
-                gradient_accumulation_steps=(
-                    batch_plan.gradient_accumulation_steps
-                ),
+                gradient_accumulation_steps=(batch_plan.gradient_accumulation_steps),
             )
             if loaded_coordinates != coordinates:
                 raise RuntimeError("Resume checkpoint changed during training setup")
@@ -2890,9 +2724,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 canonical_schedule=canonical_schedule,
             )
             if completed_epochs != starting_epoch:
-                raise ValueError(
-                    "Checkpoint completed epochs disagree with canonical progress"
-                )
+                raise ValueError("Checkpoint completed epochs disagree with canonical progress")
             _realign_scheduler(
                 scheduler,
                 runtime_global_step=runtime_global_step,
@@ -2954,6 +2786,22 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                         else accumulated_loss_sum + detached_loss
                     )
                     accumulated_loss_count += 1
+                    pinball = output.pinball_loss.detach()
+                    ranking = (
+                        output.ranking_loss.detach()
+                        if output.ranking_loss is not None
+                        else pinball.new_zeros(())
+                    )
+                    accumulated_pinball_sum = (
+                        pinball
+                        if accumulated_pinball_sum is None
+                        else accumulated_pinball_sum + pinball
+                    )
+                    accumulated_ranking_sum = (
+                        ranking
+                        if accumulated_ranking_sum is None
+                        else accumulated_ranking_sum + ranking
+                    )
                     accumulated_microbatch_samples += int(batch["target_alpha"].shape[0])
                 loss.backward()
                 should_step = (
@@ -2974,18 +2822,19 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                     global_step = loss_logging_alignment[runtime_global_step]
                     if accumulated_loss_sum is None or accumulated_loss_count < 1:
                         raise RuntimeError("Loss logging cadence has no accumulated loss")
-                    logged_loss = float(
-                        (accumulated_loss_sum / accumulated_loss_count).cpu()
-                    )
+                    logged_loss = float((accumulated_loss_sum / accumulated_loss_count).cpu())
                     tracking.log(
                         {
                             "train/loss": logged_loss,
-                            "train/pinball_loss": logged_loss,
+                            "train/pinball_loss": float(
+                                (accumulated_pinball_sum / accumulated_loss_count).cpu()
+                            ),
+                            "train/ranking_loss": float(
+                                (accumulated_ranking_sum / accumulated_loss_count).cpu()
+                            ),
                             "train/epoch": float(epoch),
                             "train/stage_fraction": config.data.train_fraction,
-                            "train/task_learning_rate": float(
-                                optimizer.param_groups[0]["lr"]
-                            ),
+                            "train/task_learning_rate": float(optimizer.param_groups[0]["lr"]),
                             "train/lora_learning_rate": float(
                                 optimizer.param_groups[-1]["lr"]
                                 if len(optimizer.param_groups) > 1
@@ -2995,6 +2844,8 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                         step=global_step,
                     )
                     accumulated_loss_sum = None
+                    accumulated_pinball_sum = None
+                    accumulated_ranking_sum = None
                     accumulated_loss_count = 0
                 if runtime_global_step in evaluation_alignment:
                     global_step = evaluation_alignment[runtime_global_step]
@@ -3019,6 +2870,11 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                         start_epoch=config.training.early_stopping_start_epoch,
                         enabled=config.training.early_stopping_enabled,
                     )
+                    if hasattr(scheduler, "observe"):
+                        scheduler.observe(selection, config.training.early_stopping_min_delta)
+                        early_stopping.triggered = (
+                            early_stopping.triggered and scheduler.permits_early_stop
+                        )
                     last_validation_flat_metrics = _flatten_metrics(validation_metrics)
                     tracking.log(
                         {
@@ -3038,8 +2894,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                     )
                     completed_epochs_at_step = (
                         epoch + 1
-                        if global_step
-                        == (epoch + 1) * canonical_schedule.optimizer_steps_per_epoch
+                        if global_step == (epoch + 1) * canonical_schedule.optimizer_steps_per_epoch
                         else epoch
                     )
                     checkpoint, last_ranking = save_ranked_checkpoint(
@@ -3131,9 +2986,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                 "selected_train_samples_per_epoch": selected_train_samples,
                 "planned_train_samples": planned_train_samples,
                 "processed_train_samples": processed_train_samples,
-                "configured_optimizer_steps": (
-                    canonical_schedule.configured_optimizer_steps
-                ),
+                "configured_optimizer_steps": (canonical_schedule.configured_optimizer_steps),
                 "completed_optimizer_steps": global_step,
                 "optimizer_step_coverage_ratio": (
                     global_step / canonical_schedule.configured_optimizer_steps
@@ -3155,7 +3008,8 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
                     "source_split": "train",
                     "sample_count": robust_scale_result.sample_count,
                     "seed": (
-                        config.data.calibration_seed if config.data.fixed_split
+                        config.data.calibration_seed
+                        if config.data.fixed_split
                         else config.training.seed + 17
                     ),
                     "horizons": config.data.alpha_horizons,
@@ -3204,9 +3058,7 @@ def _train_with_lease(config: ExperimentConfig) -> TrainingResult:
             selected_datasets=tuple(config.data.selected_datasets),
             selected_train_samples_per_epoch=selected_train_samples,
             processed_train_samples=processed_train_samples,
-            configured_optimizer_steps=(
-                canonical_schedule.configured_optimizer_steps
-            ),
+            configured_optimizer_steps=(canonical_schedule.configured_optimizer_steps),
             completed_epochs=completed_epochs,
             validation_evaluations=early_stopping.evaluation_count,
             stop_reason=stop_reason,

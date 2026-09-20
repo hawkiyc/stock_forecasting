@@ -683,6 +683,7 @@ def test_quant_model_preserves_head_and_reusable_encoder_shapes(h_start: int) ->
     assert set(output) == {
         "loss",
         "pinball_loss",
+        "ranking_loss",
         "alpha_quantiles",
         "asset_last_hidden_state",
         "benchmark_last_hidden_state",

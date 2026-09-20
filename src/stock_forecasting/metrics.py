@@ -80,8 +80,7 @@ def alpha_quantile_metrics(
     pinball = pinball_loss(target_array, prediction_array, quantiles)
     coverage = float(
         (
-            (target_array >= prediction_array[:, 0])
-            & (target_array <= prediction_array[:, -1])
+            (target_array >= prediction_array[:, 0]) & (target_array <= prediction_array[:, -1])
         ).mean()
     )
     median = prediction_array[:, median_index]
@@ -142,9 +141,7 @@ def multi_horizon_alpha_metrics(
         "selection_score": selection_score,
         "normalized_pinball": selection_score,
         "pinball": float(np.mean([metrics["pinball"] for metrics in per_horizon.values()])),
-        "median_mae": float(
-            np.mean([metrics["median_mae"] for metrics in per_horizon.values()])
-        ),
+        "median_mae": float(np.mean([metrics["median_mae"] for metrics in per_horizon.values()])),
         "interval_coverage": float(
             np.mean([metrics["interval_coverage"] for metrics in per_horizon.values()])
         ),
@@ -175,6 +172,7 @@ def cross_sectional_metrics(
     symbols: list[str],
     transaction_cost_bps: float = 10.0,
     annualization_horizon: int = 5,
+    date_groups: tuple[NDArray[np.int64], NDArray[np.int64]] | None = None,
 ) -> dict[str, float]:
     """Compute date-level RankIC and an equal-weight long/short diagnostic."""
 
@@ -188,8 +186,14 @@ def cross_sectional_metrics(
     period_returns: list[float] = []
     turnovers: list[float] = []
     previous_weights: dict[str, float] = {}
-    for current_date in sorted(set(dates)):
-        indices = np.asarray([index for index, value in enumerate(dates) if value == current_date])
+    if date_groups is None:
+        date_array = np.asarray(dates)
+        date_order = np.argsort(date_array, kind="stable")
+        boundaries = np.flatnonzero(date_array[date_order][1:] != date_array[date_order][:-1]) + 1
+    else:
+        date_order, boundaries = date_groups
+    # Sort once instead of scanning millions of rows for every forecast date.
+    for indices in np.split(date_order, boundaries):
         if indices.size < 3:
             continue
         period_targets = target_array[indices]
@@ -229,11 +233,7 @@ def cross_sectional_metrics(
         max_drawdown = float((wealth / peaks - 1.0).min())
         standard_deviation = float(return_array.std(ddof=1)) if return_array.size > 1 else 0.0
         sharpe = (
-            float(
-                return_array.mean()
-                / standard_deviation
-                * np.sqrt(252.0 / annualization_horizon)
-            )
+            float(return_array.mean() / standard_deviation * np.sqrt(252.0 / annualization_horizon))
             if standard_deviation > 0
             else 0.0
         )

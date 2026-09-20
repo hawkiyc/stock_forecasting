@@ -26,7 +26,8 @@ LIFECYCLE_KIND="$2"
 
 case "${LIFECYCLE_KEY}:${LIFECYCLE_KIND}" in
     lifecycle/stage1/training.json:stage1-training|\
-        lifecycle/stage1/validation.json:stage1-validation) ;;
+        lifecycle/stage1/validation.json:stage1-validation|\
+        lifecycle/stage1/baseline.json:stage1-baseline) ;;
     *)
         echo "GPU lifecycle key and kind do not form an approved pair" >&2
         exit 2

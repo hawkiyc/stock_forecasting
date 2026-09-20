@@ -23,6 +23,7 @@ Usage:
   bash scripts/runpod_workflow.sh cpu prepare [--interactive] [--max-api-calls N] [--eodhd-qps QPS] [--taiwan-qps QPS] [--maxRuntime DURATION] [--prepareReserve DURATION|auto] [--maxBackoff DURATION] [--cpuNumber N] [--cpuFlavor FLAVOR]
   bash scripts/runpod_workflow.sh readiness [--code-only|--gpu]
   bash scripts/runpod_workflow.sh train [--maxRuntime DURATION] [--gpuId GPU_ID]
+  bash scripts/runpod_workflow.sh baseline [--maxRuntime DURATION] [--gpuId GPU_ID]
   bash scripts/runpod_workflow.sh resume [--maxRuntime DURATION] [--gpuId GPU_ID] [RUN_ID]
   bash scripts/runpod_workflow.sh validate [VALIDATION OPTIONS]
   bash scripts/runpod_workflow.sh status
@@ -355,7 +356,7 @@ EOF
     readiness)
         exec bash "${SCRIPT_DIR}/verify_runpod_stage_readiness.sh" "$@"
         ;;
-    train)
+    train|baseline)
         train_max_runtime=12h
         train_gpu_id="NVIDIA GeForce RTX 5090"
         while [[ $# -gt 0 ]]; do
@@ -383,7 +384,7 @@ EOF
         export RUNPOD_CLI_HARD_LIMIT_SECONDS="$((train_max_seconds + 3600))"
         export RUNPOD_CLI_TERMINATE_AFTER="$(((train_max_seconds + 3659) / 60))m"
         export RUNPOD_CLI_GPU_ID="${train_gpu_id}"
-        exec env RUNPOD_GPU_WORKFLOW=train bash "${SCRIPT_DIR}/create_runpod_pod.sh"
+        exec env RUNPOD_GPU_WORKFLOW="${COMMAND}" bash "${SCRIPT_DIR}/create_runpod_pod.sh"
         ;;
     resume)
         exec bash "${SCRIPT_DIR}/create_runpod_resume_pod.sh" "$@"

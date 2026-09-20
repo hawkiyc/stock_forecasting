@@ -23,6 +23,7 @@ from stock_forecasting.data.dataset import (
     _timestamp_features,
 )
 from stock_forecasting.models.outputs import QuantForecastOutput
+from stock_forecasting.models.ranking import market_ids
 
 LOGGER = logging.getLogger(__name__)
 TARGET_NAMES = (
@@ -278,6 +279,7 @@ def extract_probe_split(
                     asset_timestamps=timestamps,
                     benchmark_timestamps=timestamps,
                     target_alpha=None,
+                    market_ids=market_ids(batch["market"], device),
                 )
             readouts = representation_readouts(output)
             count = len(batch["sample_id"])

@@ -45,14 +45,21 @@ FINALIZE_LIFECYCLE_ON_EXIT=0
 PROVIDER_WAIT_EXIT_ALLOWED=0
 RUN_DIRECTORY_ID=""
 PRESERVE_POD_ON_LAUNCH_ERROR=0
-if [[ "${1:-}" == "probe-scales" ]]; then
-    # A rejected diagnostic launch must not shut down an existing GPU workload.
+if [[ "${1:-}" == "probe-scales" || "${1:-}" == "baseline" || "${1:-}" == "verify-full-workflow" ]]; then
+    # These workflows rely exclusively on the local lifecycle guard.
     PRESERVE_POD_ON_LAUNCH_ERROR=1
 fi
 
 terminate_failed_launch() {
     local launch_exit_code=$?
     trap - EXIT
+    if [[ ${launch_exit_code} -ne 0 && "${JOB_ROLE:-}" == "gpu-baseline" && -n "${WANDB_RUN_ID:-}" ]]; then
+        "${RUNPOD_IMAGE_PYTHON}" "${READINESS_HELPER}" write-state \
+            --output "${NETWORK_VOLUME_ROOT}/lifecycle/stage1/baseline.json" \
+            --network-volume-root "${NETWORK_VOLUME_ROOT}" --kind stage1-baseline --state failed \
+            --launch-id "${LAUNCH_ID:-baseline-launch-failed}" --exit-code "${launch_exit_code}" \
+            --wandb-run-id "${WANDB_RUN_ID}" || true
+    fi
     if [[ ${launch_exit_code} -ne 0 \
         && ${PRESERVE_POD_ON_LAUNCH_ERROR} -ne 1 \
         && "${RUNPOD_POD_ID:-}" =~ ^[A-Za-z0-9_-]+$ \
@@ -80,7 +87,7 @@ for path_name in PROJECT_ROOT LOG_ROOT; do
 done
 
 if [[ $# -lt 1 || ( "$1" != "probe-scales" && $# -ne 1 ) ]]; then
-    echo "Usage: runpod_tmux_launch.sh cpu-prepare|cpu-finalize|stage1-train|stage1-validate|probe-scales [PROBE OPTIONS]" >&2
+    echo "Usage: runpod_tmux_launch.sh cpu-prepare|cpu-finalize|stage1-train|stage1-validate|baseline|probe-scales [PROBE OPTIONS]" >&2
     exit 2
 fi
 if [[ "${LOG_ROOT}" != "${NETWORK_VOLUME_ROOT}/logs" ]]; then
@@ -134,6 +141,24 @@ case "$1" in
             fi
         done
         RUNPOD_RUN_KEY="${WANDB_RUN_ID}"
+        RUN_DIRECTORY_ID="${WANDB_RUN_ID}"
+        ;;
+    baseline|verify-full-workflow)
+        SESSION_NAME=fin-ts-baseline
+        JOB_SCRIPT="${SCRIPT_DIR}/runpod_baseline.sh"
+        if [[ "$1" == "verify-full-workflow" ]]; then
+            JOB_SCRIPT="${SCRIPT_DIR}/runpod_verify_full_workflow.sh"
+        fi
+        JOB_ROLE=gpu-baseline
+        MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-43200}"
+        JOB_TIMEOUT_GRACE_SECONDS=300
+        FAILURE_LIFECYCLE_MARKER="${NETWORK_VOLUME_ROOT}/lifecycle/stage1/baseline.json"
+        FAILURE_LIFECYCLE_KIND=stage1-baseline
+        FINALIZE_LIFECYCLE_ON_EXIT=1
+        if [[ ! "${WANDB_RUN_ID:-}" =~ ^baseline-run-[A-Za-z0-9-]+$ ]]; then
+            echo "Baseline run ID must be allocated by the local workflow" >&2
+            exit 2
+        fi
         RUN_DIRECTORY_ID="${WANDB_RUN_ID}"
         ;;
     stage1-validate)
@@ -204,7 +229,7 @@ case "$1" in
         fi
         ;;
     *)
-        echo "Usage: runpod_tmux_launch.sh cpu-prepare|cpu-finalize|stage1-train|stage1-validate|probe-scales [PROBE OPTIONS]" >&2
+        echo "Usage: runpod_tmux_launch.sh cpu-prepare|cpu-finalize|stage1-train|stage1-validate|baseline|probe-scales [PROBE OPTIONS]" >&2
         exit 2
         ;;
 esac
@@ -252,7 +277,7 @@ else
     JOB_DIR="${LOG_ROOT}/tmux/${SESSION_NAME}/${LAUNCH_ID}"
 fi
 POD_TERMINAL_ROOT=""
-if [[ "${JOB_ROLE}" == "gpu-train" || "${JOB_ROLE}" == "gpu-validation" ]]; then
+if [[ "${JOB_ROLE}" == "gpu-train" || "${JOB_ROLE}" == "gpu-validation" || "${JOB_ROLE}" == "gpu-baseline" ]]; then
     POD_TERMINAL_ROOT="${NETWORK_VOLUME_ROOT}/lifecycle/runs/${RUN_DIRECTORY_ID}/pods"
 fi
 JOB_LOG="${JOB_DIR}/combined.log"
@@ -277,7 +302,7 @@ mkdir -p "${JOB_DIR}"
     printf 'export RUNPOD_ROLE=%q\n' "${JOB_ROLE}"
     printf 'export RUNPOD_LAUNCH_ID=%q\n' "${LAUNCH_ID}"
     printf 'export RUNPOD_TMUX_LOG_FILE=%q\n' "${JOB_LOG}"
-    if [[ "${JOB_ROLE}" == "gpu-train" ]]; then
+    if [[ "${JOB_ROLE}" == "gpu-train" || "${JOB_ROLE}" == "gpu-baseline" ]]; then
         printf 'export WANDB_RUN_ID=%q\n' "${RUN_DIRECTORY_ID}"
         printf 'export RUNPOD_RUN_KEY=%q\n' "${RUN_DIRECTORY_ID}"
     elif [[ "${JOB_ROLE}" == "gpu-validation" ]]; then
@@ -312,6 +337,13 @@ mkdir -p "${JOB_DIR}"
         printf '  diagnostic_lease_acquired=1\n'
         printf '  if publish_probe_state running 0; then\n'
     fi
+    if [[ "${JOB_ROLE}" == "gpu-baseline" ]]; then
+        printf 'source %q\n' "${SCRIPT_DIR}/lib/runpod_paths.sh"
+        printf 'unset RUNPOD_GPU_WORKFLOW_LEASE_HELD\n'
+        printf 'runpod_acquire_gpu_workflow_lease %q\n' "${NETWORK_VOLUME_ROOT}"
+        printf 'job_exit_code=$?\n'
+        printf 'if [[ ${job_exit_code} -eq 0 ]]; then\n'
+    fi
     printf 'timeout --signal=TERM --kill-after=60 %qs bash %q' \
         "${JOB_TIMEOUT_SECONDS}" "${JOB_SCRIPT}"
     if [[ $# -gt 0 ]]; then
@@ -321,6 +353,8 @@ mkdir -p "${JOB_DIR}"
     printf 'job_exit_code=$?\n'
     if [[ "${JOB_ROLE}" == "gpu-probe" ]]; then
         printf '  else job_exit_code=74; fi\n'
+        printf 'fi\n'
+    elif [[ "${JOB_ROLE}" == "gpu-baseline" ]]; then
         printf 'fi\n'
     fi
     printf 'finalization_exit_code=0\n'
@@ -357,7 +391,7 @@ mkdir -p "${JOB_DIR}"
     printf '  terminal_lifecycle_allowed=0\n'
     printf '  return 1\n'
     printf '}\n'
-    if [[ "${JOB_ROLE}" == "gpu-train" || "${JOB_ROLE}" == "gpu-validation" ]]; then
+    if [[ "${JOB_ROLE}" == "gpu-train" || "${JOB_ROLE}" == "gpu-validation" || "${JOB_ROLE}" == "gpu-baseline" ]]; then
         printf 'publish_lease_contention_signal() {\n'
         printf '  if [[ ${job_exit_code} -ne 75 ]]; then return 0; fi\n'
         printf '  local pod_id="${RUNPOD_POD_ID:-}"\n'
@@ -420,7 +454,7 @@ mkdir -p "${JOB_DIR}"
     printf '  finalization_exit_code=74\n'
     printf '  if ! publish_failed_status; then :; fi\n'
     printf 'fi\n'
-    if [[ "${JOB_ROLE}" == "gpu-train" || "${JOB_ROLE}" == "gpu-validation" ]]; then
+    if [[ "${JOB_ROLE}" == "gpu-train" || "${JOB_ROLE}" == "gpu-validation" || "${JOB_ROLE}" == "gpu-baseline" ]]; then
         printf 'if [[ ${job_exit_code} -eq 75 ]]; then\n'
         printf '  if ! publish_lease_contention_signal; then\n'
         printf '    printf '\''Unable to persist GPU lease-contention signal\\n'\'' >&2\n'
@@ -488,6 +522,10 @@ mkdir -p "${JOB_DIR}"
         printf 'printf '\''Diagnostic finished; awaiting Pod termination by the local guard\\n'\''\n'
         # Retain the GPU lease until the local guard removes the Pod; another
         # workload must not start between terminal publication and local polling.
+        printf 'while sleep 60; do :; done\n'
+    elif [[ "${JOB_ROLE}" == "gpu-baseline" ]]; then
+        printf 'if [[ ${job_exit_code} -eq 75 ]]; then exit 75; fi\n'
+        printf 'printf '\''Baseline finished; awaiting Pod termination by the local guard\\n'\''\n'
         printf 'while sleep 60; do :; done\n'
     else
         printf 'export RUNPOD_SHUTDOWN_DIR=%q\n' "${JOB_DIR}/pod-shutdown"

@@ -111,9 +111,7 @@ FORBIDDEN_NAMES = frozenset(
         "RUNPOD_S3_SECRET_ACCESS_KEY",
     }
 )
-ROLE_SECRET_NAMES = frozenset(
-    {"EODHD_API_TOKEN", "HF_TOKEN", "TPEX_PROXY_TOKEN", "WANDB_API_KEY"}
-)
+ROLE_SECRET_NAMES = frozenset({"EODHD_API_TOKEN", "HF_TOKEN", "TPEX_PROXY_TOKEN", "WANDB_API_KEY"})
 
 
 def read_allowlisted_environment(path):
@@ -155,7 +153,7 @@ def main() -> int:
     role = imported["RUNPOD_ROLE"]
     if role == "cpu-prep":
         imported.pop("WANDB_API_KEY", None)
-    elif role in {"gpu-train", "gpu-validation"}:
+    elif role in {"gpu-train", "gpu-validation", "gpu-baseline"}:
         imported.pop("EODHD_API_TOKEN", None)
         imported.pop("HF_TOKEN", None)
         imported.pop("TPEX_PROXY_TOKEN", None)

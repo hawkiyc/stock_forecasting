@@ -45,6 +45,7 @@ GUARD_LIFECYCLE_KINDS = frozenset(
         "stage1-mixed-finalization",
         "stage1-training",
         "stage1-validation",
+        "stage1-baseline",
     }
 )
 GUARD_LIFECYCLE_STATES = frozenset(
@@ -70,25 +71,13 @@ _CONTENT_IDENTITY_CONTRACT = runpy.run_path(
         / "content_identity.py"
     )
 )
-CONTENT_IDENTITY_SCHEMA_VERSION = _CONTENT_IDENTITY_CONTRACT[
-    "CONTENT_IDENTITY_SCHEMA_VERSION"
-]
+CONTENT_IDENTITY_SCHEMA_VERSION = _CONTENT_IDENTITY_CONTRACT["CONTENT_IDENTITY_SCHEMA_VERSION"]
 
 _DATASET_IDENTITY_CONTRACT = runpy.run_path(
-    str(
-        Path(__file__).resolve().parents[1]
-        / "src"
-        / "stock_forecasting"
-        / "dataset_identity.py"
-    )
+    str(Path(__file__).resolve().parents[1] / "src" / "stock_forecasting" / "dataset_identity.py")
 )
 _DATASET_PROFILE_CONTRACT = runpy.run_path(
-    str(
-        Path(__file__).resolve().parents[1]
-        / "src"
-        / "stock_forecasting"
-        / "dataset_profiles.py"
-    )
+    str(Path(__file__).resolve().parents[1] / "src" / "stock_forecasting" / "dataset_profiles.py")
 )
 _TRAINING_STAGE_CONTRACT = runpy.run_path(
     str(
@@ -98,12 +87,8 @@ _TRAINING_STAGE_CONTRACT = runpy.run_path(
         / "training_stage_contract.py"
     )
 )
-DATASET_REQUEST_SCHEMA_VERSION = _DATASET_IDENTITY_CONTRACT[
-    "DATASET_REQUEST_SCHEMA_VERSION"
-]
-MIN_FIXED_EVALUATION_DATES = _DATASET_IDENTITY_CONTRACT[
-    "MIN_FIXED_EVALUATION_DATES"
-]
+DATASET_REQUEST_SCHEMA_VERSION = _DATASET_IDENTITY_CONTRACT["DATASET_REQUEST_SCHEMA_VERSION"]
+MIN_FIXED_EVALUATION_DATES = _DATASET_IDENTITY_CONTRACT["MIN_FIXED_EVALUATION_DATES"]
 DEFAULT_DATASET_STORAGE_PREPARATION = _DATASET_IDENTITY_CONTRACT[
     "DEFAULT_DATASET_STORAGE_PREPARATION"
 ]
@@ -111,16 +96,12 @@ storage_preparation_spec = _DATASET_IDENTITY_CONTRACT["storage_preparation_spec"
 validate_fixed_split_audit = _DATASET_IDENTITY_CONTRACT["validate_fixed_split_audit"]
 BAR_STORE_SCHEMA_VERSION = _DATASET_IDENTITY_CONTRACT["BAR_STORE_SCHEMA_VERSION"]
 BAR_STORE_KIND = _DATASET_IDENTITY_CONTRACT["BAR_STORE_KIND"]
-dataset_request_identity_payload = _DATASET_IDENTITY_CONTRACT[
-    "dataset_request_identity_payload"
-]
+dataset_request_identity_payload = _DATASET_IDENTITY_CONTRACT["dataset_request_identity_payload"]
 PROFILE_DATASETS = {
     profile: sorted(datasets)
     for profile, datasets in _DATASET_PROFILE_CONTRACT["PROFILE_DATASETS"].items()
 }
-PRODUCTION_STAGE_SAMPLE_CONTRACTS = _TRAINING_STAGE_CONTRACT[
-    "PRODUCTION_STAGE_SAMPLE_CONTRACTS"
-]
+PRODUCTION_STAGE_SAMPLE_CONTRACTS = _TRAINING_STAGE_CONTRACT["PRODUCTION_STAGE_SAMPLE_CONTRACTS"]
 
 
 StageContract = namedtuple(
@@ -205,9 +186,7 @@ def _load_stage_contract(config_path):
     elif re.fullmatch(r"[1-9][0-9]*", raw_max_samples):
         max_samples = int(raw_max_samples)
     else:
-        raise ValueError(
-            "Training config data.max_samples must be null or a positive integer"
-        )
+        raise ValueError("Training config data.max_samples must be null or a positive integer")
     if not re.fullmatch(r"[0-9]+", data_values["embargo_trading_days"]):
         raise ValueError("Training config data.embargo_trading_days must be an integer")
     embargo_trading_days = int(data_values["embargo_trading_days"])
@@ -302,13 +281,7 @@ def _records_digest(records):
 
 
 def _content_identity_module(project_root):
-    source = (
-        Path(project_root)
-        / "src"
-        / "stock_forecasting"
-        / "data"
-        / "content_identity.py"
-    )
+    source = Path(project_root) / "src" / "stock_forecasting" / "data" / "content_identity.py"
     if not source.is_file() or source.is_symlink():
         raise ValueError("Data content identity helper is missing or is a symlink")
     specification = importlib.util.spec_from_file_location(
@@ -374,9 +347,8 @@ def _validate_code_content_identity(identity):
 
 def _dataset_content_identity_from_code(code_payload, selected_datasets):
     code_identity = _validate_code_content_identity(code_payload.get("data_content_identity"))
-    if (
-        not isinstance(selected_datasets, list)
-        or selected_datasets != sorted(set(selected_datasets))
+    if not isinstance(selected_datasets, list) or selected_datasets != sorted(
+        set(selected_datasets)
     ):
         raise ValueError("Selected datasets for content identity are invalid")
     providers = code_identity["provider_materialization_digests"]
@@ -390,9 +362,7 @@ def _dataset_content_identity_from_code(code_payload, selected_datasets):
             provider: providers[provider] for provider in selected_datasets
         },
         "raw_materialization_digest": code_identity["raw_materialization_digest"],
-        "bar_store_materialization_digest": code_identity[
-            "bar_store_materialization_digest"
-        ],
+        "bar_store_materialization_digest": code_identity["bar_store_materialization_digest"],
     }
 
 
@@ -489,9 +459,7 @@ def _validate_code_payload(payload, project_root=None):
         manifest_paths = _validate_manifest_project_files(payload, project_root)
         expected_identity, expected_paths = _project_content_identity(project_root)
         if content_identity != expected_identity or pipeline_paths != expected_paths:
-            raise ValueError(
-                "Code manifest data content identity differs from mounted source"
-            )
+            raise ValueError("Code manifest data content identity differs from mounted source")
         extra_sources = [
             relative
             for relative, _candidate in _find_unlisted_sources(project_root, manifest_paths)
@@ -708,9 +676,7 @@ def command_code_manifest(arguments):
         {_safe_relative_path(path).as_posix() for path in arguments.pipeline_path}
     )
     if requested_pipeline_paths and requested_pipeline_paths != pipeline_paths:
-        raise ValueError(
-            "Explicit data pipeline paths differ from the content identity boundary"
-        )
+        raise ValueError("Explicit data pipeline paths differ from the content identity boundary")
     record_paths = {record["path"] for record in records}
     if not set(pipeline_paths).issubset(record_paths):
         raise ValueError("Every data pipeline path must also be in the upload manifest")
@@ -849,9 +815,7 @@ def _numerical_pipeline_digest_from_code_payload(code_payload, selected_datasets
     identity = _validate_code_content_identity(code_payload.get("data_content_identity"))
     if selected_datasets is None:
         return _payload_sha256(identity)
-    return _payload_sha256(
-        _dataset_content_identity_from_code(code_payload, selected_datasets)
-    )
+    return _payload_sha256(_dataset_content_identity_from_code(code_payload, selected_datasets))
 
 
 def command_code_numerical_pipeline_digest(arguments):
@@ -876,9 +840,7 @@ def _validate_dataset_code_compatibility(
     """Validate data semantics separately from full source-release provenance."""
 
     pipeline_digest = payload.get("data_pipeline_digest")
-    if not isinstance(pipeline_digest, str) or not re.fullmatch(
-        r"[0-9a-f]{64}", pipeline_digest
-    ):
+    if not isinstance(pipeline_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", pipeline_digest):
         raise ValueError("Dataset readiness numerical pipeline digest is invalid")
     content_identity = payload.get("data_content_identity")
     selected_datasets = payload.get("selected_datasets")
@@ -892,8 +854,7 @@ def _validate_dataset_code_compatibility(
             "raw_materialization_digest",
             "bar_store_materialization_digest",
         }
-        or content_identity.get("schema_version")
-        != CONTENT_IDENTITY_SCHEMA_VERSION
+        or content_identity.get("schema_version") != CONTENT_IDENTITY_SCHEMA_VERSION
         or content_identity.get("selected_datasets") != selected_datasets
         or _payload_sha256(content_identity) != pipeline_digest
     ):
@@ -923,9 +884,7 @@ def _validate_dataset_code_compatibility(
             selected_datasets,
         )
         if content_identity != expected_identity:
-            raise ValueError(
-                "Dataset was prepared with a different numerical pipeline revision"
-            )
+            raise ValueError("Dataset was prepared with a different numerical pipeline revision")
     if expected_numerical_pipeline_digest is not None and (
         not isinstance(expected_numerical_pipeline_digest, str)
         or re.fullmatch(r"[0-9a-f]{64}", expected_numerical_pipeline_digest) is None
@@ -995,9 +954,7 @@ def _validate_quant_dataset_payload(
 
     approved_paths = {
         "raw": f"{expected_data_root}/raw/market.parquet",
-        "bar_store_manifest": (
-            f"{expected_data_root}/prepared/bar-store/bar-store.json"
-        ),
+        "bar_store_manifest": (f"{expected_data_root}/prepared/bar-store/bar-store.json"),
         "symbol_index": f"{expected_data_root}/prepared/bar-store/symbol-index.parquet",
         "cutoff_ranges": f"{expected_data_root}/prepared/bar-store/cutoff-ranges.parquet",
         "dataset_manifest": f"{expected_data_root}/dataset-manifest.json",
@@ -1072,8 +1029,7 @@ def _validate_quant_dataset_payload(
     ):
         raise ValueError("Dataset readiness storage preparation spec is invalid")
     if (
-        storage_preparation.get("bar_store_schema_version")
-        != BAR_STORE_SCHEMA_VERSION
+        storage_preparation.get("bar_store_schema_version") != BAR_STORE_SCHEMA_VERSION
         or storage_preparation.get("storage_kind") != BAR_STORE_KIND
         or storage_preparation.get("window_materialized") is not False
         or storage_preparation.get("labels_materialized") is not False
@@ -1093,8 +1049,7 @@ def _validate_quant_dataset_payload(
         or purge_bars < 0
         or not isinstance(effective_embargo_bars, int)
         or isinstance(effective_embargo_bars, bool)
-        or effective_embargo_bars
-        < DEFAULT_DATASET_STORAGE_PREPARATION["max_horizon"]
+        or effective_embargo_bars < DEFAULT_DATASET_STORAGE_PREPARATION["max_horizon"]
         or re.fullmatch(
             r"[0-9a-f]{64}",
             str(storage_preparation.get("benchmark_mapping_sha256", "")),
@@ -1126,19 +1081,17 @@ def _validate_quant_dataset_payload(
         raise ValueError("Dataset readiness requested preparation contract is invalid")
     for field in storage_preparation:
         if storage_preparation.get(field) != requested_preparation.get(field):
-            raise ValueError(
-                f"Dataset readiness storage field {field} disagrees with its request"
-            )
+            raise ValueError(f"Dataset readiness storage field {field} disagrees with its request")
     validate_fixed_split_audit(
-        payload.get("split_audit"), storage_preparation.get("fixed_split"),
+        payload.get("split_audit"),
+        storage_preparation.get("fixed_split"),
         minimum_evaluation_dates=MIN_FIXED_EVALUATION_DATES,
     )
     training_security_scope = payload.get("training_security_scope")
     if (
         not isinstance(training_security_scope, str)
         or not training_security_scope
-        or preparation_provenance.get("training_security_scope")
-        != training_security_scope
+        or preparation_provenance.get("training_security_scope") != training_security_scope
     ):
         raise ValueError("Dataset readiness training security scope is inconsistent")
     split_counts = payload.get("split_counts")
@@ -1194,9 +1147,7 @@ def _guard_lifecycle_state(
 
     if expected_kind not in GUARD_LIFECYCLE_KINDS:
         raise ValueError("Guard lifecycle kind is unsupported")
-    if not isinstance(expected_pod_id, str) or not re.fullmatch(
-        r"[A-Za-z0-9_-]+", expected_pod_id
-    ):
+    if not isinstance(expected_pod_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", expected_pod_id):
         raise ValueError("Guard expected Pod ID is invalid")
     if active_run_id and (
         not isinstance(active_run_id, str)
@@ -1216,13 +1167,8 @@ def _guard_lifecycle_state(
     if payload.get("schema_version") != LIFECYCLE_SCHEMA_VERSION:
         raise ValueError("Guard lifecycle marker has an unsupported schema")
 
-    if (
-        state in CPU_PREPARATION_RESUMABLE_STATES
-        and expected_kind != "stage1-cpu-preparation"
-    ):
-        raise ValueError(
-            "Resumable acquisition states are valid only for CPU preparation"
-        )
+    if state in CPU_PREPARATION_RESUMABLE_STATES and expected_kind != "stage1-cpu-preparation":
+        raise ValueError("Resumable acquisition states are valid only for CPU preparation")
     if (
         expected_kind == "stage1-cpu-preparation"
         and state == "downloaded"
@@ -1238,12 +1184,12 @@ def _guard_lifecycle_state(
             raise ValueError("Ready training lifecycle is incomplete")
         if expected_kind == "stage1-validation" and payload.get("validation_completed") is not True:
             raise ValueError("Ready validation lifecycle is incomplete")
+        if expected_kind == "stage1-baseline" and payload.get("baseline_completed") is not True:
+            raise ValueError("Ready baseline lifecycle is incomplete")
 
     run_id = payload.get("wandb_run_id", "")
-    if expected_kind in {"stage1-training", "stage1-validation"} and (
-        not isinstance(run_id, str)
-        or RUN_ID_PATTERN.fullmatch(run_id) is None
-        or "--" in run_id
+    if expected_kind in {"stage1-training", "stage1-validation", "stage1-baseline"} and (
+        not isinstance(run_id, str) or RUN_ID_PATTERN.fullmatch(run_id) is None or "--" in run_id
     ):
         raise ValueError("Guard lifecycle run ID is invalid")
     if active_run_id and run_id != active_run_id:
@@ -1299,10 +1245,8 @@ def _verify_dataset_artifacts(payload, network_volume_root):
         or dataset_payload.get("state") != "ready"
         or dataset_payload.get("dataset_profile") != payload.get("dataset_profile")
         or dataset_payload.get("selected_datasets") != payload.get("selected_datasets")
-        or dataset_payload.get("training_security_scope")
-        != payload.get("training_security_scope")
-        or dataset_payload.get("data_content_identity")
-        != payload.get("data_content_identity")
+        or dataset_payload.get("training_security_scope") != payload.get("training_security_scope")
+        or dataset_payload.get("data_content_identity") != payload.get("data_content_identity")
         or dataset_payload.get("data_pipeline_digest") != payload.get("data_pipeline_digest")
         or dataset_payload.get("storage_preparation_spec")
         != payload.get("storage_preparation_spec")
@@ -1357,9 +1301,7 @@ def command_check_dataset(arguments):
     payload = _validate_quant_dataset_payload(
         _load_json(arguments.marker),
         code_payload=code_payload,
-        expected_numerical_pipeline_digest=(
-            arguments.expected_numerical_pipeline_digest
-        ),
+        expected_numerical_pipeline_digest=(arguments.expected_numerical_pipeline_digest),
         stage_contract=stage_contract,
     )
     if arguments.network_volume_root is not None:
@@ -1463,7 +1405,7 @@ def _validate_runtime_robust_scales(payload):
 
 
 def _validate_run_lifecycle_paths(payload, volume_root):
-    if payload.get("kind") not in {"stage1-training", "stage1-validation"}:
+    if payload.get("kind") not in {"stage1-training", "stage1-validation", "stage1-baseline"}:
         return
     if payload.get("schema_version") != LIFECYCLE_SCHEMA_VERSION:
         raise ValueError(
@@ -1633,7 +1575,7 @@ def command_write_training_completion(arguments):
 
 
 def _validated_gpu_workflow_status(payload, *, expected_kind, volume_root):
-    if expected_kind not in {"stage1-training", "stage1-validation"}:
+    if expected_kind not in {"stage1-training", "stage1-validation", "stage1-baseline"}:
         raise ValueError("GPU workflow lifecycle kind is unsupported")
     if payload.get("kind") != expected_kind:
         raise ValueError("GPU workflow lifecycle marker has the wrong kind")
@@ -1664,9 +1606,7 @@ def command_gpu_workflow_status(arguments):
 def _runpod_pod_probe_state(payload, *, expected_pod_id, command_exit_code):
     """Classify only an explicit Pod object or an explicit RunPod 404 response."""
 
-    if not isinstance(expected_pod_id, str) or POD_ID_PATTERN.fullmatch(
-        expected_pod_id
-    ) is None:
+    if not isinstance(expected_pod_id, str) or POD_ID_PATTERN.fullmatch(expected_pod_id) is None:
         raise ValueError("Expected RunPod Pod ID is invalid")
     if not isinstance(command_exit_code, int) or isinstance(command_exit_code, bool):
         raise ValueError("RunPod Pod lookup exit code is invalid")
@@ -1880,9 +1820,7 @@ def command_resumable_cpu_preparation_lifecycle(arguments):
     progress = _load_json(progress_path)
     identity = progress.get("identity")
     context = progress.get("context")
-    expected_progress_state = (
-        "downloaded" if state == "waiting_for_preparation" else state
-    )
+    expected_progress_state = "downloaded" if state == "waiting_for_preparation" else state
     if (
         progress.get("schema_version") != 1
         or progress.get("kind") != "ohlcv-download-progress"
@@ -2173,14 +2111,13 @@ def command_write_state(arguments):
     if output == Path("/workspace") or Path("/workspace") in output.parents:
         raise ValueError("Lifecycle state must never use /workspace")
     canonical_outputs = {
-        "stage1-cpu-preparation": (
-            volume_root / "lifecycle" / "stage1" / "cpu-preparation.json"
-        ),
+        "stage1-cpu-preparation": (volume_root / "lifecycle" / "stage1" / "cpu-preparation.json"),
         "stage1-mixed-finalization": (
             volume_root / "lifecycle" / "stage1" / "mixed-finalization.json"
         ),
         "stage1-training": volume_root / "lifecycle" / "stage1" / "training.json",
         "stage1-validation": volume_root / "lifecycle" / "stage1" / "validation.json",
+        "stage1-baseline": volume_root / "lifecycle" / "stage1" / "baseline.json",
     }
     expected_output = canonical_outputs.get(arguments.kind)
     if expected_output is None:
@@ -2191,9 +2128,7 @@ def command_write_state(arguments):
         arguments.state in CPU_PREPARATION_RESUMABLE_STATES
         and arguments.kind != "stage1-cpu-preparation"
     ):
-        raise ValueError(
-            f"{arguments.state} is valid only for stage1-cpu-preparation"
-        )
+        raise ValueError(f"{arguments.state} is valid only for stage1-cpu-preparation")
     if (
         arguments.state in CPU_PREPARATION_RESUMABLE_STATES - {"downloaded"}
         and arguments.exit_code != 75
@@ -2236,14 +2171,11 @@ def command_write_state(arguments):
             or not isinstance(progress_identity, dict)
             or not isinstance(progress_context, dict)
             or progress_payload.get("identity_sha256") != _payload_sha256(progress_identity)
-            or progress_context.get("dataset_request_sha256")
-            != progress_relative.parts[0]
+            or progress_context.get("dataset_request_sha256") != progress_relative.parts[0]
         ):
             raise ValueError("Download progress identity does not match its dataset namespace")
         expected_progress_state = (
-            "downloaded"
-            if arguments.state == "waiting_for_preparation"
-            else arguments.state
+            "downloaded" if arguments.state == "waiting_for_preparation" else arguments.state
         )
         if (
             arguments.state in CPU_PREPARATION_RESUMABLE_STATES
@@ -2342,6 +2274,8 @@ def command_write_state(arguments):
     }:
         payload["validation_completed"] = arguments.state == "ready"
         payload["timed_out"] = arguments.state == "timed_out"
+    if arguments.kind == "stage1-baseline":
+        payload["baseline_completed"] = arguments.state == "ready"
     _validate_run_lifecycle_paths(payload, volume_root)
     _atomic_json(output, payload)
     return 0
@@ -2422,7 +2356,7 @@ def build_parser():
     gpu_workflow.add_argument("--network-volume-root", type=Path, required=True)
     gpu_workflow.add_argument(
         "--kind",
-        choices=("stage1-training", "stage1-validation"),
+        choices=("stage1-training", "stage1-validation", "stage1-baseline"),
         required=True,
     )
     gpu_workflow.set_defaults(handler=command_gpu_workflow_available)
@@ -2432,7 +2366,7 @@ def build_parser():
     gpu_workflow_status.add_argument("--network-volume-root", type=Path, required=True)
     gpu_workflow_status.add_argument(
         "--kind",
-        choices=("stage1-training", "stage1-validation"),
+        choices=("stage1-training", "stage1-validation", "stage1-baseline"),
         required=True,
     )
     gpu_workflow_status.set_defaults(handler=command_gpu_workflow_status)
@@ -2443,25 +2377,17 @@ def build_parser():
     pod_probe.add_argument("--command-exit-code", type=int, required=True)
     pod_probe.set_defaults(handler=command_runpod_pod_probe_state)
 
-    orphaned_gpu_workflow = subparsers.add_parser(
-        "reconcile-orphaned-gpu-workflow"
-    )
+    orphaned_gpu_workflow = subparsers.add_parser("reconcile-orphaned-gpu-workflow")
     orphaned_gpu_workflow.add_argument("--marker", required=True)
-    orphaned_gpu_workflow.add_argument(
-        "--network-volume-root", type=Path, required=True
-    )
+    orphaned_gpu_workflow.add_argument("--network-volume-root", type=Path, required=True)
     orphaned_gpu_workflow.add_argument(
         "--kind",
-        choices=("stage1-training", "stage1-validation"),
+        choices=("stage1-training", "stage1-validation", "stage1-baseline"),
         required=True,
     )
     orphaned_gpu_workflow.add_argument("--expected-pod-id", required=True)
-    orphaned_gpu_workflow.add_argument(
-        "--minimum-age-seconds", type=int, default=60
-    )
-    orphaned_gpu_workflow.set_defaults(
-        handler=command_reconcile_orphaned_gpu_workflow
-    )
+    orphaned_gpu_workflow.add_argument("--minimum-age-seconds", type=int, default=60)
+    orphaned_gpu_workflow.set_defaults(handler=command_reconcile_orphaned_gpu_workflow)
 
     completed_training_phase = subparsers.add_parser("training-phase-completed")
     completed_training_phase.add_argument("--marker", required=True)
@@ -2475,7 +2401,7 @@ def build_parser():
     finalizing_lifecycle.add_argument("--network-volume-root", type=Path, required=True)
     finalizing_lifecycle.add_argument(
         "--kind",
-        choices=("stage1-training", "stage1-validation"),
+        choices=("stage1-training", "stage1-validation", "stage1-baseline"),
         required=True,
     )
     finalizing_lifecycle.add_argument("--run-id", required=True)
@@ -2487,24 +2413,18 @@ def build_parser():
     active_lifecycle.add_argument("--network-volume-root", type=Path, required=True)
     active_lifecycle.add_argument(
         "--kind",
-        choices=("stage1-training", "stage1-validation"),
+        choices=("stage1-training", "stage1-validation", "stage1-baseline"),
         required=True,
     )
     active_lifecycle.add_argument("--run-id", required=True)
     active_lifecycle.add_argument("--launch-id", required=True)
     active_lifecycle.set_defaults(handler=command_active_run_lifecycle)
 
-    resumable_cpu_preparation = subparsers.add_parser(
-        "resumable-cpu-preparation-lifecycle"
-    )
+    resumable_cpu_preparation = subparsers.add_parser("resumable-cpu-preparation-lifecycle")
     resumable_cpu_preparation.add_argument("--marker", type=Path, required=True)
-    resumable_cpu_preparation.add_argument(
-        "--network-volume-root", type=Path, required=True
-    )
+    resumable_cpu_preparation.add_argument("--network-volume-root", type=Path, required=True)
     resumable_cpu_preparation.add_argument("--launch-id", required=True)
-    resumable_cpu_preparation.set_defaults(
-        handler=command_resumable_cpu_preparation_lifecycle
-    )
+    resumable_cpu_preparation.set_defaults(handler=command_resumable_cpu_preparation_lifecycle)
 
     guard_lifecycle = subparsers.add_parser("guard-lifecycle-state")
     guard_lifecycle.add_argument(

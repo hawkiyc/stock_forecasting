@@ -95,14 +95,15 @@ fi
 case "${LIFECYCLE_KEY}" in
     ""|lifecycle/stage1/cpu-preparation.json|\
         lifecycle/stage1/mixed-finalization.json|\
-        lifecycle/stage1/training.json|lifecycle/stage1/validation.json) ;;
+        lifecycle/stage1/training.json|lifecycle/stage1/validation.json|lifecycle/stage1/baseline.json) ;;
     *)
         echo "Unsupported lifecycle marker key" >&2
         exit 2
         ;;
 esac
 if [[ ( "${LIFECYCLE_KEY}" == "lifecycle/stage1/training.json" \
-        || "${LIFECYCLE_KEY}" == "lifecycle/stage1/validation.json" ) \
+        || "${LIFECYCLE_KEY}" == "lifecycle/stage1/validation.json" \
+        || "${LIFECYCLE_KEY}" == "lifecycle/stage1/baseline.json" ) \
     && -z "${RUNPOD_GUARD_RUN_ID}" ]]; then
     echo "GPU lifecycle guards require RUNPOD_GUARD_RUN_ID" >&2
     exit 2
@@ -149,7 +150,7 @@ matching_run_lifecycle_observed=0
 diagnostic_workflow_observed=0
 pod_terminal_key=""
 case "${LIFECYCLE_KEY}" in
-    lifecycle/stage1/training.json|lifecycle/stage1/validation.json)
+    lifecycle/stage1/training.json|lifecycle/stage1/validation.json|lifecycle/stage1/baseline.json)
         if [[ -n "${RUNPOD_GUARD_RUN_ID}" ]]; then
             pod_terminal_key="lifecycle/runs/${RUNPOD_GUARD_RUN_ID}/pods/${POD_ID}/terminal.json"
         fi
@@ -205,6 +206,9 @@ if [[ -n "${LIFECYCLE_KEY}" ]]; then
                 expected_terminal_lifecycle_kind=stage1-training
                 if [[ "${LIFECYCLE_KEY}" == "lifecycle/stage1/validation.json" ]]; then
                     expected_terminal_lifecycle_kind=stage1-validation
+                fi
+                if [[ "${LIFECYCLE_KEY}" == "lifecycle/stage1/baseline.json" ]]; then
+                    expected_terminal_lifecycle_kind=stage1-baseline
                 fi
                 if pod_terminal_json="$(runpod_guard_s3 s3 cp \
                     "s3://${volume_id}/${pod_terminal_key}" - \
@@ -267,6 +271,9 @@ raise SystemExit(0 if valid else 2)' \
                     lifecycle/stage1/validation.json)
                         expected_lifecycle_kind="stage1-validation"
                         ;;
+                    lifecycle/stage1/baseline.json)
+                        expected_lifecycle_kind="stage1-baseline"
+                        ;;
                     *)
                         continue
                         ;;
@@ -289,7 +296,8 @@ raise SystemExit(0 if valid else 2)' \
                     continue
                 fi
                 if [[ "${lifecycle_candidate}" == "lifecycle/stage1/training.json" \
-                    || "${lifecycle_candidate}" == "lifecycle/stage1/validation.json" ]]; then
+                    || "${lifecycle_candidate}" == "lifecycle/stage1/validation.json" \
+                    || "${lifecycle_candidate}" == "lifecycle/stage1/baseline.json" ]]; then
                     last_marker_json="${marker_json}"
                     matching_run_lifecycle_observed=1
                 fi
@@ -350,7 +358,8 @@ fi
 if [[ "${termination_reason}" == "hard-limit" \
     && "${diagnostic_workflow_observed}" != "1" \
     && ( "${LIFECYCLE_KEY}" == "lifecycle/stage1/training.json" \
-        || "${LIFECYCLE_KEY}" == "lifecycle/stage1/validation.json" ) \
+        || "${LIFECYCLE_KEY}" == "lifecycle/stage1/validation.json" \
+        || "${LIFECYCLE_KEY}" == "lifecycle/stage1/baseline.json" ) \
     && "${volume_id:-}" =~ ^[A-Za-z0-9_-]+$ \
     && -r "${RUNPOD_S3_WRAPPER}" ]] \
     && command -v aws >/dev/null 2>&1 \
@@ -363,7 +372,7 @@ except (TypeError, ValueError):
     previous = {}
 if not isinstance(previous, dict):
     previous = {}
-expected_kind = "stage1-validation" if sys.argv[3].endswith("validation.json") else "stage1-training"
+expected_kind = "stage1-" + pathlib.PurePosixPath(sys.argv[3]).stem
 active_run_id = sys.argv[5]
 if previous:
     previous_schema = previous.get("schema_version")
