@@ -31,13 +31,13 @@ def worker_init(_worker_id):
     pyarrow.set_io_thread_count(1)
 
 
-def loader_options(workers: int, prefetch: int = 2) -> dict:
+def loader_options(workers: int, prefetch: int = 2, *, persistent: bool = False) -> dict:
     if workers < 1:
         raise ValueError("Production baseline loaders require at least one worker")
     return {
         "num_workers": workers,
         "prefetch_factor": prefetch,
-        "persistent_workers": False,
+        "persistent_workers": persistent,
         "multiprocessing_context": "spawn",
         "worker_init_fn": worker_init,
         "timeout": 300,

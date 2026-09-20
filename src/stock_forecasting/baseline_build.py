@@ -10,6 +10,7 @@ import pickle
 import random
 import shutil
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
@@ -67,9 +68,19 @@ def _sequence(batch, device):
     )
 
 
-def _loader(config, split, workers, batch_size, *, sampler=None, prefetch=2, validated_root=None):
+def _loader(
+    config,
+    split,
+    workers,
+    batch_size,
+    *,
+    sampler=None,
+    prefetch=2,
+    validated_root=None,
+    persistent=False,
+):
     source = lazy_dataset(config, split, relative=True, validated_root=validated_root)
-    options = loader_options(workers, prefetch)
+    options = loader_options(workers, prefetch, persistent=persistent)
     if sampler is not None:
         return DataLoader(
             source,
@@ -119,7 +130,22 @@ def _neural_test(model, loader, output, horizons, scales):
         store.close()
 
 
+def _close_loader(loader):
+    """Release a persistent pool before admitting another evaluation phase."""
+
+    iterator = getattr(loader, "_iterator", None)
+    if iterator is not None:
+        iterator._shutdown_workers()
+        loader._iterator = None
+
+
 def _train_neural(config, directory, name, seed, parameters, scales, plan):
+    # All callbacks run on success, interruption and failure; never retain a third pool.
+    with ExitStack() as loaders:
+        return _train_neural_impl(config, directory, name, seed, parameters, scales, plan, loaders)
+
+
+def _train_neural_impl(config, directory, name, seed, parameters, scales, plan, loaders):
     from stock_forecasting.training import ResumableFixedSizeBatchSampler
 
     _seed_baseline(seed)
@@ -152,7 +178,9 @@ def _train_neural(config, directory, name, seed, parameters, scales, plan):
         sampler=sampler,
         prefetch=plan["prefetch_factor"],
         validated_root=source_root,
+        persistent=True,
     )
+    loaders.callback(_close_loader, train)
     validation = _loader(
         config,
         "validation",
@@ -160,7 +188,9 @@ def _train_neural(config, directory, name, seed, parameters, scales, plan):
         parameters["batch_size"],
         prefetch=plan["prefetch_factor"],
         validated_root=source_root,
+        persistent=True,
     )
+    loaders.callback(_close_loader, validation)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=parameters["learning_rate"], weight_decay=parameters["weight_decay"]
     )
@@ -267,12 +297,14 @@ def _train_neural(config, directory, name, seed, parameters, scales, plan):
             )
             if finished:
                 break
+    _close_loader(train)
     best_state = torch.load(directory / "model.pt", map_location="cuda", weights_only=True)
     model.load_state_dict(best_state["state_dict"])
     validation_metrics = _neural_test(
         model, validation, directory / "validation", list(horizons), scales
     )
     atomic_write_json(directory / "validation-metrics.json", validation_metrics)
+    _close_loader(validation)
     test = _loader(
         config,
         "test",

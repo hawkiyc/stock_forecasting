@@ -103,6 +103,22 @@ def test_full_tabular_preparation_reuses_without_touching_bar_store(small_lazy_c
     assert sha256_file(manifest) == before
 
 
+def test_neural_validation_reuses_and_closes_its_worker_pool(small_lazy_config):
+    from stock_forecasting.baseline_build import _close_loader, _loader
+
+    loader = _loader(small_lazy_config, "validation", 1, 16, persistent=True)
+    try:
+        first = sum(len(batch["symbols"]) for batch in loader)
+        processes = list(loader._iterator._workers)
+        second = sum(len(batch["symbols"]) for batch in loader)
+        assert first == second == len(loader.dataset)
+        assert [p.pid for p in processes] == [p.pid for p in loader._iterator._workers]
+    finally:
+        _close_loader(loader)
+    assert loader._iterator is None
+    assert all(not p.is_alive() for p in processes)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires authorized cloud CUDA")
 def test_neural_baseline_full_splits_and_resume(small_lazy_config, tmp_path):
     parameters = json.loads((ROOT / "configs/baseline.json").read_text())
