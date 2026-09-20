@@ -192,12 +192,15 @@ def test_guard_pid_must_still_belong_to_the_guard(
     assert RECOVERY.guard_alive("recovery-pod", tmp_path) is False
 
 
-def test_unknown_lifecycle_state_is_not_a_termination_signal() -> None:
+def test_unknown_lifecycle_state_is_not_a_termination_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class Readiness:
         @staticmethod
         def _guard_lifecycle_state(*args: object, **kwargs: object) -> str:
             raise ValueError("marker cannot be verified")
 
+    monkeypatch.setattr(RECOVERY, "load_marker", lambda *args: {"state": "unverifiable"})
     pod = _pod()
     state, evidence = RECOVERY.lifecycle_state(
         pod,

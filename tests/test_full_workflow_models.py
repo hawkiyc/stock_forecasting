@@ -330,6 +330,7 @@ def test_extended_features_masking_causality_and_output_scale():
     statistics = fit_scale_feature_statistics(features.numpy(), {"split": "train"})
     head = MultiHorizonAlphaHead(
         32,
+        horizons=tuple(range(1, 15)),
         feature_mode="combined",
         market_aware=True,
         explicit_output_scale=True,

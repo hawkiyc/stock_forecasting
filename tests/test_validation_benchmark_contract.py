@@ -157,13 +157,25 @@ def test_evaluation_contract_keeps_numerical_validation_settings(
 def _runtime_plan_reader_contracts(tmp_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
     current = _evaluation_contract(config, tmp_path / "checkpoint")
-    stored = copy.deepcopy(current)
     migration = EVALUATION_RESUME_MIGRATIONS[0]
-    for name, fingerprint in migration["to_files"].items():
-        assert current["inputs"]["evaluation_implementation"][name] == fingerprint
+    # Exercise the exact historical migration, not today's different evaluator.
+    current["inputs"]["evaluation_implementation"].update(copy.deepcopy(migration["to_files"]))
+    current["digest"] = _canonical_digest(
+        {"version": current["version"], "inputs": current["inputs"]}
+    )
+    stored = copy.deepcopy(current)
     stored["inputs"]["evaluation_implementation"].update(copy.deepcopy(migration["from_files"]))
     stored["digest"] = _canonical_digest({"version": stored["version"], "inputs": stored["inputs"]})
     return stored, current
+
+
+def test_historical_reader_migration_does_not_authorize_the_current_evaluator(
+    tmp_path: Path,
+) -> None:
+    stored, _ = _runtime_plan_reader_contracts(tmp_path)
+    config = ExperimentConfig.from_yaml(ROOT / "configs/local_mock.yaml")
+    current = _evaluation_contract(config, tmp_path / "checkpoint")
+    assert not _evaluation_contracts_are_resume_compatible(stored, current)
 
 
 def test_runtime_plan_reader_fix_preserves_completed_baselines_on_resume(tmp_path: Path) -> None:
