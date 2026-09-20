@@ -348,10 +348,20 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
         self._timestamp_indexes: OrderedDict[str, pd.DatetimeIndex] = OrderedDict()
 
     def __getstate__(self) -> dict[str, Any]:
-        state = self.__dict__.copy()
-        state["_cache"] = OrderedDict()
-        state["_timestamp_indexes"] = OrderedDict()
-        return state
+        # Keep spawn messages below pipe capacity. Sending the entire symbol index
+        # blocks each worker launch behind the previous worker's Python imports.
+        # Workers reopen only compact read-only indexes, never materialized windows.
+        return {
+            "bar_store_root": str(self.root),
+            "split": self.split,
+            "window_size": self.window_size,
+            "h_start": self.horizons[0],
+            "series_mode": self.series_mode,
+            "symbol_cache_size": self.symbol_cache_size,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__init__(**state)
 
     def __len__(self) -> int:
         return int(self._range_ends[-1])

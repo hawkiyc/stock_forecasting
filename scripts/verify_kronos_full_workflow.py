@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 import time
 from pathlib import Path
 
@@ -90,26 +91,43 @@ def main():
     bundle.model.zero_grad(set_to_none=True)
     bundle.model.eval()
     evaluation = build_evaluation_loader(config, bundle=bundle, device=device, split="test")
+    full_count = len(evaluation.dataset)
+    spawn_bytes = len(pickle.dumps(evaluation.dataset))
+    assert spawn_bytes < 1024
+    # Exhaust the bounded profiling loader naturally; abandoning a prefetched
+    # iterator can abort workers while they are still returning pinned tensors.
+    profile = DataLoader(
+        Subset(evaluation.dataset, range(min(4096, full_count))),
+        batch_size=evaluation.batch_size,
+        collate_fn=FinancialBatchCollator(),
+        pin_memory=True,
+        **loader_options(evaluation.num_workers, evaluation.prefetch_factor),
+    )
     started, profiled = time.monotonic(), 0
+    warm_started, warm_count = None, 0
     with torch.inference_mode():
-        for batch in iter_device_batches(evaluation, device):
+        for batch in iter_device_batches(profile, device):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output = forward_batch(bundle, batch, config, device)
             assert torch.isfinite(output.alpha_quantiles).all()
             profiled += len(batch["symbols"])
-            if profiled >= 2048:
-                break
+            if warm_started is None and profiled >= 256:
+                torch.cuda.synchronize()
+                warm_started, warm_count = time.monotonic(), profiled
     torch.cuda.synchronize()
+    finished = time.monotonic()
     summary["evaluation_profile"] = {
-        "full_split_size": len(evaluation.dataset),
+        "full_split_size": full_count,
         "profiled_samples": profiled,
         "batch_size": evaluation.batch_size,
         "workers": evaluation.num_workers,
         "prefetch_factor": evaluation.prefetch_factor,
         "pin_memory": evaluation.pin_memory,
         "drop_last": evaluation.drop_last,
-        "seconds": time.monotonic() - started,
-        "samples_per_second": profiled / (time.monotonic() - started),
+        "seconds": finished - started,
+        "samples_per_second": profiled / (finished - started),
+        "warm_samples_per_second": (profiled - warm_count) / (finished - warm_started),
+        "dataset_spawn_bytes": spawn_bytes,
         "purpose": "bounded throughput profile, not full holdout scoring",
         "peak_gpu_bytes": torch.cuda.max_memory_allocated(),
     }

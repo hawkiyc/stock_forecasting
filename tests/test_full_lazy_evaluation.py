@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pickle
 from dataclasses import replace
 from pathlib import Path
 
@@ -93,6 +94,11 @@ def test_every_instrument_every_valid_cutoff_independent_of_loader(
             expected.append((symbol, day.isoformat()))
     assert len(expected) == len(source) > 100
     assert len(source.ranges) < len(source)  # Only compact ranges, never expanded inputs.
+    message = pickle.dumps(source)
+    assert len(message) < 1024
+    restored = pickle.loads(message)
+    assert len(restored) == len(source)
+    assert restored[0]["sample_id"] == source[0]["sample_id"]
     config = ExperimentConfig.from_yaml(config_path)
     hashes = []
     for seed, batch, workers, prefetch in ((42, 7, 1, 2), (901, 31, 2, 3)):
