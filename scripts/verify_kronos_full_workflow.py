@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -18,7 +19,12 @@ from stock_forecasting.models.scale_features import (
     fit_scale_feature_statistics,
     historical_scale_features,
 )
-from stock_forecasting.training import _move_batch_to_device, forward_batch
+from stock_forecasting.training import (
+    _move_batch_to_device,
+    build_evaluation_loader,
+    forward_batch,
+    iter_device_batches,
+)
 
 
 def main():
@@ -79,6 +85,33 @@ def main():
         "gradient_checks": "finite_and_nonzero",
         "offline": True,
         "production_weights_saved": False,
+    }
+    del optimizer, output, batch, loader
+    bundle.model.zero_grad(set_to_none=True)
+    bundle.model.eval()
+    evaluation = build_evaluation_loader(config, bundle=bundle, device=device, split="test")
+    started, profiled = time.monotonic(), 0
+    with torch.inference_mode():
+        for batch in iter_device_batches(evaluation, device):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                output = forward_batch(bundle, batch, config, device)
+            assert torch.isfinite(output.alpha_quantiles).all()
+            profiled += len(batch["symbols"])
+            if profiled >= 2048:
+                break
+    torch.cuda.synchronize()
+    summary["evaluation_profile"] = {
+        "full_split_size": len(evaluation.dataset),
+        "profiled_samples": profiled,
+        "batch_size": evaluation.batch_size,
+        "workers": evaluation.num_workers,
+        "prefetch_factor": evaluation.prefetch_factor,
+        "pin_memory": evaluation.pin_memory,
+        "drop_last": evaluation.drop_last,
+        "seconds": time.monotonic() - started,
+        "samples_per_second": profiled / (time.monotonic() - started),
+        "purpose": "bounded throughput profile, not full holdout scoring",
+        "peak_gpu_bytes": torch.cuda.max_memory_allocated(),
     }
     root = (
         Path(os.environ["NETWORK_VOLUME_ROOT"])

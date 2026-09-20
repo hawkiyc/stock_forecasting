@@ -23,7 +23,7 @@ from stock_forecasting.run_paths import validate_checkpoint_path, validate_run_i
 from stock_forecasting.training import (
     RuntimeBatchPlan,
     _checkpoint_runtime_execution_plan,
-    build_dataloaders,
+    build_evaluation_loader,
     evaluate_loader,
     set_global_seed,
 )
@@ -134,17 +134,18 @@ def evaluate_checkpoint(
     if not isinstance(progress, dict):
         raise ValueError("Checkpoint has no runtime training progress")
     execution_plan = _checkpoint_runtime_execution_plan(checkpoint_state)
-    batch_plan = (
+    # Validate historical provenance, but never reuse old hardware's inference tuning.
+    _saved_batch_plan = (
         execution_plan.batch_plan
         if execution_plan is not None
         else RuntimeBatchPlan.from_dict(progress.get("runtime_batch_plan"))
     )
-    _train_loader, validation_loader, test_loader = build_dataloaders(
+    loader = build_evaluation_loader(
         config,
-        batch_plan=batch_plan,
-        ranking_sampling=False,
+        bundle=bundle,
+        device=device,
+        split=split,
     )
-    loader = validation_loader if split == "validation" else test_loader
     bundle.model.eval()
     metrics = evaluate_loader(
         bundle,

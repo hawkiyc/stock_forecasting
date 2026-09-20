@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 from typing import Any
 
 import numpy as np
 from torch.utils.data import SequentialSampler
 
 from stock_forecasting.config import ExperimentConfig
-from stock_forecasting.data.dataset import BlockwisePermutationSampler
 
 EVALUATION_PROTOCOL_VERSION = "full-fixed-holdout-v2"
 EVALUATION_SELECTION_BLOCK_SIZE = 128
@@ -21,18 +21,21 @@ def evaluation_sampler(
     count: int,
     config: ExperimentConfig,
     split: str,
-) -> BlockwisePermutationSampler | SequentialSampler:
+) -> SequentialSampler:
+    """Visit every lazy ordinal exactly once, independent of training RNG or caps."""
+
     if split not in ("validation", "test"):
         raise ValueError("Evaluation membership is only defined for validation and test")
-    if config.training.evaluation_max_samples is None:
-        return SequentialSampler(range(count))
-    seed = EVALUATION_SELECTION_SEED if config.data.fixed_split else config.training.seed
-    return BlockwisePermutationSampler(
-        count,
-        max_samples=config.training.evaluation_max_samples,
-        seed=seed + (1 if split == "validation" else 2),
-        block_size=EVALUATION_SELECTION_BLOCK_SIZE,
-    )
+    if count < 1:
+        raise ValueError("Evaluation requires a nonempty complete split")
+    if config.training.evaluation_max_samples is not None:
+        warnings.warn(
+            "evaluation_max_samples is retired and ignored: validation/test always visit "
+            "the entire split. Historical sampled metrics are not directly comparable.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return SequentialSampler(range(count))
 
 
 def sample_membership(symbols: list[str], dates: list[str]) -> dict[str, Any]:

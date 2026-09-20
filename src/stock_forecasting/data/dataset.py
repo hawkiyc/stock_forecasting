@@ -41,10 +41,7 @@ TIMESTAMP_FEATURE_FIELDS = ("minute", "hour", "weekday", "day", "month")
 def _context_payload(window: pd.DataFrame) -> dict[str, list[Any]]:
     return {
         "timestamp": [pd.Timestamp(value).isoformat() for value in window["timestamp"]],
-        **{
-            field: window[field].astype(float).tolist()
-            for field in CONTEXT_FIELDS
-        },
+        **{field: window[field].astype(float).tolist() for field in CONTEXT_FIELDS},
     }
 
 
@@ -59,9 +56,7 @@ def _series_from_values(values: np.ndarray, series_mode: str) -> torch.Tensor:
         values[:, :4] = np.log(np.maximum(values[:, :4], 1e-12) / reference_price)
         log_volume = np.log1p(np.maximum(values[:, 4], 0.0))
         scale = float(log_volume.std())
-        values[:, 4] = (log_volume - float(log_volume.mean())) / (
-            scale if scale > 1e-6 else 1.0
-        )
+        values[:, 4] = (log_volume - float(log_volume.mean())) / (scale if scale > 1e-6 else 1.0)
     return torch.from_numpy(values)
 
 
@@ -158,9 +153,7 @@ def _item_from_record(
         "asset_series": _series_from_context(context, series_mode),
         "asset_timestamp_features": _timestamp_features_from_context(context),
         "benchmark_series": _series_from_context(benchmark_context, series_mode),
-        "benchmark_timestamp_features": _timestamp_features_from_context(
-            benchmark_context
-        ),
+        "benchmark_timestamp_features": _timestamp_features_from_context(benchmark_context),
         "target_alpha": torch.from_numpy(target),
         "sample_id": str(record["sample_id"]),
         "symbol": str(record["symbol"]),
@@ -307,6 +300,14 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
         self.ranges = ranges.loc[ranges["split"] == split].reset_index(drop=True)
         if self.ranges.empty:
             raise ValueError(f"No lazy cutoff ranges remain for split={split}")
+        # Validate compact ranges, not an expanded list of millions of windows.
+        # Reject reordered/overlapping indexes rather than silently changing old identities.
+        canonical = self.ranges.sort_values(["symbol", "start_index"], kind="stable")
+        if not canonical.index.equals(self.ranges.index):
+            raise ValueError("Lazy cutoff ranges are not in canonical symbol/cutoff order")
+        previous_stops = self.ranges.groupby("symbol", sort=False)["stop_index"].shift()
+        if (self.ranges["start_index"] < previous_stops).any():
+            raise ValueError("Lazy cutoff ranges overlap and would duplicate windows")
         counts = self.ranges["count"].to_numpy(dtype=np.int64)
         starts = self.ranges["start_index"].to_numpy(dtype=np.int64)
         stops = self.ranges["stop_index"].to_numpy(dtype=np.int64)
@@ -317,18 +318,13 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
         ):
             raise ValueError("Lazy cutoff ranges have invalid index bounds")
         split_counts = manifest.get("split_counts")
-        if (
-            not isinstance(split_counts, dict)
-            or split_counts.get(split) != int(counts.sum())
-        ):
+        if not isinstance(split_counts, dict) or split_counts.get(split) != int(counts.sum()):
             raise ValueError("Lazy cutoff ranges disagree with the bar-store split count")
         self._range_ends = np.cumsum(counts, dtype=np.int64)
         index = pd.read_parquet(self.root / "symbol-index.parquet")
         if index["symbol"].duplicated().any():
             raise ValueError("Bar-store symbol index contains duplicate symbols")
-        self._index = {
-            str(row["symbol"]): row for row in index.to_dict(orient="records")
-        }
+        self._index = {str(row["symbol"]): row for row in index.to_dict(orient="records")}
         range_symbols = self.ranges["symbol"].astype(str)
         missing_symbols = sorted(set(range_symbols) - set(self._index))
         if missing_symbols:
@@ -460,17 +456,11 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
         holding_dates: pd.DatetimeIndex,
         benchmark_holding: pd.DataFrame,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, pd.DatetimeIndex]:
-        asset_holding = frame.iloc[
-            cutoff_index + 1 : cutoff_index + MAX_ALPHA_HORIZON + 1
-        ]
+        asset_holding = frame.iloc[cutoff_index + 1 : cutoff_index + MAX_ALPHA_HORIZON + 1]
         asset_close = asset_holding["close"].to_numpy(dtype=np.float64)
-        asset_adjusted_close = asset_holding["adjusted_close"].to_numpy(
-            dtype=np.float64
-        )
+        asset_adjusted_close = asset_holding["adjusted_close"].to_numpy(dtype=np.float64)
         benchmark_close = benchmark_holding["close"].to_numpy(dtype=np.float64)
-        benchmark_adjusted_close = benchmark_holding["adjusted_close"].to_numpy(
-            dtype=np.float64
-        )
+        benchmark_adjusted_close = benchmark_holding["adjusted_close"].to_numpy(dtype=np.float64)
         asset_entry = (
             float(asset_holding["open"].iloc[0])
             * asset_adjusted_close[0]
@@ -493,9 +483,7 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
         positions = np.asarray(self.horizons, dtype=np.int64) - 1
         asset_returns = asset_gross[positions] - 1.0
         benchmark_returns = benchmark_gross[positions] - 1.0
-        alpha_log_returns = (
-            np.log(asset_gross[positions]) - np.log(benchmark_gross[positions])
-        )
+        alpha_log_returns = np.log(asset_gross[positions]) - np.log(benchmark_gross[positions])
         return (
             alpha_log_returns,
             asset_returns,
@@ -553,9 +541,7 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
             "symbol": symbol,
             "asset_type": str(index_row["asset_type"]),
             "benchmark_symbol": benchmark_symbol,
-            "window_start_at": pd.Timestamp(
-                frame.loc[start_index, "timestamp"]
-            ).isoformat(),
+            "window_start_at": pd.Timestamp(frame.loc[start_index, "timestamp"]).isoformat(),
             "cutoff_at": cutoff_at.isoformat(),
             "context": _context_payload(observed),
             "benchmark_context": _context_payload(benchmark_observed),
@@ -605,13 +591,11 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
             benchmark,
             observed_timestamps,
         )
-        alpha_values, _asset_returns, _benchmark_returns, _exit_dates = (
-            self._target_components(
-                frame=frame,
-                cutoff_index=cutoff_index,
-                holding_dates=holding_dates,
-                benchmark_holding=benchmark_holding,
-            )
+        alpha_values, _asset_returns, _benchmark_returns, _exit_dates = self._target_components(
+            frame=frame,
+            cutoff_index=cutoff_index,
+            holding_dates=holding_dates,
+            benchmark_holding=benchmark_holding,
         )
         if not np.isfinite(alpha_values).all():
             raise ValueError("Alpha targets must be finite")
@@ -632,9 +616,7 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
                 self.series_mode,
             ),
             "benchmark_timestamp_features": _timestamp_features(observed_timestamps),
-            "target_alpha": torch.from_numpy(
-                alpha_values.astype(np.float32, copy=False)
-            ),
+            "target_alpha": torch.from_numpy(alpha_values.astype(np.float32, copy=False)),
             "sample_id": f"{symbol}-{cutoff_at.strftime('%Y%m%dT%H%M%SZ')}",
             "symbol": symbol,
             "benchmark_symbol": benchmark_symbol,
@@ -682,13 +664,11 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
             holding_dates,
             benchmark_holding,
         ) = self._sample_frames(index)
-        alpha_values, _asset, _benchmark_returns, _exit_dates = (
-            self._target_components(
-                frame=frame,
-                cutoff_index=cutoff_index,
-                holding_dates=holding_dates,
-                benchmark_holding=benchmark_holding,
-            )
+        alpha_values, _asset, _benchmark_returns, _exit_dates = self._target_components(
+            frame=frame,
+            cutoff_index=cutoff_index,
+            holding_dates=holding_dates,
+            benchmark_holding=benchmark_holding,
         )
         return torch.from_numpy(alpha_values.astype(np.float32, copy=False))
 
@@ -752,9 +732,7 @@ class BlockwisePermutationSampler(Sampler[int]):
             last_block_rank = 0
         else:
             inverse = pow(selection_multiplier, -1, block_count)
-            last_block_rank = (
-                inverse * ((block_count - 1) - selection_offset)
-            ) % block_count
+            last_block_rank = (inverse * ((block_count - 1) - selection_offset)) % block_count
 
         selected_block_count = math.ceil(self.target_count / self.block_size)
         selected_capacity = selected_block_count * self.block_size
@@ -772,12 +750,8 @@ class BlockwisePermutationSampler(Sampler[int]):
         emitted = 0
         reverse = bool(epoch_seed & 1)
         for position in range(selected_block_count):
-            selection_rank = (
-                order_multiplier * position + order_offset
-            ) % selected_block_count
-            block = (
-                selection_multiplier * selection_rank + selection_offset
-            ) % block_count
+            selection_rank = (order_multiplier * position + order_offset) % selected_block_count
+            block = (selection_multiplier * selection_rank + selection_offset) % block_count
             start = block * self.block_size
             stop = min(start + self.block_size, self.sample_count)
             preceding_capacity = selection_rank * self.block_size
@@ -788,9 +762,7 @@ class BlockwisePermutationSampler(Sampler[int]):
                 raise RuntimeError("Sampler selected an empty deterministic block")
             selected_stop = start + take
             values = (
-                range(selected_stop - 1, start - 1, -1)
-                if reverse
-                else range(start, selected_stop)
+                range(selected_stop - 1, start - 1, -1) if reverse else range(start, selected_stop)
             )
             for index in values:
                 yield index
@@ -858,11 +830,7 @@ def _padded_stream(
         stack_dimension = 0 if batch_first else 1
         series = torch.stack(series_values, dim=stack_dimension)
         timestamps = torch.stack(timestamp_values, dim=stack_dimension)
-        mask_shape = (
-            (len(items), int(lengths[0]))
-            if batch_first
-            else (int(lengths[0]), len(items))
-        )
+        mask_shape = (len(items), int(lengths[0])) if batch_first else (int(lengths[0]), len(items))
         mask = torch.ones(mask_shape, dtype=torch.bool)
         return series, timestamps, mask, lengths
     series = pad_sequence(

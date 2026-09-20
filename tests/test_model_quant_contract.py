@@ -177,12 +177,14 @@ def test_prefetch_factor_tracks_gpu_demand_with_memory_and_config_caps() -> None
         config=config,
         batch_plan=batch_plan(0.01),
         largest_host_batch_bytes=1024**2,
+        shared_memory_bytes=128 * 1024**3,
     )
     slow = plan_runtime_prefetch(
         workers,
         config=config,
         batch_plan=batch_plan(2.0),
         largest_host_batch_bytes=1024**2,
+        shared_memory_bytes=128 * 1024**3,
     )
     memory_limited_workers = plan_dataloader_workers(
         8,
@@ -194,12 +196,13 @@ def test_prefetch_factor_tracks_gpu_demand_with_memory_and_config_caps() -> None
         memory_limited_workers,
         config=config,
         batch_plan=batch_plan(0.01),
-        largest_host_batch_bytes=256 * 1024**2,
+        largest_host_batch_bytes=128 * 1024**2,
+        shared_memory_bytes=128 * 1024**3,
     )
 
     assert fast.prefetch_factor == config.training.dataloader_max_prefetch_factor == 4
     assert fast.prefetched_batches_per_pool == 32
-    assert fast.estimated_peak_prefetch_memory_bytes == 64 * 1024**2
+    assert fast.estimated_peak_prefetch_memory_bytes == 128 * 1024**2
     assert fast.prefetch_memory_budget_bytes == int(64 * 1024**3 * 0.10)
     assert slow.prefetch_factor == 2
     assert memory_limited.prefetch_factor == 1

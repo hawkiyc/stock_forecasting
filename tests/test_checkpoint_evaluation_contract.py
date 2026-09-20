@@ -61,7 +61,10 @@ def evaluation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNa
         ),
         batch_plan=batch_plan,
         worker_plan=plan_dataloader_workers(
-            2, source="fixture", visible_cpu_count=8, available_memory_bytes=56 * gib,
+            2,
+            source="fixture",
+            visible_cpu_count=8,
+            available_memory_bytes=56 * gib,
         ),
         optimizer_steps_per_epoch=10,
         configured_optimizer_steps=10,
@@ -69,20 +72,28 @@ def evaluation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNa
         resume_runtime_global_step=0,
     )
     schedule = CanonicalTrainingSchedule(
-        epochs=1, evaluations_per_epoch=1,
-        optimizer_steps_per_epoch=10, configured_optimizer_steps=10,
+        epochs=1,
+        evaluations_per_epoch=1,
+        optimizer_steps_per_epoch=10,
+        configured_optimizer_steps=10,
     )
     # Use the real training serializer so a future format change reaches this test.
-    state = json.loads(json.dumps({
-        "global_step": 5,
-        "epoch": 0,
-        "created_at": "2026-09-16T00:00:00+00:00",
-        "training_progress": _training_progress(
-            processed_train_samples=160, completed_epochs=0,
-            early_stopping=EarlyStoppingState(), canonical_schedule=schedule,
-            runtime_execution_plan=execution_plan,
-        ),
-    }))
+    state = json.loads(
+        json.dumps(
+            {
+                "global_step": 5,
+                "epoch": 0,
+                "created_at": "2026-09-16T00:00:00+00:00",
+                "training_progress": _training_progress(
+                    processed_train_samples=160,
+                    completed_epochs=0,
+                    early_stopping=EarlyStoppingState(),
+                    canonical_schedule=schedule,
+                    runtime_execution_plan=execution_plan,
+                ),
+            }
+        )
+    )
     bundle = SimpleNamespace(model=Mock())
     loaders = (
         SimpleNamespace(sampler=range(10)),
@@ -95,7 +106,9 @@ def evaluation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNa
         "build_model_bundle": Mock(return_value=bundle),
         "resolve_checkpoint": Mock(return_value=checkpoint),
         "load_checkpoint": Mock(return_value=state),
-        "build_dataloaders": Mock(return_value=loaders),
+        "build_evaluation_loader": Mock(
+            side_effect=lambda *args, **kwargs: loaders[1 if kwargs["split"] == "validation" else 2]
+        ),
         "evaluate_loader": Mock(return_value={"loss": 0.125}),
         "provenance_summary": Mock(return_value={"dataset_profile": "fixture"}),
     }
@@ -103,15 +116,22 @@ def evaluation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNa
         monkeypatch.setattr(evaluation_module, name, stub)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     return SimpleNamespace(
-        config=config, checkpoint=checkpoint, state=state,
-        batch_plan=batch_plan, bundle=bundle, loaders=loaders, stubs=stubs,
+        config=config,
+        checkpoint=checkpoint,
+        state=state,
+        batch_plan=batch_plan,
+        bundle=bundle,
+        loaders=loaders,
+        stubs=stubs,
     )
 
 
 @pytest.mark.parametrize("split", ["validation", "test"])
 @pytest.mark.parametrize("plan_format", ["current", "legacy"])
 def test_evaluation_reads_saved_runtime_plan_without_rewriting_checkpoint(
-    evaluation_case: SimpleNamespace, split: str, plan_format: str,
+    evaluation_case: SimpleNamespace,
+    split: str,
+    plan_format: str,
 ) -> None:
     case = evaluation_case
     progress = case.state["training_progress"]
@@ -131,14 +151,22 @@ def test_evaluation_reads_saved_runtime_plan_without_rewriting_checkpoint(
     result = evaluation_module.evaluate_checkpoint(case.config, case.checkpoint, split=split)
 
     selected_loader = case.loaders[1 if split == "validation" else 2]
-    case.stubs["build_dataloaders"].assert_called_once_with(
-        case.config, batch_plan=case.batch_plan, ranking_sampling=False,
+    case.stubs["build_evaluation_loader"].assert_called_once_with(
+        case.config,
+        bundle=case.bundle,
+        device=torch.device("cpu"),
+        split=split,
     )
     case.stubs["evaluate_loader"].assert_called_once_with(
-        case.bundle, selected_loader, case.config, torch.device("cpu"),
+        case.bundle,
+        selected_loader,
+        case.config,
+        torch.device("cpu"),
     )
     case.stubs["load_checkpoint"].assert_called_once_with(
-        case.checkpoint, case.bundle.model, config=case.config,
+        case.checkpoint,
+        case.bundle.model,
+        config=case.config,
     )
     case.bundle.model.eval.assert_called_once_with()
     assert result["run_id"] == "run-evaluation-contract"
@@ -151,7 +179,8 @@ def test_evaluation_reads_saved_runtime_plan_without_rewriting_checkpoint(
 
 @pytest.mark.parametrize("missing_plan", [None, "absent"])
 def test_current_progress_cannot_fall_back_to_a_legacy_batch_plan(
-    evaluation_case: SimpleNamespace, missing_plan: str | None,
+    evaluation_case: SimpleNamespace,
+    missing_plan: str | None,
 ) -> None:
     case = evaluation_case
     progress = case.state["training_progress"]
@@ -163,18 +192,19 @@ def test_current_progress_cannot_fall_back_to_a_legacy_batch_plan(
 
     with pytest.raises(ValueError, match="no runtime execution plan"):
         evaluation_module.evaluate_checkpoint(case.config, case.checkpoint)
-    case.stubs["build_dataloaders"].assert_not_called()
+    case.stubs["build_evaluation_loader"].assert_not_called()
     case.stubs["evaluate_loader"].assert_not_called()
 
 
 @pytest.mark.parametrize("invalid_plan", [None, {}, {"evaluation_batch_size": 0}])
 def test_evaluation_rejects_invalid_nested_batch_plans(
-    evaluation_case: SimpleNamespace, invalid_plan: object,
+    evaluation_case: SimpleNamespace,
+    invalid_plan: object,
 ) -> None:
     case = evaluation_case
     case.state["training_progress"]["runtime_execution_plan"]["batch_plan"] = invalid_plan
 
     with pytest.raises(ValueError, match="runtime batch plan"):
         evaluation_module.evaluate_checkpoint(case.config, case.checkpoint)
-    case.stubs["build_dataloaders"].assert_not_called()
+    case.stubs["build_evaluation_loader"].assert_not_called()
     case.stubs["evaluate_loader"].assert_not_called()

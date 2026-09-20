@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import shutil
 import time
 from collections.abc import Iterator
 from contextlib import nullcontext, suppress
@@ -19,7 +20,7 @@ from numpy.typing import NDArray
 from torch import Tensor
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset, Sampler, SequentialSampler
 
 from stock_forecasting.checkpointing import (
     load_checkpoint,
@@ -856,6 +857,7 @@ def plan_runtime_prefetch(
     config: ExperimentConfig,
     batch_plan: RuntimeBatchPlan,
     largest_host_batch_bytes: int,
+    shared_memory_bytes: int | None = None,
 ) -> DataLoaderWorkerPlan:
     """Size the worker queue from measured GPU demand and host-memory headroom."""
 
@@ -864,25 +866,38 @@ def plan_runtime_prefetch(
     workers = worker_plan.effective_workers
     if workers == 0:
         return replace(worker_plan, prefetch_factor=None)
-    queue_budget = max(
-        largest_host_batch_bytes * worker_plan.active_persistent_pools,
-        int(worker_plan.available_memory_bytes * DATALOADER_PREFETCH_MEMORY_FRACTION),
-    )
+    queue_budget = int(worker_plan.available_memory_bytes * DATALOADER_PREFETCH_MEMORY_FRACTION)
+    if shared_memory_bytes is None and Path("/dev/shm").is_dir():
+        shared_memory_bytes = shutil.disk_usage("/dev/shm").free
+    if shared_memory_bytes is not None:
+        queue_budget = min(queue_budget, int(shared_memory_bytes * 0.5))
+    # Account for shared-memory transport plus pinned copies in live worker pools.
+    bytes_per_slot = largest_host_batch_bytes * worker_plan.active_persistent_pools * 2
+    if queue_budget < bytes_per_slot:
+        raise ValueError(
+            "Insufficient RAM/shared memory for one prefetched batch; reduce batch size"
+        )
     memory_worker_limit = max(
         1,
-        queue_budget // (largest_host_batch_bytes * worker_plan.active_persistent_pools),
+        queue_budget // bytes_per_slot,
     )
     workers = min(workers, int(memory_worker_limit))
-    seconds_per_batch = batch_plan.seconds_per_training_batch
-    if seconds_per_batch is None or seconds_per_batch <= 0.0:
+    timings = [batch_plan.seconds_per_training_batch] + [
+        row.seconds_per_batch
+        for row in batch_plan.evaluation_probe
+        if row.accepted and row.batch_size == batch_plan.evaluation_batch_size
+    ]
+    timings = [value for value in timings if value is not None and value > 0]
+    if not timings:
         demand_limit = DATALOADER_INITIAL_PREFETCH_FACTOR
     else:
+        seconds_per_batch = min(timings)
         buffered_batches = math.ceil(
             config.training.dataloader_prefetch_target_seconds / seconds_per_batch
         )
         demand_limit = max(2, math.ceil(buffered_batches / workers))
     per_factor_bytes = max(
-        largest_host_batch_bytes * workers * worker_plan.active_persistent_pools,
+        bytes_per_slot * workers,
         1,
     )
     memory_limit = max(1, queue_budget // per_factor_bytes)
@@ -900,9 +915,7 @@ def plan_runtime_prefetch(
         prefetch_factor=int(factor),
         prefetched_batches_per_pool=workers * int(factor),
         prefetch_memory_budget_bytes=queue_budget,
-        estimated_peak_prefetch_memory_bytes=(
-            largest_host_batch_bytes * workers * int(factor) * worker_plan.active_persistent_pools
-        ),
+        estimated_peak_prefetch_memory_bytes=(bytes_per_slot * workers * int(factor)),
     )
 
 
@@ -987,6 +1000,8 @@ def _loader_process_options(
             {
                 "prefetch_factor": plan.prefetch_factor,
                 "worker_init_fn": _initialize_dataloader_worker,
+                "multiprocessing_context": "spawn",
+                "timeout": 300,
             }
         )
     return options
@@ -1125,6 +1140,7 @@ def build_dataloaders(
         batch_size=evaluation_batch_size,
         sampler=validation_sampler,
         shuffle=False,
+        drop_last=False,
         collate_fn=collator,
         pin_memory=pin_memory,
         **_loader_process_options(worker_plan, persistent=True),
@@ -1134,6 +1150,7 @@ def build_dataloaders(
         batch_size=evaluation_batch_size,
         sampler=test_sampler,
         shuffle=False,
+        drop_last=False,
         collate_fn=collator,
         pin_memory=pin_memory,
         **_loader_process_options(worker_plan, persistent=True),
@@ -1523,7 +1540,7 @@ def _measure_cuda_batch(
         torch.cuda.synchronize(device)
         seconds_per_batch = (time.perf_counter() - started) / config.training.auto_batch_probe_steps
         peak_allocated = int(torch.cuda.max_memory_allocated(device))
-        projected_peak = peak_allocated + (optimizer_state_reserve_bytes if training else 0)
+        projected_peak = peak_allocated + optimizer_state_reserve_bytes
         accepted = projected_peak <= device_memory_limit_bytes
         return BatchProbeMeasurement(
             batch_size=batch_size,
@@ -1680,6 +1697,7 @@ def resolve_runtime_batch_plan(
     bundle: ModelBundle,
     sample: dict[str, Any],
     device: torch.device,
+    evaluation_only: bool = False,
 ) -> RuntimeBatchPlan:
     """Empirically resolve safe high-throughput batches on the current accelerator."""
 
@@ -1738,7 +1756,11 @@ def resolve_runtime_batch_plan(
             flush=True,
         )
 
-    if isinstance(config.training.batch_size, int):
+    if evaluation_only:
+        # Standalone evaluation must never backward or reuse another GPU's training batch plan.
+        training_batch_size = config.training.auto_batch_min_size
+        optimizer_state_reserve_bytes = 0
+    elif isinstance(config.training.batch_size, int):
         training_batch_size = config.training.batch_size
         if device.type == "cuda":
             selected, training_probe = _probe_cuda_candidates(
@@ -1786,7 +1808,7 @@ def resolve_runtime_batch_plan(
         accumulation_steps = config.training.gradient_accumulation_steps
     effective_batch_size = training_batch_size * accumulation_steps
 
-    if isinstance(config.training.evaluation_batch_size, int):
+    if isinstance(config.training.evaluation_batch_size, int) and device.type != "cuda":
         evaluation_batch_size = config.training.evaluation_batch_size
     elif device.type == "cuda":
         evaluation_initial_maximum = max(
@@ -1796,18 +1818,20 @@ def resolve_runtime_batch_plan(
         selected, evaluation_probe = _probe_cuda_candidates(
             bundle=bundle,
             sample=sample,
-            candidates=_batch_candidates(
-                training_batch_size,
-                evaluation_initial_maximum,
+            candidates=(
+                (config.training.evaluation_batch_size,)
+                if isinstance(config.training.evaluation_batch_size, int)
+                else _batch_candidates(training_batch_size, evaluation_initial_maximum)
             ),
             config=config,
             device=device,
             training=False,
-            optimizer_state_reserve_bytes=0,
+            optimizer_state_reserve_bytes=optimizer_state_reserve_bytes,
             device_memory_limit_bytes=device_memory_limit_bytes,
-            expansion_maximum=max(
-                evaluation_initial_maximum,
-                evaluation_expansion_maximum,
+            expansion_maximum=(
+                None
+                if isinstance(config.training.evaluation_batch_size, int)
+                else max(evaluation_initial_maximum, evaluation_expansion_maximum)
             ),
         )
         evaluation_batch_size = selected.batch_size
@@ -1830,6 +1854,62 @@ def resolve_runtime_batch_plan(
         seconds_per_training_batch=seconds_per_training_batch,
         training_probe=training_probe,
         evaluation_probe=evaluation_probe,
+    )
+
+
+def build_evaluation_loader(
+    config: ExperimentConfig,
+    *,
+    bundle: ModelBundle,
+    device: torch.device,
+    split: str,
+) -> DataLoader[Any]:
+    """Tune inference on the current device and open only the requested complete split."""
+
+    if split not in ("validation", "test"):
+        raise ValueError("Evaluation split must be validation or test")
+    requested, source = _requested_dataloader_workers(config)
+    workers = replace(plan_dataloader_workers(requested, source=source), active_persistent_pools=1)
+    dataset = LazyFinancialWindowDataset(
+        resolve_bar_store_path(config.data.bar_store_path),
+        split=split,
+        window_size=config.data.input_length,
+        h_start=config.data.h_start,
+        symbol_cache_size=workers.symbol_cache_size_per_worker,
+    )
+    sample = dataset[0]
+    plan = resolve_runtime_batch_plan(
+        config,
+        bundle=bundle,
+        sample=sample,
+        device=device,
+        evaluation_only=True,
+    )
+    collator = FinancialBatchCollator()
+    workers = plan_runtime_prefetch(
+        workers,
+        config=config,
+        batch_plan=plan,
+        largest_host_batch_bytes=_batch_tensor_bytes(
+            collator([sample] * plan.evaluation_batch_size)
+        ),
+    )
+    print(
+        json.dumps(
+            {"evaluation_batch_plan": plan.as_dict(), "evaluation_worker_plan": workers.as_dict()},
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=plan.evaluation_batch_size,
+        sampler=evaluation_sampler(len(dataset), config, split),
+        shuffle=False,
+        drop_last=False,
+        collate_fn=collator,
+        pin_memory=device.type == "cuda",
+        **_loader_process_options(workers, persistent=False),
     )
 
 
@@ -1870,8 +1950,17 @@ def evaluate_loader(
 
     from stock_forecasting.evaluation_store import EvaluationStore
 
+    if (
+        not isinstance(loader.sampler, SequentialSampler)
+        or len(loader.sampler) != len(loader.dataset)
+        or loader.drop_last
+    ):
+        raise ValueError("Evaluation requires sequential full coverage without drop_last")
     was_training = bundle.model.training
     bundle.model.eval()
+    started = time.perf_counter()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     scales = [float(v) for v in bundle.model.alpha_head.robust_scales.float().cpu().tolist()]
     scratch = config.runtime.log_root / "evaluation-scratch"
     scratch.mkdir(parents=True, exist_ok=True)
@@ -1881,6 +1970,7 @@ def evaluate_loader(
                 Path(directory), len(loader.sampler), list(config.data.alpha_horizons), scales
             )
             try:
+                completed, last_log = 0, started
                 for batch in iter_device_batches(loader, device):
                     with _autocast_context(config, device):
                         output = forward_batch(bundle, batch, config, device)
@@ -1893,7 +1983,39 @@ def evaluate_loader(
                         asset_types=batch["asset_types"],
                         providers=batch["providers"],
                     )
-                return store.finish(signal_threshold=config.model.postprocess_alpha_threshold)
+                    completed += len(batch["symbols"])
+                    now = time.perf_counter()
+                    if now - last_log >= 30:
+                        print(
+                            json.dumps(
+                                {
+                                    "evaluation_progress": completed,
+                                    "total": len(loader.dataset),
+                                    "samples_per_second": completed / (now - started),
+                                }
+                            ),
+                            flush=True,
+                        )
+                        last_log = now
+                inference_seconds = time.perf_counter() - started
+                metrics = store.finish(signal_threshold=config.model.postprocess_alpha_threshold)
+                metrics["execution"] = {
+                    "full_population": True,
+                    "expected_samples": len(loader.dataset),
+                    "completed_samples": completed,
+                    "batch_size": loader.batch_size,
+                    "workers": loader.num_workers,
+                    "prefetch_factor": loader.prefetch_factor,
+                    "pin_memory": loader.pin_memory,
+                    "drop_last": False,
+                    "inference_seconds": inference_seconds,
+                    "samples_per_second": completed / max(inference_seconds, 1e-9),
+                    "total_seconds": time.perf_counter() - started,
+                    "peak_gpu_bytes": (
+                        torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
+                    ),
+                }
+                return metrics
             finally:
                 store.close()
     finally:
