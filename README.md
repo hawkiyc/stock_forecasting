@@ -397,6 +397,20 @@ manifest SHA 綁定；兩種校準都不讀 validation／holdout。
 磁碟暫存，逐塊彙總。所有模型使用相同 train-calibrated label scales，並驗證完整有序
 symbol/date SHA-256 相同。不同資料來源或 universe 仍必須比對這個指紋，不能只比日期。
 
+完整評估依 `symbol → cutoff` 的固定順序逐檔列舉所有有效 windows；既有
+`cutoff-ranges.parquet` 儲存的是精確可用區間，不是估計筆數。Dataset 只保存這些
+小型索引與有上限的商品快取，在 DataLoader 取 batch 時才產生 context／label，
+不會預先展開巨大的 window 資料集。最後不足一個 batch 的資料照常評估，不重複補齊。
+舊設定中的 `evaluation_max_samples` 若仍有數值，會明確警告並忽略，不能切回抽樣。
+這項固定完整遍歷只適用於 validation／testing；training 保留動態 sampling、
+各 epoch 的隨機順序與同日同市場分組，並在讀取 batch 時動態產生 windows。
+
+最終 testing 會在當次 GPU 重新測量純 inference 的 batch size，不做 backward，
+也不沿用另一張 GPU 的 training batch plan。預取深度依 inference／training 實測速度、
+RAM、容器 shared memory、同時存活的 worker pools 與 pinned-memory 複本限制；
+使用多 worker、pinned memory 與非同步 GPU transfer。結果的 `execution` 記錄實際筆數、
+batch、worker、prefetch、吞吐量與 GPU 峰值記憶體。這些是執行效能資料，不是預測效能。
+
 baseline 是主模型之前的獨立流程，所有 rule、GBDT、GRU、DLinear、PatchTST 使用完整
 train／validation／test。神經模型每 epoch 做五次完整 validation，以相同 normalized pinball
 與五次未改善 patience 選擇 checkpoint；最多五個 epochs。GBDT 每八輪新增樹後，評估完整
@@ -2420,6 +2434,24 @@ Every routine validation and final test visits its entire split, with
 Predictions leave the GPU batch by batch and use disk-backed aggregation with exact
 sample weighting. All models share train-calibrated label scales and verified ordered
 symbol/date SHA-256. Matching dates alone does not guarantee matching universes.
+
+Full evaluation enumerates every valid window in fixed `symbol → cutoff` order.
+The existing `cutoff-ranges.parquet` contains exact valid ranges, not estimated
+counts. The dataset retains compact indexes and bounded instrument caches, building
+contexts/labels only when the DataLoader fetches a batch; no giant window dataset
+is expanded. The final short batch is retained without padding or duplication.
+A numeric legacy `evaluation_max_samples` now warns and is ignored, never enabling
+sampling. This exhaustive traversal applies only to validation/testing: training
+retains dynamic sampling, epoch-wise random order and same-date/market grouping,
+with windows constructed dynamically at batch-read time.
+
+Final testing remeasures inference batch sizes on the current GPU without backward
+passes or reusing another GPU's training plan. Prefetch accounts for measured
+inference/training speed, RAM, container shared memory, live worker pools and pinned
+copies. Multiple workers, pinned memory and asynchronous transfers are used.
+The result's `execution` section records actual counts, batch size, workers,
+prefetch, throughput and peak GPU memory; these are runtime measurements, not
+predictive-performance scores.
 
 Baselines are an independent prerequisite. Rules, GBDT, GRU, DLinear and PatchTST
 use full train/validation/test. Neural models validate five times per epoch with

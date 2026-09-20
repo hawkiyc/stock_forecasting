@@ -47,7 +47,9 @@ def fixed_store(tmp_path, market_frame):
     build_symbol_bar_store(
         raw_path=raw,
         output_root=root,
-        download_manifest={"artifacts": {"raw": artifact_metadata(raw, root=tmp_path)}},
+        download_manifest={
+            "artifacts": {"raw": artifact_metadata(raw, root=tmp_path, row_count=len(frame))}
+        },
         window_size=32,
         bucket_count=2,
         batch_rows=200,
