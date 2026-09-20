@@ -2,6 +2,21 @@
 
 ## 中文
 
+### v0.2.0 2026-09-21
+
+- Training 保留動態 sampling；validation／test 動態完整遍歷精確 cutoff ranges，
+  不抽樣、不丟尾 batch、不預先展開巨大 input-window 資料集。
+- 獨立 full-data baseline 建置、權重／指標快取及本機付費 Pod 啟動前的重用檢查；
+  同 GPU 多模型與 CPU 工作有界並行。主模型訓練需先完成對應 baseline。
+- Validation-driven plateau、市場感知、20 維尺度特徵與明確輸出尺度、同日同市場
+  ranking loss、LoRA rank 32／alpha 64。沒有新增 ensemble。
+- Inference-only batch tuning、多 worker／prefetch／pinned-memory 預算、輕量 spawn
+  狀態及 baseline persistent pools；CPU prepare 的資料語意與既有資料集保持不變。
+- 工程驗收：完整 suite 與 fixture 修正重測合併後，562 項雲端通過；1 項 Git-dependent
+  檢查在本機通過。真實 Kronos CUDA 梯度、全 cutoff 稽核及百萬筆指標容量測試通過。
+- 這是已完成限定工程驗收的架構快照，不是新模型準確度改善或實盤可用性的保證；
+  尚未執行新架構的正式 A／B 全量訓練。詳見 [驗收紀錄](docs/performance_workflow_validation.md)。
+
 ### v0.1.0 2026-09-20
 
 此 tag 保存 full-size baseline 改版前的模型架構與已完成的 A／B 評估證據。
@@ -20,6 +35,24 @@
 資料不納入 Git，須以 run ID、checkpoint 與各自 manifest 追溯。
 
 ## English
+
+### v0.2.0 2026-09-21
+
+- Preserve dynamic training sampling; exhaust exact validation/test cutoff ranges
+  lazily, without sampling, dropping the final batch, or materializing input windows.
+- Independent full-data baseline building, reusable weights/metrics and a local
+  cache gate before paid Pod creation; bounded same-GPU experiments and CPU work.
+  Main-model training requires a matching completed baseline.
+- Validation-driven LR plateaus, market awareness, 20 scale features with explicit
+  output scaling, same-date/market ranking loss, and LoRA rank 32/alpha 64; no ensemble.
+- Inference-only batch tuning, memory-budgeted workers/prefetch/pinning, lightweight
+  spawn state and persistent baseline pools. Prepared-data semantics remain unchanged.
+- Bounded acceptance reconciles the full suite and repaired-fixture reruns: 562
+  cloud passes and one Git-dependent check passed locally. Real Kronos CUDA gradients,
+  exhaustive cutoff auditing and million-row metric aggregation passed.
+- This is an engineering-validated architecture snapshot, not evidence of improved
+  accuracy or live-trading readiness. Production A/B training remains outstanding;
+  see the [acceptance record](docs/performance_workflow_validation.md).
 
 ### v0.1.0 2026-09-20
 

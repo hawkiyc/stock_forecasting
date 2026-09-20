@@ -2,9 +2,10 @@
 
 ## 中文
 
-目前分支包含尚待完整雲端驗收的全量評估／baseline 改版，**不是正式訓練發佈版**。
-已標記的歷史架構快照為 `v0.1.0`；實際驗證結果與未完成項目見
-[驗收狀態](docs/performance_workflow_validation.md)。
+`v0.2.0` 全量評估／可重用 baseline 架構已完成限定範圍的工程驗收；
+training 保留動態 sampling，validation／testing 完整列舉所有合法 windows。
+新架構尚未完成正式 A／B 訓練與預測效能評估；驗收證據、容量實測及範圍見
+[驗收紀錄](docs/performance_workflow_validation.md)，歷史版本見 [版本紀錄](RELEASES.md)。
 
 ### 授權與版本
 
@@ -1952,10 +1953,12 @@ Stage 1 只證明腳本與契約可運作，不用來宣稱模型具備 alpha。
 
 ## English
 
-This branch includes the full-evaluation/baseline revision pending complete cloud
-acceptance; **it is not a production training release**. The tagged historical
-architecture snapshot is `v0.1.0`. See the [acceptance status](docs/performance_workflow_validation.md)
-for actual verification results and outstanding checks.
+The `v0.2.0` full-evaluation/reusable-baseline architecture has completed bounded
+engineering acceptance. Training retains dynamic sampling; validation/testing
+enumerate every eligible window. Production A/B training and predictive-performance
+evaluation of this architecture remain outstanding. See the
+[acceptance record](docs/performance_workflow_validation.md) for evidence, capacity
+measurements and scope, and [release history](RELEASES.md) for earlier snapshots.
 
 ### License and versions
 
