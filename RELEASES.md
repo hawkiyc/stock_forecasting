@@ -2,6 +2,19 @@
 
 ## 中文
 
+### v0.2.1 2026-09-21
+
+- Baseline 向量化動態 windows／數值特徵，新增有界 Parquet metadata cache 與必要欄位
+  解碼；同機 input 路徑對照由 52.51 秒降至 9.47 秒，不代表全量訓練加速倍數。
+- cgroup CPU quota 與 host／GPU／shared-memory 准入；每個模型自動選擇 train／eval
+  batch 與 prefetch，維持同 GPU／CPU 工作有界並行。
+- 神經模型 epoch 內 sample-cursor 接續、tabular cache durable row cursor，以及
+  GBDT horizon／quantile 中途保存；沿用既有 baseline／tmux CLI。
+- 最終完整雲端回歸 573 passed、97 subtests passed；1 項 Git-dependent 檢查於
+  本機通過。CPU prepare 與資料身份不變，不需新行情 API call。
+- 已驗證數值等價與吞吐改善；仍有 input wait，未宣稱 GPU 完全滿載或正式訓練已完成。
+  詳見 [baseline 執行效率驗收](docs/baseline_runtime_validation.md)。
+
 ### v0.2.0 2026-09-21
 
 - Training 保留動態 sampling；validation／test 動態完整遍歷精確 cutoff ranges，
@@ -35,6 +48,21 @@
 資料不納入 Git，須以 run ID、checkpoint 與各自 manifest 追溯。
 
 ## English
+
+### v0.2.1 2026-09-21
+
+- Vectorized lazy baseline windows/features, bounded Parquet metadata caching and
+  numerical-column decoding. The same-machine input-path comparison improved from
+  52.51 to 9.47 seconds; this is not a whole-training speedup measurement.
+- cgroup CPU quotas and host/GPU/shared-memory admission; per-model train/eval
+  batch and prefetch tuning, with bounded same-GPU/CPU concurrency.
+- Mid-epoch neural sample-cursor resume, durable tabular-cache row cursors and
+  GBDT horizon/quantile checkpointing, using the existing baseline/tmux CLI.
+- Final full cloud regression: 573 passed and 97 subtests passed; one Git-dependent
+  check passed locally. Prepared-data identity is unchanged; no new market calls.
+- Numerical equivalence and throughput improvements are verified. Input wait remains;
+  this is not evidence of full GPU saturation or completed production training.
+  See [baseline runtime acceptance](docs/baseline_runtime_validation.md).
 
 ### v0.2.0 2026-09-21
 

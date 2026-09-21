@@ -2,8 +2,10 @@
 
 ## 中文
 
-`v0.2.0` 全量評估／可重用 baseline 架構已完成限定範圍的工程驗收；
+`v0.2.1` 全量評估／可重用 baseline 架構已完成限定範圍的工程驗收；
 training 保留動態 sampling，validation／testing 完整列舉所有合法 windows。
+Baseline 支援硬體自動 batch／prefetch 調整、向量化有界資料讀取與中途接續訓練；
+實測與限制見 [baseline 執行效率驗收](docs/baseline_runtime_validation.md)。
 新架構尚未完成正式 A／B 訓練與預測效能評估；驗收證據、容量實測及範圍見
 [驗收紀錄](docs/performance_workflow_validation.md)，歷史版本見 [版本紀錄](RELEASES.md)。
 
@@ -1977,9 +1979,12 @@ Stage 1 只證明腳本與契約可運作，不用來宣稱模型具備 alpha。
 
 ## English
 
-The `v0.2.0` full-evaluation/reusable-baseline architecture has completed bounded
+The `v0.2.1` full-evaluation/reusable-baseline architecture has completed bounded
 engineering acceptance. Training retains dynamic sampling; validation/testing
-enumerate every eligible window. Production A/B training and predictive-performance
+enumerate every eligible window. Baselines support hardware-tuned batches/prefetch,
+bounded vectorized input and interrupted-training resume; see the
+[baseline runtime acceptance](docs/baseline_runtime_validation.md) for measurements
+and limitations. Production A/B training and predictive-performance
 evaluation of this architecture remain outstanding. See the
 [acceptance record](docs/performance_workflow_validation.md) for evidence, capacity
 measurements and scope, and [release history](RELEASES.md) for earlier snapshots.
