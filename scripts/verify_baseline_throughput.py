@@ -79,9 +79,9 @@ def neural_probe(config_payload, root, parameters, plan, name, output, barrier, 
     torch.cuda.set_per_process_memory_fraction(plan["gpu_fraction_per_job"])
     source = lazy_dataset(config, "train", relative=True, validated_root=Path(root))
     model = {
-        "gru": lambda: CausalGRUBaseline(),
-        "dlinear": lambda: DLinearBaseline(source.window_size),
-        "patchtst": lambda: PatchTSTBaseline(),
+        "gru": lambda: CausalGRUBaseline(horizons=source.horizons),
+        "dlinear": lambda: DLinearBaseline(source.window_size, horizons=source.horizons),
+        "patchtst": lambda: PatchTSTBaseline(horizons=source.horizons),
     }[name]().cuda()
     runtime = tune_baseline_runtime(model, source, parameters, plan)
     atomic_write_json(Path(output).with_suffix(".runtime.json"), runtime)
@@ -157,6 +157,8 @@ def main():
     source = lazy_dataset(config, "train", validated_root=root)
     parameters = json.loads(Path("configs/baseline.json").read_text())
     plan = resource_plan(parameters, len(source), list(source.horizons), source.window_size)
+    if plan["gpu_slots"] < 2:
+        raise MemoryError("The concurrency probe requires admission for two GPU experiments")
     atomic_write_json(args.output / "resource-plan.json", plan)
     indices = list(
         islice(iter(BlockwisePermutationSampler(len(source), seed=42, block_size=16)), 128)
