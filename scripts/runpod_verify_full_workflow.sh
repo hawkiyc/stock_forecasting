@@ -23,6 +23,9 @@ mkdir -p "${OUTPUT}"
 export TMPDIR="$(mktemp -d /tmp/fin-ts-qa.XXXXXXXX)"
 # No completion manifest is written under baselines/. This is not a baseline build.
 set +e
+timeout --kill-after=15s 600 .venv/bin/python scripts/verify_baseline_throughput.py \
+    --output "${OUTPUT}/baseline-throughput" >"${OUTPUT}/baseline-throughput.log" 2>&1
+throughput_exit=$?
 timeout --kill-after=15s 1200 .venv/bin/python -m pytest tests \
     -o faulthandler_timeout=120 --junitxml="${OUTPUT}/pytest.xml" >"${OUTPUT}/pytest.log" 2>&1
 test_exit=$?
@@ -38,14 +41,15 @@ timeout --kill-after=15s 420 .venv/bin/python scripts/verify_lazy_evaluation.py 
     >"${OUTPUT}/lazy-evaluation.log" 2>&1
 coverage_exit=$?
 set -e
-printf '{"pytest":%s,"ruff":%s,"kronos":%s,"capacity":%s,"coverage":%s}\n' \
-    "${test_exit}" "${lint_exit}" "${kronos_exit}" "${capacity_exit}" "${coverage_exit}" \
+printf '{"pytest":%s,"ruff":%s,"kronos":%s,"capacity":%s,"coverage":%s,"baseline_throughput":%s}\n' \
+    "${test_exit}" "${lint_exit}" "${kronos_exit}" "${capacity_exit}" "${coverage_exit}" "${throughput_exit}" \
     >"${OUTPUT}/acceptance-status.json"
 tail -n 65 "${OUTPUT}/pytest.log"
 tail -n 35 "${OUTPUT}/ruff.log"
 tail -n 30 "${OUTPUT}/kronos-smoke.log"
 tail -n 30 "${OUTPUT}/capacity.log"
 tail -n 20 "${OUTPUT}/lazy-evaluation.log"
+tail -n 10 "${OUTPUT}/baseline-throughput.log"
 printf 'Synthetic verification: pytest=%s ruff=%s output=%s\n' "${test_exit}" "${lint_exit}" "${OUTPUT}"
 # Keep the authorized debugging window bounded by tmux timeout and the local
 # hard-limit guard. The control host publishes the terminal lifecycle after QA.

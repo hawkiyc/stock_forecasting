@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -11,9 +13,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from stock_forecasting.baselines import (
-    BaselineRecordDataset,
+    BaselineBatchDataset,
     _relative_rule_signals,
-    baseline_arrays,
+    collate_baseline_batch,
 )
 from stock_forecasting.data.dataset import LazyFinancialWindowDataset
 from stock_forecasting.data.manifest import atomic_write_json, sha256_file
@@ -68,6 +70,8 @@ def build_tabular_cache(
     batch_size: int = 256,
     prefetch: int = 2,
     validated_root: Path | None = None,
+    checkpoint_seconds: float = 300,
+    progress_seconds: float = 30,
 ) -> dict:
     root.mkdir(parents=True, exist_ok=True)
     source_root = (
@@ -79,7 +83,7 @@ def build_tabular_cache(
     identity = {
         "manifest_sha256": manifest_sha,
         "horizons": list(config.data.alpha_horizons),
-        "schema": 1,
+        "schema": 2,
     }
     done = root / "complete.json"
     if done.is_file():
@@ -108,31 +112,56 @@ def build_tabular_cache(
             "targets": (count, len(source.horizons)),
             "signals": (count, 6),
         }
+        progress_path = directory / "resume.json"
+        offset = 0
+        if progress_path.is_file():
+            progress = json.loads(progress_path.read_text())
+            if progress["identity"] != identity or progress["count"] != count:
+                raise ValueError("Baseline partial input cache has a different data contract")
+            offset = progress["committed_rows"]
+            if type(offset) is not int or not 0 <= offset <= count:
+                raise ValueError("Invalid baseline input resume cursor")
+            validate_tabular(root, split, count, len(source.horizons))
         required = sum(np.prod(shape) * 4 for shape in shapes.values())
         if split != "train":
             required += count * META_DTYPE.itemsize
-        if shutil.disk_usage(root).free < required + 2 * 1024**3:
+        if (
+            shutil.disk_usage(root).free
+            < (0 if progress_path.is_file() else required) + 2 * 1024**3
+        ):
             raise OSError(f"Baseline {split} disk cache needs {required} bytes plus 2 GiB headroom")
         arrays = {
             name: np.lib.format.open_memmap(
-                directory / f"{name}.npy", mode="w+", dtype="float32", shape=shape
+                directory / f"{name}.npy",
+                mode="r+" if progress_path.is_file() else "w+",
+                dtype="float32",
+                shape=shape,
             )
             for name, shape in shapes.items()
         }
         if split != "train":
             arrays["metadata"] = np.lib.format.open_memmap(
-                directory / "metadata.npy", mode="w+", dtype=META_DTYPE, shape=(count,)
+                directory / "metadata.npy",
+                mode="r+" if progress_path.is_file() else "w+",
+                dtype=META_DTYPE,
+                shape=(count,),
             )
+        _commit_tabular_progress(directory, arrays, identity, count, offset)
         loader = DataLoader(
-            BaselineRecordDataset(source),
+            BaselineBatchDataset(source),
             batch_size=batch_size,
-            shuffle=False,
-            collate_fn=baseline_arrays,
+            sampler=range(offset, count),
+            collate_fn=collate_baseline_batch,
             **loader_options(workers, prefetch),
         )
-        offset = 0
+        iterator = iter(loader)
+        saved_at = reported_at = time.monotonic()
+        reported_offset = offset
+        print(
+            f"Baseline input cache {split}: resume={offset}/{count} batch={batch_size}", flush=True
+        )
         try:
-            for batch in loader:
+            for batch in iterator:
                 stop = offset + len(batch.targets)
                 arrays["features"][offset:stop] = batch.features
                 arrays["targets"][offset:stop] = batch.targets
@@ -152,11 +181,22 @@ def build_tabular_cache(
                             raise ValueError(f"Baseline metadata would be truncated: {name}")
                         arrays["metadata"][name][offset:stop] = values
                 offset = stop
-                if offset % (batch_size * 1000) == 0:
-                    print(f"Baseline input cache {split}: {offset}/{count}", flush=True)
+                now = time.monotonic()
+                if now - reported_at >= progress_seconds:
+                    rate = (offset - reported_offset) / max(now - reported_at, 1e-9)
+                    print(
+                        f"Baseline input cache {split}: {offset}/{count} windows/s={rate:.1f}",
+                        flush=True,
+                    )
+                    reported_at, reported_offset = now, offset
+                if now - saved_at >= checkpoint_seconds:
+                    _commit_tabular_progress(directory, arrays, identity, count, offset)
+                    saved_at = time.monotonic()
             if offset != count:
                 raise ValueError("Baseline input cache did not visit the entire split")
+            _commit_tabular_progress(directory, arrays, identity, count, offset)
         finally:
+            iterator._shutdown_workers()
             for array in arrays.values():
                 array.flush()
                 array._mmap.close()
@@ -164,6 +204,22 @@ def build_tabular_cache(
     payload = {"identity": identity, "counts": counts}
     atomic_write_json(done, payload)
     return payload
+
+
+def _commit_tabular_progress(directory, arrays, identity, count, offset):
+    """Publish a cursor only after every corresponding mmap is durable."""
+    for name, array in arrays.items():
+        array.flush()
+        with (directory / f"{name}.npy").open("rb") as stream:
+            os.fsync(stream.fileno())
+    atomic_write_json(
+        directory / "resume.json",
+        {
+            "identity": identity,
+            "count": count,
+            "committed_rows": offset,
+        },
+    )
 
 
 def open_tabular(root: Path, split: str) -> dict:

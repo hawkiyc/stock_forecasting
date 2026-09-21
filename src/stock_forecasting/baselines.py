@@ -79,6 +79,87 @@ class BaselineRecordDataset(Dataset[dict[str, Any]]):
         return self.dataset.record_at(index)
 
 
+class BaselineBatchDataset(Dataset):
+    """Transform bounded numerical batches in workers without per-window pandas."""
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        return self.__getitems__([index])
+
+    def __getitems__(self, indices):
+        return baseline_arrays_from_windows(self.dataset.array_batch(indices))
+
+
+def collate_baseline_batch(batch):
+    """The batched dataset already returns a complete BaselineArrays instance."""
+    return batch
+
+
+def _numeric_summary_batch(values):
+    close, high, low, volume = (values[:, :, i] for i in (3, 1, 2, 4))
+    if close.shape[1] < 2:
+        raise ValueError("Baseline context requires at least two OHLCV rows")
+    logs = np.log(np.maximum(close, 1e-12))
+    returns = [
+        logs[:, -1] - logs[:, max(0, close.shape[1] - p - 1)]
+        for p in (1, 5, 20, close.shape[1] - 1)
+    ]
+    prior = np.concatenate((close[:, :1], close[:, :-1]), axis=1)
+    ranges = np.maximum(high - low, np.maximum(abs(high - prior), abs(low - prior)))
+    recent_volume = np.log1p(np.maximum(volume[:, -20:], 0))
+    deltas = np.diff(close, axis=1)[:, -14:]
+    gain, loss = np.maximum(deltas, 0).mean(axis=1), np.maximum(-deltas, 0).mean(axis=1)
+    ratio = np.divide(gain, loss, out=np.zeros_like(gain), where=loss > 0)
+    rsi = np.where(loss > 0, 100 - 100 / (1 + ratio), np.where(gain > 0, 100, 50))
+    return np.column_stack(
+        (
+            *returns,
+            np.diff(logs, axis=1)[:, -20:].std(axis=1) * math.sqrt(252),
+            ranges[:, -14:].mean(axis=1) / np.maximum(close[:, -1], 1e-12),
+            (recent_volume[:, -1] - recent_volume.mean(axis=1))
+            / np.maximum(recent_volume.std(axis=1), 1e-6),
+            close[:, -1] / np.maximum(close[:, -20:].mean(axis=1), 1e-12) - 1,
+            close[:, -1] / np.maximum(close[:, -50:].mean(axis=1), 1e-12) - 1,
+            rsi,
+        )
+    )
+
+
+def baseline_arrays_from_windows(batch):
+    """Preserve the legacy feature/label definitions with vectorized arithmetic."""
+    summaries, sequences = [], []
+    for key in ("asset", "benchmark"):
+        summaries.append(_numeric_summary_batch(batch[key]))
+        values = batch[key].astype(np.float32)
+        reference = np.maximum(values[:, -1:, 3:4], 1e-12)
+        values[:, :, :4] = np.log(np.maximum(values[:, :, :4], 1e-12) / reference)
+        volume = np.log1p(np.maximum(values[:, :, 4], 0))
+        values[:, :, 4] = (volume - volume.mean(axis=1, keepdims=True)) / np.maximum(
+            volume.std(axis=1, keepdims=True), 1e-6
+        )
+        sequences.append(values)
+    features = np.concatenate((*summaries, summaries[0] - summaries[1]), axis=1)
+    metadata = batch["metadata"]
+    return BaselineArrays(
+        features=features,
+        sequences=np.stack(sequences, axis=1),
+        instrument_mask=np.ones((len(metadata), 2), dtype=np.bool_),
+        auxiliary=features.astype(np.float32),
+        targets=batch["targets"],
+        horizons=tuple(batch["horizons"]),
+        dates=[m[2].isoformat() for m in metadata],
+        symbols=[str(m[0]) for m in metadata],
+        asset_types=[str(m[3]["asset_type"]) for m in metadata],
+        markets=[str(m[3]["market"]) for m in metadata],
+        providers=[str(m[3]["provider"]) for m in metadata],
+    )
+
+
 def concatenate_baseline_batches(batches: Iterable[BaselineArrays]) -> BaselineArrays:
     collected = list(batches)
     if not collected:
@@ -117,9 +198,7 @@ def _numeric_summary(context: dict[str, Any]) -> list[float]:
     log_returns = np.diff(np.log(np.maximum(close, 1e-12)))
     recent_returns = log_returns[-20:]
     volatility = (
-        float(recent_returns.std(ddof=0) * math.sqrt(252.0))
-        if recent_returns.size
-        else 0.0
+        float(recent_returns.std(ddof=0) * math.sqrt(252.0)) if recent_returns.size else 0.0
     )
     prior_close = np.concatenate(([close[0]], close[:-1]))
     true_range = np.maximum(
@@ -284,8 +363,10 @@ def _evaluate_predictions(
     }
     subgroups: dict[str, Any] = {}
     for name, values in {
-        "asset_type": arrays.asset_types, "market": arrays.markets,
-        "provider": arrays.providers, "month": [day[:7] for day in arrays.dates],
+        "asset_type": arrays.asset_types,
+        "market": arrays.markets,
+        "provider": arrays.providers,
+        "month": [day[:7] for day in arrays.dates],
         "year": [day[:4] for day in arrays.dates],
     }.items():
         groups = {}
@@ -297,7 +378,8 @@ def _evaluate_predictions(
                     targets=arrays.targets[indices],
                     quantile_predictions=predictions[indices],
                     horizons=list(arrays.horizons),
-                    quantiles=list(ALPHA_QUANTILES), robust_scales=robust_scales,
+                    quantiles=list(ALPHA_QUANTILES),
+                    robust_scales=robust_scales,
                 ),
             }
         subgroups[name] = groups
@@ -307,7 +389,10 @@ def _evaluate_predictions(
         "sample_membership": sample_membership(arrays.symbols, arrays.dates),
         "evaluation_robust_scales": list(robust_scales),
         "daily_normalized_pinball": daily_normalized_pinball(
-            arrays.targets, predictions, robust_scales, arrays.dates,
+            arrays.targets,
+            predictions,
+            robust_scales,
+            arrays.dates,
         ),
         "cross_sectional_by_horizon": cross_sectional,
         "cross_sectional_5d": cross_sectional["5d"],
@@ -382,10 +467,7 @@ def _rule_medians(
         "zero_return": np.zeros_like(arrays.targets),
     }
     output.update(
-        {
-            name: signal[:, None] * horizon_multiplier[None, :]
-            for name, signal in signals.items()
-        }
+        {name: signal[:, None] * horizon_multiplier[None, :] for name, signal in signals.items()}
     )
     return output
 
@@ -393,7 +475,8 @@ def _rule_medians(
 def rule_baseline_suite(
     train: BaselineArrays,
     validation: BaselineArrays,
-    *, robust_scales: list[float] | None = None,
+    *,
+    robust_scales: list[float] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Calibrate on train and score an untouched validation or holdout split."""
 
@@ -425,7 +508,10 @@ class GradientBoostingBaseline:
 
     @classmethod
     def fit(
-        cls, train: BaselineArrays, seed: int = 42, *,
+        cls,
+        train: BaselineArrays,
+        seed: int = 42,
+        *,
         robust_scales: list[float] | None = None,
     ) -> GradientBoostingBaseline:
         models: list[list[HistGradientBoostingRegressor]] = []
@@ -630,8 +716,12 @@ def _fit_neural(
     )
     generator = torch.Generator().manual_seed(seed)
     loader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, generator=generator,
-        pin_memory=device.type == "cuda", **(loader_options or {}),
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=generator,
+        pin_memory=device.type == "cuda",
+        **(loader_options or {}),
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
     best_state: dict[str, Tensor] | None = None
@@ -642,14 +732,20 @@ def _fit_neural(
         for sequences, targets in loader:
             predictions = model(sequences.to(device, non_blocking=device.type == "cuda"))
             loss = _normalized_pinball_torch(
-                predictions, targets.to(device, non_blocking=device.type == "cuda"), scale_tensor,
+                predictions,
+                targets.to(device, non_blocking=device.type == "cuda"),
+                scale_tensor,
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
         metrics = _evaluate_neural(
-            model, validation, scales, batch_size=batch_size, loader_options=loader_options,
+            model,
+            validation,
+            scales,
+            batch_size=batch_size,
+            loader_options=loader_options,
         )
         score = float(metrics["primary_5d"]["selection_score"])
         if score < best_score:
@@ -664,8 +760,11 @@ def _fit_neural(
         raise RuntimeError("Neural baseline did not produce a validation checkpoint")
     model.load_state_dict(best_state)
     return model, _evaluate_neural(
-        model, evaluation if evaluation is not None else validation, scales,
-        batch_size=batch_size, loader_options=loader_options,
+        model,
+        evaluation if evaluation is not None else validation,
+        scales,
+        batch_size=batch_size,
+        loader_options=loader_options,
     )
 
 
@@ -693,7 +792,9 @@ def fit_causal_gru(
         patience=patience,
         batch_size=batch_size,
         learning_rate=learning_rate,
-        robust_scales=robust_scales, evaluation=evaluation, loader_options=loader_options,
+        robust_scales=robust_scales,
+        evaluation=evaluation,
+        loader_options=loader_options,
     )
     return cast(CausalGRUBaseline, trained), metrics
 
@@ -743,7 +844,9 @@ def fit_dlinear(
         patience=patience,
         batch_size=batch_size,
         learning_rate=learning_rate,
-        robust_scales=robust_scales, evaluation=evaluation, loader_options=loader_options,
+        robust_scales=robust_scales,
+        evaluation=evaluation,
+        loader_options=loader_options,
     )
     return cast(DLinearBaseline, trained), metrics
 
@@ -772,6 +875,8 @@ def fit_patchtst(
         patience=patience,
         batch_size=batch_size,
         learning_rate=learning_rate,
-        robust_scales=robust_scales, evaluation=evaluation, loader_options=loader_options,
+        robust_scales=robust_scales,
+        evaluation=evaluation,
+        loader_options=loader_options,
     )
     return cast(PatchTSTBaseline, trained), metrics

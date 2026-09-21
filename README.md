@@ -1348,6 +1348,26 @@ baseline 以 `configs/baseline.json` 管理參數及資源：預設同張 GPU �
 與進度 log 判斷硬體需求，不要以降低資料量繞過檢查。`.pt`／`.pkl` 是本專案受信任的
 hash-scoped 輸出，勿載入第三方不可信權重。
 
+每個 deep baseline 啟動時會在分配給該 experiment 的 GPU 記憶體分額內，分別實測
+training／evaluation batch size，再以實際 DataLoader 等待時間及 host／shared-memory
+預算選擇 prefetch。CPU workers／GBDT threads 同時受 affinity 與 cgroup v1／v2 CPU
+quota 限制，不會把主機核心數直接當成容器可用核心數。調校結果與測量保存在各 job 的
+`runtime-plan.json`；可在 `configs/baseline.json` 的 `resources` 調整 batch／prefetch
+上限、probe 次數及保存間隔。`auto_batch=false` 才使用固定 `batch_size`。
+
+續訓使用相同的上述 `baseline`／tmux 命令，不需指定 checkpoint 路徑。神經模型在第一個
+batch 後、預設每 300 秒及完整 validation 前後保存 `resume.pt`，包含權重、optimizer、
+LR scheduler、亂數狀態與 epoch 內樣本位置。更換硬體／batch size 後從該位置接續同一
+隨機 epoch；warmup 與 validation 邊界以樣本數對齊。未完成的 validation 會重跑完整
+split，不能把部分結果當成 early stopping 依據。training 保留動態抽樣，validation／test
+仍逐產品完整、固定順序動態取出 windows，沒有展開成常駐記憶體中的巨大資料集。
+
+CPU tabular input cache 每 300 秒先 flush／fsync 再發布續作位置；重啟從已確認的 row
+繼續，不重建已完成 split。GBDT 每完成一個 horizon／quantile 的增量 fitting 就保存；
+rules 從尚未完成的 rule 接續。中斷中的原生 GBDT fit、完整 validation 或最終 test 會重跑
+該工作單元。這些快取與 checkpoint 屬於 baseline 訓練產物，不需要新行情 API call，
+也不要求重跑 CPU prepare。進度預設每 30 秒輸出，完整結果仍由 `complete.json` 認定。
+
 #### 4. 建立 GPU Pod 並訓練
 
 先列出目前可用的完整 `gpuId`；預設是
@@ -3520,6 +3540,30 @@ when budgets permit. Insufficient resources explicitly reduce concurrency or rej
 execution. Full GBDT RAM and full-validation cost can be much higher than the former
 20,000-row workflow; inspect resource plans/logs instead of bypassing checks through
 subsampling. Load `.pt`/`.pkl` only from trusted project-generated hash-scoped output.
+
+Each deep baseline probes training and evaluation batch sizes separately within its
+concurrent GPU-memory allocation. Actual DataLoader wait measurements and host/shared
+memory budgets determine prefetch. CPU workers and GBDT threads respect both affinity
+and cgroup v1/v2 bandwidth quotas rather than assuming all host cores are available.
+Per-job `runtime-plan.json` records the measurements and selected settings. Configure
+batch/prefetch ceilings, probe repetitions and checkpoint intervals under `resources`
+in `configs/baseline.json`; `auto_batch=false` selects the fixed `batch_size` instead.
+
+Resume with the same `baseline` and tmux commands above; no checkpoint path is needed.
+Neural jobs save `resume.pt` after the first batch, every 300 seconds by default, and
+before/after full validation. It retains weights, optimizer, LR scheduler, RNG state
+and the within-epoch sample cursor. A new hardware/batch plan continues the same
+random epoch order; warmup and validation boundaries are sample-aligned. Interrupted
+validation restarts the full split and never supplies partial early-stopping metrics.
+Training remains dynamically sampled; validation/test dynamically enumerate every
+valid per-instrument window in fixed order without a giant resident window dataset.
+
+The CPU tabular input cache flushes/fsyncs before committing its row cursor every 300
+seconds and retains completed splits. GBDT saves after each horizon/quantile incremental
+fit; rule jobs reuse completed rules. An interrupted native GBDT fit, full validation
+or final test restarts that work unit. These are baseline artifacts: no new market-data
+API calls or CPU prepare reruns are required. Progress is reported every 30 seconds
+by default; only `complete.json` denotes a complete baseline result.
 
 #### 4. Create a GPU Pod and train
 

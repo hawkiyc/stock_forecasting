@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ def select_visible_cpu_count(
     *,
     reported_cpu_count: int | None,
     affinity_cpu_count: int | None = None,
+    quota_cpu_count: float | None = None,
 ) -> int:
     """Select the process-visible CPU count from host and affinity limits."""
 
@@ -41,11 +43,71 @@ def select_visible_cpu_count(
         isinstance(affinity_cpu_count, bool) or affinity_cpu_count < 1
     ):
         raise ValueError("affinity_cpu_count must be positive when provided")
-    return max(1, min(reported, affinity_cpu_count or reported))
+    if quota_cpu_count is not None and (
+        isinstance(quota_cpu_count, bool)
+        or not math.isfinite(quota_cpu_count)
+        or quota_cpu_count <= 0
+    ):
+        raise ValueError("quota_cpu_count must be finite and positive when provided")
+    return max(
+        1,
+        min(
+            reported,
+            affinity_cpu_count or reported,
+            math.floor(quota_cpu_count) if quota_cpu_count is not None else reported,
+        ),
+    )
+
+
+def detect_cpu_quota(
+    root: Path = Path("/sys/fs/cgroup"),
+    membership: Path = Path("/proc/self/cgroup"),
+) -> float | None:
+    """Read visible v1/v2 CPU bandwidth limits, including stricter ancestors."""
+    candidates = {root, root / "cpu", root / "cpu,cpuacct"}
+    try:
+        lines = membership.read_text().splitlines()
+    except (OSError, UnicodeError):
+        lines = []
+    for line in lines:
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            continue
+        controllers, relative = fields[1].split(","), Path(fields[2].lstrip("/"))
+        if ".." in relative.parts:
+            continue
+        bases = (
+            [root]
+            if fields[1] == ""
+            else ([root / "cpu", root / "cpu,cpuacct"] if "cpu" in controllers else [])
+        )
+        for base in bases:
+            path = base / relative
+            while path.is_relative_to(base):
+                candidates.add(path)
+                if path == base:
+                    break
+                path = path.parent
+    limits = []
+    for directory in candidates:
+        try:
+            quota, period = (directory / "cpu.max").read_text().split()
+            if quota != "max" and int(quota) > 0 and int(period) > 0:
+                limits.append(int(quota) / int(period))
+        except (OSError, UnicodeError, ValueError):
+            pass
+        try:
+            quota = int((directory / "cpu.cfs_quota_us").read_text())
+            period = int((directory / "cpu.cfs_period_us").read_text())
+            if quota > 0 and period > 0:
+                limits.append(quota / period)
+        except (OSError, UnicodeError, ValueError):
+            pass
+    return min(limits) if limits else None
 
 
 def detect_visible_cpu_count() -> int:
-    """Return the CPU count visible to this process, including affinity limits."""
+    """Return usable CPU capacity, bounded by affinity and container quota."""
 
     affinity_count: int | None = None
     if hasattr(os, "sched_getaffinity"):
@@ -56,6 +118,7 @@ def detect_visible_cpu_count() -> int:
     return select_visible_cpu_count(
         reported_cpu_count=os.cpu_count(),
         affinity_cpu_count=affinity_count,
+        quota_cpu_count=detect_cpu_quota(),
     )
 
 
@@ -77,10 +140,7 @@ def select_available_memory_estimate(
         eligible.append(observation)
 
     if linux_mem_available_bytes is not None:
-        if (
-            isinstance(linux_mem_available_bytes, bool)
-            or linux_mem_available_bytes < 1
-        ):
+        if isinstance(linux_mem_available_bytes, bool) or linux_mem_available_bytes < 1:
             raise ValueError("linux_mem_available_bytes must be a positive integer")
         observation = ("linux_mem_available", linux_mem_available_bytes)
         observations.append(observation)
@@ -95,9 +155,7 @@ def select_available_memory_estimate(
     # Linux page cache. It is only a fallback when cgroup headroom and the
     # kernel's MemAvailable estimate are both unavailable.
     candidates = eligible or [
-        observation
-        for observation in observations
-        if observation[0] == "posix_free_pages_fallback"
+        observation for observation in observations if observation[0] == "posix_free_pages_fallback"
     ]
     if not candidates:
         raise RuntimeError("Unable to determine available runtime memory")

@@ -20,6 +20,7 @@ from threadpoolctl import threadpool_limits
 from torch.utils.data import DataLoader
 
 from stock_forecasting.baseline_contract import runtime_contract, validate_complete
+from stock_forecasting.baseline_runtime import SampleCursorBatchSampler, tune_baseline_runtime
 from stock_forecasting.baseline_storage import (
     SIGNAL_NAMES,
     build_tabular_cache,
@@ -36,11 +37,7 @@ from stock_forecasting.baselines import (
     _seed_baseline,
 )
 from stock_forecasting.config import ExperimentConfig
-from stock_forecasting.data.dataset import (
-    BlockwisePermutationSampler,
-    FinancialBatchCollator,
-    FixedSizeBatchSampler,
-)
+from stock_forecasting.data.dataset import FinancialBatchCollator
 from stock_forecasting.data.manifest import atomic_write_json, sha256_file
 from stock_forecasting.evaluation_store import CHUNK_ROWS, META_DTYPE, EvaluationStore, Moments
 from stock_forecasting.optimization_policy import ValidationPlateauScheduler
@@ -49,7 +46,10 @@ from stock_forecasting.runtime_resources import detect_available_memory, detect_
 
 def _save_torch(path: Path, payload):
     temporary = path.with_suffix(".pending")
-    torch.save(payload, temporary)
+    with temporary.open("wb") as stream:
+        torch.save(payload, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
     temporary.replace(path)
 
 
@@ -103,9 +103,16 @@ def _loader(
 def _neural_validation(model, loader, horizons, scales):
     model.eval()
     moments = Moments(horizons, scales)
+    count, reported = 0, time.monotonic()
     for batch in loader:
         prediction = model(_sequence(batch, "cuda")).float().cpu().numpy()
         moments.add(batch["target_alpha"].numpy(), prediction)
+        count += len(prediction)
+        if time.monotonic() - reported >= 30:
+            print(f"Baseline full validation: {count}/{len(loader.dataset)}", flush=True)
+            reported = time.monotonic()
+    if count != len(loader.dataset):
+        raise RuntimeError("Baseline validation did not enumerate every window")
     model.train()
     return moments.result()["aggregate"]["selection_score"]
 
@@ -146,8 +153,6 @@ def _train_neural(config, directory, name, seed, parameters, scales, plan):
 
 
 def _train_neural_impl(config, directory, name, seed, parameters, scales, plan, loaders):
-    from stock_forecasting.training import ResumableFixedSizeBatchSampler
-
     _seed_baseline(seed)
     torch.cuda.set_per_process_memory_fraction(plan["gpu_fraction_per_job"])
     horizons = tuple(config.data.alpha_horizons)
@@ -163,20 +168,20 @@ def _train_neural_impl(config, directory, name, seed, parameters, scales, plan, 
         if plan.get("validated_bar_store_root")
         else resolve_bar_store_path(config.data.bar_store_path)
     )
-    count = len(lazy_dataset(config, "train", validated_root=source_root))
-    sampler = ResumableFixedSizeBatchSampler(
-        FixedSizeBatchSampler(
-            BlockwisePermutationSampler(count, seed=seed, block_size=128),
-            batch_size=parameters["batch_size"],
-        )
-    )
+    source = lazy_dataset(config, "train", relative=True, validated_root=source_root)
+    count = len(source)
+    runtime = tune_baseline_runtime(model, source, parameters, plan)
+    atomic_write_json(directory / "runtime-plan.json", runtime)
+    batch_size = runtime["training_batch_size"]
+    print(f"{name}/{seed} runtime: {json.dumps(runtime)}", flush=True)
+    sampler = SampleCursorBatchSampler(count, batch_size, seed, parameters["evaluations_per_epoch"])
     train = _loader(
         config,
         "train",
         plan["loader_workers"],
-        parameters["batch_size"],
+        batch_size,
         sampler=sampler,
-        prefetch=plan["prefetch_factor"],
+        prefetch=runtime["prefetch_factor"],
         validated_root=source_root,
         persistent=True,
     )
@@ -185,8 +190,8 @@ def _train_neural_impl(config, directory, name, seed, parameters, scales, plan, 
         config,
         "validation",
         plan["loader_workers"],
-        parameters["batch_size"],
-        prefetch=plan["prefetch_factor"],
+        runtime["evaluation_batch_size"],
+        prefetch=runtime["prefetch_factor"],
         validated_root=source_root,
         persistent=True,
     )
@@ -196,39 +201,119 @@ def _train_neural_impl(config, directory, name, seed, parameters, scales, plan, 
     )
     schedule = ValidationPlateauScheduler(
         optimizer,
-        math.ceil(len(train) * parameters["epochs"] * parameters["warmup_ratio"]),
+        math.ceil(count * parameters["epochs"] * parameters["warmup_ratio"]),
         patience=parameters["plateau_patience_evaluations"],
         factor=parameters["plateau_factor"],
         min_ratio=parameters["plateau_min_ratio"],
         low_lr_evaluations=parameters["plateau_min_low_lr_evaluations"],
     )
-    best, stale, start_epoch, start_batch, finished = math.inf, 0, 0, 0, False
+    best, stale, start_epoch, cursor, validated_cursor, finished = math.inf, 0, 0, 0, 0, False
     last = directory / "resume.pt"
     if last.is_file():
         # Only artifacts created in this hash-scoped, private network-volume directory are loaded.
         state = torch.load(last, map_location="cpu", weights_only=False)
+        if state.get("resume_schema") != 2 or state["train_count"] != count:
+            raise ValueError("Baseline resume has an incompatible sample-cursor contract")
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         schedule.load_state_dict(state["scheduler"])
-        best, stale, start_epoch, start_batch, finished = (
-            state[k] for k in ("best", "stale", "epoch", "next_batch", "finished")
+        best, stale, start_epoch, cursor, validated_cursor, finished = (
+            state[k]
+            for k in ("best", "stale", "epoch", "sample_cursor", "validated_cursor", "finished")
         )
         random.setstate(state["python_rng"])
         np.random.set_state(state["numpy_rng"])
         torch.set_rng_state(state["torch_rng"])
         torch.cuda.set_rng_state(state["cuda_rng"])
     scale_tensor = torch.tensor(scales, device="cuda")
-    boundaries = {
-        math.ceil(len(train) * i / parameters["evaluations_per_epoch"])
-        for i in range(1, parameters["evaluations_per_epoch"] + 1)
-    }
+    settings = parameters["resources"]
+    saved_at = reported_at = time.monotonic()
+    reported_cursor = start_epoch * count + cursor
+
+    def save(epoch):
+        nonlocal saved_at
+        _save_torch(
+            last,
+            {
+                "resume_schema": 2,
+                "train_count": count,
+                "runtime": runtime,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": schedule.state_dict(),
+                "best": best,
+                "stale": stale,
+                "epoch": epoch,
+                "sample_cursor": cursor,
+                "validated_cursor": validated_cursor,
+                "finished": finished,
+                "python_rng": random.getstate(),
+                "numpy_rng": np.random.get_state(),
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": torch.cuda.get_rng_state(),
+            },
+        )
+        saved_at = time.monotonic()
+
+    def validate(epoch):
+        nonlocal best, stale, validated_cursor, finished
+        # A pending full validation is replayed after interruption, never skipped.
+        save(epoch)
+        score = _neural_validation(model, validation, list(horizons), scales)
+        improved = score < best - parameters["early_stopping_min_delta"]
+        best, stale = (score, 0) if improved else (best, stale + 1)
+        if improved:
+            _save_torch(
+                directory / "model.pt",
+                {
+                    "state_dict": model.state_dict(),
+                    "name": name,
+                    "horizons": horizons,
+                    "context_length": config.data.input_length,
+                    "scales": scales,
+                    "seed": seed,
+                },
+            )
+        schedule.observe(score, parameters["early_stopping_min_delta"])
+        finished = (
+            stale >= parameters["early_stopping_patience_evaluations"]
+            and epoch + 1 >= parameters["early_stopping_start_epoch"]
+            and schedule.permits_early_stop
+        )
+        validated_cursor = cursor
+        save(epoch)
+        atomic_write_json(
+            directory / "progress.json",
+            {
+                "phase": "training",
+                "epoch": epoch + 1,
+                "sample_cursor": cursor,
+                "train_count": count,
+                "full_validation_score": score,
+                "best_score": best,
+                "stale_evaluations": stale,
+                "learning_rates": schedule.get_last_lr(),
+                "early_stopped": finished,
+                "runtime": runtime,
+            },
+        )
+        print(
+            f"{name}/{seed} epoch={epoch + 1} samples={cursor}/{count} full_validation={score:.8f}",
+            flush=True,
+        )
+
     for epoch in range(start_epoch, parameters["epochs"]):
         if finished:
             break
-        first = start_batch if epoch == start_epoch else 0
-        sampler.set_epoch(epoch, start_batch_index=first)
+        if epoch != start_epoch:
+            cursor, validated_cursor = 0, 0
+        if cursor in sampler.boundaries and cursor > validated_cursor:
+            validate(epoch)
+            if finished:
+                break
+        sampler.set_epoch(epoch, cursor=cursor)
         model.train()
-        for position, batch in enumerate(train, first + 1):
+        for batch in train:
             optimizer.zero_grad(set_to_none=True)
             prediction = model(_sequence(batch, "cuda"))
             loss = _normalized_pinball_torch(
@@ -237,66 +322,44 @@ def _train_neural_impl(config, directory, name, seed, parameters, scales, plan, 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            schedule.step()
-            if position not in boundaries:
-                continue
-            score = _neural_validation(model, validation, list(horizons), scales)
-            improved = score < best - parameters["early_stopping_min_delta"]
-            best, stale = (score, 0) if improved else (best, stale + 1)
-            if improved:
-                _save_torch(
-                    directory / "model.pt",
+            cursor += len(batch["target_alpha"])
+            schedule.realign(epoch * count + cursor, schedule.warmup_steps)
+            if cursor in sampler.boundaries:
+                validate(epoch)
+            elif not last.is_file() or time.monotonic() - saved_at >= settings.get(
+                "checkpoint_seconds", 300
+            ):
+                save(epoch)
+            now = time.monotonic()
+            if now - reported_at >= settings.get("progress_seconds", 30):
+                rate = (epoch * count + cursor - reported_cursor) / max(now - reported_at, 1e-9)
+                atomic_write_json(
+                    directory / "progress.json",
                     {
-                        "state_dict": model.state_dict(),
-                        "name": name,
-                        "horizons": horizons,
-                        "context_length": config.data.input_length,
-                        "scales": scales,
-                        "seed": seed,
+                        "phase": "training",
+                        "epoch": epoch + 1,
+                        "sample_cursor": cursor,
+                        "train_count": count,
+                        "windows_per_second": rate,
+                        "learning_rates": schedule.get_last_lr(),
+                        "runtime": runtime,
                     },
                 )
-            schedule.observe(score, parameters["early_stopping_min_delta"])
-            finished = (
-                stale >= parameters["early_stopping_patience_evaluations"]
-                and epoch + 1 >= parameters["early_stopping_start_epoch"]
-                and schedule.permits_early_stop
-            )
-            next_epoch, next_batch = (epoch + 1, 0) if position == len(train) else (epoch, position)
-            _save_torch(
-                last,
-                {
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": schedule.state_dict(),
-                    "best": best,
-                    "stale": stale,
-                    "epoch": next_epoch,
-                    "next_batch": next_batch,
-                    "finished": finished,
-                    "python_rng": random.getstate(),
-                    "numpy_rng": np.random.get_state(),
-                    "torch_rng": torch.get_rng_state(),
-                    "cuda_rng": torch.cuda.get_rng_state(),
-                },
-            )
-            atomic_write_json(
-                directory / "progress.json",
-                {
-                    "epoch": epoch + 1,
-                    "batch": position,
-                    "full_validation_score": score,
-                    "best_score": best,
-                    "stale_evaluations": stale,
-                    "learning_rates": schedule.get_last_lr(),
-                    "early_stopped": finished,
-                },
-            )
-            print(
-                f"{name}/{seed} epoch={epoch + 1} batch={position} full_validation={score:.8f}",
-                flush=True,
-            )
+                print(
+                    f"{name}/{seed} epoch={epoch + 1} samples={cursor}/{count} "
+                    f"windows/s={rate:.1f}",
+                    flush=True,
+                )
+                reported_at, reported_cursor = now, epoch * count + cursor
             if finished:
                 break
+        if not finished:
+            if cursor != count or validated_cursor != count:
+                raise RuntimeError(
+                    "Baseline epoch did not consume and validate its full population"
+                )
+            cursor, validated_cursor = 0, 0
+            save(epoch + 1)
     _close_loader(train)
     best_state = torch.load(directory / "model.pt", map_location="cuda", weights_only=True)
     model.load_state_dict(best_state["state_dict"])
@@ -309,8 +372,8 @@ def _train_neural_impl(config, directory, name, seed, parameters, scales, plan, 
         config,
         "test",
         plan["loader_workers"],
-        parameters["batch_size"],
-        prefetch=plan["prefetch_factor"],
+        runtime["evaluation_batch_size"],
+        prefetch=runtime["prefetch_factor"],
         validated_root=source_root,
     )
     metrics = _neural_test(model, test, directory / "test", list(horizons), scales)
@@ -371,10 +434,40 @@ def _train_gbdt(root, directory, seed, parameters, horizons, scales):
         for _ in horizons
     ]
     best, stale, start_iteration, finished = math.inf, 0, 0, False
+    active_iteration, next_model = None, 0
     resume = directory / "resume.pkl"
     if resume.is_file():
         with resume.open("rb") as stream:
-            models, best, stale, start_iteration, finished = pickle.load(stream)
+            state = pickle.load(stream)
+            if not isinstance(state, dict) or state.get("resume_schema") != 2:
+                raise ValueError("GBDT resume has an incompatible checkpoint contract")
+            models, best, stale, start_iteration, finished, active_iteration, next_model = (
+                state[k]
+                for k in (
+                    "models",
+                    "best",
+                    "stale",
+                    "iteration",
+                    "finished",
+                    "active_iteration",
+                    "next_model",
+                )
+            )
+
+    def save_gbdt(iteration, active, cursor):
+        _save_pickle(
+            resume,
+            {
+                "resume_schema": 2,
+                "models": models,
+                "best": best,
+                "stale": stale,
+                "iteration": iteration,
+                "finished": finished,
+                "active_iteration": active,
+                "next_model": cursor,
+            },
+        )
 
     def prediction(split, start, stop):
         return np.stack(
@@ -394,9 +487,21 @@ def _train_gbdt(root, directory, seed, parameters, horizons, scales):
             break
         # Native OpenMP uses only this job's assigned CPU budget; no nested process fan-out.
         for h, row in enumerate(models):
-            for model in row:
+            for q, model in enumerate(row):
+                if iteration == active_iteration and h * 3 + q < next_model:
+                    continue
                 model.set_params(max_iter=iteration)
                 model.fit(arrays["train"]["features"], arrays["train"]["targets"][:, h])
+                save_gbdt(iteration - settings["validation_every"], iteration, h * 3 + q + 1)
+                atomic_write_json(
+                    directory / "progress.json",
+                    {
+                        "phase": "fitting",
+                        "iteration": iteration,
+                        "completed_models": h * 3 + q + 1,
+                        "total_models": len(horizons) * 3,
+                    },
+                )
         score = _tabular_score(
             arrays["validation"], lambda a, b: prediction("validation", a, b), horizons, scales
         )["aggregate"]["selection_score"]
@@ -408,7 +513,7 @@ def _train_gbdt(root, directory, seed, parameters, horizons, scales):
                 {"models": models, "horizons": horizons, "scales": scales, "seed": seed},
             )
         finished = stale >= parameters["early_stopping_patience_evaluations"]
-        _save_pickle(resume, (models, best, stale, iteration, finished))
+        save_gbdt(iteration, None, 0)
         atomic_write_json(
             directory / "progress.json",
             {
@@ -515,8 +620,11 @@ def run_job(config_payload, root_string, name, seed, parameters, scales, plan):
                     config,
                     root / "inputs",
                     workers=plan["input_workers"],
+                    batch_size=plan.get("input_batch_size", parameters["batch_size"]),
                     prefetch=plan["prefetch_factor"],
                     validated_root=Path(plan["validated_bar_store_root"]),
+                    checkpoint_seconds=parameters["resources"].get("checkpoint_seconds", 300),
+                    progress_seconds=parameters["resources"].get("progress_seconds", 30),
                 )
             elif name == "rules":
                 payload = _train_rules(root, directory, list(config.data.alpha_horizons), scales)
@@ -552,9 +660,19 @@ def resource_plan(parameters, train_count, horizons, context_length=128):
         "max_loader_workers_per_experiment",
         "prefetch_factor",
         "timeout_seconds",
+        "max_training_batch_size",
+        "max_evaluation_batch_size",
+        "max_input_batch_size",
+        "max_prefetch_factor",
+        "batch_probe_repetitions",
+        "loader_probe_batches",
+        "checkpoint_seconds",
+        "progress_seconds",
     ):
         if type(settings[key]) is not int or settings[key] < 1:
             raise ValueError(f"Baseline resource limit must be a positive integer: {key}")
+    if type(settings.get("auto_batch")) is not bool:
+        raise ValueError("Baseline auto_batch must be a boolean")
     for key in ("gpu_memory_fraction", "host_memory_fraction"):
         if not 0 < settings[key] <= 0.85:
             raise ValueError(
@@ -616,6 +734,14 @@ def resource_plan(parameters, train_count, horizons, context_length=128):
         "available_gpu_bytes": free_gpu,
         "shared_memory_bytes": shared_memory,
         "input_workers": input_workers,
+        "input_batch_size": max(
+            1,
+            min(
+                settings.get("max_input_batch_size", 1024),
+                int(min(shared_memory * 0.1, memory * 0.05))
+                // (input_workers * settings["prefetch_factor"] * context_length * 2 * 5 * 8 * 8),
+            ),
+        ),
         "input_job_host_bytes": input_workers * settings["worker_bytes"] + 2 * 1024**3,
         "prefetch_factor": settings["prefetch_factor"],
         "loader_workers": workers,

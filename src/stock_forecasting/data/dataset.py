@@ -321,6 +321,9 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
         if not isinstance(split_counts, dict) or split_counts.get(split) != int(counts.sum()):
             raise ValueError("Lazy cutoff ranges disagree with the bar-store split count")
         self._range_ends = np.cumsum(counts, dtype=np.int64)
+        self._range_starts = starts
+        self._range_begins = np.concatenate((np.zeros(1, dtype=np.int64), self._range_ends[:-1]))
+        self._range_symbols = self.ranges["symbol"].astype(str).to_numpy()
         index = pd.read_parquet(self.root / "symbol-index.parquet")
         if index["symbol"].duplicated().any():
             raise ValueError("Bar-store symbol index contains duplicate symbols")
@@ -346,6 +349,7 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
             raise ValueError("Lazy cutoff ranges contain ineligible or unaligned targets")
         self._cache: OrderedDict[str, pd.DataFrame] = OrderedDict()
         self._timestamp_indexes: OrderedDict[str, pd.DatetimeIndex] = OrderedDict()
+        self._numeric_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
     def __getstate__(self) -> dict[str, Any]:
         # Keep spawn messages below pipe capacity. Sending the entire symbol index
@@ -642,19 +646,163 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
         }
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        return self._item(index)
+        return self.__getitems__([index])[0]
 
     def __getitems__(self, indices: list[int]) -> list[dict[str, Any]]:
-        """Serve one DataLoader batch in index order that maximizes cache locality."""
+        """Vectorize windows within each symbol while preserving sampler order."""
+        if len(indices) == 0:
+            return []
+        arrays = self.array_batch(indices)
+        streams = []
+        for key in ("asset", "benchmark"):
+            values = arrays[key].astype(np.float32)
+            if self.series_mode == "relative":
+                reference = np.maximum(values[:, -1:, 3:4], 1e-12)
+                values[:, :, :4] = np.log(np.maximum(values[:, :, :4], 1e-12) / reference)
+                volume = np.log1p(np.maximum(values[:, :, 4], 0.0))
+                scale = volume.std(axis=1, keepdims=True)
+                values[:, :, 4] = (volume - volume.mean(axis=1, keepdims=True)) / np.where(
+                    scale > 1e-6, scale, 1.0
+                )
+            streams.append(torch.from_numpy(values))
+        stamps = torch.from_numpy(arrays["timestamp_features"])
+        targets = torch.from_numpy(arrays["targets"].astype(np.float32))
+        output = []
+        for i, meta in enumerate(arrays["metadata"]):
+            symbol, benchmark, cutoff, row = meta
+            output.append(
+                {
+                    "asset_series": streams[0][i],
+                    "benchmark_series": streams[1][i],
+                    "asset_timestamp_features": stamps[i],
+                    "benchmark_timestamp_features": stamps[i],
+                    "target_alpha": targets[i],
+                    "sample_id": f"{symbol}-{cutoff.strftime('%Y%m%dT%H%M%SZ')}",
+                    "symbol": symbol,
+                    "benchmark_symbol": benchmark,
+                    "asset_type": str(row["asset_type"]),
+                    "market": str(row["market"]),
+                    "provider": str(row["provider"]),
+                    "dataset_profile": str(row["dataset_profile"]),
+                    "cutoff_at": cutoff.isoformat(),
+                    "diagnostics": {
+                        "capm_abnormal_return": None,
+                        "capm_status": "reserved_for_diagnostic_ablation",
+                    },
+                }
+            )
+        return output
 
-        ordered = sorted(enumerate(indices), key=lambda item: item[1])
-        resolved = [(position, self._item(index)) for position, index in ordered]
-        items: list[dict[str, Any] | None] = [None] * len(indices)
-        for position, item in resolved:
-            items[position] = item
-        if any(item is None for item in items):
-            raise RuntimeError("Batched lazy dataset lookup did not resolve every index")
-        return [item for item in items if item is not None]
+    def _numeric_symbol(self, symbol: str) -> dict[str, Any]:
+        """Decode each cached symbol once, never precompute overlapping windows."""
+        cached = self._numeric_cache.pop(symbol, None)
+        if cached is None:
+            frame = self._load_symbol(symbol)
+            raw = frame[list(CONTEXT_FIELDS)].to_numpy(dtype=np.float64)
+            adjusted = frame.get(ADJUSTED_CLOSE_FIELD, frame["close"]).to_numpy(dtype=np.float64)
+            adjusted_volume = frame.get(ADJUSTED_VOLUME_FIELD, frame["volume"]).to_numpy(
+                dtype=np.float64
+            )
+            timestamps = pd.DatetimeIndex(frame["timestamp"])
+            cached = {
+                "raw": raw,
+                "adjusted_close": adjusted,
+                "timestamps": timestamps,
+                "time_features": _timestamp_features(timestamps).numpy(),
+                "price_factor": adjusted / np.maximum(raw[:, 3], 1e-12),
+                "volume_factor": np.divide(
+                    adjusted_volume,
+                    raw[:, 4],
+                    out=np.ones_like(adjusted_volume),
+                    where=raw[:, 4] > 0,
+                ),
+            }
+        self._numeric_cache[symbol] = cached
+        while len(self._numeric_cache) > self.symbol_cache_size:
+            self._numeric_cache.popitem(last=False)
+        return cached
+
+    @staticmethod
+    def _numeric_context(bars, positions):
+        price = bars["price_factor"][positions]
+        volume = bars["volume_factor"][positions]
+        if (
+            not np.isfinite(price[:, -1]).all()
+            or (price[:, -1] <= 0).any()
+            or not np.isfinite(volume[:, -1]).all()
+            or (volume[:, -1] <= 0).any()
+        ):
+            raise ValueError("Cutoff adjustment factors must be finite and positive")
+        values = bars["raw"][positions].copy()
+        values[:, :, :4] *= (price / price[:, -1:])[:, :, None]
+        values[:, :, 4] *= volume / volume[:, -1:]
+        if not np.isfinite(values).all():
+            raise ValueError("OHLCV context must contain only finite values")
+        return values
+
+    def array_batch(self, indices: Sequence[int]) -> dict[str, Any]:
+        """Build one bounded raw float64 batch for tensors and numerical baselines."""
+        ordinals = np.asarray(indices, dtype=np.int64)
+        if ordinals.ndim != 1 or len(ordinals) == 0:
+            raise ValueError("A lazy numerical batch must be non-empty and one-dimensional")
+        ordinals = np.where(ordinals < 0, ordinals + len(self), ordinals)
+        if (ordinals < 0).any() or (ordinals >= len(self)).any():
+            raise IndexError("Lazy batch index is outside the split")
+        ranges = np.searchsorted(self._range_ends, ordinals, side="right")
+        cutoffs = self._range_starts[ranges] + ordinals - self._range_begins[ranges]
+        symbols = self._range_symbols[ranges]
+        count = len(ordinals)
+        result = {
+            "asset": np.empty((count, self.window_size, 5), dtype=np.float64),
+            "benchmark": np.empty((count, self.window_size, 5), dtype=np.float64),
+            "targets": np.empty((count, len(self.horizons)), dtype=np.float64),
+            "timestamp_features": np.empty((count, self.window_size, 5), dtype=np.int64),
+            "metadata": [None] * count,
+            "horizons": self.horizons,
+        }
+        for symbol in np.unique(symbols):
+            selected = np.flatnonzero(symbols == symbol)
+            cutoff = cutoffs[selected]
+            row = self._index[symbol]
+            benchmark_symbol = str(row["benchmark_symbol"])
+            asset, benchmark = self._numeric_symbol(symbol), self._numeric_symbol(benchmark_symbol)
+            if "alignment" not in asset:
+                asset["alignment"] = benchmark["timestamps"].get_indexer(asset["timestamps"])
+            context = cutoff[:, None] + np.arange(1 - self.window_size, 1)
+            future = cutoff[:, None] + np.arange(1, MAX_ALPHA_HORIZON + 1)
+            if (context < 0).any() or (future >= len(asset["raw"])).any():
+                raise RuntimeError("Prepared cutoff index is outside the symbol history")
+            benchmark_context, benchmark_future = (
+                asset["alignment"][context],
+                asset["alignment"][future],
+            )
+            if (benchmark_context < 0).any() or (benchmark_future < 0).any():
+                raise RuntimeError("Prepared cutoff range lost exact benchmark calendar coverage")
+            result["asset"][selected] = self._numeric_context(asset, context)
+            result["benchmark"][selected] = self._numeric_context(benchmark, benchmark_context)
+            result["timestamp_features"][selected] = asset["time_features"][context]
+            gross = []
+            for bars, positions in ((asset, future), (benchmark, benchmark_future)):
+                entry = (
+                    bars["raw"][positions[:, 0], 0]
+                    * bars["adjusted_close"][positions[:, 0]]
+                    / np.maximum(bars["raw"][positions[:, 0], 3], 1e-12)
+                )
+                values = bars["adjusted_close"][positions] / np.maximum(entry[:, None], 1e-12)
+                if not np.isfinite(values).all() or (values <= 0).any():
+                    raise ValueError(
+                        "Execution total-return gross factors must be finite and positive"
+                    )
+                gross.append(values[:, np.asarray(self.horizons) - 1])
+            result["targets"][selected] = np.log(gross[0]) - np.log(gross[1])
+            for position, cut in zip(selected, cutoff, strict=True):
+                result["metadata"][position] = (
+                    symbol,
+                    benchmark_symbol,
+                    asset["timestamps"][cut],
+                    row,
+                )
+        return result
 
     def record_at(self, index: int) -> dict[str, Any]:
         """Return one ephemeral record for numerical baseline compatibility."""

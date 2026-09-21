@@ -119,10 +119,101 @@ def test_neural_validation_reuses_and_closes_its_worker_pool(small_lazy_config):
     assert all(not p.is_alive() for p in processes)
 
 
+def test_vectorized_windows_and_baseline_features_match_legacy(small_lazy_config):
+    from stock_forecasting.baselines import baseline_arrays, baseline_arrays_from_windows
+    from stock_forecasting.data.dataset import LazyFinancialWindowDataset
+
+    for h_start in (1, 2, 3):
+        for mode in ("raw", "relative"):
+            source = LazyFinancialWindowDataset(
+                small_lazy_config.data.bar_store_path,
+                split="train",
+                window_size=32,
+                h_start=h_start,
+                series_mode=mode,
+                symbol_cache_size=4,
+            )
+            indices = [0, 7, len(source) // 2, -1, 7, 2]
+            actual = source.__getitems__(indices)
+            for index, item in zip(indices, actual, strict=True):
+                expected = source._item(index)
+                for key in expected:
+                    if isinstance(expected[key], torch.Tensor):
+                        torch.testing.assert_close(item[key], expected[key], rtol=1e-5, atol=2e-6)
+                    else:
+                        assert item[key] == expected[key]
+            expected = baseline_arrays(source.record_at(i) for i in indices)
+            actual = baseline_arrays_from_windows(source.array_batch(indices))
+            np.testing.assert_allclose(actual.features, expected.features, rtol=1e-10, atol=1e-10)
+            np.testing.assert_array_equal(actual.targets, expected.targets)
+            np.testing.assert_allclose(actual.sequences, expected.sequences, rtol=1e-5, atol=2e-6)
+            assert actual.dates == expected.dates and actual.symbols == expected.symbols
+
+
+def test_vectorized_adjustments_zero_volume_and_causal_cutoff(small_lazy_config):
+    from stock_forecasting.baseline_storage import lazy_dataset
+
+    source = lazy_dataset(small_lazy_config, "train")
+    row, cutoff = source._resolve_cutoff(7)
+    symbols = (str(row["symbol"]), str(source._index[str(row["symbol"])]["benchmark_symbol"]))
+    for symbol in symbols:
+        frame = source._load_symbol(symbol)
+        frame.loc[: cutoff - 10, "adjusted_close"] *= 0.5
+        frame.loc[: cutoff - 10, "split_adjusted_volume"] *= 2
+        frame.loc[cutoff - 4 : cutoff, ["volume", "split_adjusted_volume"]] = 0
+    first = source.__getitems__([7, 8])
+    for index, item in zip([7, 8], first, strict=True):
+        oracle = source._item(index)
+        torch.testing.assert_close(item["asset_series"], oracle["asset_series"], rtol=0, atol=0)
+        torch.testing.assert_close(item["target_alpha"], oracle["target_alpha"], rtol=0, atol=0)
+    # Globally back-adjusting the anchors must cancel at the prediction cutoff.
+    for symbol in symbols:
+        frame = source._load_symbol(symbol)
+        frame["adjusted_close"] *= 0.5
+        frame["split_adjusted_volume"] *= 2
+    source._numeric_cache.clear()
+    second = source.__getitems__([7, 8])
+    # A zero-volume cutoff uses the legacy unit volume factor; price causality is independent.
+    torch.testing.assert_close(
+        first[0]["asset_series"][:, :4], second[0]["asset_series"][:, :4], rtol=0, atol=0
+    )
+
+
+def test_tabular_cache_resumes_durable_offset(small_lazy_config, tmp_path, monkeypatch):
+    import stock_forecasting.baseline_storage as storage
+
+    root = tmp_path / "resume-inputs"
+    original = storage._commit_tabular_progress
+
+    def interrupt(directory, arrays, identity, count, offset):
+        original(directory, arrays, identity, count, offset)
+        if offset > 0:
+            raise InterruptedError("simulated interruption after durable batch")
+
+    monkeypatch.setattr(storage, "_commit_tabular_progress", interrupt)
+    with pytest.raises(InterruptedError):
+        storage.build_tabular_cache(
+            small_lazy_config, root, workers=1, batch_size=17, checkpoint_seconds=0
+        )
+    assert json.loads((root / "train/resume.json").read_text())["committed_rows"] == 17
+    starts = []
+    original_loader = storage.DataLoader
+
+    def capture(*args, **kwargs):
+        starts.append(kwargs["sampler"].start)
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(storage, "DataLoader", capture)
+    monkeypatch.setattr(storage, "_commit_tabular_progress", original)
+    result = storage.build_tabular_cache(small_lazy_config, root, workers=1, batch_size=23)
+    assert starts[0] == 17 and all(v > 0 for v in result["counts"].values())
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires authorized cloud CUDA")
 def test_neural_baseline_full_splits_and_resume(small_lazy_config, tmp_path):
     parameters = json.loads((ROOT / "configs/baseline.json").read_text())
     parameters.update(epochs=1, batch_size=16, evaluations_per_epoch=2)
+    parameters["resources"]["auto_batch"] = False
     plan = {"loader_workers": 2, "prefetch_factor": 2, "gpu_fraction_per_job": 0.35}
     directory = tmp_path / "neural"
     directory.mkdir()
@@ -134,6 +225,51 @@ def test_neural_baseline_full_splits_and_resume(small_lazy_config, tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires authorized cloud CUDA")
+@pytest.mark.parametrize("interrupt_validation", [False, True])
+def test_neural_mid_epoch_resume_rebatch(
+    small_lazy_config, tmp_path, monkeypatch, interrupt_validation
+):
+    import stock_forecasting.baseline_build as build
+    from stock_forecasting.baseline_storage import lazy_dataset
+
+    parameters = json.loads((ROOT / "configs/baseline.json").read_text())
+    parameters.update(epochs=1, batch_size=32, evaluations_per_epoch=2)
+    parameters["resources"].update(auto_batch=False, checkpoint_seconds=0)
+    plan = {"loader_workers": 1, "prefetch_factor": 2, "gpu_fraction_per_job": 0.35}
+    directory = tmp_path / "interrupted"
+    directory.mkdir()
+    scales = [0.03] * len(small_lazy_config.data.alpha_horizons)
+    original = build._save_torch
+
+    def interrupt(path, payload):
+        original(path, payload)
+        if path.name == "resume.pt" and payload["sample_cursor"] > 0:
+            boundary = math.ceil(payload["train_count"] / 2)
+            if not interrupt_validation or payload["sample_cursor"] == boundary:
+                raise InterruptedError("simulated interruption")
+
+    import math
+
+    monkeypatch.setattr(build, "_save_torch", interrupt)
+    with pytest.raises(InterruptedError):
+        build._train_neural(small_lazy_config, directory, "dlinear", 42, parameters, scales, plan)
+    before = torch.load(directory / "resume.pt", weights_only=False)
+    assert before["sample_cursor"] > 0 and before["epoch"] == 0
+    monkeypatch.setattr(build, "_save_torch", original)
+    parameters["batch_size"] = 47
+    parameters["resources"]["checkpoint_seconds"] = 300
+    result = build._train_neural(
+        small_lazy_config, directory, "dlinear", 42, parameters, scales, plan
+    )
+    after = torch.load(directory / "resume.pt", weights_only=False)
+    count = len(lazy_dataset(small_lazy_config, "train"))
+    assert after["epoch"] == 1 and after["sample_cursor"] == 0
+    assert after["scheduler"]["last_epoch"] == count
+    assert after["runtime"]["training_batch_size"] == 47
+    assert result["samples"] == len(lazy_dataset(small_lazy_config, "test"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires authorized cloud CUDA")
 def test_complete_baseline_builder_and_cache_reuse(small_lazy_config, tmp_path, monkeypatch):
     import stock_forecasting.baseline_build as build
     from stock_forecasting.baseline_contract import baseline_contract, validate_complete
@@ -142,6 +278,7 @@ def test_complete_baseline_builder_and_cache_reuse(small_lazy_config, tmp_path, 
     config = small_lazy_config
     parameters = json.loads((ROOT / "configs/baseline.json").read_text())
     parameters.update(epochs=1, batch_size=32, label_scale_calibration_samples=32)
+    parameters["resources"]["auto_batch"] = False
     parameters["gbdt"].update(max_iter=2, validation_every=1, max_leaf_nodes=3)
     config.data.label_scale_calibration_samples = 32
     config.training.learning_rate_schedule = "validation_plateau"

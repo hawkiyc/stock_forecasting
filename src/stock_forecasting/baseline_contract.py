@@ -12,6 +12,7 @@ from types import SimpleNamespace
 BASELINE_SOURCES = (
     "src/stock_forecasting/baseline_build.py",
     "src/stock_forecasting/baseline_storage.py",
+    "src/stock_forecasting/baseline_runtime.py",
     "src/stock_forecasting/baselines.py",
     "src/stock_forecasting/evaluation_store.py",
     "src/stock_forecasting/metrics.py",
