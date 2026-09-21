@@ -263,11 +263,17 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
         h_start: int = 3,
         series_mode: Literal["raw", "relative"] = "raw",
         symbol_cache_size: int = 32,
+        parquet_cache_bytes: int = 0,
+        parquet_cache_files: int = 128,
     ) -> None:
         if series_mode not in {"raw", "relative"}:
             raise ValueError("series_mode must be 'raw' or 'relative'")
         if symbol_cache_size < 2:
             raise ValueError("symbol_cache_size must be at least two")
+        if parquet_cache_bytes < 0 or parquet_cache_files < 1:
+            raise ValueError("Parquet cache needs a nonnegative byte budget and positive file cap")
+        self.parquet_cache_bytes = parquet_cache_bytes
+        self.parquet_cache_files = parquet_cache_files
         if isinstance(h_start, bool) or h_start not in SUPPORTED_H_START:
             raise ValueError("h_start must be 1, 2, or 3")
         self.root = Path(bar_store_root).resolve(strict=True)
@@ -350,6 +356,8 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
         self._cache: OrderedDict[str, pd.DataFrame] = OrderedDict()
         self._timestamp_indexes: OrderedDict[str, pd.DatetimeIndex] = OrderedDict()
         self._numeric_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._parquet_cache: OrderedDict[str, tuple[Any, int]] = OrderedDict()
+        self._parquet_bytes = 0
 
     def __getstate__(self) -> dict[str, Any]:
         # Keep spawn messages below pipe capacity. Sending the entire symbol index
@@ -362,6 +370,8 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
             "h_start": self.horizons[0],
             "series_mode": self.series_mode,
             "symbol_cache_size": self.symbol_cache_size,
+            "parquet_cache_bytes": self.parquet_cache_bytes,
+            "parquet_cache_files": self.parquet_cache_files,
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -391,12 +401,7 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
         row = self._index.get(symbol)
         if row is None:
             raise ValueError(f"Bar-store index is missing symbol: {symbol}")
-        try:
-            import pyarrow.parquet as pq
-        except ImportError as error:
-            raise RuntimeError("Lazy bar-store loading requires pyarrow") from error
-        shard = self.root / str(row["shard_relative_path"])
-        frame = pq.ParquetFile(shard).read_row_group(int(row["row_group"])).to_pandas()
+        frame = self._read_symbol_table(row).to_pandas()
         frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
         frame = frame.sort_values("timestamp", kind="stable").reset_index(drop=True)
         self._cache[symbol] = frame
@@ -405,6 +410,54 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
             evicted_symbol, _evicted_frame = self._cache.popitem(last=False)
             self._timestamp_indexes.pop(evicted_symbol)
         return frame
+
+    def _read_symbol_table(self, row, *, numerical=False):
+        """Reuse bounded immutable shard metadata, not decoded windows or whole files."""
+        import pyarrow.parquet as pq
+
+        key = str(row["shard_relative_path"])
+        cached = self._parquet_cache.pop(key, None)
+        if cached is None:
+            handle = pq.ParquetFile(self.root / key)
+            # Reserve four times serialized footer size for decoded metadata overhead.
+            size = max(4096, handle.metadata.serialized_size * 4)
+            if size <= self.parquet_cache_bytes:
+                while self._parquet_cache and (
+                    self._parquet_bytes + size > self.parquet_cache_bytes
+                    or len(self._parquet_cache) >= self.parquet_cache_files
+                ):
+                    _, (previous, previous_size) = self._parquet_cache.popitem(last=False)
+                    previous.close()
+                    self._parquet_bytes -= previous_size
+                self._parquet_bytes += size
+                cached = (handle, size)
+        else:
+            handle, size = cached
+        if cached is not None:
+            self._parquet_cache[key] = cached
+        try:
+            columns = None
+            if numerical:
+                columns = [
+                    name
+                    for name in (
+                        *CONTEXT_FIELDS,
+                        "timestamp",
+                        ADJUSTED_CLOSE_FIELD,
+                        ADJUSTED_VOLUME_FIELD,
+                    )
+                    if name in handle.schema_arrow.names
+                ]
+            return handle.read_row_group(int(row["row_group"]), columns=columns)
+        finally:
+            if cached is None:
+                handle.close()
+
+    def close(self):
+        for handle, _size in self._parquet_cache.values():
+            handle.close()
+        self._parquet_cache.clear()
+        self._parquet_bytes = 0
 
     def _aligned_rows(
         self,
@@ -697,13 +750,45 @@ class LazyFinancialWindowDataset(Dataset[dict[str, Any]]):
         """Decode each cached symbol once, never precompute overlapping windows."""
         cached = self._numeric_cache.pop(symbol, None)
         if cached is None:
-            frame = self._load_symbol(symbol)
-            raw = frame[list(CONTEXT_FIELDS)].to_numpy(dtype=np.float64)
-            adjusted = frame.get(ADJUSTED_CLOSE_FIELD, frame["close"]).to_numpy(dtype=np.float64)
-            adjusted_volume = frame.get(ADJUSTED_VOLUME_FIELD, frame["volume"]).to_numpy(
-                dtype=np.float64
-            )
-            timestamps = pd.DatetimeIndex(frame["timestamp"])
+            if symbol in self._cache:
+                frame = self._load_symbol(symbol)
+                raw = frame[list(CONTEXT_FIELDS)].to_numpy(dtype=np.float64)
+                adjusted = frame.get(ADJUSTED_CLOSE_FIELD, frame["close"]).to_numpy(
+                    dtype=np.float64
+                )
+                adjusted_volume = frame.get(ADJUSTED_VOLUME_FIELD, frame["volume"]).to_numpy(
+                    dtype=np.float64
+                )
+                timestamps = pd.DatetimeIndex(frame["timestamp"])
+            else:
+                table = self._read_symbol_table(self._index[symbol], numerical=True)
+                raw = np.column_stack([table[name].to_numpy() for name in CONTEXT_FIELDS]).astype(
+                    np.float64, copy=False
+                )
+                adjusted = (
+                    np.asarray(table[ADJUSTED_CLOSE_FIELD], dtype=np.float64)
+                    if ADJUSTED_CLOSE_FIELD in table.column_names
+                    else raw[:, 3]
+                )
+                adjusted_volume = (
+                    np.asarray(table[ADJUSTED_VOLUME_FIELD], dtype=np.float64)
+                    if ADJUSTED_VOLUME_FIELD in table.column_names
+                    else raw[:, 4]
+                )
+                timestamps = pd.DatetimeIndex(table["timestamp"].to_pandas())
+                timestamps = (
+                    timestamps.tz_localize("UTC")
+                    if timestamps.tz is None
+                    else timestamps.tz_convert("UTC")
+                )
+                if not timestamps.is_monotonic_increasing:
+                    order = np.argsort(timestamps.asi8, kind="stable")
+                    raw, adjusted, adjusted_volume, timestamps = (
+                        raw[order],
+                        adjusted[order],
+                        adjusted_volume[order],
+                        timestamps[order],
+                    )
             cached = {
                 "raw": raw,
                 "adjusted_close": adjusted,

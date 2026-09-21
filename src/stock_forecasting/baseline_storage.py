@@ -59,6 +59,10 @@ def lazy_dataset(config, split: str, *, relative: bool = False, validated_root: 
         h_start=config.data.h_start,
         series_mode="relative" if relative else "raw",
         symbol_cache_size=4,
+        parquet_cache_bytes=int(
+            os.environ.get("FIN_TS_BASELINE_PARQUET_CACHE_BYTES", str(512 * 1024**2))
+        ),
+        parquet_cache_files=int(os.environ.get("FIN_TS_BASELINE_PARQUET_CACHE_FILES", "128")),
     )
 
 

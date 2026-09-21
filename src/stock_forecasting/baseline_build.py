@@ -612,6 +612,11 @@ def run_job(config_payload, root_string, name, seed, parameters, scales, plan):
     execution = {"pid": os.getpid(), "started_at": time.time(), "job": name, "seed": seed}
     atomic_write_json(directory / "execution.json", execution)
     try:
+        for setting, environment in (
+            ("parquet_cache_bytes", "FIN_TS_BASELINE_PARQUET_CACHE_BYTES"),
+            ("parquet_cache_files", "FIN_TS_BASELINE_PARQUET_CACHE_FILES"),
+        ):
+            os.environ[environment] = str(parameters["resources"][setting])
         torch.set_num_threads(plan["cpu_threads"] if name == "gbdt" else 1)
         config = ExperimentConfig.model_validate(config_payload)
         with threadpool_limits(limits=plan["cpu_threads"] if name == "gbdt" else 1):
@@ -668,11 +673,15 @@ def resource_plan(parameters, train_count, horizons, context_length=128):
         "loader_probe_batches",
         "checkpoint_seconds",
         "progress_seconds",
+        "parquet_cache_bytes",
+        "parquet_cache_files",
     ):
         if type(settings[key]) is not int or settings[key] < 1:
             raise ValueError(f"Baseline resource limit must be a positive integer: {key}")
     if type(settings.get("auto_batch")) is not bool:
         raise ValueError("Baseline auto_batch must be a boolean")
+    if settings["parquet_cache_bytes"] > settings["worker_bytes"] * 0.75:
+        raise ValueError("Parquet cache must leave at least 25% of the worker memory reserve free")
     for key in ("gpu_memory_fraction", "host_memory_fraction"):
         if not 0 < settings[key] <= 0.85:
             raise ValueError(

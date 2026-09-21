@@ -150,6 +150,37 @@ def test_vectorized_windows_and_baseline_features_match_legacy(small_lazy_config
             assert actual.dates == expected.dates and actual.symbols == expected.symbols
 
 
+def test_numeric_arrow_reader_reuses_bounded_shard_handles(small_lazy_config, monkeypatch):
+    import pickle
+
+    import pyarrow.parquet as pq
+
+    from stock_forecasting.baseline_storage import lazy_dataset
+
+    source = lazy_dataset(small_lazy_config, "train")
+    original = pq.ParquetFile
+    opened = []
+
+    def tracked(*args, **kwargs):
+        opened.append(str(args[0]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pq, "ParquetFile", tracked)
+    first = source.array_batch([0, 1])
+    source._numeric_cache.clear()
+    second = source.array_batch([0, 1])
+    assert len(opened) == len(set(opened))
+    assert source._parquet_cache and not source._cache
+    assert source._parquet_bytes <= source.parquet_cache_bytes
+    assert len(source._parquet_cache) <= source.parquet_cache_files
+    np.testing.assert_array_equal(first["targets"], second["targets"])
+    assert len(pickle.dumps(source)) < 1024
+    restored = pickle.loads(pickle.dumps(source))
+    assert not restored._parquet_cache
+    source.close()
+    assert source._parquet_bytes == 0 and not source._parquet_cache
+
+
 def test_vectorized_adjustments_zero_volume_and_causal_cutoff(small_lazy_config):
     from stock_forecasting.baseline_storage import lazy_dataset
 
@@ -554,6 +585,46 @@ def test_full_cpu_baselines_persist_weights_and_resume(tmp_path):
     validate_tabular(tmp_path / "inputs", "test", 13, 1)
     with pytest.raises(ValueError, match="Invalid baseline"):
         validate_tabular(tmp_path / "inputs", "test", 12, 1)
+
+
+def test_gbdt_mid_round_resume_skips_committed_quantile(tmp_path, monkeypatch):
+    import pickle
+
+    import stock_forecasting.baseline_build as build
+
+    _tabular_fixture(tmp_path)
+    parameters = json.loads((ROOT / "configs/baseline.json").read_text())
+    parameters["gbdt"].update(max_iter=2, validation_every=1, max_leaf_nodes=3)
+    directory = tmp_path / "interrupted-gbdt"
+    directory.mkdir()
+    save = build._save_pickle
+
+    def interrupt(path, payload):
+        save(path, payload)
+        if path.name == "resume.pkl" and payload["next_model"] == 1:
+            raise InterruptedError("simulated interruption after one quantile fit")
+
+    monkeypatch.setattr(build, "_save_pickle", interrupt)
+    with pytest.raises(InterruptedError):
+        build._train_gbdt(tmp_path, directory, 42, parameters, [5], [0.03])
+    with (directory / "resume.pkl").open("rb") as stream:
+        state = pickle.load(stream)
+    assert state["active_iteration"] == 1 and state["next_model"] == 1
+    monkeypatch.setattr(build, "_save_pickle", save)
+    fit = build.HistGradientBoostingRegressor.fit
+    calls = []
+
+    def tracked_fit(model, *args, **kwargs):
+        calls.append((model.quantile, model.max_iter))
+        return fit(model, *args, **kwargs)
+
+    monkeypatch.setattr(build.HistGradientBoostingRegressor, "fit", tracked_fit)
+    actual = build._train_gbdt(tmp_path, directory, 42, parameters, [5], [0.03])
+    assert len(calls) == 5 and (0.1, 1) not in calls
+    reference = tmp_path / "reference-gbdt"
+    reference.mkdir()
+    expected = build._train_gbdt(tmp_path, reference, 42, parameters, [5], [0.03])
+    assert actual == expected
 
 
 def _cuda_experiment(name, output, barrier):

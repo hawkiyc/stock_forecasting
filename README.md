@@ -1354,6 +1354,10 @@ training／evaluation batch size，再以實際 DataLoader 等待時間及 host�
 quota 限制，不會把主機核心數直接當成容器可用核心數。調校結果與測量保存在各 job 的
 `runtime-plan.json`；可在 `configs/baseline.json` 的 `resources` 調整 batch／prefetch
 上限、probe 次數及保存間隔。`auto_batch=false` 才使用固定 `batch_size`。
+動態數值讀取只解碼必要的 OHLCV／調整價格／時間欄位；baseline 各 worker 使用有界
+Parquet metadata cache（預設最多 128 個檔案、512 MiB 的保守 metadata 記憶體估計），
+由 `resources.parquet_cache_files`／`parquet_cache_bytes` 調整。快取不包含展開後的
+windows，spawn 不會傳遞檔案 handles；worker 記憶體預算預設為 1 GiB。
 
 續訓使用相同的上述 `baseline`／tmux 命令，不需指定 checkpoint 路徑。神經模型在第一個
 batch 後、預設每 300 秒及完整 validation 前後保存 `resume.pt`，包含權重、optimizer、
@@ -3548,6 +3552,11 @@ and cgroup v1/v2 bandwidth quotas rather than assuming all host cores are availa
 Per-job `runtime-plan.json` records the measurements and selected settings. Configure
 batch/prefetch ceilings, probe repetitions and checkpoint intervals under `resources`
 in `configs/baseline.json`; `auto_batch=false` selects the fixed `batch_size` instead.
+Dynamic numerical readers decode only required OHLCV, adjustment and timestamp columns.
+Each baseline worker has a bounded Parquet metadata cache: at most 128 files and a
+512 MiB conservative metadata estimate by default, controlled by
+`resources.parquet_cache_files`/`parquet_cache_bytes`. It never caches expanded windows
+or serializes file handles into spawned workers. The default worker reserve is 1 GiB.
 
 Resume with the same `baseline` and tmux commands above; no checkpoint path is needed.
 Neural jobs save `resume.pt` after the first batch, every 300 seconds by default, and
